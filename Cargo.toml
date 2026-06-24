@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tracevault-protocol", "crates/tracevault-cli"]
+members = ["crates/visdom-ai-tracing-protocol", "crates/tracevault-cli"]
 resolver = "2"
 
 [workspace.package]
