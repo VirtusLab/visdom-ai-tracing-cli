@@ -31,7 +31,7 @@ runs `tracevault verify --range`, and writes a pass/fail summary to the Actions 
 - uses: actions/checkout@v4
   with:
     fetch-depth: 0   # the action verifies a commit range, so it needs full history
-- uses: VirtusLab/visdom-ai-tracing-cli/action@v0.20.1
+- uses: VirtusLab/visdom-ai-tracing-cli/action@main
   with:
     server-url: https://your-tracevault-server.example.com
     api-key: ${{ secrets.TRACEVAULT_API_KEY }}
