@@ -1,7 +1,7 @@
 # Visdom Trace CLI
 
-The public CLI for [Visdom Trace](https://github.com/VirtusLab/visdom-ai-tracing) —
-AI code tracing and attribution. Installs the `tracevault` binary.
+The public CLI for Visdom Trace — AI code tracing and attribution. Installs the
+`tracevault` binary.
 
 ## Crates
 
