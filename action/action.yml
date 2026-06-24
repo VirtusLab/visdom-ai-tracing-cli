@@ -29,10 +29,10 @@ runs:
         TARGET="x86_64-unknown-linux-gnu"
 
         if [ "$VERSION" = "latest" ]; then
-          TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-            | grep '"tag_name"' \
-            | head -1 \
-            | cut -d '"' -f 4)
+          # Capture the body first, then grep -m1 — piping curl straight into
+          # `head -1` can SIGPIPE the upstream command under `pipefail`.
+          body="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")"
+          TAG="$(printf '%s\n' "$body" | grep -m1 '"tag_name"' | cut -d '"' -f 4)"
         else
           TAG="$VERSION"
         fi
@@ -54,26 +54,44 @@ runs:
         ( cd "$tmp" && sha256sum -c "${archive}.sha256" )
 
         tar -xzf "${tmp}/${archive}" -C "$tmp"
-        install -m 0755 "${tmp}/tracevault-${TAG}-${TARGET}/tracevault" /usr/local/bin/tracevault
+        bin="${tmp}/tracevault-${TAG}-${TARGET}/tracevault"
+        if [ -w /usr/local/bin ]; then
+          install -m 0755 "$bin" /usr/local/bin/tracevault
+        else
+          sudo install -m 0755 "$bin" /usr/local/bin/tracevault
+        fi
         rm -rf "$tmp"
         tracevault --version
 
     - name: Detect commit range
       id: commits
       shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BASE: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        PUSH_BEFORE: ${{ github.event.before }}
+        PUSH_AFTER: ${{ github.event.after }}
       run: |
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          RANGE="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
-        else
-          BEFORE="${{ github.event.before }}"
-          AFTER="${{ github.event.after }}"
-          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
-            # New branch push — verify only the head commit
-            RANGE="$AFTER~1..$AFTER"
-          else
-            RANGE="${BEFORE}..${AFTER}"
-          fi
-        fi
+        set -euo pipefail
+        case "$EVENT_NAME" in
+          pull_request | pull_request_target)
+            RANGE="${PR_BASE}..${PR_HEAD}"
+            ;;
+          push)
+            if [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              # New branch push — verify only the head commit. The parent must be
+              # present locally, so the caller needs `fetch-depth: 0` on checkout.
+              RANGE="${PUSH_AFTER}~1..${PUSH_AFTER}"
+            else
+              RANGE="${PUSH_BEFORE}..${PUSH_AFTER}"
+            fi
+            ;;
+          *)
+            echo "::error::TraceVault Verify supports pull_request and push events; got '${EVENT_NAME}'"
+            exit 1
+            ;;
+        esac
         echo "range=${RANGE}" >> "$GITHUB_OUTPUT"
         echo "Commit range: ${RANGE}"
 
@@ -82,29 +100,34 @@ runs:
       env:
         TRACEVAULT_SERVER_URL: ${{ inputs.server-url }}
         TRACEVAULT_API_KEY: ${{ inputs.api-key }}
+        RANGE: ${{ steps.commits.outputs.range }}
       run: |
-        RANGE="${{ steps.commits.outputs.range }}"
+        set -uo pipefail
+        out="$(mktemp)"
 
-        echo "## TraceVault Verification" >> "$GITHUB_STEP_SUMMARY"
-        echo "" >> "$GITHUB_STEP_SUMMARY"
-
-        if tracevault verify --range "$RANGE" 2>&1 | tee /tmp/tracevault-output.txt; then
-          echo "| Result | Status |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|--------|--------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Verification | :white_check_mark: Passed |" >> "$GITHUB_STEP_SUMMARY"
+        # Run once; capture the real exit code (a `… | tee` pipeline would mask it).
+        if tracevault verify --range "$RANGE" >"$out" 2>&1; then
+          rc=0
+          status=":white_check_mark: Passed"
         else
-          echo "| Result | Status |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|--------|--------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Verification | :x: Failed |" >> "$GITHUB_STEP_SUMMARY"
+          rc=$?
+          status=":x: Failed"
         fi
 
-        echo "" >> "$GITHUB_STEP_SUMMARY"
-        echo "<details><summary>Details</summary>" >> "$GITHUB_STEP_SUMMARY"
-        echo "" >> "$GITHUB_STEP_SUMMARY"
-        echo '```' >> "$GITHUB_STEP_SUMMARY"
-        cat /tmp/tracevault-output.txt >> "$GITHUB_STEP_SUMMARY"
-        echo '```' >> "$GITHUB_STEP_SUMMARY"
-        echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+        {
+          echo "## TraceVault Verification"
+          echo ""
+          echo "| Result | Status |"
+          echo "|--------|--------|"
+          echo "| Verification | ${status} |"
+          echo ""
+          echo "<details><summary>Details</summary>"
+          echo ""
+          echo '```'
+          cat "$out"
+          echo '```'
+          echo "</details>"
+        } >> "$GITHUB_STEP_SUMMARY"
 
-        # Re-run to get the exit code (tee masks it)
-        tracevault verify --range "$RANGE"
+        cat "$out"
+        exit "$rc"

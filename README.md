@@ -28,6 +28,9 @@ traces sealed on the server. It installs the CLI, detects the commit range from 
 runs `tracevault verify --range`, and writes a pass/fail summary to the Actions step summary.
 
 ```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0   # the action verifies a commit range, so it needs full history
 - uses: VirtusLab/visdom-ai-tracing-cli/action@v0.20.1
   with:
     server-url: https://your-tracevault-server.example.com
