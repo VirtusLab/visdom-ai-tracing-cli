@@ -21,6 +21,20 @@ or from crates.io:
 cargo install tracevault-cli
 ```
 
+## GitHub Action
+
+This repo ships a composite action that verifies commits in a PR or push have corresponding
+traces sealed on the server. It installs the CLI, detects the commit range from the event,
+runs `tracevault verify --range`, and writes a pass/fail summary to the Actions step summary.
+
+```yaml
+- uses: VirtusLab/visdom-ai-tracing-cli/action@v0.20.1
+  with:
+    server-url: https://your-tracevault-server.example.com
+    api-key: ${{ secrets.TRACEVAULT_API_KEY }}
+    # version: v0.20.1   # optional; defaults to the latest release
+```
+
 ## License
 
 Apache-2.0.

@@ -1,0 +1,110 @@
+name: "TraceVault Verify"
+description: "Verify AI code governance traces and policies on pull requests and pushes"
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  server-url:
+    description: "TraceVault server URL"
+    required: true
+  api-key:
+    description: "TraceVault API key"
+    required: true
+  version:
+    description: "TraceVault CLI release tag to install, e.g. v0.20.1 (default: latest)"
+    required: false
+    default: "latest"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install TraceVault CLI
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        REPO="VirtusLab/visdom-ai-tracing-cli"
+        TARGET="x86_64-unknown-linux-gnu"
+
+        if [ "$VERSION" = "latest" ]; then
+          TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+            | grep '"tag_name"' \
+            | head -1 \
+            | cut -d '"' -f 4)
+        else
+          TAG="$VERSION"
+        fi
+
+        if [ -z "${TAG:-}" ]; then
+          echo "::error::Could not determine the TraceVault CLI release tag"
+          exit 1
+        fi
+
+        archive="tracevault-${TAG}-${TARGET}.tar.gz"
+        base="https://github.com/${REPO}/releases/download/${TAG}"
+        echo "Installing TraceVault CLI ${TAG} from ${base}/${archive}..."
+
+        tmp="$(mktemp -d)"
+        curl -fsSL "${base}/${archive}" -o "${tmp}/${archive}"
+        curl -fsSL "${base}/${archive}.sha256" -o "${tmp}/${archive}.sha256"
+
+        # The .sha256 sidecar records the bare archive name, so verify from $tmp.
+        ( cd "$tmp" && sha256sum -c "${archive}.sha256" )
+
+        tar -xzf "${tmp}/${archive}" -C "$tmp"
+        install -m 0755 "${tmp}/tracevault-${TAG}-${TARGET}/tracevault" /usr/local/bin/tracevault
+        rm -rf "$tmp"
+        tracevault --version
+
+    - name: Detect commit range
+      id: commits
+      shell: bash
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          RANGE="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+        else
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.event.after }}"
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            # New branch push — verify only the head commit
+            RANGE="$AFTER~1..$AFTER"
+          else
+            RANGE="${BEFORE}..${AFTER}"
+          fi
+        fi
+        echo "range=${RANGE}" >> "$GITHUB_OUTPUT"
+        echo "Commit range: ${RANGE}"
+
+    - name: Verify commits
+      shell: bash
+      env:
+        TRACEVAULT_SERVER_URL: ${{ inputs.server-url }}
+        TRACEVAULT_API_KEY: ${{ inputs.api-key }}
+      run: |
+        RANGE="${{ steps.commits.outputs.range }}"
+
+        echo "## TraceVault Verification" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+
+        if tracevault verify --range "$RANGE" 2>&1 | tee /tmp/tracevault-output.txt; then
+          echo "| Result | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Verification | :white_check_mark: Passed |" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "| Result | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Verification | :x: Failed |" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        echo "<details><summary>Details</summary>" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        cat /tmp/tracevault-output.txt >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+
+        # Re-run to get the exit code (tee masks it)
+        tracevault verify --range "$RANGE"
