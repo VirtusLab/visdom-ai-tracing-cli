@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.20.0...v0.20.1) - 2026-06-24
+
+### Other
+
+- rename protocol crate to visdom-ai-tracing-protocol ([#2](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/2))
+- bootstrap public CLI repo (tracevault-protocol + tracevault-cli)
+
 ## [0.20.0](https://github.com/VirtusLab/visdom-ai-tracing/compare/v0.19.0...v0.20.0) - 2026-06-22
 
 ### Fixed
