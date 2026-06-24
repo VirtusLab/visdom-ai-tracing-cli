@@ -1,0 +1,133 @@
+name: "TraceVault Verify"
+description: "Verify AI code governance traces and policies on pull requests and pushes"
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  server-url:
+    description: "TraceVault server URL"
+    required: true
+  api-key:
+    description: "TraceVault API key"
+    required: true
+  version:
+    description: "TraceVault CLI release tag to install, e.g. v0.20.1 (default: latest)"
+    required: false
+    default: "latest"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install TraceVault CLI
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        REPO="VirtusLab/visdom-ai-tracing-cli"
+        TARGET="x86_64-unknown-linux-gnu"
+
+        if [ "$VERSION" = "latest" ]; then
+          # Capture the body first, then grep -m1 — piping curl straight into
+          # `head -1` can SIGPIPE the upstream command under `pipefail`.
+          body="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")"
+          TAG="$(printf '%s\n' "$body" | grep -m1 '"tag_name"' | cut -d '"' -f 4)"
+        else
+          TAG="$VERSION"
+        fi
+
+        if [ -z "${TAG:-}" ]; then
+          echo "::error::Could not determine the TraceVault CLI release tag"
+          exit 1
+        fi
+
+        archive="tracevault-${TAG}-${TARGET}.tar.gz"
+        base="https://github.com/${REPO}/releases/download/${TAG}"
+        echo "Installing TraceVault CLI ${TAG} from ${base}/${archive}..."
+
+        tmp="$(mktemp -d)"
+        curl -fsSL "${base}/${archive}" -o "${tmp}/${archive}"
+        curl -fsSL "${base}/${archive}.sha256" -o "${tmp}/${archive}.sha256"
+
+        # The .sha256 sidecar records the bare archive name, so verify from $tmp.
+        ( cd "$tmp" && sha256sum -c "${archive}.sha256" )
+
+        tar -xzf "${tmp}/${archive}" -C "$tmp"
+        bin="${tmp}/tracevault-${TAG}-${TARGET}/tracevault"
+        if [ -w /usr/local/bin ]; then
+          install -m 0755 "$bin" /usr/local/bin/tracevault
+        else
+          sudo install -m 0755 "$bin" /usr/local/bin/tracevault
+        fi
+        rm -rf "$tmp"
+        tracevault --version
+
+    - name: Detect commit range
+      id: commits
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BASE: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        PUSH_BEFORE: ${{ github.event.before }}
+        PUSH_AFTER: ${{ github.event.after }}
+      run: |
+        set -euo pipefail
+        case "$EVENT_NAME" in
+          pull_request | pull_request_target)
+            RANGE="${PR_BASE}..${PR_HEAD}"
+            ;;
+          push)
+            if [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              # New branch push — verify only the head commit. The parent must be
+              # present locally, so the caller needs `fetch-depth: 0` on checkout.
+              RANGE="${PUSH_AFTER}~1..${PUSH_AFTER}"
+            else
+              RANGE="${PUSH_BEFORE}..${PUSH_AFTER}"
+            fi
+            ;;
+          *)
+            echo "::error::TraceVault Verify supports pull_request and push events; got '${EVENT_NAME}'"
+            exit 1
+            ;;
+        esac
+        echo "range=${RANGE}" >> "$GITHUB_OUTPUT"
+        echo "Commit range: ${RANGE}"
+
+    - name: Verify commits
+      shell: bash
+      env:
+        TRACEVAULT_SERVER_URL: ${{ inputs.server-url }}
+        TRACEVAULT_API_KEY: ${{ inputs.api-key }}
+        RANGE: ${{ steps.commits.outputs.range }}
+      run: |
+        set -uo pipefail
+        out="$(mktemp)"
+
+        # Run once; capture the real exit code (a `… | tee` pipeline would mask it).
+        if tracevault verify --range "$RANGE" >"$out" 2>&1; then
+          rc=0
+          status=":white_check_mark: Passed"
+        else
+          rc=$?
+          status=":x: Failed"
+        fi
+
+        {
+          echo "## TraceVault Verification"
+          echo ""
+          echo "| Result | Status |"
+          echo "|--------|--------|"
+          echo "| Verification | ${status} |"
+          echo ""
+          echo "<details><summary>Details</summary>"
+          echo ""
+          echo '```'
+          cat "$out"
+          echo '```'
+          echo "</details>"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        cat "$out"
+        exit "$rc"
