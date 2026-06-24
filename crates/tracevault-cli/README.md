@@ -1,6 +1,6 @@
 # tracevault
 
-CLI tool for [Visdom Trace](https://github.com/VirtusLab/visdom-ai-tracing) — AI code tracing and attribution.
+CLI tool for Visdom Trace — AI code tracing and attribution.
 
 ## Install
 
