@@ -1675,23 +1675,10 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tracevault-protocol",
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "tracevault-protocol"
-version = "0.20.0"
-dependencies = [
- "chrono",
- "hex",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "uuid",
+ "visdom-ai-tracing-protocol",
 ]
 
 [[package]]
@@ -1820,6 +1807,19 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "visdom-ai-tracing-protocol"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "uuid",
+]
 
 [[package]]
 name = "walkdir"

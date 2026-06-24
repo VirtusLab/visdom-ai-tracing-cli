@@ -6,7 +6,7 @@ AI code tracing and attribution. Installs the `tracevault` binary.
 ## Crates
 
 - **`tracevault-cli`** — the `tracevault` command-line tool (hooks, session capture, verification).
-- **`tracevault-protocol`** — the wire-protocol types (stream + hook events) shared between the
+- **`visdom-ai-tracing-protocol`** — the wire-protocol types (stream + hook events) shared between the
   CLI and the Visdom Trace server. Published so both sides depend on one source of truth.
 
 ## Install
