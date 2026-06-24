@@ -1,0 +1,11 @@
+# Keep the published binary's git tag clean (`v0.20.0`), so release assets are
+# `tracevault-v0.20.0-<target>.tar.gz` (not `tracevault-tracevault-cli-v...`)
+# and the Homebrew formula's download URLs stay tidy. tracevault-protocol gets
+# its own prefixed tag so the two crates' tags never collide.
+[[package]]
+name = "tracevault-cli"
+git_tag_name = "v{{ version }}"
+
+[[package]]
+name = "tracevault-protocol"
+git_tag_name = "protocol-v{{ version }}"

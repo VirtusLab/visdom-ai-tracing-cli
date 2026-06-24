@@ -1,0 +1,92 @@
+name: Release-plz
+
+permissions:
+  pull-requests: write
+  contents: write
+  actions: write
+
+on:
+  push:
+    branches: [main]
+  # Backup trigger: GitHub's push event sometimes does not fire after a
+  # squash merge. Catch the merge via pull_request_target so release-plz
+  # still runs.
+  pull_request_target:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  release-plz-release:
+    name: Release-plz release
+    if: >-
+      github.event_name != 'pull_request_target' ||
+      github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    # A release merge fires BOTH `push` and `pull_request_target: closed`.
+    # Without this guard the release job runs twice concurrently and the two
+    # attempts collide on `cargo publish` / tag creation ("Reference already
+    # exists"), the job fails, and the binary+brew trigger below never runs.
+    concurrency:
+      group: release-plz-release-main
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: main
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Run release-plz
+        id: release-plz
+        uses: release-plz/action@1528104d2ca23787631a1c1f022abb64b34c1e11 # v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Trigger binary builds and Homebrew update
+        if: steps.release-plz.outputs.releases_created == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The binary + Homebrew formula track tracevault-cli specifically.
+          tag=$(echo '${{ steps.release-plz.outputs.releases }}' \
+            | jq -r '.[] | select(.package_name == "tracevault-cli") | .tag')
+          if [ -z "$tag" ]; then
+            echo "No tracevault-cli release in this run; skipping binary build."
+            exit 0
+          fi
+          echo "tracevault-cli released as tag: $tag"
+          gh workflow run release-binaries.yml \
+            --repo ${{ github.repository }} \
+            --field tag="$tag"
+
+  release-plz-pr:
+    name: Release-plz PR
+    if: >-
+      github.event_name != 'pull_request_target' ||
+      github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-plz-pr-main
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: main
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Run release-plz
+        uses: release-plz/action@1528104d2ca23787631a1c1f022abb64b34c1e11 # v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

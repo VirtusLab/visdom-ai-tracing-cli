@@ -1,0 +1,21 @@
+[workspace]
+members = ["crates/tracevault-protocol", "crates/tracevault-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.20.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["VirtusLab"]
+homepage = "https://github.com/VirtusLab/visdom-ai-tracing-cli"
+repository = "https://github.com/VirtusLab/visdom-ai-tracing-cli"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

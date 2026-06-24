@@ -1,0 +1,25 @@
+[package]
+name = "tracevault-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+description = "Wire protocol types (streaming + hooks) shared by the Visdom Trace CLI and server"
+readme = "README.md"
+keywords = ["tracing", "attribution", "ai", "protocol"]
+categories = ["development-tools"]
+
+[lib]
+name = "tracevault_protocol"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+sha2 = "0.11"
+hex = "0.4"
