@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.2](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.20.1...v0.20.2) - 2026-07-01
+
+### Fixed
+
+- *(cli)* send explicit Content-Length: 0 on bodyless auth POSTs ([#7](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/7))
+
+### Other
+
+- drop the main-repo link from the tracevault-cli crate README ([#6](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/6))
+
 ## [0.20.1](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.20.0...v0.20.1) - 2026-06-24
 
 ### Other
