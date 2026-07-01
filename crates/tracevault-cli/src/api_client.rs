@@ -184,7 +184,11 @@ impl ApiClient {
     pub async fn device_start(&self) -> Result<DeviceAuthResponse, Box<dyn Error>> {
         let resp = self
             .client
+            // Send an explicit `Content-Length: 0`. reqwest/hyper omit the header
+            // entirely for a bodyless POST, and strict frontends (e.g. Google
+            // Front End) reject such requests with `411 Length Required`.
             .post(format!("{}/api/v1/auth/device", self.base_url))
+            .header(reqwest::header::CONTENT_LENGTH, "0")
             .send()
             .await?;
 
@@ -223,7 +227,12 @@ impl ApiClient {
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
         }
-        let resp = builder.send().await?;
+        // Explicit `Content-Length: 0` (see `device_start`): reqwest/hyper omit it
+        // for a bodyless POST, which strict frontends reject with 411.
+        let resp = builder
+            .header(reqwest::header::CONTENT_LENGTH, "0")
+            .send()
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
