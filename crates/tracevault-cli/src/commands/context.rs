@@ -224,17 +224,29 @@ fn apply_update_mutations(
     Ok(())
 }
 
-/// `tracevault context show` — print three labelled sections:
-///   1. Global — the repo-wide `context.json`.
-///   2. This worktree — the per-worktree context (Linked only; "(none)" when missing).
-///   3. Effective — the merged result that the hook stamps on every event.
-///
-/// Also prints the resolved file paths.
+/// `tracevault context show` — print four labelled sections:
+///   1. User — the cross-repo user-level context (only when `user_context` is
+///      enabled in `config.toml`; shows the resolved file path either way).
+///   2. Global — the repo-wide `context.json`.
+///   3. This worktree — the per-worktree context (Linked only; "(none)" when missing).
+///   4. Effective — the merged result that the hook stamps on every event, with
+///      each label/param annotated with the layer it came from.
 ///
 /// Prints a hint if no `.tracevault/` directory is found (i.e. `tracevault init` has
 /// not been run), using `find_project_root` for the diagnostic.
 pub fn run_show(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let (paths, _user, global, worktree, effective) = Context::effective_with_parts(cwd, None);
+    // Resolve the user-level context source from config.toml (if any project
+    // root/config exists yet — tolerate neither being present, same as
+    // `user_context_path`).
+    let config = find_project_root(cwd)
+        .ok()
+        .and_then(|root| TracevaultConfig::load(&root))
+        .unwrap_or_default();
+    let user_path = config.user_context.resolve();
+    let user_enabled = user_path.is_some();
+
+    let (paths, user, global, worktree, effective) =
+        Context::effective_with_parts(cwd, user_path.as_deref());
 
     // If the tracevault directory doesn't exist yet, hint that init is needed.
     // find_project_root gives the classic walk-up path; if it also fails, the
@@ -243,31 +255,202 @@ pub fn run_show(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("hint: No .tracevault/ directory found. Run `tracevault init` first.");
     }
 
-    println!("=== Global ===");
-    println!("File: {}", paths.global_path().display());
-    println!("{}", serde_json::to_string_pretty(&global)?);
+    let is_linked = matches!(paths.scope, WorktreeScope::Linked { .. });
 
-    match &paths.scope {
-        WorktreeScope::Linked { key } => {
-            let wt_path = paths
-                .worktree_path()
-                .expect("Linked scope always has a worktree_path");
-            println!("\n=== This worktree ({key}) ===");
-            println!("File: {}", wt_path.display());
-            match &worktree {
-                Some(wt) => println!("{}", serde_json::to_string_pretty(wt)?),
-                None => println!("(none)"),
-            }
+    print!(
+        "{}",
+        show_report(
+            user.as_ref(),
+            user_enabled,
+            user_path.as_deref(),
+            &global,
+            worktree.as_ref(),
+            is_linked,
+            &effective,
+        )
+    );
+
+    Ok(())
+}
+
+/// Layer names used in provenance annotations, precedence low→high.
+const LAYER_USER: &str = "user";
+const LAYER_REPO: &str = "repo";
+const LAYER_WORKTREE: &str = "worktree";
+
+/// Highest-precedence layer (`worktree` > `repo` > `user`) whose stored
+/// `params` map has `key` set to `Some(_)`. `None` tombstones are skipped:
+/// per `Context::merge_layers`, a key only survives into the effective
+/// params at all if the highest layer that *touches* it sets `Some`, so the
+/// highest `Some` always identifies the correct source.
+fn param_source(
+    user: Option<&Context>,
+    global: &Context,
+    worktree: Option<&Context>,
+    key: &str,
+) -> &'static str {
+    if let Some(w) = worktree {
+        if matches!(w.params.get(key), Some(Some(_))) {
+            return LAYER_WORKTREE;
         }
-        WorktreeScope::Primary => {
-            // No separate per-worktree section for the primary checkout.
+    }
+    if matches!(global.params.get(key), Some(Some(_))) {
+        return LAYER_REPO;
+    }
+    if let Some(u) = user {
+        if matches!(u.params.get(key), Some(Some(_))) {
+            return LAYER_USER;
+        }
+    }
+    "?"
+}
+
+/// First (lowest-precedence) layer whose `labels` contains `label` — labels
+/// are a union, so the *introducing* layer (not the overriding one) is the
+/// meaningful provenance.
+fn label_source(
+    user: Option<&Context>,
+    global: &Context,
+    worktree: Option<&Context>,
+    label: &str,
+) -> &'static str {
+    if let Some(u) = user {
+        if u.labels.iter().any(|l| l == label) {
+            return LAYER_USER;
+        }
+    }
+    if global.labels.iter().any(|l| l == label) {
+        return LAYER_REPO;
+    }
+    if let Some(w) = worktree {
+        if w.labels.iter().any(|l| l == label) {
+            return LAYER_WORKTREE;
+        }
+    }
+    "?"
+}
+
+/// Highest-precedence layer whose `flow_id` is `Some(_)` — same "highest
+/// wins" rule `merge_layers` uses for `flow_id`.
+fn flow_source(
+    user: Option<&Context>,
+    global: &Context,
+    worktree: Option<&Context>,
+) -> &'static str {
+    if let Some(w) = worktree {
+        if w.flow_id.is_some() {
+            return LAYER_WORKTREE;
+        }
+    }
+    if global.flow_id.is_some() {
+        return LAYER_REPO;
+    }
+    if let Some(u) = user {
+        if u.flow_id.is_some() {
+            return LAYER_USER;
+        }
+    }
+    "?"
+}
+
+/// Pure formatter for `tracevault context show`. Extracted out of `run_show`
+/// so the provenance logic is unit-testable without capturing stdout.
+///
+/// `user_enabled`/`user_path` carry the `user_context` config state needed
+/// for the `User` header (a `Context`/`EffectiveContext` alone can't tell
+/// "disabled" apart from "enabled but file missing"). `is_linked` likewise
+/// carries `ContextPaths::scope`: a bare `worktree: Option<&Context>` can't
+/// distinguish "primary checkout, no per-worktree section at all" from
+/// "linked worktree with no per-worktree file yet ('(none)')".
+#[allow(clippy::too_many_arguments)]
+fn show_report(
+    user: Option<&Context>,
+    user_enabled: bool,
+    user_path: Option<&Path>,
+    global: &Context,
+    worktree: Option<&Context>,
+    is_linked: bool,
+    eff: &crate::context::EffectiveContext,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    let file_desc = match user_path {
+        Some(p) if user_enabled => p.display().to_string(),
+        _ => "disabled".to_string(),
+    };
+    let _ = writeln!(
+        out,
+        "=== User (enabled: {user_enabled}, file: {file_desc}) ==="
+    );
+    match user {
+        Some(u) => {
+            let _ = writeln!(
+                out,
+                "{}",
+                serde_json::to_string_pretty(u).unwrap_or_default()
+            );
+        }
+        None => {
+            let _ = writeln!(out, "(none)");
         }
     }
 
-    println!("\n=== Effective ===");
-    println!("{}", serde_json::to_string_pretty(&effective)?);
+    let _ = writeln!(out, "\n=== Global ===");
+    let _ = writeln!(
+        out,
+        "{}",
+        serde_json::to_string_pretty(global).unwrap_or_default()
+    );
 
-    Ok(())
+    if is_linked {
+        let _ = writeln!(out, "\n=== This worktree ===");
+        match worktree {
+            Some(wt) => {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(wt).unwrap_or_default()
+                );
+            }
+            None => {
+                let _ = writeln!(out, "(none)");
+            }
+        }
+    }
+
+    let _ = writeln!(out, "\n=== Effective ===");
+    match &eff.flow_id {
+        Some(f) => {
+            let source = flow_source(user, global, worktree);
+            let _ = writeln!(out, "flow_id = {f}   [from {source}]");
+        }
+        None => {
+            let _ = writeln!(out, "flow_id = (none)");
+        }
+    }
+
+    let _ = writeln!(out, "labels:");
+    if eff.labels.is_empty() {
+        let _ = writeln!(out, "  (none)");
+    } else {
+        for label in &eff.labels {
+            let source = label_source(user, global, worktree, label);
+            let _ = writeln!(out, "  {label}   [from {source}]");
+        }
+    }
+
+    let _ = writeln!(out, "params:");
+    if eff.params.is_empty() {
+        let _ = writeln!(out, "  (none)");
+    } else {
+        for (k, v) in &eff.params {
+            let source = param_source(user, global, worktree, k);
+            let _ = writeln!(out, "  {k} = {v}   [from {source}]");
+        }
+    }
+
+    out
 }
 
 /// `tracevault context clear` — remove/reset the context for the chosen scope.
@@ -362,7 +545,42 @@ pub fn run_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::fs;
+
+    #[test]
+    fn show_report_includes_user_section_and_repo_provenance() {
+        let user = Context {
+            flow_id: None,
+            labels: vec![],
+            params: BTreeMap::from([("owner".to_string(), Some("alice".to_string()))]),
+        };
+        let global = Context {
+            flow_id: None,
+            labels: vec![],
+            params: BTreeMap::from([("owner".to_string(), Some("bob".to_string()))]),
+        };
+        let eff = Context::merge_layers(&[&user, &global]);
+
+        let report = show_report(
+            Some(&user),
+            true,
+            Some(Path::new("/tmp/user.json")),
+            &global,
+            None,
+            false,
+            &eff,
+        );
+
+        assert!(
+            report.contains("=== User"),
+            "missing User section: {report}"
+        );
+        assert!(
+            report.contains("owner = bob   [from repo]"),
+            "missing repo provenance for overridden param: {report}"
+        );
+    }
 
     /// Create a temp project with a `.tracevault/config.toml` for `run_source` tests.
     fn temp_project() -> tempfile::TempDir {
