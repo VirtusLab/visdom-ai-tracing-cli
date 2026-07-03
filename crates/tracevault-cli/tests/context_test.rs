@@ -58,6 +58,7 @@ fn set_creates_context_with_all_fields() {
         vec!["alpha".to_string(), "beta".to_string()],
         vec!["k1=v1".to_string(), "k2=v2".to_string()],
         false,
+        false,
     )
     .unwrap();
 
@@ -81,6 +82,7 @@ fn set_replaces_previous_context_entirely() {
         vec!["old-label".to_string()],
         vec!["old_key=old_val".to_string()],
         false,
+        false,
     )
     .unwrap();
 
@@ -90,6 +92,7 @@ fn set_replaces_previous_context_entirely() {
         Some("flow-B".to_string()),
         vec![],
         vec![],
+        false,
         false,
     )
     .unwrap();
@@ -103,7 +106,15 @@ fn set_replaces_previous_context_entirely() {
 #[test]
 fn set_no_flow_leaves_flow_none() {
     let tmp = tmp_project();
-    run_set(tmp.path(), None, vec!["lbl".to_string()], vec![], false).unwrap();
+    run_set(
+        tmp.path(),
+        None,
+        vec!["lbl".to_string()],
+        vec![],
+        false,
+        false,
+    )
+    .unwrap();
     let ctx = load_ctx(&tmp);
     assert!(ctx.flow_id.is_none());
     assert_eq!(ctx.labels, vec!["lbl"]);
@@ -112,7 +123,15 @@ fn set_no_flow_leaves_flow_none() {
 #[test]
 fn set_comma_split_labels() {
     let tmp = tmp_project();
-    run_set(tmp.path(), None, vec!["a,b,c".to_string()], vec![], false).unwrap();
+    run_set(
+        tmp.path(),
+        None,
+        vec!["a,b,c".to_string()],
+        vec![],
+        false,
+        false,
+    )
+    .unwrap();
     let ctx = load_ctx(&tmp);
     assert_eq!(ctx.labels, vec!["a", "b", "c"]);
 }
@@ -125,6 +144,7 @@ fn set_malformed_param_errors() {
         None,
         vec![],
         vec!["noequals".to_string()],
+        false,
         false,
     )
     .unwrap_err();
@@ -146,6 +166,7 @@ fn update_changes_flow_keeps_labels() {
         vec!["keep-me".to_string()],
         vec![],
         false,
+        false,
     )
     .unwrap();
 
@@ -156,6 +177,7 @@ fn update_changes_flow_keeps_labels() {
         vec![],
         vec![],
         vec![],
+        false,
         false,
     )
     .unwrap();
@@ -169,7 +191,15 @@ fn update_changes_flow_keeps_labels() {
 fn update_unions_labels() {
     let tmp = tmp_project();
 
-    run_set(tmp.path(), None, vec!["a".to_string()], vec![], false).unwrap();
+    run_set(
+        tmp.path(),
+        None,
+        vec!["a".to_string()],
+        vec![],
+        false,
+        false,
+    )
+    .unwrap();
     run_update(
         tmp.path(),
         None,
@@ -177,6 +207,7 @@ fn update_unions_labels() {
         vec![],
         vec![],
         vec![],
+        false,
         false,
     )
     .unwrap();
@@ -190,7 +221,15 @@ fn update_unions_labels() {
 fn update_overwrites_param_key() {
     let tmp = tmp_project();
 
-    run_set(tmp.path(), None, vec![], vec!["key=old".to_string()], false).unwrap();
+    run_set(
+        tmp.path(),
+        None,
+        vec![],
+        vec!["key=old".to_string()],
+        false,
+        false,
+    )
+    .unwrap();
 
     run_update(
         tmp.path(),
@@ -199,6 +238,7 @@ fn update_overwrites_param_key() {
         vec!["key=new".to_string()],
         vec![],
         vec![],
+        false,
         false,
     )
     .unwrap();
@@ -217,6 +257,7 @@ fn update_remove_label_works() {
         vec!["keep".to_string(), "drop".to_string()],
         vec![],
         false,
+        false,
     )
     .unwrap();
 
@@ -227,6 +268,7 @@ fn update_remove_label_works() {
         vec![],
         vec!["drop".to_string()],
         vec![],
+        false,
         false,
     )
     .unwrap();
@@ -245,6 +287,7 @@ fn update_remove_param_works() {
         vec![],
         vec!["keep=yes".to_string(), "drop=yes".to_string()],
         false,
+        false,
     )
     .unwrap();
 
@@ -255,6 +298,7 @@ fn update_remove_param_works() {
         vec![],
         vec![],
         vec!["drop".to_string()],
+        false,
         false,
     )
     .unwrap();
@@ -277,9 +321,20 @@ fn update_no_flow_arg_leaves_flow_unchanged() {
         vec![],
         vec![],
         false,
+        false,
     )
     .unwrap();
-    run_update(tmp.path(), None, vec![], vec![], vec![], vec![], false).unwrap();
+    run_update(
+        tmp.path(),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        false,
+        false,
+    )
+    .unwrap();
 
     let ctx = load_ctx(&tmp);
     assert_eq!(ctx.flow_id, Some("stable-flow".to_string()));
@@ -295,6 +350,7 @@ fn update_malformed_param_errors() {
         vec!["bad".to_string()],
         vec![],
         vec![],
+        false,
         false,
     )
     .unwrap_err();
@@ -316,10 +372,11 @@ fn clear_empties_all_fields() {
         vec!["lbl".to_string()],
         vec!["k=v".to_string()],
         false,
+        false,
     )
     .unwrap();
 
-    run_clear(tmp.path(), false).unwrap();
+    run_clear(tmp.path(), false, false).unwrap();
 
     let ctx = load_ctx(&tmp);
     assert_eq!(ctx, Context::default());
@@ -332,7 +389,7 @@ fn clear_empties_all_fields() {
 #[test]
 fn set_errors_without_tracevault_dir() {
     let tmp = tempfile::TempDir::new().unwrap(); // no .tracevault/
-    let err = run_set(tmp.path(), None, vec![], vec![], false).unwrap_err();
+    let err = run_set(tmp.path(), None, vec![], vec![], false, false).unwrap_err();
     assert!(
         err.to_string().contains("tracevault init"),
         "error must mention 'tracevault init', got: {err}"
@@ -342,7 +399,17 @@ fn set_errors_without_tracevault_dir() {
 #[test]
 fn update_errors_without_tracevault_dir() {
     let tmp = tempfile::TempDir::new().unwrap(); // no .tracevault/
-    let err = run_update(tmp.path(), None, vec![], vec![], vec![], vec![], false).unwrap_err();
+    let err = run_update(
+        tmp.path(),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        false,
+        false,
+    )
+    .unwrap_err();
     assert!(
         err.to_string().contains("tracevault init"),
         "error must mention 'tracevault init', got: {err}"
@@ -352,7 +419,7 @@ fn update_errors_without_tracevault_dir() {
 #[test]
 fn clear_errors_without_tracevault_dir() {
     let tmp = tempfile::TempDir::new().unwrap(); // no .tracevault/
-    let err = run_clear(tmp.path(), false).unwrap_err();
+    let err = run_clear(tmp.path(), false, false).unwrap_err();
     assert!(
         err.to_string().contains("tracevault init"),
         "error must mention 'tracevault init', got: {err}"
@@ -377,6 +444,7 @@ fn show_does_not_error_with_populated_context() {
         Some("show-flow".to_string()),
         vec!["tag1".to_string()],
         vec!["env=prod".to_string()],
+        false,
         false,
     )
     .unwrap();

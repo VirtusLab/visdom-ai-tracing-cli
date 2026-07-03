@@ -431,6 +431,7 @@ fn set_from_linked_worktree_writes_worktree_file_not_global() {
         vec!["wt-label".to_string()],
         vec![],
         false, // not --global
+        false,
     )
     .unwrap();
 
@@ -475,6 +476,7 @@ fn set_global_flag_from_linked_worktree_writes_global_file() {
         vec!["forced-label".to_string()],
         vec![],
         true, // --global
+        false,
     )
     .unwrap();
 
@@ -514,6 +516,7 @@ fn set_from_primary_writes_global_file() {
         vec!["primary-label".to_string()],
         vec![],
         false,
+        false,
     )
     .unwrap();
 
@@ -547,6 +550,7 @@ fn linked_worktree_effective_is_merge_of_global_and_worktree() {
         vec!["global-label".to_string()],
         vec!["shared=yes".to_string(), "global-only=1".to_string()],
         false,
+        false,
     )
     .unwrap();
 
@@ -556,6 +560,7 @@ fn linked_worktree_effective_is_merge_of_global_and_worktree() {
         Some("wt-flow".to_string()),  // overrides global flow
         vec!["wt-label".to_string()], // added to global labels
         vec!["shared=override".to_string(), "wt-only=2".to_string()],
+        false,
         false,
     )
     .unwrap();
@@ -614,6 +619,7 @@ fn update_from_linked_worktree_writes_worktree_file() {
         vec!["a".to_string()],
         vec![],
         false,
+        false,
     )
     .unwrap();
 
@@ -625,6 +631,7 @@ fn update_from_linked_worktree_writes_worktree_file() {
         vec![],
         vec![],
         vec![],
+        false,
         false,
     )
     .unwrap();
@@ -656,11 +663,20 @@ fn clear_from_linked_worktree_deletes_worktree_file_not_global() {
         vec!["g-label".to_string()],
         vec![],
         false,
+        false,
     )
     .unwrap();
 
     // Linked worktree context.
-    run_set(&wt_dir, Some("wt-flow".to_string()), vec![], vec![], false).unwrap();
+    run_set(
+        &wt_dir,
+        Some("wt-flow".to_string()),
+        vec![],
+        vec![],
+        false,
+        false,
+    )
+    .unwrap();
 
     // Confirm the per-worktree file exists before clearing.
     let linked_paths = resolve_context_paths(&wt_dir);
@@ -673,7 +689,7 @@ fn clear_from_linked_worktree_deletes_worktree_file_not_global() {
     );
 
     // Clear from linked worktree (no --global).
-    run_clear(&wt_dir, false).unwrap();
+    run_clear(&wt_dir, false, false).unwrap();
 
     // After clear, the per-worktree file must NOT exist (absent-vs-empty invariant).
     assert!(
@@ -731,7 +747,8 @@ fn clear_from_linked_worktree_with_no_file_is_noop() {
     assert!(!wt_path.exists(), "sanity: file must be absent before test");
 
     // Clear must not error even if the file doesn't exist.
-    run_clear(&wt_dir, false).expect("clear must succeed even when per-worktree file is absent");
+    run_clear(&wt_dir, false, false)
+        .expect("clear must succeed even when per-worktree file is absent");
 
     // File must still be absent.
     assert!(
@@ -770,6 +787,7 @@ fn two_linked_worktrees_are_isolated() {
         vec!["global-label".to_string()],
         vec!["env=prod".to_string()],
         false,
+        false,
     )
     .unwrap();
 
@@ -780,6 +798,7 @@ fn two_linked_worktrees_are_isolated() {
         vec!["label-A".to_string()],
         vec!["wt=A".to_string()],
         false,
+        false,
     )
     .unwrap();
 
@@ -789,6 +808,7 @@ fn two_linked_worktrees_are_isolated() {
         Some("flow-B".to_string()),
         vec!["label-B".to_string()],
         vec!["wt=B".to_string()],
+        false,
         false,
     )
     .unwrap();
@@ -904,6 +924,7 @@ fn update_remove_label_and_param_at_worktree_scope() {
         vec!["global-only".to_string()],
         vec!["g=global".to_string()],
         false,
+        false,
     )
     .unwrap();
 
@@ -913,6 +934,7 @@ fn update_remove_label_and_param_at_worktree_scope() {
         None,
         vec!["keep-label".to_string(), "drop-label".to_string()],
         vec!["keep=yes".to_string(), "drop=yes".to_string()],
+        false,
         false,
     )
     .unwrap();
@@ -925,6 +947,7 @@ fn update_remove_label_and_param_at_worktree_scope() {
         vec![],
         vec!["drop-label".to_string()], // --remove-label
         vec!["drop".to_string()],       // --remove-param
+        false,
         false,
     )
     .unwrap();
@@ -992,6 +1015,7 @@ fn apply_context_stamps_effective_merged_context() {
         vec!["global-label".to_string()],
         vec!["env=prod".to_string()],
         false,
+        false,
     )
     .unwrap();
 
@@ -1001,6 +1025,7 @@ fn apply_context_stamps_effective_merged_context() {
         Some("wt-flow".to_string()),
         vec!["wt-label".to_string()],
         vec!["env=staging".to_string()],
+        false,
         false,
     )
     .unwrap();

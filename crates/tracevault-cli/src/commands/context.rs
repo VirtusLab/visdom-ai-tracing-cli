@@ -44,6 +44,16 @@ fn split_labels(labels: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Resolve the file backing the project's user-level context source
+/// (`user_context` in `config.toml`), regardless of whether it is enabled.
+///
+/// Used by `--user` on `context set/update/clear` to edit that file directly.
+fn user_context_path(cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let root = find_project_root(cwd)?;
+    let config = TracevaultConfig::load(&root).unwrap_or_default();
+    Ok(config.user_context.path())
+}
+
 /// `tracevault context set` — build a fresh Context from flags, save it.
 /// Omitted dimensions are empty. Clears anything not explicitly provided.
 ///
@@ -52,12 +62,14 @@ fn split_labels(labels: &[String]) -> Vec<String> {
 /// - Primary checkout → writes the global `context.json`.
 ///
 /// `global = true` forces the global file from any worktree.
+/// `user = true` writes the resolved user-context file instead (wins over `global`).
 pub fn run_set(
     cwd: &Path,
     flow: Option<String>,
     labels: Vec<String>,
     params: Vec<String>,
     global: bool,
+    user: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut parsed_params = std::collections::BTreeMap::new();
     for raw in &params {
@@ -70,6 +82,14 @@ pub fn run_set(
         labels: split_labels(&labels),
         params: parsed_params,
     };
+
+    if user {
+        let path = user_context_path(cwd)?;
+        ctx.save_to(&path)
+            .map_err(|e: io::Error| format!("failed to save context: {e}"))?;
+        println!("Context set.");
+        return Ok(());
+    }
 
     let paths = resolve_context_paths(cwd);
 
@@ -96,6 +116,8 @@ pub fn run_set(
 /// - Primary checkout → reads/writes the global `context.json`.
 ///
 /// `global = true` forces the global file from any worktree.
+/// `user = true` reads/writes the resolved user-context file instead (wins over `global`).
+#[allow(clippy::too_many_arguments)]
 pub fn run_update(
     cwd: &Path,
     flow: Option<String>,
@@ -104,7 +126,25 @@ pub fn run_update(
     remove_labels: Vec<String>,
     remove_params: Vec<String>,
     global: bool,
+    user: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if user {
+        let path = user_context_path(cwd)?;
+        let mut ctx = Context::load_from(&path);
+        apply_update_mutations(
+            &mut ctx,
+            flow,
+            &labels,
+            &params,
+            &remove_labels,
+            &remove_params,
+        )?;
+        ctx.save_to(&path)
+            .map_err(|e: io::Error| format!("failed to save context: {e}"))?;
+        println!("Context updated.");
+        return Ok(());
+    }
+
     let paths = resolve_context_paths(cwd);
 
     // Require an initialised .tracevault/ before mutating.
@@ -120,35 +160,14 @@ pub fn run_update(
         Context::load_worktree(&paths).unwrap_or_default()
     };
 
-    // Set flow if provided
-    if let Some(f) = flow {
-        ctx.flow_id = Some(f);
-    }
-
-    // Union-add labels (dedup guarded inline by the contains check below; save also normalises)
-    let new_labels = split_labels(&labels);
-    for l in new_labels {
-        if !ctx.labels.contains(&l) {
-            ctx.labels.push(l);
-        }
-    }
-
-    // Insert/overwrite params
-    for raw in &params {
-        let (k, v) = parse_param(raw)?;
-        ctx.params.insert(k, Some(v));
-    }
-
-    // Remove labels
-    let remove_set: std::collections::HashSet<String> =
-        split_labels(&remove_labels).into_iter().collect();
-    ctx.labels.retain(|l| !remove_set.contains(l));
-
-    // Remove params: insert a `None` tombstone so the removal propagates through
-    // the merge and drops the key even when a lower-precedence layer sets it.
-    for k in &remove_params {
-        ctx.params.insert(k.clone(), None);
-    }
+    apply_update_mutations(
+        &mut ctx,
+        flow,
+        &labels,
+        &params,
+        &remove_labels,
+        &remove_params,
+    )?;
 
     if use_global {
         ctx.save_global(&paths)
@@ -158,6 +177,50 @@ pub fn run_update(
     .map_err(|e: io::Error| format!("failed to save context: {e}"))?;
 
     println!("Context updated.");
+    Ok(())
+}
+
+/// Apply the `update` flow's mutations (set flow, union labels, upsert params,
+/// remove labels/params) to an already-loaded `ctx`. Shared by the
+/// repo/worktree/global path and the `--user` path so both branches stay in sync.
+fn apply_update_mutations(
+    ctx: &mut Context,
+    flow: Option<String>,
+    labels: &[String],
+    params: &[String],
+    remove_labels: &[String],
+    remove_params: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Set flow if provided
+    if let Some(f) = flow {
+        ctx.flow_id = Some(f);
+    }
+
+    // Union-add labels (dedup guarded inline by the contains check below; save also normalises)
+    let new_labels = split_labels(labels);
+    for l in new_labels {
+        if !ctx.labels.contains(&l) {
+            ctx.labels.push(l);
+        }
+    }
+
+    // Insert/overwrite params
+    for raw in params {
+        let (k, v) = parse_param(raw)?;
+        ctx.params.insert(k, Some(v));
+    }
+
+    // Remove labels
+    let remove_set: std::collections::HashSet<String> =
+        split_labels(remove_labels).into_iter().collect();
+    ctx.labels.retain(|l| !remove_set.contains(l));
+
+    // Remove params: insert a `None` tombstone so the removal propagates through
+    // the merge and drops the key even when a lower-precedence layer sets it.
+    for k in remove_params {
+        ctx.params.insert(k.clone(), None);
+    }
+
     Ok(())
 }
 
@@ -219,7 +282,19 @@ pub fn run_show(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
 ///   distinction to preserve, and `show`/`effective` always read it.
 ///
 /// `global = true` forces clearing the global file from any worktree.
-pub fn run_clear(cwd: &Path, global: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// `user = true` clears the resolved user-context file instead (wins over `global`);
+/// like the global file, the user file is canonical, so it is overwritten with an
+/// empty context rather than deleted.
+pub fn run_clear(cwd: &Path, global: bool, user: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if user {
+        let path = user_context_path(cwd)?;
+        Context::default()
+            .save_to(&path)
+            .map_err(|e: io::Error| format!("failed to clear context: {e}"))?;
+        println!("Context cleared.");
+        return Ok(());
+    }
+
     let paths = resolve_context_paths(cwd);
 
     // Require an initialised .tracevault/ before mutating.
@@ -365,5 +440,95 @@ mod tests {
     fn split_labels_comma_separated() {
         let result = split_labels(&["a,b,c".to_string(), "d".to_string()]);
         assert_eq!(result, vec!["a", "b", "c", "d"]);
+    }
+
+    /// Create a temp project whose `config.toml` points `user_context` at an
+    /// explicit path outside the project (`uc_path`).
+    fn temp_project_with_user_context(uc_path: &Path) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let tv_dir = dir.path().join(".tracevault");
+        fs::create_dir_all(&tv_dir).unwrap();
+        let config = TracevaultConfig {
+            user_context: UserContext::Path(uc_path.display().to_string()),
+            ..TracevaultConfig::default()
+        };
+        fs::write(tv_dir.join("config.toml"), config.to_toml()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn set_user_writes_resolved_user_context_file() {
+        let uc_dir = tempfile::tempdir().unwrap();
+        let uc_path = uc_dir.path().join("uc.json");
+        let project = temp_project_with_user_context(&uc_path);
+
+        run_set(
+            project.path(),
+            None,
+            vec!["team".to_string()],
+            vec!["env=prod".to_string()],
+            false,
+            true,
+        )
+        .unwrap();
+
+        let ctx = Context::load_from(&uc_path);
+        assert_eq!(ctx.labels, vec!["team".to_string()]);
+        assert_eq!(ctx.params.get("env"), Some(&Some("prod".to_string())));
+    }
+
+    #[test]
+    fn update_user_merges_into_resolved_user_context_file() {
+        let uc_dir = tempfile::tempdir().unwrap();
+        let uc_path = uc_dir.path().join("uc.json");
+        let project = temp_project_with_user_context(&uc_path);
+
+        run_set(
+            project.path(),
+            None,
+            vec!["team".to_string()],
+            vec!["env=prod".to_string()],
+            false,
+            true,
+        )
+        .unwrap();
+
+        run_update(
+            project.path(),
+            None,
+            vec!["extra".to_string()],
+            vec![],
+            vec![],
+            vec!["env".to_string()],
+            false,
+            true,
+        )
+        .unwrap();
+
+        let ctx = Context::load_from(&uc_path);
+        assert_eq!(ctx.labels, vec!["team".to_string(), "extra".to_string()]);
+        assert_eq!(ctx.params.get("env"), Some(&None));
+    }
+
+    #[test]
+    fn clear_user_resets_resolved_user_context_file() {
+        let uc_dir = tempfile::tempdir().unwrap();
+        let uc_path = uc_dir.path().join("uc.json");
+        let project = temp_project_with_user_context(&uc_path);
+
+        run_set(
+            project.path(),
+            None,
+            vec!["team".to_string()],
+            vec![],
+            false,
+            true,
+        )
+        .unwrap();
+
+        run_clear(project.path(), false, true).unwrap();
+
+        let ctx = Context::load_from(&uc_path);
+        assert_eq!(ctx, Context::default());
     }
 }

@@ -140,6 +140,9 @@ enum ContextAction {
         /// Write to the global context file regardless of worktree scope
         #[arg(long)]
         global: bool,
+        /// Write to the resolved user-context file instead (wins over --global)
+        #[arg(long)]
+        user: bool,
     },
     /// Update the existing context, merging changes in.
     ///
@@ -167,6 +170,9 @@ enum ContextAction {
         /// Write to the global context file regardless of worktree scope
         #[arg(long)]
         global: bool,
+        /// Write to the resolved user-context file instead (wins over --global)
+        #[arg(long)]
+        user: bool,
     },
     /// Show the current context (path + pretty JSON).
     ///
@@ -181,6 +187,9 @@ enum ContextAction {
         /// Clear the global context file regardless of worktree scope
         #[arg(long)]
         global: bool,
+        /// Clear the resolved user-context file instead (wins over --global)
+        #[arg(long)]
+        user: bool,
     },
     /// Enable/disable or point the project's user-level context source.
     Source {
@@ -359,7 +368,8 @@ async fn main() {
                     label,
                     param,
                     global,
-                } => commands::context::run_set(&cwd, flow, label, param, global),
+                    user,
+                } => commands::context::run_set(&cwd, flow, label, param, global, user),
                 ContextAction::Update {
                     flow,
                     label,
@@ -367,6 +377,7 @@ async fn main() {
                     remove_label,
                     remove_param,
                     global,
+                    user,
                 } => commands::context::run_update(
                     &cwd,
                     flow,
@@ -375,9 +386,12 @@ async fn main() {
                     remove_label,
                     remove_param,
                     global,
+                    user,
                 ),
                 ContextAction::Show => commands::context::run_show(&cwd),
-                ContextAction::Clear { global } => commands::context::run_clear(&cwd, global),
+                ContextAction::Clear { global, user } => {
+                    commands::context::run_clear(&cwd, global, user)
+                }
                 ContextAction::Source {
                     enable,
                     disable,
