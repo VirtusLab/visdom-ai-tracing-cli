@@ -1,5 +1,5 @@
 use crate::api_client::ApiClient;
-use crate::config::TracevaultConfig;
+use crate::config::{TracevaultConfig, UserContext};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -123,6 +123,7 @@ pub async fn init_in_directory(
     server_url: Option<&str>,
     claude_settings: Option<ClaudeSettingsTarget>,
     no_gitignore: bool,
+    user_context: UserContext,
 ) -> Result<ClaudeSettingsTarget, io::Error> {
     // Check for git repository
     if !project_root.join(".git").exists() {
@@ -180,6 +181,7 @@ pub async fn init_in_directory(
         config.server_url = Some(url.to_string());
     }
     config.org_slug = org_slug.clone();
+    config.user_context = user_context;
     fs::write(
         TracevaultConfig::config_path(project_root),
         config.to_toml(),

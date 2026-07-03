@@ -29,6 +29,12 @@ enum Cli {
         /// .gitignore separately or you want to commit the Claude settings files.
         #[arg(long)]
         no_gitignore: bool,
+        /// Disable the cross-repo user-level context for this project
+        #[arg(long)]
+        no_user_context: bool,
+        /// Enable the user-level context and read it from this explicit path
+        #[arg(long)]
+        user_context: Option<String>,
     },
     /// Show current session status
     Status,
@@ -193,13 +199,21 @@ async fn main() {
             server_url,
             claude_settings,
             no_gitignore,
+            no_user_context,
+            user_context,
         } => {
             let cwd = env::current_dir().expect("Cannot determine current directory");
+            let user_context = match (no_user_context, user_context) {
+                (true, _) => config::UserContext::Toggle(false),
+                (false, Some(p)) => config::UserContext::Path(p),
+                (false, None) => config::UserContext::Toggle(true),
+            };
             match commands::init::init_in_directory(
                 &cwd,
                 server_url.as_deref(),
                 claude_settings,
                 no_gitignore,
+                user_context,
             )
             .await
             {
