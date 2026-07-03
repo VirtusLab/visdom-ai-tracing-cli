@@ -18,6 +18,8 @@ pub struct TracevaultConfig {
     pub org_slug: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default_user_context")]
+    pub user_context: UserContext,
 }
 
 fn default_agent() -> String {
@@ -32,8 +34,73 @@ impl Default for TracevaultConfig {
             api_key: None,
             org_slug: None,
             repo_id: None,
+            user_context: UserContext::default(),
         }
     }
+}
+
+/// Cross-repo user context source. Cargo-`dependency`-style shorthand:
+/// bool toggles enable at the default path; a string is enable + that path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UserContext {
+    Toggle(bool),
+    Path(String),
+    Full {
+        #[serde(default = "crate::config::enable_default")]
+        enable: bool,
+        #[serde(default)]
+        path: Option<String>,
+    },
+}
+
+impl Default for UserContext {
+    fn default() -> Self {
+        UserContext::Toggle(false)
+    }
+}
+
+pub(crate) fn enable_default() -> bool {
+    true
+}
+
+/// `~/.config/tracevault/context.json`, alongside credentials.json.
+// Not yet called from main.rs; consumed by the `--user` editing and hook
+// wiring added in later tasks of the user-context-layer feature.
+#[allow(dead_code)]
+pub fn default_user_context_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("tracevault")
+        .join("context.json")
+}
+
+impl UserContext {
+    /// The file this source points at (configured path or default), regardless
+    /// of whether it is enabled. Used by `--user` editing.
+    #[allow(dead_code)]
+    pub fn path(&self) -> PathBuf {
+        match self {
+            UserContext::Path(p) => PathBuf::from(p),
+            UserContext::Full { path: Some(p), .. } => PathBuf::from(p),
+            _ => default_user_context_path(),
+        }
+    }
+
+    /// `Some(path)` when enabled (consulted by the hook); `None` when disabled.
+    #[allow(dead_code)]
+    pub fn resolve(&self) -> Option<PathBuf> {
+        let enabled = match self {
+            UserContext::Toggle(b) => *b,
+            UserContext::Path(_) => true,
+            UserContext::Full { enable, .. } => *enable,
+        };
+        enabled.then(|| self.path())
+    }
+}
+
+fn is_default_user_context(uc: &UserContext) -> bool {
+    matches!(uc, UserContext::Toggle(false))
 }
 
 impl TracevaultConfig {
@@ -94,6 +161,7 @@ mod tests {
             api_key: None, // api_key not included in to_toml
             org_slug: Some("my-org".into()),
             repo_id: Some("repo-1".into()),
+            user_context: UserContext::default(),
         };
         let toml = cfg.to_toml();
         assert!(toml.contains("agent = \"claude-code\""));
@@ -156,6 +224,7 @@ mod tests {
             api_key: Some("secret".into()),
             org_slug: Some("my-org".into()),
             repo_id: None,
+            user_context: UserContext::default(),
         };
         let toml = cfg.to_toml();
         assert!(toml.contains("agent = \"claude-code\""));
@@ -170,6 +239,39 @@ mod tests {
         assert_eq!(parsed.server_url.as_deref(), Some("https://example.com"));
         assert_eq!(parsed.org_slug.as_deref(), Some("my-org"));
         assert_eq!(parsed.api_key, None);
+    }
+
+    #[test]
+    fn user_context_forms_resolve_correctly() {
+        // absent ⇒ default ⇒ disabled
+        let none_cfg: TracevaultConfig = toml::from_str("agent = \"claude-code\"").unwrap();
+        assert!(none_cfg.user_context.resolve().is_none());
+
+        // false ⇒ disabled
+        let f: TracevaultConfig =
+            toml::from_str("agent=\"claude-code\"\nuser_context = false").unwrap();
+        assert!(f.user_context.resolve().is_none());
+
+        // true ⇒ enabled at default path
+        let t: TracevaultConfig =
+            toml::from_str("agent=\"claude-code\"\nuser_context = true").unwrap();
+        assert_eq!(t.user_context.resolve(), Some(default_user_context_path()));
+
+        // "path" ⇒ enabled at that path
+        let p: TracevaultConfig =
+            toml::from_str("agent=\"claude-code\"\nuser_context = \"/tmp/ctx.json\"").unwrap();
+        assert_eq!(
+            p.user_context.resolve(),
+            Some(PathBuf::from("/tmp/ctx.json"))
+        );
+
+        // { enable = false, path = ... } ⇒ disabled but path() remembers it
+        let obj: TracevaultConfig = toml::from_str(
+            "agent=\"claude-code\"\n[user_context]\nenable = false\npath = \"/tmp/x.json\"",
+        )
+        .unwrap();
+        assert!(obj.user_context.resolve().is_none());
+        assert_eq!(obj.user_context.path(), PathBuf::from("/tmp/x.json"));
     }
 
     #[test]
