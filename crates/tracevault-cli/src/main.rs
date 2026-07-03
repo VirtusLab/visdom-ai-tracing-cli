@@ -182,6 +182,21 @@ enum ContextAction {
         #[arg(long)]
         global: bool,
     },
+    /// Enable/disable or point the project's user-level context source.
+    Source {
+        /// Enable the user context at the default path
+        #[arg(long)]
+        enable: bool,
+        /// Disable the user context
+        #[arg(long)]
+        disable: bool,
+        /// Enable and read the user context from this explicit path
+        #[arg(long)]
+        path: Option<String>,
+        /// Enable and clear any explicit path back to the default location
+        #[arg(long)]
+        default: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -363,6 +378,12 @@ async fn main() {
                 ),
                 ContextAction::Show => commands::context::run_show(&cwd),
                 ContextAction::Clear { global } => commands::context::run_clear(&cwd, global),
+                ContextAction::Source {
+                    enable,
+                    disable,
+                    path,
+                    default,
+                } => commands::context::run_source(&cwd, enable, disable, path, default),
             };
             if let Err(e) = result {
                 eprintln!("Context error: {e}");

@@ -1,3 +1,4 @@
+use crate::config::{TracevaultConfig, UserContext};
 use crate::context::{resolve_context_paths, Context, WorktreeScope};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -251,9 +252,90 @@ pub fn run_clear(cwd: &Path, global: bool) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// `tracevault context source` — enable/disable or point the project's
+/// user-level context source (`user_context` in `config.toml`).
+///
+/// `--disable` wins over everything else; then `--path <p>`; then
+/// `--default`/`--enable` (both just mean "enabled at the default path").
+/// If none of the flags are given, errors rather than silently no-op'ing.
+pub fn run_source(
+    cwd: &Path,
+    enable: bool,
+    disable: bool,
+    path: Option<String>,
+    default: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = find_project_root(cwd)?;
+    let mut config = TracevaultConfig::load(&root)
+        .ok_or("no config.toml found — run 'tracevault init' first")?;
+
+    config.user_context = if disable {
+        UserContext::Toggle(false)
+    } else if let Some(p) = path {
+        UserContext::Path(p)
+    } else if default || enable {
+        UserContext::Toggle(true)
+    } else {
+        return Err("specify one of --enable, --disable, --path <file>, --default".into());
+    };
+
+    std::fs::write(TracevaultConfig::config_path(&root), config.to_toml())?;
+    println!("Updated user_context.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    /// Create a temp project with a `.tracevault/config.toml` for `run_source` tests.
+    fn temp_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let tv_dir = dir.path().join(".tracevault");
+        fs::create_dir_all(&tv_dir).unwrap();
+        fs::write(
+            tv_dir.join("config.toml"),
+            TracevaultConfig::default().to_toml(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn source_enable_disable_and_path() {
+        let dir = temp_project();
+
+        run_source(dir.path(), true, false, None, false).unwrap();
+        let cfg = TracevaultConfig::load(dir.path()).unwrap();
+        assert!(cfg.user_context.resolve().is_some());
+
+        run_source(dir.path(), false, true, None, false).unwrap();
+        let cfg = TracevaultConfig::load(dir.path()).unwrap();
+        assert!(cfg.user_context.resolve().is_none());
+
+        run_source(dir.path(), false, false, Some("/p".to_string()), false).unwrap();
+        let cfg = TracevaultConfig::load(dir.path()).unwrap();
+        assert_eq!(
+            cfg.user_context.resolve(),
+            Some(std::path::PathBuf::from("/p"))
+        );
+    }
+
+    #[test]
+    fn source_default_flag_enables() {
+        let dir = temp_project();
+        run_source(dir.path(), false, false, None, true).unwrap();
+        let cfg = TracevaultConfig::load(dir.path()).unwrap();
+        assert!(cfg.user_context.resolve().is_some());
+    }
+
+    #[test]
+    fn source_no_flags_errors() {
+        let dir = temp_project();
+        let err = run_source(dir.path(), false, false, None, false).unwrap_err();
+        assert!(err.to_string().contains("--enable"));
+    }
 
     #[test]
     fn parse_param_valid() {
