@@ -205,11 +205,21 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
         .as_deref()
         .and_then(|uid| extract_is_error_from_transcript(uid, &transcript_lines));
 
-    // Load the EFFECTIVE merged context (global merged with per-worktree, if any)
-    // and extract fields before building the request.  Using `effective` means
-    // parallel sessions in different linked worktrees each stamp their own
-    // per-worktree context without interfering with each other.
-    let ctx = crate::context::Context::effective(hook_cwd, None);
+    // Load config once, up front, so it can back both the user-level context
+    // layer resolution below and the org_slug/repo_id lookup further down —
+    // avoids a redundant second `TracevaultConfig::load` of the same file.
+    // Best-effort here: a missing/malformed config simply yields no user
+    // layer (matching the prior behavior of always passing `None`); the
+    // org_slug/repo_id requirement is still enforced later.
+    let config = crate::config::TracevaultConfig::load(&project_root);
+    let user_layer = config.as_ref().and_then(|c| c.user_context.resolve());
+
+    // Load the EFFECTIVE merged context (user layer, if enabled, merged with
+    // global and per-worktree) and extract fields before building the
+    // request.  Using `effective` means parallel sessions in different linked
+    // worktrees each stamp their own per-worktree context without
+    // interfering with each other.
+    let ctx = crate::context::Context::effective(hook_cwd, user_layer.as_deref());
     let (ctx_flow_id, ctx_labels, ctx_params) = apply_context(ctx);
 
     let mut req = StreamEventRequest {
@@ -245,9 +255,9 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
     // 6. Resolve credentials
     let (server_url, token) = crate::api_client::resolve_credentials(&project_root);
 
-    // 7. Load config for org_slug and repo_id
-    let config =
-        crate::config::TracevaultConfig::load(&project_root).ok_or("TracevaultConfig not found")?;
+    // 7. Config for org_slug and repo_id (loaded above, alongside the
+    // user-level context layer resolution).
+    let config = config.ok_or("TracevaultConfig not found")?;
     let org_slug = config
         .org_slug
         .as_deref()
@@ -309,8 +319,29 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::UserContext;
     use crate::context::{Context, EffectiveContext};
     use std::collections::BTreeMap;
+
+    // ── user layer resolution: disabled config → no user layer ────────────────
+
+    #[test]
+    fn disabled_user_context_resolves_to_none() {
+        // Default/disabled `user_context` (the `Toggle(false)` variant) must
+        // resolve to `None`, matching the pre-existing hook behavior of
+        // stamping without a user layer when it isn't configured.
+        assert!(UserContext::Toggle(false).resolve().is_none());
+    }
+
+    #[test]
+    fn effective_with_no_user_layer_on_empty_repo_is_empty() {
+        // With no user layer and no global/worktree context files present,
+        // `Context::effective` must yield a default (empty) `EffectiveContext`
+        // — i.e. passing `None` for `user_layer` is behavior-preserving.
+        let dir = tempfile::tempdir().unwrap();
+        let effective = Context::effective(dir.path(), None);
+        assert_eq!(effective, EffectiveContext::default());
+    }
 
     // ── apply_context: all three fields populated ─────────────────────────────
 

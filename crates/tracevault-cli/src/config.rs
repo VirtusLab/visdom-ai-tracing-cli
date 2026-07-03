@@ -65,9 +65,6 @@ pub(crate) fn enable_default() -> bool {
 }
 
 /// `~/.config/tracevault/context.json`, alongside credentials.json.
-// Not yet called from main.rs; consumed by the `--user` editing and hook
-// wiring added in later tasks of the user-context-layer feature.
-#[allow(dead_code)]
 pub fn default_user_context_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -78,7 +75,6 @@ pub fn default_user_context_path() -> PathBuf {
 impl UserContext {
     /// The file this source points at (configured path or default), regardless
     /// of whether it is enabled. Used by `--user` editing.
-    #[allow(dead_code)]
     pub fn path(&self) -> PathBuf {
         match self {
             UserContext::Path(p) => PathBuf::from(p),
@@ -88,7 +84,6 @@ impl UserContext {
     }
 
     /// `Some(path)` when enabled (consulted by the hook); `None` when disabled.
-    #[allow(dead_code)]
     pub fn resolve(&self) -> Option<PathBuf> {
         let enabled = match self {
             UserContext::Toggle(b) => *b,
