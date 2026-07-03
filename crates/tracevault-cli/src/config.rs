@@ -3,11 +3,25 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TracevaultConfig {
+    #[serde(default = "default_agent")]
     pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_url: Option<String>,
+    // Never persisted; may still be parsed if present in a hand-authored file.
+    // No production code reads this field today (credentials are resolved
+    // independently in api_client.rs::resolve_credentials); kept on the
+    // struct for forward-compat / round-trip parsing of existing files.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_id: Option<String>,
+}
+
+fn default_agent() -> String {
+    "claude-code".to_string()
 }
 
 impl Default for TracevaultConfig {
@@ -50,40 +64,20 @@ impl TracevaultConfig {
     }
 
     pub fn to_toml(&self) -> String {
-        let mut out = format!("# TraceVault configuration\nagent = \"{}\"\n", self.agent);
-        if let Some(url) = &self.server_url {
-            out.push_str(&format!("server_url = \"{url}\"\n"));
-        }
-        if let Some(slug) = &self.org_slug {
-            out.push_str(&format!("org_slug = \"{slug}\"\n"));
-        }
-        if let Some(rid) = &self.repo_id {
-            out.push_str(&format!("repo_id = \"{rid}\"\n"));
-        }
-        out
+        let body = toml::to_string(self).unwrap_or_default();
+        format!("# TraceVault configuration\n{body}")
     }
 
-    /// Parse config from the TOML file using simple line-based parsing
-    /// (consistent with the existing resolve_credentials approach).
     pub fn load(project_root: &Path) -> Option<Self> {
         let path = Self::config_path(project_root);
         let content = std::fs::read_to_string(path).ok()?;
-
-        let parse_field = |key: &str| -> Option<String> {
-            content
-                .lines()
-                .find(|l| l.starts_with(key))
-                .and_then(|l| l.split('=').nth(1))
-                .map(|s| s.trim().trim_matches('"').to_string())
-        };
-
-        Some(Self {
-            agent: parse_field("agent").unwrap_or_else(|| "claude-code".to_string()),
-            server_url: parse_field("server_url"),
-            api_key: parse_field("api_key"),
-            org_slug: parse_field("org_slug"),
-            repo_id: parse_field("repo_id"),
-        })
+        match toml::from_str(&content) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                eprintln!("tracevault: warning: malformed config.toml: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -152,6 +146,30 @@ mod tests {
         assert!(content.contains("sessions/"), "must ignore sessions/");
         assert!(content.contains("cache/"), "must ignore cache/");
         assert!(content.contains("*.local.toml"), "must ignore *.local.toml");
+    }
+
+    #[test]
+    fn toml_round_trip_omits_api_key_and_none_fields() {
+        let cfg = TracevaultConfig {
+            agent: "claude-code".into(),
+            server_url: Some("https://example.com".into()),
+            api_key: Some("secret".into()),
+            org_slug: Some("my-org".into()),
+            repo_id: None,
+        };
+        let toml = cfg.to_toml();
+        assert!(toml.contains("agent = \"claude-code\""));
+        assert!(toml.contains("server_url = \"https://example.com\""));
+        assert!(toml.contains("org_slug = \"my-org\""));
+        assert!(!toml.contains("api_key"), "api_key must never be written");
+        assert!(!toml.contains("repo_id"), "None fields must be omitted");
+
+        // Re-parse (api_key absent from disk) round-trips the rest.
+        let parsed: TracevaultConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(parsed.agent, "claude-code");
+        assert_eq!(parsed.server_url.as_deref(), Some("https://example.com"));
+        assert_eq!(parsed.org_slug.as_deref(), Some("my-org"));
+        assert_eq!(parsed.api_key, None);
     }
 
     #[test]
