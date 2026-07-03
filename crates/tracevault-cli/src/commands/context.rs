@@ -61,7 +61,7 @@ pub fn run_set(
     let mut parsed_params = std::collections::BTreeMap::new();
     for raw in &params {
         let (k, v) = parse_param(raw)?;
-        parsed_params.insert(k, v);
+        parsed_params.insert(k, Some(v));
     }
 
     let ctx = Context {
@@ -135,7 +135,7 @@ pub fn run_update(
     // Insert/overwrite params
     for raw in &params {
         let (k, v) = parse_param(raw)?;
-        ctx.params.insert(k, v);
+        ctx.params.insert(k, Some(v));
     }
 
     // Remove labels
@@ -143,9 +143,10 @@ pub fn run_update(
         split_labels(&remove_labels).into_iter().collect();
     ctx.labels.retain(|l| !remove_set.contains(l));
 
-    // Remove params
+    // Remove params: insert a `None` tombstone so the removal propagates through
+    // the merge and drops the key even when a lower-precedence layer sets it.
     for k in &remove_params {
-        ctx.params.remove(k);
+        ctx.params.insert(k.clone(), None);
     }
 
     if use_global {
@@ -169,7 +170,7 @@ pub fn run_update(
 /// Prints a hint if no `.tracevault/` directory is found (i.e. `tracevault init` has
 /// not been run), using `find_project_root` for the diagnostic.
 pub fn run_show(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let (paths, global, worktree, effective) = Context::effective_with_parts(cwd);
+    let (paths, _user, global, worktree, effective) = Context::effective_with_parts(cwd, None);
 
     // If the tracevault directory doesn't exist yet, hint that init is needed.
     // find_project_root gives the classic walk-up path; if it also fails, the

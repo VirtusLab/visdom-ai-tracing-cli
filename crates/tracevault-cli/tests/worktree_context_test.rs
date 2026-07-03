@@ -68,7 +68,7 @@ fn make_ctx(flow: Option<&str>, labels: &[&str], params: &[(&str, &str)]) -> Con
         labels: labels.iter().map(|s| s.to_string()).collect(),
         params: params
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (k.to_string(), Some(v.to_string())))
             .collect(),
     }
 }
@@ -213,7 +213,7 @@ fn merge_rules_flow_labels_params_with_real_worktree() {
     wt_ctx.save_to(&wt_path).unwrap();
 
     // Load effective from the linked worktree dir.
-    let effective = Context::effective(&wt_dir);
+    let effective = Context::effective(&wt_dir, None);
 
     // flow: worktree wins
     assert_eq!(
@@ -244,8 +244,14 @@ fn effective_from_primary_equals_global() {
     let paths = resolve_context_paths(&repo_dir);
     global.save_to(&paths.global_path()).unwrap();
 
-    let effective = Context::effective(&repo_dir);
-    assert_eq!(effective, global, "from primary, effective == global");
+    let effective = Context::effective(&repo_dir, None);
+    // effective is now an EffectiveContext; from a primary checkout with no user
+    // layer it must equal the single-layer fold of the global context.
+    assert_eq!(
+        effective,
+        Context::merge_layers(&[&global]),
+        "from primary, effective == global"
+    );
 }
 
 #[test]
@@ -383,7 +389,8 @@ fn effective_with_parts_returns_all_three() {
         .save_to(&linked_paths.worktree_path().unwrap())
         .unwrap();
 
-    let (_paths, loaded_global, loaded_wt, effective) = Context::effective_with_parts(&wt_dir);
+    let (_paths, _user, loaded_global, loaded_wt, effective) =
+        Context::effective_with_parts(&wt_dir, None);
 
     assert_eq!(loaded_global.flow_id, Some("g".to_string()));
     assert_eq!(
@@ -554,7 +561,7 @@ fn linked_worktree_effective_is_merge_of_global_and_worktree() {
     .unwrap();
 
     // Effective from linked worktree.
-    let effective = Context::effective(&wt_dir);
+    let effective = Context::effective(&wt_dir, None);
 
     // flow: worktree wins
     assert_eq!(
@@ -682,7 +689,7 @@ fn clear_from_linked_worktree_deletes_worktree_file_not_global() {
     );
 
     // Effective must fall back to global (since there is no per-worktree context).
-    let effective = Context::effective(&wt_dir);
+    let effective = Context::effective(&wt_dir, None);
     assert_eq!(
         effective.flow_id,
         Some("global-flow".to_string()),
@@ -787,8 +794,8 @@ fn two_linked_worktrees_are_isolated() {
     .unwrap();
 
     // Verify effective contexts are distinct.
-    let effective_a = Context::effective(&wt_a_dir);
-    let effective_b = Context::effective(&wt_b_dir);
+    let effective_a = Context::effective(&wt_a_dir, None);
+    let effective_b = Context::effective(&wt_b_dir, None);
 
     // Worktree A: sees flow-A, label-A (not B).
     assert_eq!(
@@ -934,13 +941,17 @@ fn update_remove_label_and_param_at_worktree_scope() {
         !wt_ctx.labels.contains(&"drop-label".to_string()),
         "drop-label must be removed from the worktree file"
     );
-    assert!(
-        wt_ctx.params.contains_key("keep"),
+    assert_eq!(
+        wt_ctx.params.get("keep"),
+        Some(&Some("yes".to_string())),
         "keep param must remain in the worktree file"
     );
-    assert!(
-        !wt_ctx.params.contains_key("drop"),
-        "drop param must be removed from the worktree file"
+    // `--remove-param drop` now records a `None` tombstone (rather than deleting
+    // the key) so the removal propagates through the layered merge.
+    assert_eq!(
+        wt_ctx.params.get("drop"),
+        Some(&None),
+        "drop param must be recorded as a tombstone in the worktree file"
     );
 
     // Global must be completely untouched.
@@ -952,8 +963,8 @@ fn update_remove_label_and_param_at_worktree_scope() {
         "global labels must not be touched by worktree-scoped update"
     );
     assert_eq!(
-        global_ctx.params.get("g").map(String::as_str),
-        Some("global"),
+        global_ctx.params.get("g"),
+        Some(&Some("global".to_string())),
         "global params must not be touched by worktree-scoped update"
     );
 }
@@ -995,7 +1006,7 @@ fn apply_context_stamps_effective_merged_context() {
     .unwrap();
 
     // Simulate what the hook does: load effective context and call apply_context.
-    let effective = Context::effective(&wt_dir);
+    let effective = Context::effective(&wt_dir, None);
     let (flow_id, labels, params) = apply_context(effective);
 
     // flow: worktree wins

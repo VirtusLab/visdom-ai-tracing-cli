@@ -65,8 +65,8 @@ fn set_creates_context_with_all_fields() {
     assert_eq!(ctx.flow_id, Some("flow-xyz".to_string()));
     assert_eq!(ctx.labels, vec!["alpha", "beta"]);
     let mut expected = BTreeMap::new();
-    expected.insert("k1".to_string(), "v1".to_string());
-    expected.insert("k2".to_string(), "v2".to_string());
+    expected.insert("k1".to_string(), Some("v1".to_string()));
+    expected.insert("k2".to_string(), Some("v2".to_string()));
     assert_eq!(ctx.params, expected);
 }
 
@@ -204,7 +204,7 @@ fn update_overwrites_param_key() {
     .unwrap();
 
     let ctx = load_ctx(&tmp);
-    assert_eq!(ctx.params["key"], "new");
+    assert_eq!(ctx.params["key"], Some("new".to_string()));
 }
 
 #[test]
@@ -260,8 +260,11 @@ fn update_remove_param_works() {
     .unwrap();
 
     let ctx = load_ctx(&tmp);
-    assert!(ctx.params.contains_key("keep"));
-    assert!(!ctx.params.contains_key("drop"));
+    // `keep` retains its value; `--remove-param drop` now records a `None`
+    // tombstone (rather than deleting the key) so the removal propagates
+    // through the layered merge and drops any inherited lower-layer value.
+    assert_eq!(ctx.params.get("keep"), Some(&Some("yes".to_string())));
+    assert_eq!(ctx.params.get("drop"), Some(&None));
 }
 
 #[test]

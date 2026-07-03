@@ -8,8 +8,8 @@ use tracevault_protocol::streaming::{
     extract_is_error_from_transcript, StreamEventRequest, StreamEventType,
 };
 
-/// Convert a loaded [`crate::context::Context`] into the three optional fields
-/// that are stamped onto a [`StreamEventRequest`].
+/// Convert a resolved [`crate::context::EffectiveContext`] into the three
+/// optional fields that are stamped onto a [`StreamEventRequest`].
 ///
 /// - `flow_id`  — taken directly from `ctx.flow_id`
 /// - `labels`   — `None` when the vec is empty, `Some(vec)` otherwise
@@ -19,7 +19,7 @@ use tracevault_protocol::streaming::{
 /// This is a pure function so it can be unit-tested without I/O.
 #[allow(clippy::type_complexity)]
 pub fn apply_context(
-    ctx: crate::context::Context,
+    ctx: crate::context::EffectiveContext,
 ) -> (
     Option<String>,
     Option<Vec<String>>,
@@ -209,7 +209,7 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
     // and extract fields before building the request.  Using `effective` means
     // parallel sessions in different linked worktrees each stamp their own
     // per-worktree context without interfering with each other.
-    let ctx = crate::context::Context::effective(hook_cwd);
+    let ctx = crate::context::Context::effective(hook_cwd, None);
     let (ctx_flow_id, ctx_labels, ctx_params) = apply_context(ctx);
 
     let mut req = StreamEventRequest {
@@ -309,7 +309,7 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::Context;
+    use crate::context::{Context, EffectiveContext};
     use std::collections::BTreeMap;
 
     // ── apply_context: all three fields populated ─────────────────────────────
@@ -321,7 +321,7 @@ mod tests {
         params.insert("env".to_string(), "prod".to_string());
         params.insert("region".to_string(), "eu-west-1".to_string());
 
-        let ctx = Context {
+        let ctx = EffectiveContext {
             flow_id: Some("flow-xyz".to_string()),
             labels: vec!["backend".to_string(), "urgent".to_string()],
             params,
@@ -338,21 +338,22 @@ mod tests {
         assert_eq!(p.get("env").map(String::as_str), Some("prod"));
         assert_eq!(p.get("region").map(String::as_str), Some("eu-west-1"));
 
-        // Verify the context file round-trips through save_to → load_from → apply_context.
+        // Verify the stored context round-trips through save_to → load_from →
+        // merge_layers → apply_context (stored params are now `Option<String>`).
         let written = Context {
             flow_id: Some("flow-xyz".to_string()),
             labels: vec!["backend".to_string(), "urgent".to_string()],
             params: {
                 let mut m = BTreeMap::new();
-                m.insert("env".to_string(), "prod".to_string());
-                m.insert("region".to_string(), "eu-west-1".to_string());
+                m.insert("env".to_string(), Some("prod".to_string()));
+                m.insert("region".to_string(), Some("eu-west-1".to_string()));
                 m
             },
         };
         let ctx_path = dir.path().join(".tracevault").join("context.json");
         written.save_to(&ctx_path).unwrap();
         let loaded = Context::load_from(&ctx_path);
-        let (flow_id2, labels2, params2) = apply_context(loaded);
+        let (flow_id2, labels2, params2) = apply_context(Context::merge_layers(&[&loaded]));
         assert_eq!(flow_id2, Some("flow-xyz".to_string()));
         assert!(labels2.is_some());
         assert!(params2.is_some());
@@ -365,7 +366,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing_path = dir.path().join(".tracevault").join("context.json");
         let ctx = Context::load_from(&missing_path); // no context.json → default
-        let (flow_id, labels, params) = apply_context(ctx);
+        let (flow_id, labels, params) = apply_context(Context::merge_layers(&[&ctx]));
         assert!(flow_id.is_none(), "flow_id should be None");
         assert!(labels.is_none(), "labels should be None");
         assert!(params.is_none(), "params should be None");
@@ -375,7 +376,7 @@ mod tests {
 
     #[test]
     fn apply_context_empty_collections_are_none() {
-        let ctx = Context {
+        let ctx = EffectiveContext {
             flow_id: None,
             labels: vec![],
             params: BTreeMap::new(),
@@ -396,7 +397,7 @@ mod tests {
 
     #[test]
     fn apply_context_flow_id_only() {
-        let ctx = Context {
+        let ctx = EffectiveContext {
             flow_id: Some("my-flow".to_string()),
             labels: vec![],
             params: BTreeMap::new(),

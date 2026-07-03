@@ -19,6 +19,18 @@ pub struct Context {
     /// Deduplicated, non-empty labels. Duplicates are removed on save (first
     /// occurrence wins); blank/whitespace-only entries are dropped.
     pub labels: Vec<String>,
+    /// Stored params. `Some(v)` sets a value; `None` is a delete tombstone that
+    /// removes an inherited key from a lower-precedence layer during the merge.
+    /// On disk, `Some("v")` serializes as `"v"` and `None` as `null`.
+    pub params: BTreeMap<String, Option<String>>,
+}
+
+/// Fully resolved context stamped onto every event. Unlike [`Context`] its
+/// params are string-only — tombstones have already been applied and dropped.
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
+pub struct EffectiveContext {
+    pub flow_id: Option<String>,
+    pub labels: Vec<String>,
     pub params: BTreeMap<String, String>,
 }
 
@@ -259,62 +271,75 @@ impl Context {
     // Effective merge
     // ---------------------------------------------------------------------------
 
-    /// Compute the effective context by merging global and per-worktree contexts:
-    ///
-    /// - `flow_id`: worktree wins if set, otherwise falls back to global.
-    /// - `labels`: global ∪ worktree (dedup, global-first order, stable).
-    /// - `params`: global then worktree overwrites keys (worktree takes precedence).
-    pub fn merge_effective(global: &Context, worktree: Option<&Context>) -> Context {
-        let wt = match worktree {
-            Some(w) => w,
-            None => return global.clone(),
-        };
+    /// Fold layers low→high into the effective context.
+    /// - flow_id: highest layer that sets a non-null value wins.
+    /// - labels: union across layers, deduped, low→high stable order.
+    /// - params: JSON merge-patch per layer — `Some(v)` sets/overrides,
+    ///   `None` deletes an inherited key. Effective params are string-only.
+    pub fn merge_layers(layers: &[&Context]) -> EffectiveContext {
+        let mut flow_id: Option<String> = None;
+        let mut all_labels: Vec<String> = Vec::new();
+        let mut params: BTreeMap<String, String> = BTreeMap::new();
 
-        // flow: worktree wins if set
-        let flow_id = wt.flow_id.clone().or_else(|| global.flow_id.clone());
-
-        // labels: global ∪ worktree, dedup (global-first, stable order).
-        // dedup_labels trims, drops blanks, and deduplicates — no separate contains-loop needed.
-        let combined_labels: Vec<String> = global
-            .labels
-            .iter()
-            .chain(wt.labels.iter())
-            .cloned()
-            .collect();
-        let labels = dedup_labels(&combined_labels);
-
-        // params: global base, worktree overrides
-        let mut params = global.params.clone();
-        for (k, v) in &wt.params {
-            params.insert(k.clone(), v.clone());
+        for layer in layers {
+            if layer.flow_id.is_some() {
+                flow_id = layer.flow_id.clone();
+            }
+            all_labels.extend(layer.labels.iter().cloned());
+            for (k, v) in &layer.params {
+                match v {
+                    Some(val) => {
+                        params.insert(k.clone(), val.clone());
+                    }
+                    None => {
+                        params.remove(k);
+                    }
+                }
+            }
         }
 
-        Context {
+        EffectiveContext {
             flow_id,
-            labels,
+            labels: dedup_labels(&all_labels),
             params,
         }
     }
 
-    /// Resolve paths from `start_dir`, load global + per-worktree, and return the
-    /// merged effective context. This is what the hook stamps.
-    pub fn effective(start_dir: &Path) -> Context {
-        let paths = resolve_context_paths(start_dir);
-        let global = Self::load_global(&paths);
-        let worktree = Self::load_worktree(&paths);
-        Self::merge_effective(&global, worktree.as_ref())
+    /// Load user (if given) + global + per-worktree and return the merged
+    /// effective context that the hook stamps.
+    pub fn effective(start_dir: &Path, user_layer: Option<&Path>) -> EffectiveContext {
+        let (_, _, _, _, eff) = Self::effective_with_parts(start_dir, user_layer);
+        eff
     }
 
-    /// Like `effective`, but also returns the resolved paths, global, and per-worktree
-    /// contexts separately (for `show` to display all three).
+    /// Like `effective`, returning each layer separately (for `show`).
+    /// Tuple: (paths, user, global, worktree, effective).
+    #[allow(clippy::type_complexity)]
     pub fn effective_with_parts(
         start_dir: &Path,
-    ) -> (ContextPaths, Context, Option<Context>, Context) {
+        user_layer: Option<&Path>,
+    ) -> (
+        ContextPaths,
+        Option<Context>,
+        Context,
+        Option<Context>,
+        EffectiveContext,
+    ) {
         let paths = resolve_context_paths(start_dir);
+        let user = user_layer.map(Self::load_from);
         let global = Self::load_global(&paths);
         let worktree = Self::load_worktree(&paths);
-        let effective = Self::merge_effective(&global, worktree.as_ref());
-        (paths, global, worktree, effective)
+
+        let mut layers: Vec<&Context> = Vec::new();
+        if let Some(u) = &user {
+            layers.push(u);
+        }
+        layers.push(&global);
+        if let Some(w) = &worktree {
+            layers.push(w);
+        }
+        let effective = Self::merge_layers(&layers);
+        (paths, user, global, worktree, effective)
     }
 }
 
@@ -355,8 +380,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx_path = dir.path().join(".tracevault").join("context.json");
         let mut params = BTreeMap::new();
-        params.insert("key1".to_string(), "value1".to_string());
-        params.insert("key2".to_string(), "value2".to_string());
+        params.insert("key1".to_string(), Some("value1".to_string()));
+        params.insert("key2".to_string(), Some("value2".to_string()));
 
         let ctx = Context {
             flow_id: Some("flow-abc-123".to_string()),
@@ -427,8 +452,41 @@ mod tests {
         assert!(ctx_path.exists());
     }
 
+    #[test]
+    fn params_tombstone_round_trips_as_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".tracevault").join("context.json");
+        let mut params = BTreeMap::new();
+        params.insert("keep".to_string(), Some("v".to_string()));
+        params.insert("drop".to_string(), None); // tombstone
+        let ctx = Context {
+            flow_id: None,
+            labels: vec![],
+            params,
+        };
+        ctx.save_to(&path).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("\"drop\": null"),
+            "tombstone must serialize as null"
+        );
+        assert!(raw.contains("\"keep\": \"v\""));
+        assert_eq!(Context::load_from(&path), ctx);
+    }
+
+    #[test]
+    fn legacy_string_params_load_as_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".tracevault").join("context.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"flow_id":null,"labels":[],"params":{"k":"v"}}"#).unwrap();
+        let ctx = Context::load_from(&path);
+        assert_eq!(ctx.params.get("k"), Some(&Some("v".to_string())));
+    }
+
     // ---------------------------------------------------------------------------
-    // merge_effective unit tests
+    // merge_layers (ordered fold) unit tests
     // ---------------------------------------------------------------------------
 
     fn ctx(flow: Option<&str>, labels: &[&str], params: &[(&str, &str)]) -> Context {
@@ -437,79 +495,41 @@ mod tests {
             labels: labels.iter().map(|s| s.to_string()).collect(),
             params: params
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .map(|(k, v)| (k.to_string(), Some(v.to_string())))
                 .collect(),
         }
     }
 
     #[test]
-    fn merge_no_worktree_returns_global() {
-        let global = ctx(Some("g"), &["a"], &[("k", "1")]);
-        let result = Context::merge_effective(&global, None);
-        assert_eq!(result, global);
+    fn fold_precedence_and_labels_union() {
+        let user = ctx(Some("u"), &["base"], &[("env", "prod"), ("owner", "u")]);
+        let repo = ctx(Some("r"), &["repo"], &[("owner", "team")]); // overrides owner
+        let wt = ctx(None, &["wt"], &[]);
+        let eff = Context::merge_layers(&[&user, &repo, &wt]);
+        assert_eq!(eff.flow_id, Some("r".to_string())); // highest non-null (wt is None)
+        assert_eq!(eff.labels, vec!["base", "repo", "wt"]); // union, low→high order
+        assert_eq!(eff.params["env"], "prod"); // only user set it
+        assert_eq!(eff.params["owner"], "team"); // repo overrides user
     }
 
     #[test]
-    fn merge_worktree_flow_wins() {
-        let global = ctx(Some("g"), &[], &[]);
-        let wt = ctx(Some("w"), &[], &[]);
-        let result = Context::merge_effective(&global, Some(&wt));
-        assert_eq!(result.flow_id, Some("w".to_string()));
+    fn fold_tombstone_removes_lower_layer_param() {
+        let user = ctx(Some("u"), &[], &[("secret", "x")]);
+        let mut repo = ctx(None, &[], &[]);
+        repo.params.insert("secret".to_string(), None); // tombstone
+        let eff = Context::merge_layers(&[&user, &repo]);
+        assert!(
+            !eff.params.contains_key("secret"),
+            "tombstone drops inherited key"
+        );
     }
 
     #[test]
-    fn merge_worktree_flow_none_falls_back_to_global() {
-        let global = ctx(Some("g"), &[], &[]);
-        let wt = ctx(None, &[], &[]);
-        let result = Context::merge_effective(&global, Some(&wt));
-        assert_eq!(result.flow_id, Some("g".to_string()));
-    }
-
-    #[test]
-    fn merge_labels_union_dedup_global_first() {
-        let global = ctx(None, &["a"], &[]);
-        let wt = ctx(None, &["b"], &[]);
-        let result = Context::merge_effective(&global, Some(&wt));
-        assert_eq!(result.labels, vec!["a", "b"]);
-    }
-
-    #[test]
-    fn merge_labels_no_duplicates() {
-        let global = ctx(None, &["a", "b"], &[]);
-        let wt = ctx(None, &["b", "c"], &[]);
-        let result = Context::merge_effective(&global, Some(&wt));
-        assert_eq!(result.labels, vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn merge_params_worktree_overwrites_keys() {
-        let global = ctx(None, &[], &[("k", "1"), ("m", "old")]);
-        let wt = ctx(None, &[], &[("k", "2"), ("m", "3")]);
-        let result = Context::merge_effective(&global, Some(&wt));
-        assert_eq!(result.params["k"], "2");
-        assert_eq!(result.params["m"], "3");
-    }
-
-    #[test]
-    fn merge_params_global_keys_not_in_worktree_preserved() {
-        let global = ctx(None, &[], &[("g_only", "yes")]);
-        let wt = ctx(None, &[], &[("wt_only", "yes")]);
-        let result = Context::merge_effective(&global, Some(&wt));
-        assert_eq!(result.params["g_only"], "yes");
-        assert_eq!(result.params["wt_only"], "yes");
-    }
-
-    #[test]
-    fn merge_full_example_from_spec() {
-        // global{flow:g, labels:[a], params:{k:1}}
-        // worktree{flow:w, labels:[b], params:{k:2,m:3}}
-        // → effective{flow:w, labels:[a,b], params:{k:2,m:3}}
-        let global = ctx(Some("g"), &["a"], &[("k", "1")]);
-        let wt = ctx(Some("w"), &["b"], &[("k", "2"), ("m", "3")]);
-        let result = Context::merge_effective(&global, Some(&wt));
-        assert_eq!(result.flow_id, Some("w".to_string()));
-        assert_eq!(result.labels, vec!["a", "b"]);
-        assert_eq!(result.params["k"], "2");
-        assert_eq!(result.params["m"], "3");
+    fn fold_single_layer_matches_input() {
+        let only = ctx(Some("g"), &["a"], &[("k", "1")]);
+        let eff = Context::merge_layers(&[&only]);
+        assert_eq!(eff.flow_id, Some("g".to_string()));
+        assert_eq!(eff.labels, vec!["a"]);
+        assert_eq!(eff.params["k"], "1");
     }
 }
