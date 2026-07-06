@@ -50,11 +50,24 @@ pub fn sessions_dir() -> Option<PathBuf> {
     Some(base.join("tracevault").join("sessions"))
 }
 
+/// A session id is used to build the state file path, so it must be a safe
+/// filename token — no path separators or `..` that could escape the sessions
+/// directory. Claude Code session ids are UUIDs, which satisfy this.
+fn is_safe_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 fn state_path_in(sessions_dir: &std::path::Path, session_id: &str) -> PathBuf {
     sessions_dir.join(format!("{session_id}.toml"))
 }
 
 fn load_in(sessions_dir: &std::path::Path, session_id: &str) -> SessionState {
+    if !is_safe_session_id(session_id) {
+        return SessionState::default();
+    }
     match std::fs::read_to_string(state_path_in(sessions_dir, session_id)) {
         Ok(s) => toml::from_str(&s).unwrap_or_default(),
         Err(_) => SessionState::default(),
@@ -66,6 +79,9 @@ fn save_in(
     session_id: &str,
     state: &SessionState,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !is_safe_session_id(session_id) {
+        return Err(format!("invalid session id: {session_id:?}").into());
+    }
     std::fs::create_dir_all(sessions_dir)?;
     std::fs::write(
         state_path_in(sessions_dir, session_id),
@@ -134,5 +150,19 @@ mod tests {
             load_in(tmp.path(), "no-such-session"),
             SessionState::default()
         );
+    }
+
+    #[test]
+    fn rejects_unsafe_session_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = SessionState::default();
+        // Path-traversal / separator ids must be refused, never written to disk.
+        assert!(save_in(tmp.path(), "../evil", &s).is_err());
+        assert!(save_in(tmp.path(), "a/b", &s).is_err());
+        assert!(save_in(tmp.path(), "", &s).is_err());
+        // load of an unsafe id never touches disk; returns the default.
+        assert_eq!(load_in(tmp.path(), "../evil"), SessionState::default());
+        // A UUID-style id is accepted.
+        assert!(save_in(tmp.path(), "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", &s).is_ok());
     }
 }

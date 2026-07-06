@@ -1,25 +1,32 @@
 //! Tests ApiClient::resolve_repo against a one-shot raw HTTP server.
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 use tracevault_cli::api_client::ApiClient;
 
+/// How long a test waits for the captured request before failing (rather than
+/// hanging forever if the client never connects).
+const RECV_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Spawn a one-shot server that returns `response` (a full HTTP response) to
-/// the first request. Captures the request line and sends it (as lossy UTF-8)
-/// over the returned channel before writing the response.
-/// Returns (base_url, request_receiver).
+/// the first request. Captures the HTTP request line (the first line, which
+/// carries the method + path + query) and sends it over the returned channel
+/// before writing the response. Returns (base_url, request_receiver).
 fn spawn_once(response: &'static str) -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 2048];
-            if let Ok(n) = stream.read(&mut buf) {
-                let request_str = String::from_utf8_lossy(&buf[..n]).to_string();
-                let _ = tx.send(request_str);
-            }
+        if let Ok((stream, _)) = listener.accept() {
+            // Read exactly the request line — a single `read()` could return a
+            // partial buffer and make the query-string assertions flaky.
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            let _ = tx.send(request_line);
+            let mut stream = reader.into_inner();
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
         }
@@ -47,7 +54,7 @@ async fn resolve_repo_returns_id_on_200() {
     );
 
     // Verify the git_url was percent-encoded in the request.
-    let request = rx.recv().unwrap();
+    let request = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
     assert!(request.contains("/api/v1/orgs/org/repos/resolve?git_url="));
     assert!(
         request.contains("%40"),
@@ -71,6 +78,7 @@ async fn resolve_repo_returns_none_on_404() {
         .await
         .unwrap();
     assert_eq!(got, None);
-    // Drain the receiver (we don't assert, just consume it).
-    let _ = rx.recv();
+    // Drain the receiver (we don't assert, just consume it) with a timeout so
+    // the test can't hang if the request was never sent.
+    let _ = rx.recv_timeout(RECV_TIMEOUT);
 }
