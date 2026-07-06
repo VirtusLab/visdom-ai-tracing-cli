@@ -33,7 +33,8 @@ enum Cli {
         #[arg(long)]
         no_user_context: bool,
         /// Enable the user-level context and read it from this explicit path
-        #[arg(long)]
+        /// (conflicts with --no-user-context).
+        #[arg(long, conflicts_with = "no_user_context")]
         user_context: Option<String>,
     },
     /// Show current session status
@@ -404,5 +405,37 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn init_user_context_flags_conflict() {
+        // `--no-user-context` and `--user-context <path>` are mutually exclusive
+        // and must be rejected up front rather than silently prioritizing one.
+        // `Cli` has no `Debug` impl, so match instead of `expect_err`.
+        let err = match Cli::try_parse_from([
+            "tracevault",
+            "init",
+            "--no-user-context",
+            "--user-context",
+            "/tmp/ctx.json",
+        ]) {
+            Ok(_) => panic!("both flags together must be a parse error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn init_user_context_flags_are_ok_alone() {
+        assert!(Cli::try_parse_from(["tracevault", "init", "--no-user-context"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["tracevault", "init", "--user-context", "/tmp/ctx.json"]).is_ok()
+        );
     }
 }

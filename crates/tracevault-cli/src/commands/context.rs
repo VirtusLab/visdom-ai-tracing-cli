@@ -50,7 +50,13 @@ fn split_labels(labels: &[String]) -> Vec<String> {
 /// Used by `--user` on `context set/update/clear` to edit that file directly.
 fn user_context_path(cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let root = find_project_root(cwd)?;
-    let config = TracevaultConfig::load(&root).unwrap_or_default();
+    // A *malformed* config.toml must not silently fall back to the default path:
+    // that could route a `--user` edit to the wrong file when the user actually
+    // configured a custom path we failed to parse. A *missing* config is fine —
+    // there is no configured override, so the default path is correct.
+    let config = TracevaultConfig::try_load(&root)
+        .map_err(|e| format!("cannot resolve --user path: malformed .tracevault/config.toml: {e}"))?
+        .unwrap_or_default();
     Ok(config.user_context.path())
 }
 
@@ -225,8 +231,9 @@ fn apply_update_mutations(
 }
 
 /// `tracevault context show` — print four labelled sections:
-///   1. User — the cross-repo user-level context (only when `user_context` is
-///      enabled in `config.toml`; shows the resolved file path either way).
+///   1. User — the cross-repo user-level context (its contents are shown only
+///      when `user_context` is enabled in `config.toml`; the header shows the
+///      resolved file path when enabled and `disabled` otherwise).
 ///   2. Global — the repo-wide `context.json`.
 ///   3. This worktree — the per-worktree context (Linked only; "(none)" when missing).
 ///   4. Effective — the merged result that the hook stamps on every event, with

@@ -130,11 +130,29 @@ impl TracevaultConfig {
         format!("# TraceVault configuration\n{body}")
     }
 
-    pub fn load(project_root: &Path) -> Option<Self> {
+    /// Load `config.toml`, distinguishing a **missing** file (`Ok(None)`) from a
+    /// present-but-**malformed** one (`Err(message)`). Callers that need to react
+    /// differently to those two cases (e.g. to avoid silently writing to a
+    /// default path when a configured one failed to parse) should use this.
+    pub fn try_load(project_root: &Path) -> Result<Option<Self>, String> {
         let path = Self::config_path(project_root);
-        let content = std::fs::read_to_string(path).ok()?;
-        match toml::from_str(&content) {
-            Ok(cfg) => Some(cfg),
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            // Missing (or otherwise unreadable) file: not an error — no config.
+            Err(_) => return Ok(None),
+        };
+        toml::from_str(&content)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Lenient load: a missing **or** malformed `config.toml` yields `None`, with
+    /// a warning printed for the malformed case. Kept for callers that treat "no
+    /// usable config" uniformly; prefer [`try_load`](Self::try_load) when the
+    /// missing/malformed distinction matters.
+    pub fn load(project_root: &Path) -> Option<Self> {
+        match Self::try_load(project_root) {
+            Ok(cfg) => cfg,
             Err(e) => {
                 eprintln!("tracevault: warning: malformed config.toml: {e}");
                 None
@@ -193,6 +211,33 @@ mod tests {
     fn load_missing_file_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(TracevaultConfig::load(dir.path()).is_none());
+    }
+
+    #[test]
+    fn try_load_distinguishes_missing_valid_and_malformed() {
+        // Missing file → Ok(None), not an error.
+        let missing = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            TracevaultConfig::try_load(missing.path()),
+            Ok(None)
+        ));
+
+        // Valid file → Ok(Some(cfg)).
+        let valid = tempfile::tempdir().unwrap();
+        let tv_dir = valid.path().join(".tracevault");
+        fs::create_dir_all(&tv_dir).unwrap();
+        fs::write(tv_dir.join("config.toml"), "agent = \"claude-code\"\n").unwrap();
+        assert!(matches!(
+            TracevaultConfig::try_load(valid.path()),
+            Ok(Some(_))
+        ));
+
+        // Present but unparseable → Err (NOT silently treated as missing).
+        let bad = tempfile::tempdir().unwrap();
+        let bad_dir = bad.path().join(".tracevault");
+        fs::create_dir_all(&bad_dir).unwrap();
+        fs::write(bad_dir.join("config.toml"), "this = = not valid toml").unwrap();
+        assert!(TracevaultConfig::try_load(bad.path()).is_err());
     }
 
     #[test]

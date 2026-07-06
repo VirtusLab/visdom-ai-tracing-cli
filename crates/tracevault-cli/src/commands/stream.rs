@@ -207,12 +207,18 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
 
     // Load config once, up front, so it can back both the user-level context
     // layer resolution below and the org_slug/repo_id lookup further down —
-    // avoids a redundant second `TracevaultConfig::load` of the same file.
-    // Best-effort here: a missing/malformed config simply yields no user
+    // avoids a redundant second read of the same file. `try_load` keeps the
+    // missing/malformed distinction so the required-config error further down
+    // can report which one it is.
+    // Best-effort here: a missing OR malformed config simply yields no user
     // layer (matching the prior behavior of always passing `None`); the
     // org_slug/repo_id requirement is still enforced later.
-    let config = crate::config::TracevaultConfig::load(&project_root);
-    let user_layer = config.as_ref().and_then(|c| c.user_context.resolve());
+    let config = crate::config::TracevaultConfig::try_load(&project_root);
+    let user_layer = config
+        .as_ref()
+        .ok()
+        .and_then(|opt| opt.as_ref())
+        .and_then(|c| c.user_context.resolve());
 
     // Load the EFFECTIVE merged context (user layer, if enabled, merged with
     // global and per-worktree) and extract fields before building the
@@ -256,8 +262,15 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
     let (server_url, token) = crate::api_client::resolve_credentials(&project_root);
 
     // 7. Config for org_slug and repo_id (loaded above, alongside the
-    // user-level context layer resolution).
-    let config = config.ok_or("TracevaultConfig not found")?;
+    // user-level context layer resolution). Distinguish a missing config from a
+    // malformed one — the latter is easy to miss in hook output.
+    let config = match config {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => {
+            return Err("no .tracevault/config.toml found — run 'tracevault init' first".into())
+        }
+        Err(e) => return Err(format!("malformed .tracevault/config.toml: {e}").into()),
+    };
     let org_slug = config
         .org_slug
         .as_deref()

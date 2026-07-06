@@ -48,8 +48,9 @@ there is no removal of a label across layers, only `--remove-label` on the file 
 editing removes it from that file. `params` support a `null` tombstone: `context update
 --remove-param KEY` records `KEY = null` in that layer's file rather than deleting the key,
 so the removal propagates through the merge and drops an inherited value from a
-lower-precedence layer (`context show`'s per-value provenance shows exactly which layer a
-value — or its absence — came from).
+lower-precedence layer (`context show`'s per-value provenance shows exactly which layer each
+value in the effective context came from; values dropped by a tombstone are simply absent
+from the output).
 
 **Enabling the user layer — `user_context` in `config.toml`**
 
