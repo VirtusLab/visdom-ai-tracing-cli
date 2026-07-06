@@ -1750,6 +1750,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "visdom-ai-tracing-protocol",
 ]

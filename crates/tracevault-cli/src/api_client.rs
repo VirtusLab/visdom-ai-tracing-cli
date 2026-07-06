@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::path::Path;
+use url::Url;
 
 pub struct ApiClient {
     base_url: String,
@@ -419,10 +420,12 @@ impl ApiClient {
         org_slug: &str,
         git_url: &str,
     ) -> Result<Option<uuid::Uuid>, Box<dyn std::error::Error>> {
-        let url = format!(
-            "{}/api/v1/orgs/{}/repos/resolve?git_url={}",
-            self.base_url, org_slug, git_url
-        );
+        let mut url = Url::parse(&format!(
+            "{}/api/v1/orgs/{}/repos/resolve",
+            self.base_url, org_slug
+        ))?;
+        url.query_pairs_mut().append_pair("git_url", git_url);
+
         let mut builder = self.client.get(url);
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
