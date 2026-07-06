@@ -49,30 +49,43 @@ pub fn sessions_dir() -> Option<PathBuf> {
     Some(base.join("tracevault").join("sessions"))
 }
 
-fn state_path(session_id: &str) -> Option<PathBuf> {
-    Some(sessions_dir()?.join(format!("{session_id}.toml")))
+fn state_path_in(sessions_dir: &std::path::Path, session_id: &str) -> PathBuf {
+    sessions_dir.join(format!("{session_id}.toml"))
 }
 
-/// Load a session's state, returning the default (empty) state if the file is
-/// absent or malformed (workspace state is best-effort, never fatal).
-pub fn load(session_id: &str) -> SessionState {
-    let Some(path) = state_path(session_id) else {
-        return SessionState::default();
-    };
-    match std::fs::read_to_string(&path) {
+fn load_in(sessions_dir: &std::path::Path, session_id: &str) -> SessionState {
+    match std::fs::read_to_string(state_path_in(sessions_dir, session_id)) {
         Ok(s) => toml::from_str(&s).unwrap_or_default(),
         Err(_) => SessionState::default(),
     }
 }
 
+fn save_in(
+    sessions_dir: &std::path::Path,
+    session_id: &str,
+    state: &SessionState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(sessions_dir)?;
+    std::fs::write(
+        state_path_in(sessions_dir, session_id),
+        toml::to_string(state)?,
+    )?;
+    Ok(())
+}
+
+/// Load a session's state, returning the default (empty) state if the file is
+/// absent or malformed (workspace state is best-effort, never fatal).
+pub fn load(session_id: &str) -> SessionState {
+    match sessions_dir() {
+        Some(dir) => load_in(&dir, session_id),
+        None => SessionState::default(),
+    }
+}
+
 /// Persist a session's state, creating the state dir if needed.
 pub fn save(session_id: &str, state: &SessionState) -> Result<(), Box<dyn std::error::Error>> {
-    let path = state_path(session_id).ok_or("cannot determine state dir")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, toml::to_string(state)?)?;
-    Ok(())
+    let dir = sessions_dir().ok_or("cannot determine state dir")?;
+    save_in(&dir, session_id, state)
 }
 
 #[cfg(test)]
@@ -102,22 +115,21 @@ mod tests {
     }
 
     #[test]
-    fn save_then_load_round_trips() {
-        // Redirect the state dir to a temp location for the test.
+    fn save_in_then_load_in_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_STATE_HOME", tmp.path());
         let mut s = SessionState::default();
         s.active = Some(binding("r1"));
         s.subagents.insert("/wt/a".into(), binding("r2"));
-        save("sess-1", &s).unwrap();
-        let loaded = load("sess-1");
-        assert_eq!(loaded, s);
+        save_in(tmp.path(), "sess-1", &s).unwrap();
+        assert_eq!(load_in(tmp.path(), "sess-1"), s);
     }
 
     #[test]
-    fn load_missing_returns_default() {
+    fn load_in_missing_returns_default() {
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_STATE_HOME", tmp.path());
-        assert_eq!(load("no-such-session"), SessionState::default());
+        assert_eq!(
+            load_in(tmp.path(), "no-such-session"),
+            SessionState::default()
+        );
     }
 }
