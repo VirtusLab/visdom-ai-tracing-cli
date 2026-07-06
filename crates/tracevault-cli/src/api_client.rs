@@ -20,6 +20,8 @@ pub struct RegisterRepoResponse {
     pub repo_id: uuid::Uuid,
 }
 
+// Wired into workspace-mode commands in a follow-up; unused in the bin until then.
+#[allow(dead_code)]
 #[derive(Deserialize)]
 struct ResolveRepoResponse {
     repo_id: uuid::Uuid,
@@ -415,6 +417,8 @@ impl ApiClient {
     /// Resolve a git remote URL to a registered repo id within `org_slug`.
     /// `Ok(None)` when the server has no matching repo (404). Used by
     /// workspace/detached mode, which has no pinned repo_id in config.
+    // Wired into workspace-mode commands in a follow-up; unused in the bin until then.
+    #[allow(dead_code)]
     pub async fn resolve_repo(
         &self,
         org_slug: &str,

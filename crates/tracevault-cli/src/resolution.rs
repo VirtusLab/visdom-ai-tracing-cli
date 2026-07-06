@@ -3,6 +3,7 @@
 //! effective binding for an event/command from the precedence chain
 //! (`--repo` flag → subagent worktree override → session active → bound
 //! `.tracevault/config.toml`). See design §2/§3/§4.
+#![allow(dead_code)] // workspace-mode foundation; wired into commands in a follow-up sub-plan
 
 use std::path::Path;
 
@@ -99,6 +100,7 @@ pub fn effective_binding(inputs: ResolveInputs) -> Option<RepoBinding> {
 mod tests {
     use super::*;
     use crate::session_state::{RepoBinding, SessionState};
+    use std::collections::HashMap;
 
     fn binding(id: &str) -> RepoBinding {
         RepoBinding {
@@ -111,11 +113,10 @@ mod tests {
 
     #[test]
     fn effective_binding_precedence() {
-        let mut session = SessionState::default();
-        session.active = Some(binding("session"));
-        session
-            .subagents
-            .insert("/wt/a".into(), binding("subagent"));
+        let session = SessionState {
+            active: Some(binding("session")),
+            subagents: HashMap::from([("/wt/a".to_string(), binding("subagent"))]),
+        };
 
         // 1. repo_flag wins over everything.
         let got = effective_binding(ResolveInputs {

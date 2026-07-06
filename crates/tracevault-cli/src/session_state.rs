@@ -2,6 +2,7 @@
 //! session is currently bound to. Persisted outside any repo so it survives a
 //! session that changes directories. Set by `tracevault repo switch`
 //! (sub-plan B); read by `stream`/commands as a resolution fallback.
+#![allow(dead_code)] // workspace-mode foundation; wired into commands in a follow-up sub-plan
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -103,9 +104,10 @@ mod tests {
 
     #[test]
     fn effective_prefers_subagent_override_for_worktree() {
-        let mut s = SessionState::default();
-        s.active = Some(binding("session-repo"));
-        s.subagents.insert("/wt/a".into(), binding("subagent-repo"));
+        let s = SessionState {
+            active: Some(binding("session-repo")),
+            subagents: HashMap::from([("/wt/a".to_string(), binding("subagent-repo"))]),
+        };
         assert_eq!(s.effective(Some("/wt/a")).unwrap().repo_id, "subagent-repo");
         assert_eq!(
             s.effective(Some("/wt/unknown")).unwrap().repo_id,
@@ -117,9 +119,10 @@ mod tests {
     #[test]
     fn save_in_then_load_in_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut s = SessionState::default();
-        s.active = Some(binding("r1"));
-        s.subagents.insert("/wt/a".into(), binding("r2"));
+        let s = SessionState {
+            active: Some(binding("r1")),
+            subagents: HashMap::from([("/wt/a".to_string(), binding("r2"))]),
+        };
         save_in(tmp.path(), "sess-1", &s).unwrap();
         assert_eq!(load_in(tmp.path(), "sess-1"), s);
     }
