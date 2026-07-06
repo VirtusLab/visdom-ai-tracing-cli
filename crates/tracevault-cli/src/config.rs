@@ -3,11 +3,27 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TracevaultConfig {
+    #[serde(default = "default_agent")]
     pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_url: Option<String>,
+    // Never persisted; may still be parsed if present in a hand-authored file.
+    // No production code reads this field today (credentials are resolved
+    // independently in api_client.rs::resolve_credentials); kept on the
+    // struct for forward-compat / round-trip parsing of existing files.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default_user_context")]
+    pub user_context: UserContext,
+}
+
+fn default_agent() -> String {
+    "claude-code".to_string()
 }
 
 impl Default for TracevaultConfig {
@@ -18,8 +34,68 @@ impl Default for TracevaultConfig {
             api_key: None,
             org_slug: None,
             repo_id: None,
+            user_context: UserContext::default(),
         }
     }
+}
+
+/// Cross-repo user context source. Cargo-`dependency`-style shorthand:
+/// bool toggles enable at the default path; a string is enable + that path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UserContext {
+    Toggle(bool),
+    Path(String),
+    Full {
+        #[serde(default = "crate::config::enable_default")]
+        enable: bool,
+        #[serde(default)]
+        path: Option<String>,
+    },
+}
+
+impl Default for UserContext {
+    fn default() -> Self {
+        UserContext::Toggle(false)
+    }
+}
+
+pub(crate) fn enable_default() -> bool {
+    true
+}
+
+/// `~/.config/tracevault/context.json`, alongside credentials.json.
+pub fn default_user_context_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("tracevault")
+        .join("context.json")
+}
+
+impl UserContext {
+    /// The file this source points at (configured path or default), regardless
+    /// of whether it is enabled. Used by `--user` editing.
+    pub fn path(&self) -> PathBuf {
+        match self {
+            UserContext::Path(p) => PathBuf::from(p),
+            UserContext::Full { path: Some(p), .. } => PathBuf::from(p),
+            _ => default_user_context_path(),
+        }
+    }
+
+    /// `Some(path)` when enabled (consulted by the hook); `None` when disabled.
+    pub fn resolve(&self) -> Option<PathBuf> {
+        let enabled = match self {
+            UserContext::Toggle(b) => *b,
+            UserContext::Path(_) => true,
+            UserContext::Full { enable, .. } => *enable,
+        };
+        enabled.then(|| self.path())
+    }
+}
+
+fn is_default_user_context(uc: &UserContext) -> bool {
+    matches!(uc, UserContext::Toggle(false))
 }
 
 impl TracevaultConfig {
@@ -50,40 +126,42 @@ impl TracevaultConfig {
     }
 
     pub fn to_toml(&self) -> String {
-        let mut out = format!("# TraceVault configuration\nagent = \"{}\"\n", self.agent);
-        if let Some(url) = &self.server_url {
-            out.push_str(&format!("server_url = \"{url}\"\n"));
-        }
-        if let Some(slug) = &self.org_slug {
-            out.push_str(&format!("org_slug = \"{slug}\"\n"));
-        }
-        if let Some(rid) = &self.repo_id {
-            out.push_str(&format!("repo_id = \"{rid}\"\n"));
-        }
-        out
+        let body = toml::to_string(self).unwrap_or_default();
+        format!("# TraceVault configuration\n{body}")
     }
 
-    /// Parse config from the TOML file using simple line-based parsing
-    /// (consistent with the existing resolve_credentials approach).
-    pub fn load(project_root: &Path) -> Option<Self> {
+    /// Load `config.toml`, distinguishing a **missing** file (`Ok(None)`) from a
+    /// present-but-**malformed** one (`Err(message)`). Callers that need to react
+    /// differently to those two cases (e.g. to avoid silently writing to a
+    /// default path when a configured one failed to parse) should use this.
+    ///
+    /// Only a genuine "not found" counts as missing; any other IO error (e.g.
+    /// permission denied) is surfaced as `Err` with the path, rather than being
+    /// masked as an absent config.
+    pub fn try_load(project_root: &Path) -> Result<Option<Self>, String> {
         let path = Self::config_path(project_root);
-        let content = std::fs::read_to_string(path).ok()?;
-
-        let parse_field = |key: &str| -> Option<String> {
-            content
-                .lines()
-                .find(|l| l.starts_with(key))
-                .and_then(|l| l.split('=').nth(1))
-                .map(|s| s.trim().trim_matches('"').to_string())
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         };
+        toml::from_str(&content)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
 
-        Some(Self {
-            agent: parse_field("agent").unwrap_or_else(|| "claude-code".to_string()),
-            server_url: parse_field("server_url"),
-            api_key: parse_field("api_key"),
-            org_slug: parse_field("org_slug"),
-            repo_id: parse_field("repo_id"),
-        })
+    /// Lenient load: a missing **or** malformed `config.toml` yields `None`, with
+    /// a warning printed for the malformed case. Kept for callers that treat "no
+    /// usable config" uniformly; prefer [`try_load`](Self::try_load) when the
+    /// missing/malformed distinction matters.
+    pub fn load(project_root: &Path) -> Option<Self> {
+        match Self::try_load(project_root) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("tracevault: warning: malformed config.toml: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -100,6 +178,7 @@ mod tests {
             api_key: None, // api_key not included in to_toml
             org_slug: Some("my-org".into()),
             repo_id: Some("repo-1".into()),
+            user_context: UserContext::default(),
         };
         let toml = cfg.to_toml();
         assert!(toml.contains("agent = \"claude-code\""));
@@ -139,6 +218,39 @@ mod tests {
     }
 
     #[test]
+    fn try_load_distinguishes_missing_valid_and_malformed() {
+        // Missing file → Ok(None), not an error.
+        let missing = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            TracevaultConfig::try_load(missing.path()),
+            Ok(None)
+        ));
+
+        // Valid file → Ok(Some(cfg)).
+        let valid = tempfile::tempdir().unwrap();
+        let tv_dir = valid.path().join(".tracevault");
+        fs::create_dir_all(&tv_dir).unwrap();
+        fs::write(tv_dir.join("config.toml"), "agent = \"claude-code\"\n").unwrap();
+        assert!(matches!(
+            TracevaultConfig::try_load(valid.path()),
+            Ok(Some(_))
+        ));
+
+        // Present but unparseable → Err (NOT silently treated as missing).
+        let bad = tempfile::tempdir().unwrap();
+        let bad_dir = bad.path().join(".tracevault");
+        fs::create_dir_all(&bad_dir).unwrap();
+        fs::write(bad_dir.join("config.toml"), "this = = not valid toml").unwrap();
+        assert!(TracevaultConfig::try_load(bad.path()).is_err());
+
+        // Present but unreadable (a non-NotFound IO error — here config.toml is a
+        // directory) → Err, NOT masked as missing.
+        let io = tempfile::tempdir().unwrap();
+        fs::create_dir_all(io.path().join(".tracevault").join("config.toml")).unwrap();
+        assert!(TracevaultConfig::try_load(io.path()).is_err());
+    }
+
+    #[test]
     fn ensure_gitignore_creates_runtime_ignore_file() {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join(".tracevault");
@@ -152,6 +264,64 @@ mod tests {
         assert!(content.contains("sessions/"), "must ignore sessions/");
         assert!(content.contains("cache/"), "must ignore cache/");
         assert!(content.contains("*.local.toml"), "must ignore *.local.toml");
+    }
+
+    #[test]
+    fn toml_round_trip_omits_api_key_and_none_fields() {
+        let cfg = TracevaultConfig {
+            agent: "claude-code".into(),
+            server_url: Some("https://example.com".into()),
+            api_key: Some("secret".into()),
+            org_slug: Some("my-org".into()),
+            repo_id: None,
+            user_context: UserContext::default(),
+        };
+        let toml = cfg.to_toml();
+        assert!(toml.contains("agent = \"claude-code\""));
+        assert!(toml.contains("server_url = \"https://example.com\""));
+        assert!(toml.contains("org_slug = \"my-org\""));
+        assert!(!toml.contains("api_key"), "api_key must never be written");
+        assert!(!toml.contains("repo_id"), "None fields must be omitted");
+
+        // Re-parse (api_key absent from disk) round-trips the rest.
+        let parsed: TracevaultConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(parsed.agent, "claude-code");
+        assert_eq!(parsed.server_url.as_deref(), Some("https://example.com"));
+        assert_eq!(parsed.org_slug.as_deref(), Some("my-org"));
+        assert_eq!(parsed.api_key, None);
+    }
+
+    #[test]
+    fn user_context_forms_resolve_correctly() {
+        // absent ⇒ default ⇒ disabled
+        let none_cfg: TracevaultConfig = toml::from_str("agent = \"claude-code\"").unwrap();
+        assert!(none_cfg.user_context.resolve().is_none());
+
+        // false ⇒ disabled
+        let f: TracevaultConfig =
+            toml::from_str("agent=\"claude-code\"\nuser_context = false").unwrap();
+        assert!(f.user_context.resolve().is_none());
+
+        // true ⇒ enabled at default path
+        let t: TracevaultConfig =
+            toml::from_str("agent=\"claude-code\"\nuser_context = true").unwrap();
+        assert_eq!(t.user_context.resolve(), Some(default_user_context_path()));
+
+        // "path" ⇒ enabled at that path
+        let p: TracevaultConfig =
+            toml::from_str("agent=\"claude-code\"\nuser_context = \"/tmp/ctx.json\"").unwrap();
+        assert_eq!(
+            p.user_context.resolve(),
+            Some(PathBuf::from("/tmp/ctx.json"))
+        );
+
+        // { enable = false, path = ... } ⇒ disabled but path() remembers it
+        let obj: TracevaultConfig = toml::from_str(
+            "agent=\"claude-code\"\n[user_context]\nenable = false\npath = \"/tmp/x.json\"",
+        )
+        .unwrap();
+        assert!(obj.user_context.resolve().is_none());
+        assert_eq!(obj.user_context.path(), PathBuf::from("/tmp/x.json"));
     }
 
     #[test]

@@ -29,6 +29,13 @@ enum Cli {
         /// .gitignore separately or you want to commit the Claude settings files.
         #[arg(long)]
         no_gitignore: bool,
+        /// Disable the cross-repo user-level context for this project
+        #[arg(long)]
+        no_user_context: bool,
+        /// Enable the user-level context and read it from this explicit path
+        /// (conflicts with --no-user-context).
+        #[arg(long, conflicts_with = "no_user_context")]
+        user_context: Option<String>,
     },
     /// Show current session status
     Status,
@@ -134,6 +141,9 @@ enum ContextAction {
         /// Write to the global context file regardless of worktree scope
         #[arg(long)]
         global: bool,
+        /// Write to the resolved user-context file instead (wins over --global)
+        #[arg(long)]
+        user: bool,
     },
     /// Update the existing context, merging changes in.
     ///
@@ -161,6 +171,9 @@ enum ContextAction {
         /// Write to the global context file regardless of worktree scope
         #[arg(long)]
         global: bool,
+        /// Write to the resolved user-context file instead (wins over --global)
+        #[arg(long)]
+        user: bool,
     },
     /// Show the current context (path + pretty JSON).
     ///
@@ -175,6 +188,27 @@ enum ContextAction {
         /// Clear the global context file regardless of worktree scope
         #[arg(long)]
         global: bool,
+        /// Clear the resolved user-context file instead (wins over --global)
+        #[arg(long)]
+        user: bool,
+    },
+    /// Enable/disable or point the project's user-level context source.
+    ///
+    /// The mode flags are mutually exclusive: at most one may be given.
+    #[command(group(clap::ArgGroup::new("source_mode").multiple(false)))]
+    Source {
+        /// Enable the user context at the default path
+        #[arg(long, group = "source_mode")]
+        enable: bool,
+        /// Disable the user context
+        #[arg(long, group = "source_mode")]
+        disable: bool,
+        /// Enable and read the user context from this explicit path
+        #[arg(long, group = "source_mode")]
+        path: Option<String>,
+        /// Enable and clear any explicit path back to the default location
+        #[arg(long, group = "source_mode")]
+        default: bool,
     },
 }
 
@@ -193,13 +227,21 @@ async fn main() {
             server_url,
             claude_settings,
             no_gitignore,
+            no_user_context,
+            user_context,
         } => {
             let cwd = env::current_dir().expect("Cannot determine current directory");
+            let user_context = match (no_user_context, user_context) {
+                (true, _) => config::UserContext::Toggle(false),
+                (false, Some(p)) => config::UserContext::Path(p),
+                (false, None) => config::UserContext::Toggle(true),
+            };
             match commands::init::init_in_directory(
                 &cwd,
                 server_url.as_deref(),
                 claude_settings,
                 no_gitignore,
+                user_context,
             )
             .await
             {
@@ -330,7 +372,8 @@ async fn main() {
                     label,
                     param,
                     global,
-                } => commands::context::run_set(&cwd, flow, label, param, global),
+                    user,
+                } => commands::context::run_set(&cwd, flow, label, param, global, user),
                 ContextAction::Update {
                     flow,
                     label,
@@ -338,6 +381,7 @@ async fn main() {
                     remove_label,
                     remove_param,
                     global,
+                    user,
                 } => commands::context::run_update(
                     &cwd,
                     flow,
@@ -346,14 +390,96 @@ async fn main() {
                     remove_label,
                     remove_param,
                     global,
+                    user,
                 ),
                 ContextAction::Show => commands::context::run_show(&cwd),
-                ContextAction::Clear { global } => commands::context::run_clear(&cwd, global),
+                ContextAction::Clear { global, user } => {
+                    commands::context::run_clear(&cwd, global, user)
+                }
+                ContextAction::Source {
+                    enable,
+                    disable,
+                    path,
+                    default,
+                } => commands::context::run_source(&cwd, enable, disable, path, default),
             };
             if let Err(e) = result {
                 eprintln!("Context error: {e}");
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn init_user_context_flags_conflict() {
+        // `--no-user-context` and `--user-context <path>` are mutually exclusive
+        // and must be rejected up front rather than silently prioritizing one.
+        // `Cli` has no `Debug` impl, so match instead of `expect_err`.
+        let err = match Cli::try_parse_from([
+            "tracevault",
+            "init",
+            "--no-user-context",
+            "--user-context",
+            "/tmp/ctx.json",
+        ]) {
+            Ok(_) => panic!("both flags together must be a parse error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn init_user_context_flags_are_ok_alone() {
+        assert!(Cli::try_parse_from(["tracevault", "init", "--no-user-context"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["tracevault", "init", "--user-context", "/tmp/ctx.json"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn context_source_mode_flags_conflict() {
+        // The `source` mode flags are mutually exclusive; two together must be a
+        // parse-time conflict rather than relying on run_source precedence.
+        for extra in [["--enable", "--disable"], ["--disable", "--default"]] {
+            let err = match Cli::try_parse_from(
+                ["tracevault", "context", "source"].into_iter().chain(extra),
+            ) {
+                Ok(_) => panic!("{extra:?} together must be a parse error"),
+                Err(e) => e,
+            };
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+        // --path with --disable also conflicts.
+        let err = match Cli::try_parse_from([
+            "tracevault",
+            "context",
+            "source",
+            "--path",
+            "/tmp/ctx.json",
+            "--disable",
+        ]) {
+            Ok(_) => panic!("--path with --disable must be a parse error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn context_source_single_mode_is_ok() {
+        assert!(Cli::try_parse_from(["tracevault", "context", "source", "--enable"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "tracevault",
+            "context",
+            "source",
+            "--path",
+            "/tmp/ctx.json"
+        ])
+        .is_ok());
     }
 }

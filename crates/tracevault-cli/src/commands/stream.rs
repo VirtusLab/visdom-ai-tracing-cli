@@ -8,8 +8,8 @@ use tracevault_protocol::streaming::{
     extract_is_error_from_transcript, StreamEventRequest, StreamEventType,
 };
 
-/// Convert a loaded [`crate::context::Context`] into the three optional fields
-/// that are stamped onto a [`StreamEventRequest`].
+/// Convert a resolved [`crate::context::EffectiveContext`] into the three
+/// optional fields that are stamped onto a [`StreamEventRequest`].
 ///
 /// - `flow_id`  — taken directly from `ctx.flow_id`
 /// - `labels`   — `None` when the vec is empty, `Some(vec)` otherwise
@@ -19,7 +19,7 @@ use tracevault_protocol::streaming::{
 /// This is a pure function so it can be unit-tested without I/O.
 #[allow(clippy::type_complexity)]
 pub fn apply_context(
-    ctx: crate::context::Context,
+    ctx: crate::context::EffectiveContext,
 ) -> (
     Option<String>,
     Option<Vec<String>>,
@@ -205,11 +205,27 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
         .as_deref()
         .and_then(|uid| extract_is_error_from_transcript(uid, &transcript_lines));
 
-    // Load the EFFECTIVE merged context (global merged with per-worktree, if any)
-    // and extract fields before building the request.  Using `effective` means
-    // parallel sessions in different linked worktrees each stamp their own
-    // per-worktree context without interfering with each other.
-    let ctx = crate::context::Context::effective(hook_cwd);
+    // Load config once, up front, so it can back both the user-level context
+    // layer resolution below and the org_slug/repo_id lookup further down —
+    // avoids a redundant second read of the same file. `try_load` keeps the
+    // missing/malformed distinction so the required-config error further down
+    // can report which one it is.
+    // Best-effort here: a missing OR malformed config simply yields no user
+    // layer (matching the prior behavior of always passing `None`); the
+    // org_slug/repo_id requirement is still enforced later.
+    let config = crate::config::TracevaultConfig::try_load(&project_root);
+    let user_layer = config
+        .as_ref()
+        .ok()
+        .and_then(|opt| opt.as_ref())
+        .and_then(|c| c.user_context.resolve());
+
+    // Load the EFFECTIVE merged context (user layer, if enabled, merged with
+    // global and per-worktree) and extract fields before building the
+    // request.  Using `effective` means parallel sessions in different linked
+    // worktrees each stamp their own per-worktree context without
+    // interfering with each other.
+    let ctx = crate::context::Context::effective(hook_cwd, user_layer.as_deref());
     let (ctx_flow_id, ctx_labels, ctx_params) = apply_context(ctx);
 
     let mut req = StreamEventRequest {
@@ -245,9 +261,16 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
     // 6. Resolve credentials
     let (server_url, token) = crate::api_client::resolve_credentials(&project_root);
 
-    // 7. Load config for org_slug and repo_id
-    let config =
-        crate::config::TracevaultConfig::load(&project_root).ok_or("TracevaultConfig not found")?;
+    // 7. Config for org_slug and repo_id (loaded above, alongside the
+    // user-level context layer resolution). Distinguish a missing config from a
+    // malformed one — the latter is easy to miss in hook output.
+    let config = match config {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => {
+            return Err("no .tracevault/config.toml found — run 'tracevault init' first".into())
+        }
+        Err(e) => return Err(format!("malformed .tracevault/config.toml: {e}").into()),
+    };
     let org_slug = config
         .org_slug
         .as_deref()
@@ -309,8 +332,29 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::Context;
+    use crate::config::UserContext;
+    use crate::context::{Context, EffectiveContext};
     use std::collections::BTreeMap;
+
+    // ── user layer resolution: disabled config → no user layer ────────────────
+
+    #[test]
+    fn disabled_user_context_resolves_to_none() {
+        // Default/disabled `user_context` (the `Toggle(false)` variant) must
+        // resolve to `None`, matching the pre-existing hook behavior of
+        // stamping without a user layer when it isn't configured.
+        assert!(UserContext::Toggle(false).resolve().is_none());
+    }
+
+    #[test]
+    fn effective_with_no_user_layer_on_empty_repo_is_empty() {
+        // With no user layer and no global/worktree context files present,
+        // `Context::effective` must yield a default (empty) `EffectiveContext`
+        // — i.e. passing `None` for `user_layer` is behavior-preserving.
+        let dir = tempfile::tempdir().unwrap();
+        let effective = Context::effective(dir.path(), None);
+        assert_eq!(effective, EffectiveContext::default());
+    }
 
     // ── apply_context: all three fields populated ─────────────────────────────
 
@@ -321,7 +365,7 @@ mod tests {
         params.insert("env".to_string(), "prod".to_string());
         params.insert("region".to_string(), "eu-west-1".to_string());
 
-        let ctx = Context {
+        let ctx = EffectiveContext {
             flow_id: Some("flow-xyz".to_string()),
             labels: vec!["backend".to_string(), "urgent".to_string()],
             params,
@@ -338,21 +382,22 @@ mod tests {
         assert_eq!(p.get("env").map(String::as_str), Some("prod"));
         assert_eq!(p.get("region").map(String::as_str), Some("eu-west-1"));
 
-        // Verify the context file round-trips through save_to → load_from → apply_context.
+        // Verify the stored context round-trips through save_to → load_from →
+        // merge_layers → apply_context (stored params are now `Option<String>`).
         let written = Context {
             flow_id: Some("flow-xyz".to_string()),
             labels: vec!["backend".to_string(), "urgent".to_string()],
             params: {
                 let mut m = BTreeMap::new();
-                m.insert("env".to_string(), "prod".to_string());
-                m.insert("region".to_string(), "eu-west-1".to_string());
+                m.insert("env".to_string(), Some("prod".to_string()));
+                m.insert("region".to_string(), Some("eu-west-1".to_string()));
                 m
             },
         };
         let ctx_path = dir.path().join(".tracevault").join("context.json");
         written.save_to(&ctx_path).unwrap();
         let loaded = Context::load_from(&ctx_path);
-        let (flow_id2, labels2, params2) = apply_context(loaded);
+        let (flow_id2, labels2, params2) = apply_context(Context::merge_layers(&[&loaded]));
         assert_eq!(flow_id2, Some("flow-xyz".to_string()));
         assert!(labels2.is_some());
         assert!(params2.is_some());
@@ -365,7 +410,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing_path = dir.path().join(".tracevault").join("context.json");
         let ctx = Context::load_from(&missing_path); // no context.json → default
-        let (flow_id, labels, params) = apply_context(ctx);
+        let (flow_id, labels, params) = apply_context(Context::merge_layers(&[&ctx]));
         assert!(flow_id.is_none(), "flow_id should be None");
         assert!(labels.is_none(), "labels should be None");
         assert!(params.is_none(), "params should be None");
@@ -375,7 +420,7 @@ mod tests {
 
     #[test]
     fn apply_context_empty_collections_are_none() {
-        let ctx = Context {
+        let ctx = EffectiveContext {
             flow_id: None,
             labels: vec![],
             params: BTreeMap::new(),
@@ -396,7 +441,7 @@ mod tests {
 
     #[test]
     fn apply_context_flow_id_only() {
-        let ctx = Context {
+        let ctx = EffectiveContext {
             flow_id: Some("my-flow".to_string()),
             labels: vec![],
             params: BTreeMap::new(),
