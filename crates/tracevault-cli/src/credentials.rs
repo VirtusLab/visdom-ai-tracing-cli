@@ -7,6 +7,8 @@ pub struct Credentials {
     pub server_url: String,
     pub token: String,
     pub email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_slug: Option<String>,
 }
 
 impl Credentials {

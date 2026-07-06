@@ -102,6 +102,7 @@ pub async fn login(server_url: &str, no_browser: bool) -> Result<(), Box<dyn std
                         server_url: server_url.to_string(),
                         token,
                         email,
+                        org_slug: None,
                     };
                     creds.save()?;
                     println!("Credentials saved to {}", Credentials::path().display());
