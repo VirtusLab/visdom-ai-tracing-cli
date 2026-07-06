@@ -134,12 +134,16 @@ impl TracevaultConfig {
     /// present-but-**malformed** one (`Err(message)`). Callers that need to react
     /// differently to those two cases (e.g. to avoid silently writing to a
     /// default path when a configured one failed to parse) should use this.
+    ///
+    /// Only a genuine "not found" counts as missing; any other IO error (e.g.
+    /// permission denied) is surfaced as `Err` with the path, rather than being
+    /// masked as an absent config.
     pub fn try_load(project_root: &Path) -> Result<Option<Self>, String> {
         let path = Self::config_path(project_root);
-        let content = match std::fs::read_to_string(path) {
+        let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
-            // Missing (or otherwise unreadable) file: not an error — no config.
-            Err(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         };
         toml::from_str(&content)
             .map(Some)
@@ -238,6 +242,12 @@ mod tests {
         fs::create_dir_all(&bad_dir).unwrap();
         fs::write(bad_dir.join("config.toml"), "this = = not valid toml").unwrap();
         assert!(TracevaultConfig::try_load(bad.path()).is_err());
+
+        // Present but unreadable (a non-NotFound IO error — here config.toml is a
+        // directory) → Err, NOT masked as missing.
+        let io = tempfile::tempdir().unwrap();
+        fs::create_dir_all(io.path().join(".tracevault").join("config.toml")).unwrap();
+        assert!(TracevaultConfig::try_load(io.path()).is_err());
     }
 
     #[test]

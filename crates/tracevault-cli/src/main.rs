@@ -193,18 +193,21 @@ enum ContextAction {
         user: bool,
     },
     /// Enable/disable or point the project's user-level context source.
+    ///
+    /// The mode flags are mutually exclusive: at most one may be given.
+    #[command(group(clap::ArgGroup::new("source_mode").multiple(false)))]
     Source {
         /// Enable the user context at the default path
-        #[arg(long)]
+        #[arg(long, group = "source_mode")]
         enable: bool,
         /// Disable the user context
-        #[arg(long)]
+        #[arg(long, group = "source_mode")]
         disable: bool,
         /// Enable and read the user context from this explicit path
-        #[arg(long)]
+        #[arg(long, group = "source_mode")]
         path: Option<String>,
         /// Enable and clear any explicit path back to the default location
-        #[arg(long)]
+        #[arg(long, group = "source_mode")]
         default: bool,
     },
 }
@@ -437,5 +440,46 @@ mod tests {
         assert!(
             Cli::try_parse_from(["tracevault", "init", "--user-context", "/tmp/ctx.json"]).is_ok()
         );
+    }
+
+    #[test]
+    fn context_source_mode_flags_conflict() {
+        // The `source` mode flags are mutually exclusive; two together must be a
+        // parse-time conflict rather than relying on run_source precedence.
+        for extra in [["--enable", "--disable"], ["--disable", "--default"]] {
+            let err = match Cli::try_parse_from(
+                ["tracevault", "context", "source"].into_iter().chain(extra),
+            ) {
+                Ok(_) => panic!("{extra:?} together must be a parse error"),
+                Err(e) => e,
+            };
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+        // --path with --disable also conflicts.
+        let err = match Cli::try_parse_from([
+            "tracevault",
+            "context",
+            "source",
+            "--path",
+            "/tmp/ctx.json",
+            "--disable",
+        ]) {
+            Ok(_) => panic!("--path with --disable must be a parse error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn context_source_single_mode_is_ok() {
+        assert!(Cli::try_parse_from(["tracevault", "context", "source", "--enable"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "tracevault",
+            "context",
+            "source",
+            "--path",
+            "/tmp/ctx.json"
+        ])
+        .is_ok());
     }
 }

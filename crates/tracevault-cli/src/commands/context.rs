@@ -520,9 +520,11 @@ pub fn run_clear(cwd: &Path, global: bool, user: bool) -> Result<(), Box<dyn std
 /// `tracevault context source` — enable/disable or point the project's
 /// user-level context source (`user_context` in `config.toml`).
 ///
-/// `--disable` wins over everything else; then `--path <p>`; then
-/// `--default`/`--enable` (both just mean "enabled at the default path").
-/// If none of the flags are given, errors rather than silently no-op'ing.
+/// The mode flags (`--enable`, `--disable`, `--path <p>`, `--default`) are
+/// mutually exclusive — enforced at the CLI layer — so exactly one mode is set:
+/// `--path` points at an explicit file; `--enable`/`--default` both mean
+/// "enabled at the default path"; `--disable` turns it off. If none are given,
+/// errors rather than silently no-op'ing.
 pub fn run_source(
     cwd: &Path,
     enable: bool,
@@ -531,8 +533,16 @@ pub fn run_source(
     default: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = find_project_root(cwd)?;
-    let mut config = TracevaultConfig::load(&root)
-        .ok_or("no config.toml found — run 'tracevault init' first")?;
+    // Editing `user_context`, so distinguish a missing config from a malformed
+    // one (same as `run_stream` / `user_context_path`) rather than reporting a
+    // malformed file as "not found".
+    let mut config = match TracevaultConfig::try_load(&root) {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => {
+            return Err("no .tracevault/config.toml found — run 'tracevault init' first".into())
+        }
+        Err(e) => return Err(format!("malformed .tracevault/config.toml: {e}").into()),
+    };
 
     config.user_context = if disable {
         UserContext::Toggle(false)
