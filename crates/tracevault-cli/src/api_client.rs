@@ -20,6 +20,11 @@ pub struct RegisterRepoResponse {
 }
 
 #[derive(Deserialize)]
+struct ResolveRepoResponse {
+    repo_id: uuid::Uuid,
+}
+
+#[derive(Deserialize)]
 pub struct DeviceAuthResponse {
     pub token: String,
 }
@@ -404,6 +409,35 @@ impl ApiClient {
 
         let result: CheckPoliciesResponse = resp.json().await?;
         Ok(result)
+    }
+
+    /// Resolve a git remote URL to a registered repo id within `org_slug`.
+    /// `Ok(None)` when the server has no matching repo (404). Used by
+    /// workspace/detached mode, which has no pinned repo_id in config.
+    pub async fn resolve_repo(
+        &self,
+        org_slug: &str,
+        git_url: &str,
+    ) -> Result<Option<uuid::Uuid>, Box<dyn std::error::Error>> {
+        let url = format!(
+            "{}/api/v1/orgs/{}/repos/resolve?git_url={}",
+            self.base_url, org_slug, git_url
+        );
+        let mut builder = self.client.get(url);
+        if let Some(key) = &self.api_key {
+            builder = builder.header("Authorization", format!("Bearer {key}"));
+        }
+        let resp = builder.send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("resolve_repo failed ({status}): {body}").into());
+        }
+        let parsed: ResolveRepoResponse = resp.json().await?;
+        Ok(Some(parsed.repo_id))
     }
 }
 
