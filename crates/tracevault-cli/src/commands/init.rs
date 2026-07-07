@@ -538,22 +538,40 @@ fn safe_join(base: &Path, name: &str) -> io::Result<PathBuf> {
 /// array already has an inner hook with the same `command` (dedupe → makes
 /// repeated calls idempotent). Never removes or overwrites the user's other
 /// hooks or top-level keys.
-fn merge_hooks(settings: &mut serde_json::Value, ours: &serde_json::Value) {
-    if !settings.is_object() {
+///
+/// Absent values (no top-level `settings`, no `hooks` key, no entry for a
+/// given event) are created fresh — that's fine. But if an EXISTING value
+/// has an unexpected shape (top-level `settings` isn't an object, an
+/// existing `hooks` isn't an object, or an existing per-event value isn't an
+/// array), this errors loudly instead of silently discarding it, mirroring
+/// `install_claude_hooks`'s treatment of a non-object settings file.
+fn merge_hooks(
+    settings: &mut serde_json::Value,
+    ours: &serde_json::Value,
+    path: &Path,
+) -> io::Result<()> {
+    if settings.is_null() {
         *settings = serde_json::json!({});
     }
-    let settings_obj = settings.as_object_mut().expect("just ensured object");
+    let settings_obj = settings.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a JSON object", path.display()),
+        )
+    })?;
 
     let hooks_value = settings_obj
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}));
-    if !hooks_value.is_object() {
-        *hooks_value = serde_json::json!({});
-    }
-    let hooks_obj = hooks_value.as_object_mut().expect("just ensured object");
+    let hooks_obj = hooks_value.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} \"hooks\" key is not a JSON object", path.display()),
+        )
+    })?;
 
     let Some(ours_obj) = ours.as_object() else {
-        return;
+        return Ok(());
     };
 
     for (event, our_array) in ours_obj {
@@ -564,10 +582,15 @@ fn merge_hooks(settings: &mut serde_json::Value, ours: &serde_json::Value) {
         let existing_value = hooks_obj
             .entry(event.clone())
             .or_insert_with(|| serde_json::json!([]));
-        if !existing_value.is_array() {
-            *existing_value = serde_json::json!([]);
-        }
-        let existing_array = existing_value.as_array_mut().expect("just ensured array");
+        let existing_array = existing_value.as_array_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} \"hooks\".\"{event}\" is not a JSON array",
+                    path.display()
+                ),
+            )
+        })?;
 
         for our_entry in our_entries {
             let our_command = entry_command(our_entry);
@@ -579,6 +602,8 @@ fn merge_hooks(settings: &mut serde_json::Value, ours: &serde_json::Value) {
             }
         }
     }
+
+    Ok(())
 }
 
 /// Extract the inner `hooks[0].command` string from a hook-event entry, if
@@ -626,11 +651,16 @@ pub fn install_global_hooks(claude_dir: &Path) -> io::Result<()> {
         serde_json::json!({})
     };
 
-    merge_hooks(&mut settings, &tracevault_hooks());
+    merge_hooks(&mut settings, &tracevault_hooks(), &settings_path)?;
 
     let formatted = serde_json::to_string_pretty(&settings)
         .map_err(|e| io::Error::other(format!("Failed to serialize settings: {e}")))?;
-    fs::write(&settings_path, formatted)?;
+    // Write to a temp file in the same directory, then atomically rename over
+    // the target so a crash or ENOSPC mid-write can never truncate/corrupt
+    // the user's global settings.json.
+    let tmp_settings_path = settings_path.with_extension("json.tmp");
+    fs::write(&tmp_settings_path, formatted)?;
+    fs::rename(&tmp_settings_path, &settings_path)?;
 
     // --- CLAUDE.md: append instruction block, idempotently ---
     let claude_md_path = safe_join(&base, "CLAUDE.md")?;
@@ -721,7 +751,7 @@ mod tests {
     fn merge_hooks_into_empty_settings_adds_all_our_events() {
         let mut settings = serde_json::json!({});
         let ours = tracevault_hooks();
-        merge_hooks(&mut settings, &ours);
+        merge_hooks(&mut settings, &ours, Path::new("settings.json")).unwrap();
 
         let hooks = settings.get("hooks").unwrap();
         for event in [
@@ -748,7 +778,7 @@ mod tests {
             }
         });
         let ours = tracevault_hooks();
-        merge_hooks(&mut settings, &ours);
+        merge_hooks(&mut settings, &ours, Path::new("settings.json")).unwrap();
 
         // Other top-level keys preserved.
         assert_eq!(settings.get("model").unwrap(), "opus");
@@ -771,8 +801,8 @@ mod tests {
     fn merge_hooks_is_idempotent() {
         let mut settings = serde_json::json!({});
         let ours = tracevault_hooks();
-        merge_hooks(&mut settings, &ours);
-        merge_hooks(&mut settings, &ours);
+        merge_hooks(&mut settings, &ours, Path::new("settings.json")).unwrap();
+        merge_hooks(&mut settings, &ours, Path::new("settings.json")).unwrap();
 
         for event in [
             "PreToolUse",
@@ -804,7 +834,7 @@ mod tests {
             }
         });
         let ours = tracevault_hooks();
-        merge_hooks(&mut settings, &ours);
+        merge_hooks(&mut settings, &ours, Path::new("settings.json")).unwrap();
 
         let pre_tool_use = settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(
@@ -812,6 +842,45 @@ mod tests {
             1,
             "must not append a duplicate PreToolUse entry when our command is present at hooks[1]"
         );
+    }
+
+    #[test]
+    fn merge_hooks_errors_on_non_object_top_level() {
+        let mut settings = serde_json::json!([1, 2, 3]);
+        let ours = tracevault_hooks();
+        let err = merge_hooks(&mut settings, &ours, Path::new("settings.json")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("settings.json"));
+    }
+
+    #[test]
+    fn merge_hooks_errors_on_non_object_top_level_number() {
+        let mut settings = serde_json::json!(42);
+        let ours = tracevault_hooks();
+        let err = merge_hooks(&mut settings, &ours, Path::new("settings.json")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn merge_hooks_errors_on_non_object_hooks() {
+        let mut settings = serde_json::json!({ "hooks": "not-an-object" });
+        let ours = tracevault_hooks();
+        let err = merge_hooks(&mut settings, &ours, Path::new("settings.json")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("hooks"));
+    }
+
+    #[test]
+    fn merge_hooks_errors_on_non_array_event_value() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": "not-an-array"
+            }
+        });
+        let ours = tracevault_hooks();
+        let err = merge_hooks(&mut settings, &ours, Path::new("settings.json")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("PreToolUse"));
     }
 
     #[test]
@@ -877,6 +946,82 @@ mod tests {
         let claude_md = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
         assert!(claude_md.contains("# My existing notes"));
         assert!(claude_md.contains(GLOBAL_CLAUDE_MD_MARKER));
+    }
+
+    #[test]
+    fn install_global_hooks_settings_write_is_atomic_no_tmp_leftover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+
+        install_global_hooks(&claude_dir).unwrap();
+
+        let settings_content = fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&settings_content).unwrap();
+        assert!(settings["hooks"].get("SessionStart").is_some());
+
+        let leftover = fs::read_dir(&claude_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(
+            !leftover,
+            "no settings.json.tmp should remain after install"
+        );
+    }
+
+    #[test]
+    fn install_global_hooks_errors_on_non_object_settings_and_does_not_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let settings_path = claude_dir.join("settings.json");
+        let original = "[1, 2, 3]";
+        fs::write(&settings_path, original).unwrap();
+
+        let err = install_global_hooks(&claude_dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // The original (malformed-for-our-purposes but validly-JSON) file
+        // must be untouched, and no stray tmp file left behind.
+        let after = fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(after, original);
+        let leftover = fs::read_dir(&claude_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover, "no tmp file should be left behind on error");
+    }
+
+    #[test]
+    fn install_global_hooks_errors_on_non_object_hooks_key_and_does_not_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let settings_path = claude_dir.join("settings.json");
+        let original = r#"{"hooks": "oops"}"#;
+        fs::write(&settings_path, original).unwrap();
+
+        let err = install_global_hooks(&claude_dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let after = fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(after, original);
+    }
+
+    #[test]
+    fn install_global_hooks_errors_on_non_array_event_and_does_not_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let settings_path = claude_dir.join("settings.json");
+        let original = r#"{"hooks": {"PreToolUse": "oops"}}"#;
+        fs::write(&settings_path, original).unwrap();
+
+        let err = install_global_hooks(&claude_dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let after = fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(after, original);
     }
 
     #[test]
