@@ -16,18 +16,19 @@
 //! handled internally, and the function always prints a valid `HookOutput`
 //! JSON payload before returning `Ok(())`.
 
-use std::io::Read as _;
 use std::path::Path;
 
-use tracevault_protocol::hooks::parse_hook_event;
-
-use crate::commands::session_hooks::{resolve_and_inject, HookOutput};
+use crate::commands::session_hooks::{read_hook_event_or_allow, resolve_and_inject};
 
 /// Append `export TRACEVAULT_SESSION_ID='<session_id>'` to the Claude Code
-/// session env file. Pure I/O helper factored out so it can be unit-tested
-/// without touching the real `CLAUDE_ENV_FILE` env var. Creates the file if it
-/// doesn't exist; appends (never truncates) so it composes with whatever else
-/// writes to the same env file.
+/// session env file, unless that exact line is already present. Pure I/O
+/// helper factored out so it can be unit-tested without touching the real
+/// `CLAUDE_ENV_FILE` env var. Creates the file if it doesn't exist.
+///
+/// `SessionStart` fires on startup *and* on resume/clear/compact — all with
+/// the same session id — so an unconditional append would grow the env file
+/// with duplicate export lines every time. Reading the file first and
+/// skipping an already-present line makes the write idempotent.
 ///
 /// `session_id` is untrusted input from the hook event JSON, and this file is
 /// later `source`d by the shell — a naive unquoted interpolation would be a
@@ -42,28 +43,26 @@ pub fn write_session_env(env_file: &Path, session_id: &str) -> std::io::Result<(
     if !crate::session_state::is_safe_session_id(session_id) {
         return Ok(());
     }
+    let line = format!("export TRACEVAULT_SESSION_ID='{session_id}'");
+
+    if let Ok(existing) = std::fs::read_to_string(env_file) {
+        if existing.lines().any(|l| l == line) {
+            return Ok(());
+        }
+    }
+
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(env_file)?;
-    writeln!(file, "export TRACEVAULT_SESSION_ID='{session_id}'")
-}
-
-fn print_allow() -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", serde_json::to_string(&HookOutput::allow())?);
-    Ok(())
+    writeln!(file, "{line}")
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Read the hook event from stdin. A parse error must never fail the
     // hook — print the minimal allow response and return Ok.
-    let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
-        return print_allow();
-    }
-    let hook_event = match parse_hook_event(&input) {
-        Ok(e) => e,
-        Err(_) => return print_allow(),
+    let Some(hook_event) = read_hook_event_or_allow() else {
+        return Ok(());
     };
 
     // 2. Export the session id, best-effort. Older Claude Code versions don't
@@ -74,7 +73,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Resolve the effective repo binding and, if warranted, inject its
     // policies. Shared with `user-prompt` (sub-plan C's UserPromptSubmit hook).
-    resolve_and_inject("SessionStart", &hook_event).await
+    resolve_and_inject(&hook_event).await
 }
 
 #[cfg(test)]
@@ -93,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    fn write_session_env_appends_on_repeated_calls() {
+    fn write_session_env_appends_on_repeated_calls_with_different_ids() {
         let dir = tempfile::tempdir().unwrap();
         let env_file = dir.path().join("env.sh");
 
@@ -109,6 +108,23 @@ mod tests {
                 "export TRACEVAULT_SESSION_ID='sess-b'",
             ]
         );
+    }
+
+    #[test]
+    fn write_session_env_is_idempotent_for_repeated_calls_with_same_id() {
+        // SessionStart fires on startup, resume, clear, AND compact — all
+        // with the SAME session id — so repeated calls for the same id must
+        // not grow the file with duplicate export lines.
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join("env.sh");
+
+        write_session_env(&env_file, "sess-a").unwrap();
+        write_session_env(&env_file, "sess-a").unwrap();
+        write_session_env(&env_file, "sess-a").unwrap();
+
+        let content = std::fs::read_to_string(&env_file).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines, vec!["export TRACEVAULT_SESSION_ID='sess-a'"]);
     }
 
     #[test]

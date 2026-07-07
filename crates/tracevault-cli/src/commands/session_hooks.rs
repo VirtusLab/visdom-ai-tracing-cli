@@ -3,13 +3,14 @@
 //! the pure decision logic for when to inject, and the shared
 //! resolve-binding-then-inject flow used by both hook commands.
 
+use std::io::Read as _;
 use std::path::Path;
 
 use serde::Serialize;
 
-use tracevault_protocol::hooks::HookEvent;
+use tracevault_protocol::hooks::{parse_hook_event, HookEvent};
 
-use crate::api_client::resolve_credentials;
+use crate::api_client::{resolve_credentials, ApiClient};
 use crate::resolution::{binding_from_config, effective_binding, ResolveInputs};
 
 /// Claude Code hook output. Field names are camelCase to match CC's contract
@@ -55,13 +56,23 @@ impl HookOutput {
     }
 }
 
-/// Maximum additionalContext size (CC guidance). Larger → replaced with a notice.
+/// Maximum additionalContext size (CC guidance). Larger → truncated.
 const MAX_CONTEXT: usize = 10_000;
 
-/// Cap injected context; oversize policy text is replaced with a short pointer.
+/// How much of an oversize policy text to keep before appending the
+/// truncation suffix. Chosen so `HEAD_LEN` + the suffix stays under
+/// `MAX_CONTEXT`.
+const HEAD_LEN: usize = 9_500;
+
+/// Cap injected context. Oversize policy text is truncated to its first
+/// `HEAD_LEN` chars with a suffix pointing at `tracevault repo status` —
+/// unlike `tracevault agent-policies`, `repo status` works in workspace mode
+/// (no `.tracevault/config.toml` required), so the fallback is reachable in
+/// every install mode.
 pub fn cap_context(s: String) -> String {
     if s.chars().count() > MAX_CONTEXT {
-        "TraceVault policies are too large to inline here — run `tracevault agent-policies` to see them.".to_string()
+        let head: String = s.chars().take(HEAD_LEN).collect();
+        format!("{head}\n\n…(truncated; run `tracevault repo status` to see full policies)")
     } else {
         s
     }
@@ -83,9 +94,48 @@ pub fn should_inject(
     }
 }
 
-fn print_allow() -> Result<(), Box<dyn std::error::Error>> {
+/// Print the minimal allow/quiet `HookOutput` and return `Ok(())`. Shared by
+/// every hook command's error paths — a hook must always emit valid JSON,
+/// even (especially) when something upstream failed.
+pub(crate) fn print_allow() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", serde_json::to_string(&HookOutput::allow())?);
     Ok(())
+}
+
+/// Read stdin, parse it as a `HookEvent`, and return it. On any read or parse
+/// error, print the allow response (never fail the hook) and return `None`.
+/// Shared by `session-start` and `user-prompt`, whose `run()` bodies both
+/// start with "read the hook event or bail out allowing".
+pub(crate) fn read_hook_event_or_allow() -> Option<HookEvent> {
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        let _ = print_allow();
+        return None;
+    }
+    match parse_hook_event(&input) {
+        Ok(e) => Some(e),
+        Err(_) => {
+            let _ = print_allow();
+            None
+        }
+    }
+}
+
+/// Fetch rendered policies and build the injection output; `None` on ANY
+/// error (best-effort — a fetch failure degrades to allow, never blocks the
+/// hook). Factored out of `resolve_and_inject` so the network step can be
+/// exercised in a unit test without touching creds/env/git.
+async fn fetch_context(
+    client: &ApiClient,
+    event: &str,
+    org_slug: &str,
+    repo_id: uuid::Uuid,
+) -> Option<HookOutput> {
+    let resp = client
+        .get_agent_instructions(org_slug, &repo_id)
+        .await
+        .ok()?;
+    Some(HookOutput::with_context(event, cap_context(resp.content)))
 }
 
 /// Resolve the session's effective binding and, if `should_inject(event, ...)`,
@@ -96,10 +146,8 @@ fn print_allow() -> Result<(), Box<dyn std::error::Error>> {
 /// resolve-binding → decide → fetch-and-inject flow, differing only in which
 /// hook-specific steps happen around it (SessionStart also writes the session
 /// env file, which stays in `session_start.rs`).
-pub async fn resolve_and_inject(
-    event: &str,
-    hook_event: &HookEvent,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn std::error::Error>> {
+    let event = hook_event.hook_event_name.as_str();
     let hook_cwd = Path::new(&hook_event.cwd);
     let project_root = crate::paths::resolve_project_root(hook_cwd).root;
     let session = crate::session_state::load(&hook_event.session_id);
@@ -137,24 +185,24 @@ pub async fn resolve_and_inject(
     let Some(server_url) = server_url else {
         return print_allow();
     };
-    let client = crate::api_client::ApiClient::new(&server_url, token.as_deref());
+    let client = ApiClient::new(&server_url, token.as_deref());
 
-    match client
-        .get_agent_instructions(&binding.org_slug, &repo_uuid)
-        .await
-    {
-        Ok(resp) => {
-            let output = HookOutput::with_context(event, cap_context(resp.content));
+    match fetch_context(&client, event, &binding.org_slug, repo_uuid).await {
+        Some(output) => {
             println!("{}", serde_json::to_string(&output)?);
             // Best-effort: persist the last-injected repo so a later
             // UserPromptSubmit can avoid redundant re-injection. A save
-            // failure must not turn this into a hook failure.
-            let mut session = session;
-            session.last_injected_repo = Some(binding.repo_id.clone());
-            let _ = crate::session_state::save(&hook_event.session_id, &session);
+            // failure must not turn this into a hook failure. Reload the
+            // session state right before saving (rather than reusing the
+            // snapshot loaded before the network `await` above) so a
+            // concurrent `repo switch`/`reset` that happened during the
+            // fetch isn't silently reverted by this save.
+            let mut fresh = crate::session_state::load(&hook_event.session_id);
+            fresh.last_injected_repo = Some(binding.repo_id.clone());
+            let _ = crate::session_state::save(&hook_event.session_id, &fresh);
             Ok(())
         }
-        Err(_) => print_allow(),
+        None => print_allow(),
     }
 }
 
@@ -228,13 +276,17 @@ mod tests {
     }
 
     #[test]
-    fn cap_context_replaces_oversize_string_with_notice() {
+    fn cap_context_truncates_oversize_string_and_points_at_repo_status() {
         let s = "a".repeat(MAX_CONTEXT + 1);
-        let capped = cap_context(s);
-        assert_eq!(
-            capped,
-            "TraceVault policies are too large to inline here — run `tracevault agent-policies` to see them."
-        );
+        let capped = cap_context(s.clone());
+        // Head is preserved (truncated policy text is still useful context)…
+        assert!(capped.starts_with(&"a".repeat(HEAD_LEN)));
+        // …and the fallback points at a command that works without
+        // `.tracevault/config.toml` (workspace mode), unlike
+        // `tracevault agent-policies`.
+        assert!(capped.contains("tracevault repo status"));
+        assert!(!capped.contains("agent-policies"));
+        assert!(capped.chars().count() <= MAX_CONTEXT);
     }
 
     #[test]
@@ -287,7 +339,25 @@ mod tests {
             source: None,
         };
 
-        let result = resolve_and_inject("UserPromptSubmit", &hook_event).await;
+        let result = resolve_and_inject(&hook_event).await;
         assert!(result.is_ok());
+    }
+
+    // ── fetch_context ────────────────────────────────────────────────────
+    //
+    // `resolve_and_inject` can't be unit-tested end-to-end without real
+    // creds/env/git, but the network step it delegates to (`fetch_context`)
+    // can be: point an `ApiClient` at a port nothing listens on so the
+    // request fails fast with connection-refused, and assert the failure
+    // degrades to `None` (→ `print_allow()` in the caller) rather than
+    // propagating an error. This proves the hook never blocks on a fetch
+    // failure.
+
+    #[tokio::test]
+    async fn fetch_context_returns_none_on_network_failure() {
+        let client = ApiClient::new("http://127.0.0.1:1", None);
+        let repo_id = uuid::Uuid::new_v4();
+        let result = fetch_context(&client, "SessionStart", "org", repo_id).await;
+        assert!(result.is_none());
     }
 }

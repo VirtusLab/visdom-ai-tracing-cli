@@ -12,30 +12,16 @@
 //! internally, and the function always prints a valid `HookOutput` JSON
 //! payload before returning `Ok(())`.
 
-use std::io::Read as _;
-
-use tracevault_protocol::hooks::parse_hook_event;
-
-use crate::commands::session_hooks::{resolve_and_inject, HookOutput};
-
-fn print_allow() -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", serde_json::to_string(&HookOutput::allow())?);
-    Ok(())
-}
+use crate::commands::session_hooks::{read_hook_event_or_allow, resolve_and_inject};
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Read the hook event from stdin. A parse error must never fail the
     // hook — print the minimal allow response and return Ok.
-    let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
-        return print_allow();
-    }
-    let hook_event = match parse_hook_event(&input) {
-        Ok(e) => e,
-        Err(_) => return print_allow(),
+    let Some(hook_event) = read_hook_event_or_allow() else {
+        return Ok(());
     };
 
     // 2. Resolve the effective repo binding and, if the repo changed since
     // the last injection, inject its policies. Shared with `session-start`.
-    resolve_and_inject("UserPromptSubmit", &hook_event).await
+    resolve_and_inject(&hook_event).await
 }
