@@ -26,6 +26,12 @@ pub struct SessionState {
     pub active: Option<RepoBinding>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub subagents: HashMap<String, RepoBinding>,
+    /// The repo id whose policies were last injected into a hook response for
+    /// this session (sub-plan C). Used by `UserPromptSubmit` to avoid
+    /// re-injecting unchanged context on every prompt. `#[serde(default)]`
+    /// keeps old on-disk session files (without this field) loadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_injected_repo: Option<String>,
 }
 
 /// `$XDG_STATE_HOME/tracevault/sessions` or `~/.local/state/tracevault/sessions`.
@@ -112,6 +118,7 @@ mod tests {
         let s = SessionState {
             active: Some(binding("r1")),
             subagents: HashMap::from([("/wt/a".to_string(), binding("r2"))]),
+            ..Default::default()
         };
         save_in(tmp.path(), "sess-1", &s).unwrap();
         assert_eq!(load_in(tmp.path(), "sess-1"), s);
@@ -146,6 +153,7 @@ mod tests {
         let s = SessionState {
             active: Some(binding("r1")),
             subagents: HashMap::new(),
+            ..Default::default()
         };
         save_in(tmp.path(), "sess-atomic", &s).unwrap();
         assert_eq!(load_in(tmp.path(), "sess-atomic"), s);

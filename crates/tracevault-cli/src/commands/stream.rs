@@ -671,6 +671,7 @@ mod tests {
         let session = SessionState {
             active: Some(binding("session-repo")),
             subagents: HashMap::new(),
+            ..Default::default()
         };
         let got = resolve_stream_binding(&session, "/wt/top", None);
         assert_eq!(got.unwrap().repo_id, "session-repo");
@@ -701,6 +702,7 @@ mod tests {
         let session = SessionState {
             active: Some(binding("session-repo")),
             subagents: HashMap::from([("/wt/x".to_string(), binding("subagent-repo"))]),
+            ..Default::default()
         };
         let got = resolve_stream_binding(&session, "/wt/x", Some(binding("bound-repo")));
         assert_eq!(got.unwrap().repo_id, "subagent-repo");
