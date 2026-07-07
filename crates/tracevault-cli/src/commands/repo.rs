@@ -73,7 +73,7 @@ pub async fn run(
         RepoCmd::Switch { path, session_id } => {
             switch(&path, session_id.as_deref(), project_root).await
         }
-        RepoCmd::Reset { .. } => Err("`repo reset` not yet implemented (sub-plan B task 3)".into()),
+        RepoCmd::Reset { session_id } => reset(session_id.as_deref()),
     }
 }
 
@@ -99,6 +99,21 @@ async fn resolve_switch_binding(
 /// Apply a switch to session state (session-level active binding). Pure.
 fn apply_switch(state: &mut SessionState, binding: RepoBinding) {
     state.active = Some(binding);
+}
+
+/// Clear the session's workspace binding (session-level reset). Pure.
+fn apply_reset(state: &mut SessionState) {
+    *state = SessionState::default();
+}
+
+fn reset(session_id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let id = resolve_session_id(session_id)?;
+    let mut state = session_state::load(&id);
+    apply_reset(&mut state);
+    session_state::save(&id, &state)?;
+    // NOTE: subagent worktree-scoped reset-to-parent is handled in sub-plan C.
+    println!("cleared workspace repo binding for session {id}");
+    Ok(())
 }
 
 async fn switch(
@@ -249,6 +264,16 @@ mod tests {
         let mut state = SessionState::default();
         apply_switch(&mut state, binding("new-repo"));
         assert_eq!(state.active.unwrap().repo_id, "new-repo");
+    }
+
+    #[test]
+    fn apply_reset_clears_active_and_subagents() {
+        let mut state = SessionState {
+            active: Some(binding("r")),
+            subagents: std::collections::HashMap::from([("/wt/a".to_string(), binding("r2"))]),
+        };
+        apply_reset(&mut state);
+        assert_eq!(state, SessionState::default());
     }
 
     #[test]
