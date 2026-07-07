@@ -555,7 +555,7 @@ fn merge_hooks(settings: &mut serde_json::Value, ours: &serde_json::Value) {
             let our_command = entry_command(our_entry);
             let already_present = existing_array
                 .iter()
-                .any(|existing_entry| entry_command(existing_entry) == our_command);
+                .any(|existing_entry| entry_contains_command(existing_entry, our_command));
             if !already_present {
                 existing_array.push(our_entry.clone());
             }
@@ -567,6 +567,19 @@ fn merge_hooks(settings: &mut serde_json::Value, ours: &serde_json::Value) {
 /// present.
 fn entry_command(entry: &serde_json::Value) -> Option<&str> {
     entry.get("hooks")?.get(0)?.get("command")?.as_str()
+}
+
+/// Whether any of `entry`'s inner `hooks[].command` values equal `cmd`. Unlike
+/// `entry_command` (which only looks at `hooks[0]`), this scans the whole
+/// inner `hooks` array — a user entry can have our command anywhere in it
+/// (e.g. `hooks[1]`), and missing that would let a duplicate get appended.
+fn entry_contains_command(entry: &serde_json::Value, cmd: Option<&str>) -> bool {
+    let Some(hooks) = entry.get("hooks").and_then(|h| h.as_array()) else {
+        return false;
+    };
+    hooks
+        .iter()
+        .any(|hook| hook.get("command").and_then(|c| c.as_str()) == cmd)
 }
 
 /// Install TraceVault's Claude Code hooks into `claude_dir/settings.json`
@@ -750,6 +763,33 @@ mod tests {
             let arr = settings["hooks"][event].as_array().unwrap();
             assert_eq!(arr.len(), 1, "event {event} should not be duplicated");
         }
+    }
+
+    #[test]
+    fn merge_hooks_dedupes_command_found_in_non_first_inner_hook() {
+        // The existing PreToolUse entry has our command at hooks[1], not
+        // hooks[0] — a naive `entry_command` (hooks[0] only) comparison would
+        // miss it and append a duplicate entry.
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Write|Edit|Bash",
+                    "hooks": [
+                        { "type": "command", "command": "other" },
+                        { "type": "command", "command": "tracevault stream --event pre-tool-use" }
+                    ]
+                }]
+            }
+        });
+        let ours = tracevault_hooks();
+        merge_hooks(&mut settings, &ours);
+
+        let pre_tool_use = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            pre_tool_use.len(),
+            1,
+            "must not append a duplicate PreToolUse entry when our command is present at hooks[1]"
+        );
     }
 
     #[test]

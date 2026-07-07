@@ -27,7 +27,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Read the hook event from stdin. A parse error must never fail the
     // hook — print the minimal allow response and return Ok.
     let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return print_allow();
+    }
     let hook_event = match parse_hook_event(&input) {
         Ok(e) => e,
         Err(_) => return print_allow(),

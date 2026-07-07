@@ -45,7 +45,7 @@ pub fn sessions_dir() -> Option<PathBuf> {
 /// A session id is used to build the state file path, so it must be a safe
 /// filename token — no path separators or `..` that could escape the sessions
 /// directory. Claude Code session ids are UUIDs, which satisfy this.
-fn is_safe_session_id(session_id: &str) -> bool {
+pub(crate) fn is_safe_session_id(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id
             .chars()
