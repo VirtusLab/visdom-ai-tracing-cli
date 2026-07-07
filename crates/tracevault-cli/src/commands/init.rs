@@ -515,6 +515,24 @@ output as binding. Use `--path <path>` on `tracevault repo status` for a one-off
 already be registered with TraceVault.
 ";
 
+/// Join a constant file name to `base` and confirm the result stays directly
+/// within `base` — defense-in-depth so a path derived from the environment
+/// ($HOME) cannot escape the intended `.claude` directory.
+fn safe_join(base: &Path, name: &str) -> io::Result<PathBuf> {
+    let joined = base.join(name);
+    if joined.parent() != Some(base) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to access path outside {}: {}",
+                base.display(),
+                joined.display()
+            ),
+        ));
+    }
+    Ok(joined)
+}
+
 /// Merge our hook entries into an existing `settings["hooks"]` object, per
 /// event, appending our entry only if no existing entry in that event's
 /// array already has an inner hook with the same `command` (dedupe → makes
@@ -590,8 +608,12 @@ fn entry_contains_command(entry: &serde_json::Value, cmd: Option<&str>) -> bool 
 pub fn install_global_hooks(claude_dir: &Path) -> io::Result<()> {
     fs::create_dir_all(claude_dir)?;
 
+    // Canonicalize the base to defend against path traversal attacks.
+    // safe_join will verify that target files stay directly within this base.
+    let base = claude_dir.canonicalize()?;
+
     // --- settings.json: deep-merge hooks ---
-    let settings_path = claude_dir.join("settings.json");
+    let settings_path = safe_join(&base, "settings.json")?;
     let mut settings: serde_json::Value = if settings_path.exists() {
         let content = fs::read_to_string(&settings_path)?;
         serde_json::from_str(&content).map_err(|e| {
@@ -611,7 +633,7 @@ pub fn install_global_hooks(claude_dir: &Path) -> io::Result<()> {
     fs::write(&settings_path, formatted)?;
 
     // --- CLAUDE.md: append instruction block, idempotently ---
-    let claude_md_path = claude_dir.join("CLAUDE.md");
+    let claude_md_path = safe_join(&base, "CLAUDE.md")?;
     let existing = if claude_md_path.exists() {
         fs::read_to_string(&claude_md_path)?
     } else {
@@ -855,5 +877,35 @@ mod tests {
         let claude_md = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
         assert!(claude_md.contains("# My existing notes"));
         assert!(claude_md.contains(GLOBAL_CLAUDE_MD_MARKER));
+    }
+
+    #[test]
+    fn safe_join_allows_direct_child_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let result = safe_join(base, "settings.json").unwrap();
+        assert_eq!(result.parent(), Some(base));
+        assert_eq!(result.file_name().unwrap(), "settings.json");
+    }
+
+    #[test]
+    fn safe_join_rejects_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let result = safe_join(base, "../evil");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("refusing to access path outside"));
+    }
+
+    #[test]
+    fn safe_join_rejects_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let result = safe_join(base, "/etc/passwd");
+        // An absolute path joined to a base will replace the base,
+        // so parent will not equal base.
+        assert!(result.is_err());
     }
 }
