@@ -102,6 +102,13 @@ pub fn drain_pending(pending_path: &Path) -> Result<Vec<String>, io::Error> {
     Ok(lines)
 }
 
+/// Offline-queue path for a specific repo binding. Keyed by repo id so a
+/// mid-session rebind (workspace mode) can never flush one repo's queued
+/// events to another.
+fn pending_path_for(session_dir: &Path, repo_id: &str) -> std::path::PathBuf {
+    session_dir.join(format!("pending-{repo_id}.jsonl"))
+}
+
 /// Resolve the project root and session directory for a stream hook invocation.
 ///
 /// This is the pure, testable core of `run_stream`'s path resolution. It uses
@@ -125,6 +132,30 @@ pub fn resolve_session_paths(
         .join("sessions")
         .join(session_id);
     (resolved, session_dir)
+}
+
+/// A resolved binding is usable for hook attribution only if its repo_id is a
+/// real UUID — guards against a corrupted/edited session-state file injecting
+/// path separators into the pending-<repo_id>.jsonl filename.
+fn binding_repo_id_is_valid(repo_id: &str) -> bool {
+    uuid::Uuid::parse_str(repo_id).is_ok()
+}
+
+/// The effective repo binding for a stream event, given the loaded session
+/// state, the event's worktree, and the bound-config fallback. Pure — the
+/// hook path has no repo-override flag, so `repo_flag` is always `None` here.
+pub(crate) fn resolve_stream_binding(
+    session: &crate::session_state::SessionState,
+    worktree: &str,
+    bound: Option<crate::session_state::RepoBinding>,
+) -> Option<crate::session_state::RepoBinding> {
+    crate::resolution::effective_binding(crate::resolution::ResolveInputs {
+        repo_flag: None,
+        session,
+        worktree_path: Some(worktree),
+        bound,
+    })
+    .map(|(b, _)| b)
 }
 
 pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -261,28 +292,57 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
     // 6. Resolve credentials
     let (server_url, token) = crate::api_client::resolve_credentials(&project_root);
 
-    // 7. Config for org_slug and repo_id (loaded above, alongside the
-    // user-level context layer resolution). Distinguish a missing config from a
-    // malformed one — the latter is easy to miss in hook output.
-    let config = match config {
-        Ok(Some(cfg)) => cfg,
-        Ok(None) => {
-            return Err("no .tracevault/config.toml found — run 'tracevault init' first".into())
-        }
-        Err(e) => return Err(format!("malformed .tracevault/config.toml: {e}").into()),
+    // 7. Config (loaded above, alongside the user-level context layer
+    // resolution) no longer directly gates org_slug/repo_id — a missing
+    // config is not fatal on its own, since the repo may instead resolve via
+    // the workspace-mode precedence chain (session binding / subagent
+    // worktree override) below. A malformed config is still surfaced here —
+    // that's easy to miss in hook output otherwise. Only a bound
+    // `config.toml`'s org_slug/repo_id feed the lowest-precedence tier
+    // (via `binding_from_config` below).
+    if let Err(e) = &config {
+        return Err(format!("malformed .tracevault/config.toml: {e}").into());
+    }
+
+    // Resolve the effective repo binding (workspace/detached mode). Bound
+    // mode (a pinned config.toml) still works — it's the lowest-precedence
+    // tier, wired below via `binding_from_config`, fed from the `config`
+    // already loaded above (no second read of config.toml on this hot path).
+    let session = crate::session_state::load(&hook_event.session_id);
+    let bound = config
+        .as_ref()
+        .ok()
+        .and_then(|opt| opt.as_ref())
+        .and_then(crate::resolution::binding_from_config);
+    let binding = resolve_stream_binding(&session, &worktree_top, bound);
+    // Graceful no-op, exactly like the hook's normal success path. Do NOT
+    // error: a failing hook would block the tool.
+    let no_op_allow = || -> Result<(), Box<dyn std::error::Error>> {
+        let response = HookResponse::allow();
+        println!("{}", serde_json::to_string(&response)?);
+        Ok(())
     };
-    let org_slug = config
-        .org_slug
-        .as_deref()
-        .ok_or("org_slug not configured")?;
-    let repo_id = config.repo_id.as_deref().ok_or("repo_id not configured")?;
+    let Some(binding) = binding else {
+        // No repo resolves.
+        no_op_allow()?;
+        return Ok(());
+    };
+    if !binding_repo_id_is_valid(&binding.repo_id) {
+        // A corrupted/hand-edited session-state file could contain a
+        // repo_id with path separators, which would otherwise land in the
+        // `pending-<repo_id>.jsonl` filename below.
+        no_op_allow()?;
+        return Ok(());
+    }
+    let org_slug = binding.org_slug.as_str();
+    let repo_id = binding.repo_id.as_str();
 
     // 8. Create ApiClient
     let server_url = server_url.ok_or("server_url not configured")?;
     let client = crate::api_client::ApiClient::new(&server_url, token.as_deref());
 
     // 9. Try drain pending queue and send
-    let pending_path = session_dir.join("pending.jsonl");
+    let pending_path = pending_path_for(&session_dir, repo_id);
     let pending_events = drain_pending(&pending_path)?;
 
     let mut send_failed = false;
@@ -588,6 +648,100 @@ mod tests {
             origin_content.trim(),
             expected.as_str(),
             "origin marker must contain the canonicalized worktree toplevel"
+        );
+    }
+
+    // ── resolve_stream_binding: workspace-mode precedence for the stream hook ──
+
+    use crate::session_state::{RepoBinding, SessionState};
+
+    fn binding(id: &str) -> RepoBinding {
+        RepoBinding {
+            org_slug: "org".into(),
+            repo_id: id.into(),
+            git_url: None,
+            updated_at: "t".into(),
+        }
+    }
+
+    /// Workspace mode: no pinned config, but the session is bound (e.g. via
+    /// `tracevault repo switch`) — the stream event attributes to that repo.
+    #[test]
+    fn resolve_stream_binding_uses_session_active_when_unbound() {
+        let session = SessionState {
+            active: Some(binding("session-repo")),
+            subagents: HashMap::new(),
+        };
+        let got = resolve_stream_binding(&session, "/wt/top", None);
+        assert_eq!(got.unwrap().repo_id, "session-repo");
+    }
+
+    /// Bound-mode regression: an empty session (no `repo switch` ever run)
+    /// with a bound config.toml still resolves via the config.
+    #[test]
+    fn resolve_stream_binding_falls_back_to_bound_config() {
+        let session = SessionState::default();
+        let got = resolve_stream_binding(&session, "/wt/top", Some(binding("bound-repo")));
+        assert_eq!(got.unwrap().repo_id, "bound-repo");
+    }
+
+    /// No session binding and no bound config: nothing resolves, which is
+    /// exactly what should trigger `run_stream`'s graceful no-op.
+    #[test]
+    fn resolve_stream_binding_none_when_nothing_resolves() {
+        let session = SessionState::default();
+        let got = resolve_stream_binding(&session, "/wt/top", None);
+        assert!(got.is_none());
+    }
+
+    /// Subagent override precedence: a per-worktree override for the current
+    /// worktree wins over the session's `active` binding.
+    #[test]
+    fn resolve_stream_binding_prefers_subagent_override_for_worktree() {
+        let session = SessionState {
+            active: Some(binding("session-repo")),
+            subagents: HashMap::from([("/wt/x".to_string(), binding("subagent-repo"))]),
+        };
+        let got = resolve_stream_binding(&session, "/wt/x", Some(binding("bound-repo")));
+        assert_eq!(got.unwrap().repo_id, "subagent-repo");
+    }
+
+    // ── binding_repo_id_is_valid: hook-attribution UUID guard ────────────────
+
+    #[test]
+    fn binding_repo_id_is_valid_accepts_real_uuid() {
+        assert!(binding_repo_id_is_valid(
+            "550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
+    fn binding_repo_id_is_valid_rejects_path_traversal() {
+        assert!(!binding_repo_id_is_valid("../evil"));
+    }
+
+    #[test]
+    fn binding_repo_id_is_valid_rejects_empty() {
+        assert!(!binding_repo_id_is_valid(""));
+    }
+
+    #[test]
+    fn binding_repo_id_is_valid_rejects_non_uuid() {
+        assert!(!binding_repo_id_is_valid("not-a-uuid"));
+    }
+
+    // ── pending_path_for: repo-scoped offline queue ──────────────────────────
+
+    #[test]
+    fn pending_path_is_repo_scoped() {
+        let dir = std::path::Path::new("/tmp/sess");
+        assert_eq!(
+            pending_path_for(dir, "repo-a"),
+            std::path::Path::new("/tmp/sess/pending-repo-a.jsonl")
+        );
+        assert_ne!(
+            pending_path_for(dir, "repo-a"),
+            pending_path_for(dir, "repo-b"),
         );
     }
 }

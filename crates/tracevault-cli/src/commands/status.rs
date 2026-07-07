@@ -230,23 +230,35 @@ fn project_checks(project_root: &Path) -> (Vec<Check>, Option<TracevaultConfig>)
     }
     out.push(Check::ok("TraceVault initialized", ".tracevault/ present"));
 
-    let config = TracevaultConfig::load(project_root);
-    match &config {
-        Some(c) => {
+    // Distinguish "no config.toml" (expected in workspace/detached mode —
+    // just a warning) from "config.toml present but malformed" (a genuine
+    // error) via `try_load`, rather than the lenient `load` which collapses
+    // both cases to `None`.
+    let config = match TracevaultConfig::try_load(project_root) {
+        Ok(Some(c)) => {
             let slug = c.org_slug.as_deref().unwrap_or("<unset>");
             let url = c.server_url.as_deref().unwrap_or("<unset>");
             out.push(Check::ok(
                 "Project config",
                 format!("org={slug}, server={url}"),
             ));
+            Some(c)
         }
-        None => {
+        Ok(None) => {
+            out.push(Check::warn(
+                "Project config",
+                "No .tracevault/config.toml. Bound mode: run `tracevault init`. Workspace/detached mode: this is expected — use `tracevault repo status` to see the session binding.",
+            ));
+            None
+        }
+        Err(e) => {
             out.push(Check::err(
                 "Project config",
-                ".tracevault/config.toml missing or unreadable",
+                format!(".tracevault/config.toml malformed: {e}"),
             ));
+            None
         }
-    }
+    };
 
     // Hooks — presence of our markers, not just existence of the hook file.
     out.push(git_hook_check(
@@ -408,6 +420,50 @@ async fn server_repo_checks(
 
 // --- Sessions ---
 
+/// True for a per-repo `pending-<id>.jsonl` (nonempty id) queue file —
+/// tighter than a bare `starts_with("pending") && ends_with(".jsonl")`
+/// check, which would also match e.g. `pendingfoo.jsonl` or `pending-.jsonl`.
+/// The legacy `pending.jsonl` name is handled separately by callers, since
+/// whether it counts depends on whether there's a bound `repo_id` to
+/// attribute it to (see `count_pending_events`).
+fn is_pending_queue_filename(name: &str) -> bool {
+    crate::commands::flush::repo_id_from_pending_filename(name).is_some()
+}
+
+/// Sum the non-empty lines across every per-repo (and, if `include_legacy`,
+/// legacy) pending queue file in a session directory: `pending.jsonl` and
+/// `pending-<repo_id>.jsonl`.
+///
+/// `include_legacy` should be true only when the project has a bound
+/// `repo_id` (config.toml), since `flush` only drains the legacy
+/// `pending.jsonl` in that case (best-effort attribution). Otherwise a
+/// stray `pending.jsonl` would be counted here but never cleared by
+/// `flush`, leaving `status` permanently reporting stuck events.
+fn count_pending_events(session_dir: &Path, include_legacy: bool) -> usize {
+    let Ok(read) = fs::read_dir(session_dir) else {
+        return 0;
+    };
+
+    read.flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map(|name| {
+                    is_pending_queue_filename(name) || (include_legacy && name == "pending.jsonl")
+                })
+                .unwrap_or(false)
+        })
+        .map(|entry| {
+            fs::read_to_string(entry.path())
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count()
+        })
+        .sum()
+}
+
 fn session_checks(project_root: &Path) -> Vec<Check> {
     let sessions_dir = project_root.join(".tracevault/sessions");
     if !sessions_dir.exists() {
@@ -416,6 +472,13 @@ fn session_checks(project_root: &Path) -> Vec<Check> {
             "no .tracevault/sessions/ yet (no captures recorded)",
         )];
     }
+
+    // The legacy `pending.jsonl` is only drainable by `flush` when there's a
+    // bound `repo_id` to attribute it to (best-effort attribution). Counting
+    // it here otherwise would report events that `flush` can never clear.
+    let include_legacy = TracevaultConfig::load(project_root)
+        .and_then(|c| c.repo_id)
+        .is_some();
 
     let mut total_sessions = 0usize;
     let mut sessions_with_pending = 0usize;
@@ -427,17 +490,10 @@ fn session_checks(project_root: &Path) -> Vec<Check> {
                 continue;
             }
             total_sessions += 1;
-            let pending_path = entry.path().join("pending.jsonl");
-            if pending_path.exists() {
-                let count = fs::read_to_string(&pending_path)
-                    .unwrap_or_default()
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .count();
-                if count > 0 {
-                    sessions_with_pending += 1;
-                    pending_event_count += count;
-                }
+            let count = count_pending_events(&entry.path(), include_legacy);
+            if count > 0 {
+                sessions_with_pending += 1;
+                pending_event_count += count;
             }
         }
     }
@@ -548,7 +604,15 @@ pub async fn run_status(project_root: &Path) -> i32 {
         ),
     }
 
-    if errors > 0 {
+    exit_code_for(&all)
+}
+
+/// Only `Level::Error` checks force a non-zero exit; `Warn` and `Skip` are
+/// surfaced to the user but don't fail the command. Pulled out as a pure
+/// function so the severity→exit-code mapping is unit-testable independent
+/// of the network-calling `run_status`.
+fn exit_code_for(checks: &[&Check]) -> i32 {
+    if checks.iter().any(|c| c.level == Level::Error) {
         1
     } else {
         0
@@ -620,5 +684,148 @@ mod tests {
         assert!(checks
             .iter()
             .any(|c| c.level == Level::Error && c.label == "TraceVault initialized"));
+    }
+
+    #[test]
+    fn project_checks_warns_when_config_toml_missing() {
+        // Pure workspace/detached-mode user: .tracevault/ exists (or not,
+        // doesn't matter for this check) but there's no config.toml because
+        // `tracevault init` was never run. This must be a Warn, not an
+        // Error, and therefore must not force the process exit code to 1.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
+        let (checks, cfg) = project_checks(dir.path());
+        assert!(cfg.is_none());
+        let project_config_check = checks
+            .iter()
+            .find(|c| c.label == "Project config")
+            .expect("Project config check present");
+        assert_eq!(project_config_check.level, Level::Warn);
+
+        let refs: Vec<&Check> = checks.iter().collect();
+        assert_eq!(
+            exit_code_for(&refs),
+            0,
+            "a missing config.toml alone must not force a non-zero exit code"
+        );
+    }
+
+    #[test]
+    fn project_checks_errors_on_malformed_config_toml() {
+        // A config.toml that exists but fails to parse is a genuine error,
+        // distinct from "no config.toml at all" — it should stay Check::err
+        // and keep forcing a non-zero exit code.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
+        std::fs::write(
+            dir.path().join(".tracevault/config.toml"),
+            "not valid toml {{{",
+        )
+        .unwrap();
+        let (checks, cfg) = project_checks(dir.path());
+        assert!(cfg.is_none());
+        let project_config_check = checks
+            .iter()
+            .find(|c| c.label == "Project config")
+            .expect("Project config check present");
+        assert_eq!(project_config_check.level, Level::Error);
+
+        let refs: Vec<&Check> = checks.iter().collect();
+        assert_eq!(exit_code_for(&refs), 1);
+    }
+
+    #[test]
+    fn exit_code_for_warn_only_is_zero() {
+        let checks = [
+            Check::warn("a", ""),
+            Check::ok("b", ""),
+            Check::skip("c", ""),
+        ];
+        let refs: Vec<&Check> = checks.iter().collect();
+        assert_eq!(exit_code_for(&refs), 0);
+    }
+
+    #[test]
+    fn exit_code_for_any_error_is_one() {
+        let checks = [
+            Check::ok("a", ""),
+            Check::err("b", ""),
+            Check::warn("c", ""),
+        ];
+        let refs: Vec<&Check> = checks.iter().collect();
+        assert_eq!(exit_code_for(&refs), 1);
+    }
+
+    #[test]
+    fn count_pending_events_sums_across_per_repo_queues() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pending-a.jsonl"), "line1\nline2\n").unwrap();
+        std::fs::write(dir.path().join("pending-b.jsonl"), "line1\n").unwrap();
+        std::fs::write(dir.path().join("pending-c.jsonl"), "").unwrap();
+        assert_eq!(count_pending_events(dir.path(), false), 3);
+        assert_eq!(count_pending_events(dir.path(), true), 3);
+    }
+
+    #[test]
+    fn count_pending_events_ignores_unrelated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pending-a.jsonl"), "line1\n").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "line1\nline2\n").unwrap();
+        assert_eq!(count_pending_events(dir.path(), false), 1);
+    }
+
+    #[test]
+    fn count_pending_events_zero_for_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(count_pending_events(dir.path(), false), 0);
+        assert_eq!(count_pending_events(dir.path(), true), 0);
+    }
+
+    #[test]
+    fn is_pending_queue_filename_matches_per_repo_only() {
+        assert!(!is_pending_queue_filename("pending.jsonl"));
+        assert!(is_pending_queue_filename("pending-a.jsonl"));
+    }
+
+    #[test]
+    fn is_pending_queue_filename_rejects_lookalikes() {
+        assert!(!is_pending_queue_filename("pendingfoo.jsonl"));
+        assert!(!is_pending_queue_filename("pending-.jsonl"));
+    }
+
+    #[test]
+    fn count_pending_events_legacy_pending_jsonl_requires_include_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pending.jsonl"), "line1\nline2\n").unwrap();
+        assert_eq!(
+            count_pending_events(dir.path(), false),
+            0,
+            "legacy pending.jsonl must not be counted when there's no bound repo_id"
+        );
+        assert_eq!(
+            count_pending_events(dir.path(), true),
+            2,
+            "legacy pending.jsonl counts once a repo_id is bound"
+        );
+    }
+
+    #[test]
+    fn count_pending_events_legacy_and_per_repo_both_count_when_included() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pending.jsonl"), "line1\n").unwrap();
+        std::fs::write(dir.path().join("pending-a.jsonl"), "line1\nline2\n").unwrap();
+        assert_eq!(count_pending_events(dir.path(), false), 2);
+        assert_eq!(count_pending_events(dir.path(), true), 3);
+    }
+
+    #[test]
+    fn count_pending_events_ignores_lookalike_filenames() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pendingfoo.jsonl"), "line1\n").unwrap();
+        std::fs::write(dir.path().join("pending-.jsonl"), "line1\n").unwrap();
+        assert_eq!(count_pending_events(dir.path(), false), 0);
+        assert_eq!(count_pending_events(dir.path(), true), 0);
     }
 }

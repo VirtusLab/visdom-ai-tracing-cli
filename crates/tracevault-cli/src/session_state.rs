@@ -2,7 +2,6 @@
 //! session is currently bound to. Persisted outside any repo so it survives a
 //! session that changes directories. Set by `tracevault repo switch`
 //! (sub-plan B); read by `stream`/commands as a resolution fallback.
-#![allow(dead_code)] // workspace-mode foundation; wired into commands in a follow-up sub-plan
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -27,19 +26,6 @@ pub struct SessionState {
     pub active: Option<RepoBinding>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub subagents: HashMap<String, RepoBinding>,
-}
-
-impl SessionState {
-    /// The binding that applies for `worktree_path`: a subagent override for
-    /// that worktree if one exists, otherwise the session-level `active`.
-    pub fn effective(&self, worktree_path: Option<&str>) -> Option<&RepoBinding> {
-        if let Some(wt) = worktree_path {
-            if let Some(b) = self.subagents.get(wt) {
-                return Some(b);
-            }
-        }
-        self.active.as_ref()
-    }
 }
 
 /// `$XDG_STATE_HOME/tracevault/sessions` or `~/.local/state/tracevault/sessions`.
@@ -83,10 +69,12 @@ fn save_in(
         return Err(format!("invalid session id: {session_id:?}").into());
     }
     std::fs::create_dir_all(sessions_dir)?;
-    std::fs::write(
-        state_path_in(sessions_dir, session_id),
-        toml::to_string(state)?,
-    )?;
+    let final_path = state_path_in(sessions_dir, session_id);
+    // Write to a temp file in the same dir, then atomically rename over the
+    // target so a crash or a concurrent reader never sees a partial/empty file.
+    let tmp_path = sessions_dir.join(format!("{session_id}.toml.tmp"));
+    std::fs::write(&tmp_path, toml::to_string(state)?)?;
+    std::fs::rename(&tmp_path, &final_path)?;
     Ok(())
 }
 
@@ -116,20 +104,6 @@ mod tests {
             git_url: None,
             updated_at: "t".into(),
         }
-    }
-
-    #[test]
-    fn effective_prefers_subagent_override_for_worktree() {
-        let s = SessionState {
-            active: Some(binding("session-repo")),
-            subagents: HashMap::from([("/wt/a".to_string(), binding("subagent-repo"))]),
-        };
-        assert_eq!(s.effective(Some("/wt/a")).unwrap().repo_id, "subagent-repo");
-        assert_eq!(
-            s.effective(Some("/wt/unknown")).unwrap().repo_id,
-            "session-repo"
-        );
-        assert_eq!(s.effective(None).unwrap().repo_id, "session-repo");
     }
 
     #[test]
@@ -164,5 +138,25 @@ mod tests {
         assert_eq!(load_in(tmp.path(), "../evil"), SessionState::default());
         // A UUID-style id is accepted.
         assert!(save_in(tmp.path(), "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", &s).is_ok());
+    }
+
+    #[test]
+    fn save_in_is_atomic_and_leaves_no_tmp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = SessionState {
+            active: Some(binding("r1")),
+            subagents: HashMap::new(),
+        };
+        save_in(tmp.path(), "sess-atomic", &s).unwrap();
+        assert_eq!(load_in(tmp.path(), "sess-atomic"), s);
+        // no stray temp file
+        let leftover = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(
+            !leftover,
+            "temp file should be renamed away, not left behind"
+        );
     }
 }
