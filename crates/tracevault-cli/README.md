@@ -26,6 +26,12 @@ than a single pinned repo), use workspace mode to bind a session to different re
 multi-repo workspaces, or a user-level (global) installation — versus the normal `tracevault init`
 single-repo flow.
 
+**Global installation** — `tracevault init --global` installs TraceVault hooks once into
+`~/.claude/settings.json` (deep-merged; appends to existing hooks and does not clobber) for use
+across ALL Claude Code sessions without per-repo setup. Does not create `.tracevault/config.toml`.
+Adds two session-level hooks: `SessionStart` exports the session ID and injects the bound repo's
+policies, and `UserPromptSubmit` re-injects policies when the session's effective repo changes.
+
 **Commands**
 
 - `tracevault repo switch <path>` — bind the current session's tracing to the repo at `<path>`
