@@ -7,6 +7,7 @@ pub mod init;
 pub mod login;
 pub mod logout;
 pub mod proxy;
+pub mod repo;
 pub mod stats;
 pub mod status;
 pub mod stream;

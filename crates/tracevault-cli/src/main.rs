@@ -8,8 +8,12 @@ mod context;
 mod credentials;
 mod hooks;
 mod paths;
+mod resolution;
+mod session_state;
 #[cfg(test)]
 mod test_helpers;
+
+use commands::repo::RepoCmd;
 
 #[derive(Parser)]
 #[command(name = "tracevault", version, about = "AI code governance platform")]
@@ -114,6 +118,11 @@ enum Cli {
     Context {
         #[command(subcommand)]
         action: ContextAction,
+    },
+    /// Bind/inspect the repo a detached session is working on (workspace mode).
+    Repo {
+        #[command(subcommand)]
+        cmd: RepoCmd,
     },
 }
 
@@ -405,6 +414,14 @@ async fn main() {
             };
             if let Err(e) = result {
                 eprintln!("Context error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Cli::Repo { cmd } => {
+            let cwd = env::current_dir().expect("Cannot determine current directory");
+            let project_root = crate::paths::resolve_project_root(&cwd).root;
+            if let Err(e) = commands::repo::run(cmd, &project_root, &cwd).await {
+                eprintln!("Repo error: {e}");
                 std::process::exit(1);
             }
         }
