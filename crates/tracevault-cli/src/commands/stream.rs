@@ -102,6 +102,13 @@ pub fn drain_pending(pending_path: &Path) -> Result<Vec<String>, io::Error> {
     Ok(lines)
 }
 
+/// Offline-queue path for a specific repo binding. Keyed by repo id so a
+/// mid-session rebind (workspace mode) can never flush one repo's queued
+/// events to another.
+fn pending_path_for(session_dir: &Path, repo_id: &str) -> std::path::PathBuf {
+    session_dir.join(format!("pending-{repo_id}.jsonl"))
+}
+
 /// Resolve the project root and session directory for a stream hook invocation.
 ///
 /// This is the pure, testable core of `run_stream`'s path resolution. It uses
@@ -310,7 +317,7 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
     let client = crate::api_client::ApiClient::new(&server_url, token.as_deref());
 
     // 9. Try drain pending queue and send
-    let pending_path = session_dir.join("pending.jsonl");
+    let pending_path = pending_path_for(&session_dir, repo_id);
     let pending_events = drain_pending(&pending_path)?;
 
     let mut send_failed = false;
@@ -672,5 +679,20 @@ mod tests {
         };
         let got = resolve_stream_binding(&session, "/wt/x", Some(binding("bound-repo")));
         assert_eq!(got.unwrap().repo_id, "subagent-repo");
+    }
+
+    // ── pending_path_for: repo-scoped offline queue ──────────────────────────
+
+    #[test]
+    fn pending_path_is_repo_scoped() {
+        let dir = std::path::Path::new("/tmp/sess");
+        assert_eq!(
+            pending_path_for(dir, "repo-a"),
+            std::path::Path::new("/tmp/sess/pending-repo-a.jsonl")
+        );
+        assert_ne!(
+            pending_path_for(dir, "repo-a"),
+            pending_path_for(dir, "repo-b"),
+        );
     }
 }
