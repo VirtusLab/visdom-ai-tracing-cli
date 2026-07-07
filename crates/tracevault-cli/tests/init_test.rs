@@ -132,6 +132,8 @@ fn tracevault_hooks_has_pre_post_and_notification() {
     assert!(hooks.get("PreToolUse").is_some());
     assert!(hooks.get("PostToolUse").is_some());
     assert!(hooks.get("Notification").is_some());
+    assert!(hooks.get("SessionStart").is_some());
+    assert!(hooks.get("UserPromptSubmit").is_some());
 }
 
 #[tokio::test]

@@ -482,8 +482,142 @@ pub fn tracevault_hooks() -> serde_json::Value {
                 "timeout": 10,
                 "statusMessage": "TraceVault: finalizing session"
             }]
+        }],
+        "SessionStart": [{
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": "tracevault session-start",
+                "timeout": 10,
+                "statusMessage": "TraceVault: session start"
+            }]
+        }],
+        "UserPromptSubmit": [{
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": "tracevault user-prompt",
+                "timeout": 10,
+                "statusMessage": "TraceVault: policy reinforcement"
+            }]
         }]
     })
+}
+
+const GLOBAL_CLAUDE_MD_MARKER: &str = "<!-- tracevault:workspace-mode -->";
+
+const GLOBAL_CLAUDE_MD_BLOCK: &str = "\
+<!-- tracevault:workspace-mode -->
+## TraceVault (workspace mode)
+You may be running detached from any single repository. Before working on a repo, run
+`tracevault repo switch <path>` to bind tracing and fetch that repo's policies; treat its
+output as binding. Use `--path <path>` on `tracevault repo status` for a one-off. Repos must
+already be registered with TraceVault.
+";
+
+/// Merge our hook entries into an existing `settings["hooks"]` object, per
+/// event, appending our entry only if no existing entry in that event's
+/// array already has an inner hook with the same `command` (dedupe → makes
+/// repeated calls idempotent). Never removes or overwrites the user's other
+/// hooks or top-level keys.
+fn merge_hooks(settings: &mut serde_json::Value, ours: &serde_json::Value) {
+    if !settings.is_object() {
+        *settings = serde_json::json!({});
+    }
+    let settings_obj = settings.as_object_mut().expect("just ensured object");
+
+    let hooks_value = settings_obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    if !hooks_value.is_object() {
+        *hooks_value = serde_json::json!({});
+    }
+    let hooks_obj = hooks_value.as_object_mut().expect("just ensured object");
+
+    let Some(ours_obj) = ours.as_object() else {
+        return;
+    };
+
+    for (event, our_array) in ours_obj {
+        let Some(our_entries) = our_array.as_array() else {
+            continue;
+        };
+
+        let existing_value = hooks_obj
+            .entry(event.clone())
+            .or_insert_with(|| serde_json::json!([]));
+        if !existing_value.is_array() {
+            *existing_value = serde_json::json!([]);
+        }
+        let existing_array = existing_value.as_array_mut().expect("just ensured array");
+
+        for our_entry in our_entries {
+            let our_command = entry_command(our_entry);
+            let already_present = existing_array
+                .iter()
+                .any(|existing_entry| entry_command(existing_entry) == our_command);
+            if !already_present {
+                existing_array.push(our_entry.clone());
+            }
+        }
+    }
+}
+
+/// Extract the inner `hooks[0].command` string from a hook-event entry, if
+/// present.
+fn entry_command(entry: &serde_json::Value) -> Option<&str> {
+    entry.get("hooks")?.get(0)?.get("command")?.as_str()
+}
+
+/// Install TraceVault's Claude Code hooks into `claude_dir/settings.json`
+/// (deep-merged, never clobbering existing hooks/keys) and append a
+/// workspace-mode instruction block to `claude_dir/CLAUDE.md` (idempotent,
+/// guarded by a marker comment). Intended for `tracevault init --global`,
+/// installing once for all Claude Code sessions rather than per-repo.
+pub fn install_global_hooks(claude_dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(claude_dir)?;
+
+    // --- settings.json: deep-merge hooks ---
+    let settings_path = claude_dir.join("settings.json");
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let content = fs::read_to_string(&settings_path)?;
+        serde_json::from_str(&content).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse {}: {e}", settings_path.display()),
+            )
+        })?
+    } else {
+        serde_json::json!({})
+    };
+
+    merge_hooks(&mut settings, &tracevault_hooks());
+
+    let formatted = serde_json::to_string_pretty(&settings)
+        .map_err(|e| io::Error::other(format!("Failed to serialize settings: {e}")))?;
+    fs::write(&settings_path, formatted)?;
+
+    // --- CLAUDE.md: append instruction block, idempotently ---
+    let claude_md_path = claude_dir.join("CLAUDE.md");
+    let existing = if claude_md_path.exists() {
+        fs::read_to_string(&claude_md_path)?
+    } else {
+        String::new()
+    };
+
+    if !existing.contains(GLOBAL_CLAUDE_MD_MARKER) {
+        let mut content = existing;
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(GLOBAL_CLAUDE_MD_BLOCK);
+        fs::write(&claude_md_path, content)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -546,5 +680,140 @@ mod tests {
     #[test]
     fn parse_github_org_invalid() {
         assert_eq!(parse_github_org("not-a-url"), None);
+    }
+
+    #[test]
+    fn merge_hooks_into_empty_settings_adds_all_our_events() {
+        let mut settings = serde_json::json!({});
+        let ours = tracevault_hooks();
+        merge_hooks(&mut settings, &ours);
+
+        let hooks = settings.get("hooks").unwrap();
+        for event in [
+            "PreToolUse",
+            "PostToolUse",
+            "Notification",
+            "Stop",
+            "SessionStart",
+            "UserPromptSubmit",
+        ] {
+            assert!(hooks.get(event).is_some(), "missing event {event}");
+        }
+    }
+
+    #[test]
+    fn merge_hooks_preserves_unrelated_user_hook_and_keys() {
+        let mut settings = serde_json::json!({
+            "model": "opus",
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "",
+                    "hooks": [{ "type": "command", "command": "my-own-hook" }]
+                }]
+            }
+        });
+        let ours = tracevault_hooks();
+        merge_hooks(&mut settings, &ours);
+
+        // Other top-level keys preserved.
+        assert_eq!(settings.get("model").unwrap(), "opus");
+
+        let pre_tool_use = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        // Both the user's own hook and ours are present.
+        assert_eq!(pre_tool_use.len(), 2);
+        let commands: Vec<&str> = pre_tool_use
+            .iter()
+            .map(|e| entry_command(e).unwrap())
+            .collect();
+        assert!(commands.contains(&"my-own-hook"));
+        assert!(commands.contains(&"tracevault stream --event pre-tool-use"));
+
+        // Other events were added fresh.
+        assert!(settings["hooks"]["SessionStart"].is_array());
+    }
+
+    #[test]
+    fn merge_hooks_is_idempotent() {
+        let mut settings = serde_json::json!({});
+        let ours = tracevault_hooks();
+        merge_hooks(&mut settings, &ours);
+        merge_hooks(&mut settings, &ours);
+
+        for event in [
+            "PreToolUse",
+            "PostToolUse",
+            "Notification",
+            "Stop",
+            "SessionStart",
+            "UserPromptSubmit",
+        ] {
+            let arr = settings["hooks"][event].as_array().unwrap();
+            assert_eq!(arr.len(), 1, "event {event} should not be duplicated");
+        }
+    }
+
+    #[test]
+    fn install_global_hooks_writes_settings_and_claude_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+
+        install_global_hooks(&claude_dir).unwrap();
+
+        let settings_content = fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&settings_content).unwrap();
+        for event in ["SessionStart", "UserPromptSubmit", "PreToolUse"] {
+            assert!(settings["hooks"].get(event).is_some(), "missing {event}");
+        }
+
+        let claude_md = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        assert!(claude_md.contains(GLOBAL_CLAUDE_MD_MARKER));
+    }
+
+    #[test]
+    fn install_global_hooks_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+
+        install_global_hooks(&claude_dir).unwrap();
+        install_global_hooks(&claude_dir).unwrap();
+
+        let settings_content = fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&settings_content).unwrap();
+        for event in [
+            "PreToolUse",
+            "PostToolUse",
+            "Notification",
+            "Stop",
+            "SessionStart",
+            "UserPromptSubmit",
+        ] {
+            let arr = settings["hooks"][event].as_array().unwrap();
+            assert_eq!(arr.len(), 1, "event {event} should not be duplicated");
+        }
+
+        let claude_md = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        let marker_count = claude_md.matches(GLOBAL_CLAUDE_MD_MARKER).count();
+        assert_eq!(
+            marker_count, 1,
+            "CLAUDE.md marker should appear exactly once"
+        );
+    }
+
+    #[test]
+    fn install_global_hooks_preserves_existing_claude_md_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("CLAUDE.md"),
+            "# My existing notes\nSome content.\n",
+        )
+        .unwrap();
+
+        install_global_hooks(&claude_dir).unwrap();
+
+        let claude_md = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        assert!(claude_md.contains("# My existing notes"));
+        assert!(claude_md.contains(GLOBAL_CLAUDE_MD_MARKER));
     }
 }

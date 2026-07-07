@@ -40,6 +40,11 @@ enum Cli {
         /// (conflicts with --no-user-context).
         #[arg(long, conflicts_with = "no_user_context")]
         user_context: Option<String>,
+        /// Install TraceVault hooks once into ~/.claude/ for ALL Claude Code
+        /// sessions, instead of initializing the current repo. Ignores
+        /// --claude-settings/--no-gitignore and does not require git.
+        #[arg(long)]
+        global: bool,
     },
     /// Show current session status
     Status,
@@ -249,7 +254,31 @@ async fn main() {
             no_gitignore,
             no_user_context,
             user_context,
+            global,
         } => {
+            if global {
+                let claude_dir = match dirs::home_dir() {
+                    Some(home) => home.join(".claude"),
+                    None => {
+                        eprintln!("Error: cannot determine home directory");
+                        std::process::exit(1);
+                    }
+                };
+                match commands::init::install_global_hooks(&claude_dir) {
+                    Ok(()) => {
+                        println!(
+                            "Installed TraceVault hooks globally in {}",
+                            claude_dir.display()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+
             let cwd = env::current_dir().expect("Cannot determine current directory");
             let user_context = match (no_user_context, user_context) {
                 (true, _) => config::UserContext::Toggle(false),
