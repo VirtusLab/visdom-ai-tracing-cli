@@ -127,6 +127,22 @@ pub fn resolve_session_paths(
     (resolved, session_dir)
 }
 
+/// The effective repo binding for a stream event, given the loaded session
+/// state, the event's worktree, and the bound-config fallback. Pure — the
+/// hook path has no `--repo` flag, so `repo_flag` is always `None` here.
+pub(crate) fn resolve_stream_binding(
+    session: &crate::session_state::SessionState,
+    worktree: &str,
+    bound: Option<crate::session_state::RepoBinding>,
+) -> Option<crate::session_state::RepoBinding> {
+    crate::resolution::effective_binding(crate::resolution::ResolveInputs {
+        repo_flag: None,
+        session,
+        worktree_path: Some(worktree),
+        bound,
+    })
+}
+
 pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Read HookEvent from stdin
     let mut input = String::new();
@@ -261,21 +277,33 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
     // 6. Resolve credentials
     let (server_url, token) = crate::api_client::resolve_credentials(&project_root);
 
-    // 7. Config for org_slug and repo_id (loaded above, alongside the
-    // user-level context layer resolution). Distinguish a missing config from a
-    // malformed one — the latter is easy to miss in hook output.
-    let config = match config {
-        Ok(Some(cfg)) => cfg,
-        Ok(None) => {
-            return Err("no .tracevault/config.toml found — run 'tracevault init' first".into())
-        }
-        Err(e) => return Err(format!("malformed .tracevault/config.toml: {e}").into()),
+    // 7. Config (loaded above, alongside the user-level context layer
+    // resolution) no longer directly gates org_slug/repo_id — a missing
+    // config is not fatal on its own, since the repo may instead resolve via
+    // the workspace-mode precedence chain (session binding / subagent
+    // worktree override) below. A malformed config is still surfaced here —
+    // that's easy to miss in hook output otherwise. Only a bound
+    // `config.toml`'s org_slug/repo_id feed the lowest-precedence tier
+    // (via `bound_binding` below).
+    if let Err(e) = &config {
+        return Err(format!("malformed .tracevault/config.toml: {e}").into());
+    }
+
+    // Resolve the effective repo binding (workspace/detached mode). Bound
+    // mode (a pinned config.toml) still works — it's the lowest-precedence
+    // tier, wired below via `bound_binding`.
+    let session = crate::session_state::load(&hook_event.session_id);
+    let bound = crate::commands::repo::bound_binding(&project_root);
+    let binding = resolve_stream_binding(&session, &worktree_top, bound);
+    let Some(binding) = binding else {
+        // No repo resolves — graceful no-op, exactly like the hook's normal
+        // success path. Do NOT error: a failing hook would block the tool.
+        let response = HookResponse::allow();
+        println!("{}", serde_json::to_string(&response)?);
+        return Ok(());
     };
-    let org_slug = config
-        .org_slug
-        .as_deref()
-        .ok_or("org_slug not configured")?;
-    let repo_id = config.repo_id.as_deref().ok_or("repo_id not configured")?;
+    let org_slug = binding.org_slug.as_str();
+    let repo_id = binding.repo_id.as_str();
 
     // 8. Create ApiClient
     let server_url = server_url.ok_or("server_url not configured")?;
@@ -589,5 +617,60 @@ mod tests {
             expected.as_str(),
             "origin marker must contain the canonicalized worktree toplevel"
         );
+    }
+
+    // ── resolve_stream_binding: workspace-mode precedence for the stream hook ──
+
+    use crate::session_state::{RepoBinding, SessionState};
+
+    fn binding(id: &str) -> RepoBinding {
+        RepoBinding {
+            org_slug: "org".into(),
+            repo_id: id.into(),
+            git_url: None,
+            updated_at: "t".into(),
+        }
+    }
+
+    /// Workspace mode: no pinned config, but the session is bound (e.g. via
+    /// `tracevault repo switch`) — the stream event attributes to that repo.
+    #[test]
+    fn resolve_stream_binding_uses_session_active_when_unbound() {
+        let session = SessionState {
+            active: Some(binding("session-repo")),
+            subagents: HashMap::new(),
+        };
+        let got = resolve_stream_binding(&session, "/wt/top", None);
+        assert_eq!(got.unwrap().repo_id, "session-repo");
+    }
+
+    /// Bound-mode regression: an empty session (no `repo switch` ever run)
+    /// with a bound config.toml still resolves via the config.
+    #[test]
+    fn resolve_stream_binding_falls_back_to_bound_config() {
+        let session = SessionState::default();
+        let got = resolve_stream_binding(&session, "/wt/top", Some(binding("bound-repo")));
+        assert_eq!(got.unwrap().repo_id, "bound-repo");
+    }
+
+    /// No session binding and no bound config: nothing resolves, which is
+    /// exactly what should trigger `run_stream`'s graceful no-op.
+    #[test]
+    fn resolve_stream_binding_none_when_nothing_resolves() {
+        let session = SessionState::default();
+        let got = resolve_stream_binding(&session, "/wt/top", None);
+        assert!(got.is_none());
+    }
+
+    /// Subagent override precedence: a per-worktree override for the current
+    /// worktree wins over the session's `active` binding.
+    #[test]
+    fn resolve_stream_binding_prefers_subagent_override_for_worktree() {
+        let session = SessionState {
+            active: Some(binding("session-repo")),
+            subagents: HashMap::from([("/wt/x".to_string(), binding("subagent-repo"))]),
+        };
+        let got = resolve_stream_binding(&session, "/wt/x", Some(binding("bound-repo")));
+        assert_eq!(got.unwrap().repo_id, "subagent-repo");
     }
 }
