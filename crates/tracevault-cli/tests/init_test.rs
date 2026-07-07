@@ -99,6 +99,70 @@ async fn init_installs_claude_hooks() {
 }
 
 #[tokio::test]
+async fn init_installs_session_hooks() {
+    let tmp = tmp_git_repo();
+
+    tracevault_cli::commands::init::init_in_directory(
+        tmp.path(),
+        None,
+        Some(ClaudeSettingsTarget::Shared),
+        false,
+        UserContext::Toggle(true),
+    )
+    .await
+    .unwrap();
+
+    let settings_path = tmp.path().join(".claude/settings.json");
+    assert!(settings_path.exists());
+
+    let content = fs::read_to_string(&settings_path).unwrap();
+    let settings: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let hooks = settings.get("hooks").unwrap();
+
+    // Per-repo init installs SessionStart hook (exports session ID and injects policies)
+    assert!(
+        hooks.get("SessionStart").is_some(),
+        "missing SessionStart hook"
+    );
+    assert!(
+        hooks["SessionStart"].is_array(),
+        "SessionStart should be an array"
+    );
+    let session_start_entry = &hooks["SessionStart"][0];
+    let session_start_cmd = session_start_entry
+        .get("hooks")
+        .and_then(|h| h.get(0))
+        .and_then(|h| h.get("command"))
+        .and_then(|c| c.as_str());
+    assert_eq!(
+        session_start_cmd,
+        Some("tracevault session-start"),
+        "SessionStart hook should run 'tracevault session-start'"
+    );
+
+    // Per-repo init installs UserPromptSubmit hook (re-injects policies when repo changes)
+    assert!(
+        hooks.get("UserPromptSubmit").is_some(),
+        "missing UserPromptSubmit hook"
+    );
+    assert!(
+        hooks["UserPromptSubmit"].is_array(),
+        "UserPromptSubmit should be an array"
+    );
+    let user_prompt_entry = &hooks["UserPromptSubmit"][0];
+    let user_prompt_cmd = user_prompt_entry
+        .get("hooks")
+        .and_then(|h| h.get(0))
+        .and_then(|h| h.get("command"))
+        .and_then(|c| c.as_str());
+    assert_eq!(
+        user_prompt_cmd,
+        Some("tracevault user-prompt"),
+        "UserPromptSubmit hook should run 'tracevault user-prompt'"
+    );
+}
+
+#[tokio::test]
 async fn init_merges_into_existing_settings() {
     let tmp = tmp_git_repo();
 

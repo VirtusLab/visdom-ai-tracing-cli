@@ -17,6 +17,11 @@ tracevault check       # Evaluate policies before push
 tracevault flush       # Retry any events that failed to stream live
 ```
 
+**Per-repo initialization** — `tracevault init` sets up a repository with `.tracevault/` config,
+git hooks, and Claude Code hooks including a `SessionStart` hook (exports the session ID and injects
+the repo's policies at session start) and a `UserPromptSubmit` hook (re-injects policies when the
+session's effective repo changes).
+
 ### Workspace / detached mode
 
 For headless or autonomous workers that clone and work across multiple repositories (rather
