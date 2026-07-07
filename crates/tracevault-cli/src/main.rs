@@ -51,6 +51,11 @@ enum Cli {
         #[arg(long)]
         event: String,
     },
+    /// SessionStart hook: exports the session id and injects the bound repo's
+    /// policies as additionalContext. Installed into .claude/settings.json by
+    /// `tracevault init --global` — not intended to be run manually.
+    #[command(name = "session-start", hide = true)]
+    SessionStart,
     /// Check session policies before pushing
     Check,
     /// Sync repo remote URL with the TraceVault server
@@ -281,6 +286,16 @@ async fn main() {
         Cli::Stream { event } => {
             if let Err(e) = commands::stream::run_stream(&event).await {
                 eprintln!("Stream error: {e}");
+            }
+        }
+        Cli::SessionStart => {
+            // The hook itself always prints a valid HookOutput JSON payload
+            // before returning; an Err here is a genuine last-resort case
+            // (e.g. stdin unreadable) and — same as `Stream` — must never
+            // turn into a non-zero exit, which would block the Claude Code
+            // session from starting.
+            if let Err(e) = commands::session_start::run().await {
+                eprintln!("SessionStart error: {e}");
             }
         }
         Cli::Check => {
