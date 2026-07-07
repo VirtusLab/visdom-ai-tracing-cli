@@ -83,16 +83,45 @@ pub struct ResolveInputs<'a> {
     pub bound: Option<RepoBinding>,
 }
 
-/// The binding that applies: `--repo` flag → subagent worktree override →
-/// session active → bound config → none.
-pub fn effective_binding(inputs: ResolveInputs) -> Option<RepoBinding> {
+/// Which precedence tier produced the [`effective_binding`] result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingSource {
+    /// A `--repo <path>` flag override.
+    RepoFlag,
+    /// A subagent's per-worktree override.
+    Subagent,
+    /// The session's session-level active binding.
+    SessionActive,
+    /// A pinned `.tracevault/config.toml` (bound mode).
+    Bound,
+}
+
+/// The binding that applies, and which tier produced it: `--repo` flag →
+/// subagent worktree override → session active → bound config → none.
+pub fn effective_binding(inputs: ResolveInputs) -> Option<(RepoBinding, BindingSource)> {
     if let Some(b) = inputs.repo_flag {
-        return Some(b);
+        return Some((b, BindingSource::RepoFlag));
     }
-    if let Some(b) = inputs.session.effective(inputs.worktree_path) {
-        return Some(b.clone());
+    if let Some(wt) = inputs.worktree_path {
+        if let Some(b) = inputs.session.subagents.get(wt) {
+            return Some((b.clone(), BindingSource::Subagent));
+        }
     }
-    inputs.bound
+    if let Some(b) = &inputs.session.active {
+        return Some((b.clone(), BindingSource::SessionActive));
+    }
+    inputs.bound.map(|b| (b, BindingSource::Bound))
+}
+
+/// A RepoBinding from a pinned `.tracevault/config.toml` (bound mode), if it has
+/// both org_slug and repo_id. Pure — caller supplies the already-loaded config.
+pub fn binding_from_config(config: &crate::config::TracevaultConfig) -> Option<RepoBinding> {
+    Some(RepoBinding {
+        org_slug: config.org_slug.clone()?,
+        repo_id: config.repo_id.clone()?,
+        git_url: None,
+        updated_at: String::new(),
+    })
 }
 
 #[cfg(test)]
@@ -118,41 +147,49 @@ mod tests {
         };
 
         // 1. repo_flag wins over everything.
-        let got = effective_binding(ResolveInputs {
+        let (b, source) = effective_binding(ResolveInputs {
             repo_flag: Some(binding("flag")),
             session: &session,
             worktree_path: Some("/wt/a"),
             bound: Some(binding("bound")),
-        });
-        assert_eq!(got.unwrap().repo_id, "flag");
+        })
+        .unwrap();
+        assert_eq!(b.repo_id, "flag");
+        assert_eq!(source, BindingSource::RepoFlag);
 
         // 2. subagent override (for the worktree) wins over session active + bound.
-        let got = effective_binding(ResolveInputs {
+        let (b, source) = effective_binding(ResolveInputs {
             repo_flag: None,
             session: &session,
             worktree_path: Some("/wt/a"),
             bound: Some(binding("bound")),
-        });
-        assert_eq!(got.unwrap().repo_id, "subagent");
+        })
+        .unwrap();
+        assert_eq!(b.repo_id, "subagent");
+        assert_eq!(source, BindingSource::Subagent);
 
         // 3. session active wins over bound when no subagent override matches.
-        let got = effective_binding(ResolveInputs {
+        let (b, source) = effective_binding(ResolveInputs {
             repo_flag: None,
             session: &session,
             worktree_path: Some("/wt/other"),
             bound: Some(binding("bound")),
-        });
-        assert_eq!(got.unwrap().repo_id, "session");
+        })
+        .unwrap();
+        assert_eq!(b.repo_id, "session");
+        assert_eq!(source, BindingSource::SessionActive);
 
         // 4. bound is last resort.
         let empty = SessionState::default();
-        let got = effective_binding(ResolveInputs {
+        let (b, source) = effective_binding(ResolveInputs {
             repo_flag: None,
             session: &empty,
             worktree_path: None,
             bound: Some(binding("bound")),
-        });
-        assert_eq!(got.unwrap().repo_id, "bound");
+        })
+        .unwrap();
+        assert_eq!(b.repo_id, "bound");
+        assert_eq!(source, BindingSource::Bound);
 
         // 5. nothing → None.
         let got = effective_binding(ResolveInputs {

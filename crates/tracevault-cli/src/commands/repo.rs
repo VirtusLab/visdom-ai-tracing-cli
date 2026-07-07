@@ -3,7 +3,9 @@
 use std::path::Path;
 
 use crate::api_client::{resolve_credentials, ApiClient};
-use crate::resolution::{effective_binding, org_slug_for, resolve_path_to_binding, ResolveInputs};
+use crate::resolution::{
+    binding_from_config, effective_binding, org_slug_for, resolve_path_to_binding, ResolveInputs,
+};
 use crate::session_state::{self, RepoBinding, SessionState};
 
 /// Sub-actions for `tracevault repo` (workspace/detached mode).
@@ -46,19 +48,6 @@ pub fn resolve_session_id(explicit: Option<&str>) -> Result<String, Box<dyn std:
              (installed by `tracevault init --global`)"
                 .into()
         })
-}
-
-/// The binding implied by a pinned `.tracevault/config.toml` (bound mode), if any.
-pub fn bound_binding(project_root: &Path) -> Option<RepoBinding> {
-    let cfg = crate::config::TracevaultConfig::load(project_root)?;
-    let org_slug = cfg.org_slug?;
-    let repo_id = cfg.repo_id?;
-    Some(RepoBinding {
-        org_slug,
-        repo_id,
-        git_url: None,
-        updated_at: String::new(),
-    })
 }
 
 pub async fn run(
@@ -218,7 +207,9 @@ async fn status(
         Err(_) => SessionState::default(),
     };
     let worktree = crate::paths::worktree_toplevel(cwd);
-    let bound = bound_binding(project_root);
+    let bound = crate::config::TracevaultConfig::load(project_root)
+        .as_ref()
+        .and_then(binding_from_config);
 
     // A --repo override on status resolves live (needs org_slug + server).
     let repo_flag = resolve_repo_flag(repo_flag_path, project_root).await;
@@ -228,7 +219,9 @@ async fn status(
         session: &session,
         worktree_path: Some(&worktree),
         bound,
-    }) {
+    })
+    .map(|(b, _)| b)
+    {
         Some(b) => println!("bound to repo {} (org {})", b.repo_id, b.org_slug),
         None => {
             println!("not bound to any repo (workspace mode; run `tracevault repo switch <path>`)")

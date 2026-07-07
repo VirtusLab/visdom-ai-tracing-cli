@@ -148,6 +148,7 @@ pub(crate) fn resolve_stream_binding(
         worktree_path: Some(worktree),
         bound,
     })
+    .map(|(b, _)| b)
 }
 
 pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -291,16 +292,21 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
     // worktree override) below. A malformed config is still surfaced here —
     // that's easy to miss in hook output otherwise. Only a bound
     // `config.toml`'s org_slug/repo_id feed the lowest-precedence tier
-    // (via `bound_binding` below).
+    // (via `binding_from_config` below).
     if let Err(e) = &config {
         return Err(format!("malformed .tracevault/config.toml: {e}").into());
     }
 
     // Resolve the effective repo binding (workspace/detached mode). Bound
     // mode (a pinned config.toml) still works — it's the lowest-precedence
-    // tier, wired below via `bound_binding`.
+    // tier, wired below via `binding_from_config`, fed from the `config`
+    // already loaded above (no second read of config.toml on this hot path).
     let session = crate::session_state::load(&hook_event.session_id);
-    let bound = crate::commands::repo::bound_binding(&project_root);
+    let bound = config
+        .as_ref()
+        .ok()
+        .and_then(|opt| opt.as_ref())
+        .and_then(crate::resolution::binding_from_config);
     let binding = resolve_stream_binding(&session, &worktree_top, bound);
     // Graceful no-op, exactly like the hook's normal success path. Do NOT
     // error: a failing hook would block the tool.

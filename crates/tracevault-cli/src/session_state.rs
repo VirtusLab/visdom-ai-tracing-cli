@@ -28,19 +28,6 @@ pub struct SessionState {
     pub subagents: HashMap<String, RepoBinding>,
 }
 
-impl SessionState {
-    /// The binding that applies for `worktree_path`: a subagent override for
-    /// that worktree if one exists, otherwise the session-level `active`.
-    pub fn effective(&self, worktree_path: Option<&str>) -> Option<&RepoBinding> {
-        if let Some(wt) = worktree_path {
-            if let Some(b) = self.subagents.get(wt) {
-                return Some(b);
-            }
-        }
-        self.active.as_ref()
-    }
-}
-
 /// `$XDG_STATE_HOME/tracevault/sessions` or `~/.local/state/tracevault/sessions`.
 pub fn sessions_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
@@ -115,20 +102,6 @@ mod tests {
             git_url: None,
             updated_at: "t".into(),
         }
-    }
-
-    #[test]
-    fn effective_prefers_subagent_override_for_worktree() {
-        let s = SessionState {
-            active: Some(binding("session-repo")),
-            subagents: HashMap::from([("/wt/a".to_string(), binding("subagent-repo"))]),
-        };
-        assert_eq!(s.effective(Some("/wt/a")).unwrap().repo_id, "subagent-repo");
-        assert_eq!(
-            s.effective(Some("/wt/unknown")).unwrap().repo_id,
-            "session-repo"
-        );
-        assert_eq!(s.effective(None).unwrap().repo_id, "session-repo");
     }
 
     #[test]
