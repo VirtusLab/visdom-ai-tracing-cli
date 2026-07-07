@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.20.2...v0.21.0) - 2026-07-07
+
+### Added
+
+- *(cli)* init --global + session hooks (workspace mode, sub-plan C) ([#12](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/12))
+- *(cli)* workspace-mode repo commands + stream wiring (sub-plan B) ([#11](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/11))
+- *(cli)* workspace-mode repo resolution foundation (sub-plan A) ([#10](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/10))
+- *(cli)* user-level context layer (hierarchical context) ([#8](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/8))
+
 ## [0.20.2](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.20.1...v0.20.2) - 2026-07-01
 
 ### Fixed
