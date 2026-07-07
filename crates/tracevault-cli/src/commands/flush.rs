@@ -7,8 +7,10 @@ use tracevault_protocol::streaming::StreamEventRequest;
 /// Extract the repo id from a per-repo pending queue filename
 /// (`pending-<repo_id>.jsonl`). Returns None for anything else (e.g. a legacy
 /// `pending.jsonl`).
-fn repo_id_from_pending_filename(name: &str) -> Option<&str> {
-    name.strip_prefix("pending-")?.strip_suffix(".jsonl")
+pub(crate) fn repo_id_from_pending_filename(name: &str) -> Option<&str> {
+    name.strip_prefix("pending-")?
+        .strip_suffix(".jsonl")
+        .filter(|s| !s.is_empty())
 }
 
 pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -18,6 +20,12 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
     let (server_url, token) = resolve_credentials(project_root);
     let server_url = server_url.ok_or("server_url not configured")?;
     let client = ApiClient::new(&server_url, token.as_deref());
+
+    // Lenient config load: used only to attribute the legacy `pending.jsonl`
+    // (written by releases before per-repo queue files existed) to the bound
+    // repo id, if any. Best-effort — a missing/malformed config just means
+    // any legacy queue can't be attributed and is left in place.
+    let bound_repo_id = crate::config::TracevaultConfig::load(project_root).and_then(|c| c.repo_id);
 
     let sessions_dir = project_root.join(".tracevault").join("sessions");
     if !sessions_dir.exists() {
@@ -37,15 +45,28 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
         // Collect (path, repo_id) pairs for every per-repo pending queue in
         // this session directory before draining, to keep the borrow/async
         // loop below simple.
-        let pending_queues: Vec<(std::path::PathBuf, String)> = fs::read_dir(session_entry.path())?
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let path = e.path();
-                let name = path.file_name()?.to_str()?.to_string();
-                let repo_id = repo_id_from_pending_filename(&name)?.to_string();
-                Some((path, repo_id))
-            })
-            .collect();
+        let mut pending_queues: Vec<(std::path::PathBuf, String)> =
+            fs::read_dir(session_entry.path())?
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let path = e.path();
+                    let name = path.file_name()?.to_str()?.to_string();
+                    let repo_id = repo_id_from_pending_filename(&name)?.to_string();
+                    Some((path, repo_id))
+                })
+                .collect();
+
+        // Back-compat: releases before per-repo queue files existed wrote a
+        // single `pending.jsonl`, implicitly attributed to the bound
+        // `config.repo_id`. `status` counts these, so `flush` must be able to
+        // drain them or they're stuck forever. If there's no bound repo_id,
+        // skip it — there's nothing to attribute it to (best-effort).
+        let legacy_path = session_entry.path().join("pending.jsonl");
+        if legacy_path.exists() {
+            if let Some(repo_id) = &bound_repo_id {
+                pending_queues.push((legacy_path, repo_id.clone()));
+            }
+        }
 
         for (pending_path, repo_id) in pending_queues {
             let events = drain_pending(&pending_path)?;
@@ -59,7 +80,7 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
             for (i, mut event) in events.into_iter().enumerate() {
                 eprint!(
                     "\r  Session {} — event {}/{} ...",
-                    &event.session_id[..8],
+                    event.session_id.get(..8).unwrap_or(&event.session_id),
                     i + 1,
                     event_total
                 );
@@ -175,6 +196,11 @@ mod tests {
     fn repo_id_from_pending_filename_none_for_unrelated_name() {
         assert_eq!(repo_id_from_pending_filename("events.jsonl"), None);
         assert_eq!(repo_id_from_pending_filename("pending-abc.txt"), None);
+    }
+
+    #[test]
+    fn repo_id_from_pending_filename_none_for_empty_id() {
+        assert_eq!(repo_id_from_pending_filename("pending-.jsonl"), None);
     }
 
     /// From a sibling worktree the resolved project root must point at the

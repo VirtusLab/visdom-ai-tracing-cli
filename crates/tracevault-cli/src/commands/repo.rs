@@ -131,17 +131,20 @@ async fn switch(
 
     let binding = resolve_switch_binding(Path::new(path), &org_slug, &client).await?;
 
+    // Validate the repo id BEFORE persisting anything: a malformed repo_id
+    // must not leave a persisted session binding behind.
+    let repo_uuid = binding.repo_id.parse::<uuid::Uuid>().map_err(|e| {
+        format!(
+            "server returned an invalid repo id {:?}: {e}",
+            binding.repo_id
+        )
+    })?;
+
     // NOTE: subagent worktree-override writes are handled in sub-plan C.
     let mut state = session_state::load(&id);
     apply_switch(&mut state, binding.clone());
     session_state::save(&id, &state)?;
 
-    let repo_uuid: uuid::Uuid = binding.repo_id.parse().map_err(|e| {
-        format!(
-            "invalid repo id {:?} returned by server: {e}",
-            binding.repo_id
-        )
-    })?;
     // The binding was already saved above — that's the primary effect of
     // `switch`. A failure to fetch policies afterward shouldn't make the
     // whole command report as an error.

@@ -408,6 +408,14 @@ async fn server_repo_checks(
 
 // --- Sessions ---
 
+/// True for the legacy `pending.jsonl` or a per-repo `pending-<id>.jsonl`
+/// (nonempty id) queue file — tighter than a bare `starts_with("pending") &&
+/// ends_with(".jsonl")` check, which would also match e.g. `pendingfoo.jsonl`
+/// or `pending-.jsonl`.
+fn is_pending_queue_filename(name: &str) -> bool {
+    name == "pending.jsonl" || crate::commands::flush::repo_id_from_pending_filename(name).is_some()
+}
+
 /// Sum the non-empty lines across every per-repo (and legacy) pending queue
 /// file in a session directory: `pending.jsonl` and `pending-<repo_id>.jsonl`.
 fn count_pending_events(session_dir: &Path) -> usize {
@@ -420,7 +428,7 @@ fn count_pending_events(session_dir: &Path) -> usize {
             entry
                 .file_name()
                 .to_str()
-                .map(|name| name.starts_with("pending") && name.ends_with(".jsonl"))
+                .map(is_pending_queue_filename)
                 .unwrap_or(false)
         })
         .map(|entry| {
@@ -660,6 +668,33 @@ mod tests {
     #[test]
     fn count_pending_events_zero_for_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
+        assert_eq!(count_pending_events(dir.path()), 0);
+    }
+
+    #[test]
+    fn is_pending_queue_filename_matches_legacy_and_per_repo() {
+        assert!(is_pending_queue_filename("pending.jsonl"));
+        assert!(is_pending_queue_filename("pending-a.jsonl"));
+    }
+
+    #[test]
+    fn is_pending_queue_filename_rejects_lookalikes() {
+        assert!(!is_pending_queue_filename("pendingfoo.jsonl"));
+        assert!(!is_pending_queue_filename("pending-.jsonl"));
+    }
+
+    #[test]
+    fn count_pending_events_counts_legacy_pending_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pending.jsonl"), "line1\nline2\n").unwrap();
+        assert_eq!(count_pending_events(dir.path()), 2);
+    }
+
+    #[test]
+    fn count_pending_events_ignores_lookalike_filenames() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pendingfoo.jsonl"), "line1\n").unwrap();
+        std::fs::write(dir.path().join("pending-.jsonl"), "line1\n").unwrap();
         assert_eq!(count_pending_events(dir.path()), 0);
     }
 }

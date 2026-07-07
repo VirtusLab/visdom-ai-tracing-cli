@@ -302,13 +302,25 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
     let session = crate::session_state::load(&hook_event.session_id);
     let bound = crate::commands::repo::bound_binding(&project_root);
     let binding = resolve_stream_binding(&session, &worktree_top, bound);
-    let Some(binding) = binding else {
-        // No repo resolves — graceful no-op, exactly like the hook's normal
-        // success path. Do NOT error: a failing hook would block the tool.
+    // Graceful no-op, exactly like the hook's normal success path. Do NOT
+    // error: a failing hook would block the tool.
+    let no_op_allow = || -> Result<(), Box<dyn std::error::Error>> {
         let response = HookResponse::allow();
         println!("{}", serde_json::to_string(&response)?);
+        Ok(())
+    };
+    let Some(binding) = binding else {
+        // No repo resolves.
+        no_op_allow()?;
         return Ok(());
     };
+    if uuid::Uuid::parse_str(&binding.repo_id).is_err() {
+        // A corrupted/hand-edited session-state file could contain a
+        // repo_id with path separators, which would otherwise land in the
+        // `pending-<repo_id>.jsonl` filename below.
+        no_op_allow()?;
+        return Ok(());
+    }
     let org_slug = binding.org_slug.as_str();
     let repo_id = binding.repo_id.as_str();
 
