@@ -41,9 +41,19 @@ enum Cli {
         #[arg(long, conflicts_with = "no_user_context")]
         user_context: Option<String>,
         /// Install TraceVault hooks once into ~/.claude/ for ALL Claude Code
-        /// sessions, instead of initializing the current repo. Ignores
-        /// --claude-settings/--no-gitignore and does not require git.
-        #[arg(long)]
+        /// sessions, instead of initializing the current repo. Does not
+        /// require git. Conflicts with the per-repo-only flags below, which
+        /// this mode has no use for.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "server_url",
+                "claude_settings",
+                "no_gitignore",
+                "no_user_context",
+                "user_context"
+            ]
+        )]
         global: bool,
     },
     /// Show current session status
@@ -267,8 +277,12 @@ async fn main() {
                 match commands::init::install_global_hooks(&claude_dir) {
                     Ok(()) => {
                         println!(
-                            "Installed TraceVault hooks globally in {}",
-                            claude_dir.display()
+                            "Installed TraceVault hooks in {}",
+                            claude_dir.join("settings.json").display()
+                        );
+                        println!("Updated {}", claude_dir.join("CLAUDE.md").display());
+                        println!(
+                            "These apply to ALL Claude Code sessions on this machine, not just this repo."
                         );
                     }
                     Err(e) => {
