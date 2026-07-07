@@ -134,6 +134,13 @@ pub fn resolve_session_paths(
     (resolved, session_dir)
 }
 
+/// A resolved binding is usable for hook attribution only if its repo_id is a
+/// real UUID — guards against a corrupted/edited session-state file injecting
+/// path separators into the pending-<repo_id>.jsonl filename.
+fn binding_repo_id_is_valid(repo_id: &str) -> bool {
+    uuid::Uuid::parse_str(repo_id).is_ok()
+}
+
 /// The effective repo binding for a stream event, given the loaded session
 /// state, the event's worktree, and the bound-config fallback. Pure — the
 /// hook path has no `--repo` flag, so `repo_flag` is always `None` here.
@@ -320,7 +327,7 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
         no_op_allow()?;
         return Ok(());
     };
-    if uuid::Uuid::parse_str(&binding.repo_id).is_err() {
+    if !binding_repo_id_is_valid(&binding.repo_id) {
         // A corrupted/hand-edited session-state file could contain a
         // repo_id with path separators, which would otherwise land in the
         // `pending-<repo_id>.jsonl` filename below.
@@ -697,6 +704,30 @@ mod tests {
         };
         let got = resolve_stream_binding(&session, "/wt/x", Some(binding("bound-repo")));
         assert_eq!(got.unwrap().repo_id, "subagent-repo");
+    }
+
+    // ── binding_repo_id_is_valid: hook-attribution UUID guard ────────────────
+
+    #[test]
+    fn binding_repo_id_is_valid_accepts_real_uuid() {
+        assert!(binding_repo_id_is_valid(
+            "550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
+    fn binding_repo_id_is_valid_rejects_path_traversal() {
+        assert!(!binding_repo_id_is_valid("../evil"));
+    }
+
+    #[test]
+    fn binding_repo_id_is_valid_rejects_empty() {
+        assert!(!binding_repo_id_is_valid(""));
+    }
+
+    #[test]
+    fn binding_repo_id_is_valid_rejects_non_uuid() {
+        assert!(!binding_repo_id_is_valid("not-a-uuid"));
     }
 
     // ── pending_path_for: repo-scoped offline queue ──────────────────────────

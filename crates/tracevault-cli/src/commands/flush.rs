@@ -13,6 +13,46 @@ pub(crate) fn repo_id_from_pending_filename(name: &str) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Classify a session dir's pending queue files. Returns (path, repo_id) pairs;
+/// per-repo files carry their own id, the legacy `pending.jsonl` is attributed
+/// to `bound_repo_id` (skipped entirely when None).
+fn pending_queues_in(
+    session_dir: &Path,
+    bound_repo_id: Option<&str>,
+) -> Vec<(std::path::PathBuf, String)> {
+    let mut pending_queues: Vec<(std::path::PathBuf, String)> = fs::read_dir(session_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            let repo_id = repo_id_from_pending_filename(&name)?.to_string();
+            Some((path, repo_id))
+        })
+        .collect();
+
+    // Back-compat: releases before per-repo queue files existed wrote a
+    // single `pending.jsonl`, implicitly attributed to the bound
+    // `config.repo_id`. `status` counts these, so `flush` must be able to
+    // drain them or they're stuck forever. If there's no bound repo_id,
+    // skip it — there's nothing to attribute it to (best-effort).
+    let legacy_path = session_dir.join("pending.jsonl");
+    if legacy_path.exists() {
+        if let Some(repo_id) = bound_repo_id {
+            pending_queues.push((legacy_path, repo_id.to_string()));
+        }
+    }
+
+    pending_queues
+}
+
+/// The progress line uses a short prefix of the session id for display; guards
+/// against a prior `[..8]` panic on session ids shorter than 8 bytes.
+fn short_session_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
 pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let org_slug = crate::resolution::org_slug_for(project_root)
         .ok_or("no org configured (set TRACEVAULT_ORG_SLUG, log in, or run in a bound repo)")?;
@@ -42,31 +82,10 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
         .collect();
 
     for session_entry in session_entries {
-        // Collect (path, repo_id) pairs for every per-repo pending queue in
-        // this session directory before draining, to keep the borrow/async
-        // loop below simple.
-        let mut pending_queues: Vec<(std::path::PathBuf, String)> =
-            fs::read_dir(session_entry.path())?
-                .filter_map(|e| e.ok())
-                .filter_map(|e| {
-                    let path = e.path();
-                    let name = path.file_name()?.to_str()?.to_string();
-                    let repo_id = repo_id_from_pending_filename(&name)?.to_string();
-                    Some((path, repo_id))
-                })
-                .collect();
-
-        // Back-compat: releases before per-repo queue files existed wrote a
-        // single `pending.jsonl`, implicitly attributed to the bound
-        // `config.repo_id`. `status` counts these, so `flush` must be able to
-        // drain them or they're stuck forever. If there's no bound repo_id,
-        // skip it — there's nothing to attribute it to (best-effort).
-        let legacy_path = session_entry.path().join("pending.jsonl");
-        if legacy_path.exists() {
-            if let Some(repo_id) = &bound_repo_id {
-                pending_queues.push((legacy_path, repo_id.clone()));
-            }
-        }
+        // Collect (path, repo_id) pairs for every pending queue in this
+        // session directory before draining, to keep the borrow/async loop
+        // below simple.
+        let pending_queues = pending_queues_in(&session_entry.path(), bound_repo_id.as_deref());
 
         for (pending_path, repo_id) in pending_queues {
             let events = drain_pending(&pending_path)?;
@@ -80,7 +99,7 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
             for (i, mut event) in events.into_iter().enumerate() {
                 eprint!(
                     "\r  Session {} — event {}/{} ...",
-                    event.session_id.get(..8).unwrap_or(&event.session_id),
+                    short_session_id(&event.session_id),
                     i + 1,
                     event_total
                 );
@@ -174,7 +193,7 @@ fn append_pending(
 
 #[cfg(test)]
 mod tests {
-    use super::repo_id_from_pending_filename;
+    use super::{pending_queues_in, repo_id_from_pending_filename, short_session_id};
     use crate::paths::resolve_project_root;
     use crate::test_helpers::{add_worktree, init_git_repo};
     use std::fs;
@@ -242,5 +261,69 @@ mod tests {
             got_sessions, expected_sessions,
             "flush must look for sessions under the PRIMARY repo, not the sibling worktree dir"
         );
+    }
+
+    // ── pending_queues_in: per-session pending-queue enumeration ─────────────
+
+    fn setup_session_dir_with_pending_files() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("pending-a.jsonl"), "").unwrap();
+        fs::write(dir.path().join("pending-b.jsonl"), "").unwrap();
+        fs::write(dir.path().join("pending.jsonl"), "").unwrap();
+        fs::write(dir.path().join("notes.txt"), "").unwrap();
+        fs::write(dir.path().join("pending-.jsonl"), "").unwrap();
+        dir
+    }
+
+    #[test]
+    fn pending_queues_in_with_bound_repo_includes_legacy() {
+        let dir = setup_session_dir_with_pending_files();
+        let mut got = pending_queues_in(dir.path(), Some("cfg"));
+        got.sort_by(|a, b| a.1.cmp(&b.1));
+
+        let repo_ids: Vec<&str> = got.iter().map(|(_, id)| id.as_str()).collect();
+        assert_eq!(repo_ids, vec!["a", "b", "cfg"]);
+
+        let legacy = got.iter().find(|(_, id)| id == "cfg").unwrap();
+        assert_eq!(legacy.0, dir.path().join("pending.jsonl"));
+    }
+
+    #[test]
+    fn pending_queues_in_without_bound_repo_skips_legacy() {
+        let dir = setup_session_dir_with_pending_files();
+        let mut got = pending_queues_in(dir.path(), None);
+        got.sort_by(|a, b| a.1.cmp(&b.1));
+
+        let repo_ids: Vec<&str> = got.iter().map(|(_, id)| id.as_str()).collect();
+        assert_eq!(repo_ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn pending_queues_in_ignores_unrelated_and_malformed_names() {
+        let dir = setup_session_dir_with_pending_files();
+        let got = pending_queues_in(dir.path(), Some("cfg"));
+
+        assert!(!got.iter().any(|(p, _)| p.ends_with("notes.txt")));
+        assert!(!got.iter().any(|(p, _)| p.ends_with("pending-.jsonl")));
+    }
+
+    // ── short_session_id: display-only truncation, no panic on short ids ─────
+
+    #[test]
+    fn short_session_id_truncates_long_id() {
+        assert_eq!(
+            short_session_id("0190a1b2-cccc-dddd-eeee-ffffffffffff"),
+            "0190a1b2"
+        );
+    }
+
+    #[test]
+    fn short_session_id_returns_whole_string_when_shorter_than_8() {
+        assert_eq!(short_session_id("x"), "x");
+    }
+
+    #[test]
+    fn short_session_id_handles_empty_string() {
+        assert_eq!(short_session_id(""), "");
     }
 }
