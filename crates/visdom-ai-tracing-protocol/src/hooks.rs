@@ -17,6 +17,11 @@ pub struct HookEvent {
     pub tool_response: Option<serde_json::Value>,
     #[serde(default)]
     pub tool_use_id: Option<String>,
+    /// Present on `SessionStart` events: `"startup"`, `"resume"`, `"clear"`,
+    /// or `"compact"`. Additive/back-compat — older/other hook events simply
+    /// omit it.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +83,7 @@ mod tests {
             tool_input: None,
             tool_response: None,
             tool_use_id: None,
+            source: None,
         }
     }
 

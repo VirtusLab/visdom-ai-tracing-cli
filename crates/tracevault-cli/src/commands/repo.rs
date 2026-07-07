@@ -300,6 +300,7 @@ mod tests {
         let mut state = SessionState {
             active: Some(binding("r")),
             subagents: std::collections::HashMap::from([("/wt/a".to_string(), binding("r2"))]),
+            ..Default::default()
         };
         apply_reset(&mut state);
         assert_eq!(state, SessionState::default());
@@ -310,6 +311,7 @@ mod tests {
         let mut state = SessionState {
             active: Some(binding("old-repo")),
             subagents: Default::default(),
+            ..Default::default()
         };
         apply_switch(&mut state, binding("new-repo"));
         assert_eq!(state.active.unwrap().repo_id, "new-repo");

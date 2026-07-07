@@ -40,6 +40,21 @@ enum Cli {
         /// (conflicts with --no-user-context).
         #[arg(long, conflicts_with = "no_user_context")]
         user_context: Option<String>,
+        /// Install TraceVault hooks once into ~/.claude/ for ALL Claude Code
+        /// sessions, instead of initializing the current repo. Does not
+        /// require git. Conflicts with the per-repo-only flags below, which
+        /// this mode has no use for.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "server_url",
+                "claude_settings",
+                "no_gitignore",
+                "no_user_context",
+                "user_context"
+            ]
+        )]
+        global: bool,
     },
     /// Show current session status
     Status,
@@ -51,6 +66,17 @@ enum Cli {
         #[arg(long)]
         event: String,
     },
+    /// SessionStart hook: exports the session id and injects the bound repo's
+    /// policies as additionalContext. Installed into .claude/settings.json by
+    /// `tracevault init --global` — not intended to be run manually.
+    #[command(name = "session-start", hide = true)]
+    SessionStart,
+    /// UserPromptSubmit hook: reinforces the bound repo's policies as
+    /// additionalContext when the effective repo has changed since the last
+    /// injection. Installed into .claude/settings.json by
+    /// `tracevault init --global` — not intended to be run manually.
+    #[command(name = "user-prompt", hide = true)]
+    UserPrompt,
     /// Check session policies before pushing
     Check,
     /// Sync repo remote URL with the TraceVault server
@@ -238,7 +264,35 @@ async fn main() {
             no_gitignore,
             no_user_context,
             user_context,
+            global,
         } => {
+            if global {
+                let claude_dir = match dirs::home_dir() {
+                    Some(home) => home.join(".claude"),
+                    None => {
+                        eprintln!("Error: cannot determine home directory");
+                        std::process::exit(1);
+                    }
+                };
+                match commands::init::install_global_hooks(&claude_dir) {
+                    Ok(()) => {
+                        println!(
+                            "Installed TraceVault hooks in {}",
+                            claude_dir.join("settings.json").display()
+                        );
+                        println!("Updated {}", claude_dir.join("CLAUDE.md").display());
+                        println!(
+                            "These apply to ALL Claude Code sessions on this machine, not just this repo."
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+
             let cwd = env::current_dir().expect("Cannot determine current directory");
             let user_context = match (no_user_context, user_context) {
                 (true, _) => config::UserContext::Toggle(false),
@@ -281,6 +335,25 @@ async fn main() {
         Cli::Stream { event } => {
             if let Err(e) = commands::stream::run_stream(&event).await {
                 eprintln!("Stream error: {e}");
+            }
+        }
+        Cli::SessionStart => {
+            // The hook itself always prints a valid HookOutput JSON payload
+            // before returning; an Err here is a genuine last-resort case
+            // (e.g. stdin unreadable) and — same as `Stream` — must never
+            // turn into a non-zero exit, which would block the Claude Code
+            // session from starting.
+            if let Err(e) = commands::session_start::run().await {
+                eprintln!("SessionStart error: {e}");
+            }
+        }
+        Cli::UserPrompt => {
+            // Same reasoning as `SessionStart`: this hook always prints a
+            // valid HookOutput JSON payload before returning; an Err here
+            // must never turn into a non-zero exit, which would block the
+            // prompt from being submitted.
+            if let Err(e) = commands::user_prompt::run().await {
+                eprintln!("UserPromptSubmit error: {e}");
             }
         }
         Cli::Check => {

@@ -156,6 +156,7 @@ mod tests {
         let session = SessionState {
             active: Some(binding("session")),
             subagents: HashMap::from([("/wt/a".to_string(), binding("subagent"))]),
+            ..Default::default()
         };
 
         // 1. repo_flag wins over everything.
