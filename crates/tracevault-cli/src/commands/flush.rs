@@ -16,6 +16,7 @@ pub(crate) fn repo_id_from_pending_filename(name: &str) -> Option<&str> {
 /// Classify a session dir's pending queue files. Returns (path, repo_id) pairs;
 /// per-repo files carry their own id, the legacy `pending.jsonl` is attributed
 /// to `bound_repo_id` (skipped entirely when None).
+/// Per-repo files are only included if their derived repo_id is a valid UUID.
 fn pending_queues_in(
     session_dir: &Path,
     bound_repo_id: Option<&str>,
@@ -26,7 +27,12 @@ fn pending_queues_in(
             let path = e.path();
             let name = path.file_name()?.to_str()?.to_string();
             let repo_id = repo_id_from_pending_filename(&name)?.to_string();
-            Some((path, repo_id))
+            // Validate repo_id is a UUID (guards against corrupted/hand-created files)
+            if uuid::Uuid::parse_str(&repo_id).is_ok() {
+                Some((path, repo_id))
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -265,24 +271,46 @@ mod tests {
 
     fn setup_session_dir_with_pending_files() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("pending-a.jsonl"), "").unwrap();
-        fs::write(dir.path().join("pending-b.jsonl"), "").unwrap();
+        fs::write(
+            dir.path()
+                .join("pending-0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b.jsonl"),
+            "",
+        )
+        .unwrap();
+        fs::write(
+            dir.path()
+                .join("pending-550e8400-e29b-41d4-a716-446655440000.jsonl"),
+            "",
+        )
+        .unwrap();
         fs::write(dir.path().join("pending.jsonl"), "").unwrap();
         fs::write(dir.path().join("notes.txt"), "").unwrap();
         fs::write(dir.path().join("pending-.jsonl"), "").unwrap();
+        fs::write(dir.path().join("pending-not-a-uuid.jsonl"), "").unwrap();
         dir
     }
 
     #[test]
     fn pending_queues_in_with_bound_repo_includes_legacy() {
         let dir = setup_session_dir_with_pending_files();
-        let mut got = pending_queues_in(dir.path(), Some("cfg")).unwrap();
+        let mut got =
+            pending_queues_in(dir.path(), Some("550e8400-e29b-41d4-a716-446655440001")).unwrap();
         got.sort_by(|a, b| a.1.cmp(&b.1));
 
         let repo_ids: Vec<&str> = got.iter().map(|(_, id)| id.as_str()).collect();
-        assert_eq!(repo_ids, vec!["a", "b", "cfg"]);
+        assert_eq!(
+            repo_ids,
+            vec![
+                "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+                "550e8400-e29b-41d4-a716-446655440000",
+                "550e8400-e29b-41d4-a716-446655440001"
+            ]
+        );
 
-        let legacy = got.iter().find(|(_, id)| id == "cfg").unwrap();
+        let legacy = got
+            .iter()
+            .find(|(_, id)| id == "550e8400-e29b-41d4-a716-446655440001")
+            .unwrap();
         assert_eq!(legacy.0, dir.path().join("pending.jsonl"));
     }
 
@@ -293,16 +321,45 @@ mod tests {
         got.sort_by(|a, b| a.1.cmp(&b.1));
 
         let repo_ids: Vec<&str> = got.iter().map(|(_, id)| id.as_str()).collect();
-        assert_eq!(repo_ids, vec!["a", "b"]);
+        assert_eq!(
+            repo_ids,
+            vec![
+                "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+                "550e8400-e29b-41d4-a716-446655440000"
+            ]
+        );
     }
 
     #[test]
     fn pending_queues_in_ignores_unrelated_and_malformed_names() {
         let dir = setup_session_dir_with_pending_files();
-        let got = pending_queues_in(dir.path(), Some("cfg")).unwrap();
+        let got =
+            pending_queues_in(dir.path(), Some("550e8400-e29b-41d4-a716-446655440001")).unwrap();
 
         assert!(!got.iter().any(|(p, _)| p.ends_with("notes.txt")));
         assert!(!got.iter().any(|(p, _)| p.ends_with("pending-.jsonl")));
+        // Non-UUID repo_ids are silently skipped (guards against corrupted files)
+        assert!(!got
+            .iter()
+            .any(|(p, _)| p.ends_with("pending-not-a-uuid.jsonl")));
+    }
+
+    #[test]
+    fn pending_queues_in_validates_uuid_in_per_repo_files() {
+        let dir = setup_session_dir_with_pending_files();
+        let got = pending_queues_in(dir.path(), None).unwrap();
+
+        // Valid UUIDs are included
+        assert!(got
+            .iter()
+            .any(|(p, _)| p.ends_with("pending-0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b.jsonl")));
+        assert!(got
+            .iter()
+            .any(|(p, _)| p.ends_with("pending-550e8400-e29b-41d4-a716-446655440000.jsonl")));
+        // Non-UUID files are NOT included
+        assert!(!got
+            .iter()
+            .any(|(p, _)| p.ends_with("pending-not-a-uuid.jsonl")));
     }
 
     // ── short_session_id: display-only truncation, no panic on short ids ─────

@@ -143,7 +143,7 @@ fn binding_repo_id_is_valid(repo_id: &str) -> bool {
 
 /// The effective repo binding for a stream event, given the loaded session
 /// state, the event's worktree, and the bound-config fallback. Pure — the
-/// hook path has no `--repo` flag, so `repo_flag` is always `None` here.
+/// hook path has no repo-override flag, so `repo_flag` is always `None` here.
 pub(crate) fn resolve_stream_binding(
     session: &crate::session_state::SessionState,
     worktree: &str,
