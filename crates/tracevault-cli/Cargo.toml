@@ -20,7 +20,7 @@ name = "tracevault"
 path = "src/main.rs"
 
 [dependencies]
-visdom-ai-tracing-protocol = { path = "../visdom-ai-tracing-protocol", version = "0.20" }
+visdom-ai-tracing-protocol = { path = "../visdom-ai-tracing-protocol", version = "0.21" }
 clap = { version = "4", features = ["derive"] }
 chrono.workspace = true
 tokio.workspace = true
