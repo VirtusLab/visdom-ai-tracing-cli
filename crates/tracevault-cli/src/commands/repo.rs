@@ -4,7 +4,8 @@ use std::path::Path;
 
 use crate::api_client::{resolve_credentials, ApiClient};
 use crate::resolution::{
-    binding_from_config, effective_binding, org_slug_for, resolve_path_to_binding, ResolveInputs,
+    binding_from_config, effective_binding, org_slug_for, resolve_path_to_binding, BindingSource,
+    ResolveInputs,
 };
 use crate::session_state::{self, RepoBinding, SessionState};
 
@@ -23,9 +24,9 @@ pub enum RepoCmd {
     Status {
         #[arg(long)]
         session_id: Option<String>,
-        /// One-off override: resolve this path instead of the session binding.
+        /// One-off: resolve this checkout path instead of the session binding.
         #[arg(long)]
-        repo: Option<String>,
+        path: Option<String>,
     },
     /// Clear the current session's binding.
     Reset {
@@ -56,8 +57,8 @@ pub async fn run(
     cwd: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        RepoCmd::Status { session_id, repo } => {
-            status(session_id.as_deref(), repo.as_deref(), project_root, cwd).await
+        RepoCmd::Status { session_id, path } => {
+            status(session_id.as_deref(), path.as_deref(), project_root, cwd).await
         }
         RepoCmd::Switch { path, session_id } => {
             switch(&path, session_id.as_deref(), project_root).await
@@ -67,7 +68,7 @@ pub async fn run(
 }
 
 /// Resolve a path to a binding for `repo switch`, turning "unregistered" into
-/// a clear error (switch should fail loudly, unlike the best-effort `--repo`
+/// a clear error (switch should fail loudly, unlike the best-effort `--path`
 /// status override).
 async fn resolve_switch_binding(
     path: &Path,
@@ -134,6 +135,11 @@ async fn switch(
     apply_switch(&mut state, binding.clone());
     session_state::save(&id, &state)?;
 
+    println!(
+        "bound session {id} to repo {} (org {})",
+        binding.repo_id, binding.org_slug
+    );
+
     // The binding was already saved above — that's the primary effect of
     // `switch`. A failure to fetch policies afterward shouldn't make the
     // whole command report as an error.
@@ -147,7 +153,7 @@ async fn switch(
     Ok(())
 }
 
-/// Resolve a `--repo <path>` override into a live `RepoBinding`, if possible.
+/// Resolve a `--path <path>` override into a live `RepoBinding`, if possible.
 /// Best-effort: prints a clear message and returns `None` on any failure
 /// (missing org slug / credentials, or a server error) rather than failing
 /// the whole `status` inspector.
@@ -159,8 +165,8 @@ async fn resolve_repo_flag(
 
     let Some(org_slug) = org_slug_for(project_root) else {
         eprintln!(
-            "--repo {path}: no org slug configured (set TRACEVAULT_ORG_SLUG, log in, or bind \
-             the repo); showing binding without the --repo override"
+            "--path {path}: no org slug configured (set TRACEVAULT_ORG_SLUG, log in, or bind \
+             the repo); showing binding without the --path override"
         );
         return None;
     };
@@ -168,8 +174,8 @@ async fn resolve_repo_flag(
     let (server_url, token) = resolve_credentials(project_root);
     let Some(server_url) = server_url else {
         eprintln!(
-            "--repo {path}: no server URL configured (run `tracevault login`); showing binding \
-             without the --repo override"
+            "--path {path}: no server URL configured (run `tracevault login`); showing binding \
+             without the --path override"
         );
         return None;
     };
@@ -179,17 +185,31 @@ async fn resolve_repo_flag(
         Ok(Some(binding)) => Some(binding),
         Ok(None) => {
             eprintln!(
-                "--repo {path}: no registered repo found for this path's git remote; showing \
-                 binding without the --repo override"
+                "--path {path}: no registered repo found for this path's git remote; showing \
+                 binding without the --path override"
             );
             None
         }
         Err(e) => {
             eprintln!(
-                "--repo {path}: failed to resolve ({e}); showing binding without the --repo \
+                "--path {path}: failed to resolve ({e}); showing binding without the --path \
                  override"
             );
             None
+        }
+    }
+}
+
+/// Pure formatter for `repo status`'s output: which repo is bound, and via
+/// which precedence tier. Kept separate from I/O so it can be unit-tested.
+fn format_status(binding: Option<(&RepoBinding, BindingSource)>) -> String {
+    match binding {
+        Some((b, source)) => format!(
+            "bound to repo {} (org {}) via {source}",
+            b.repo_id, b.org_slug
+        ),
+        None => {
+            "not bound to any repo (workspace mode; run `tracevault repo switch <path>`)".into()
         }
     }
 }
@@ -201,32 +221,36 @@ async fn status(
     cwd: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Session state is best-effort: if a session id resolves, load it; else
-    // fall back to an empty SessionState rather than failing the inspector.
+    // warn and fall back to an empty SessionState rather than silently
+    // reporting "not bound" without the user knowing why.
     let session = match resolve_session_id(session_id) {
         Ok(id) => session_state::load(&id),
-        Err(_) => SessionState::default(),
+        Err(_) => {
+            eprintln!(
+                "warning: no session id (pass --session-id or set TRACEVAULT_SESSION_ID); \
+                 showing binding without session context"
+            );
+            SessionState::default()
+        }
     };
     let worktree = crate::paths::worktree_toplevel(cwd);
     let bound = crate::config::TracevaultConfig::load(project_root)
         .as_ref()
         .and_then(binding_from_config);
 
-    // A --repo override on status resolves live (needs org_slug + server).
+    // A --path override on status resolves live (needs org_slug + server).
     let repo_flag = resolve_repo_flag(repo_flag_path, project_root).await;
 
-    match effective_binding(ResolveInputs {
+    let effective = effective_binding(ResolveInputs {
         repo_flag,
         session: &session,
         worktree_path: Some(&worktree),
         bound,
-    })
-    .map(|(b, _)| b)
-    {
-        Some(b) => println!("bound to repo {} (org {})", b.repo_id, b.org_slug),
-        None => {
-            println!("not bound to any repo (workspace mode; run `tracevault repo switch <path>`)")
-        }
-    }
+    });
+    println!(
+        "{}",
+        format_status(effective.as_ref().map(|(b, s)| (b, *s)))
+    );
     Ok(())
 }
 
@@ -286,6 +310,50 @@ mod tests {
         };
         apply_switch(&mut state, binding("new-repo"));
         assert_eq!(state.active.unwrap().repo_id, "new-repo");
+    }
+
+    #[test]
+    fn format_status_none() {
+        assert_eq!(
+            format_status(None),
+            "not bound to any repo (workspace mode; run `tracevault repo switch <path>`)"
+        );
+    }
+
+    #[test]
+    fn format_status_repo_flag() {
+        let b = binding("r1");
+        assert_eq!(
+            format_status(Some((&b, BindingSource::RepoFlag))),
+            "bound to repo r1 (org org) via --path override"
+        );
+    }
+
+    #[test]
+    fn format_status_subagent() {
+        let b = binding("r2");
+        assert_eq!(
+            format_status(Some((&b, BindingSource::Subagent))),
+            "bound to repo r2 (org org) via subagent worktree override"
+        );
+    }
+
+    #[test]
+    fn format_status_session_active() {
+        let b = binding("r3");
+        assert_eq!(
+            format_status(Some((&b, BindingSource::SessionActive))),
+            "bound to repo r3 (org org) via session (repo switch)"
+        );
+    }
+
+    #[test]
+    fn format_status_bound() {
+        let b = binding("r4");
+        assert_eq!(
+            format_status(Some((&b, BindingSource::Bound))),
+            "bound to repo r4 (org org) via bound .tracevault/config.toml"
+        );
     }
 
     fn add_origin_remote(dir: &std::path::Path, url: &str) {

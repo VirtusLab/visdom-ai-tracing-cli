@@ -1,7 +1,7 @@
 //! Detached/workspace-mode repo resolution: turn a filesystem path into a
 //! `RepoBinding` (via the path's git remote + the server), and pick the
 //! effective binding for an event/command from the precedence chain
-//! (`--repo` flag → subagent worktree override → session active → bound
+//! (`--path` flag → subagent worktree override → session active → bound
 //! `.tracevault/config.toml`). See design §2/§3/§4.
 
 use std::path::Path;
@@ -73,7 +73,7 @@ pub async fn resolve_path_to_binding(
 }
 
 /// Inputs for the effective-binding precedence chain. `repo_flag` and `bound`
-/// are resolved by the caller (the `--repo` override and the bound
+/// are resolved by the caller (the `--path` override and the bound
 /// `config.toml`, respectively); `session`/`worktree_path` come from the
 /// per-session state.
 pub struct ResolveInputs<'a> {
@@ -86,7 +86,7 @@ pub struct ResolveInputs<'a> {
 /// Which precedence tier produced the [`effective_binding`] result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingSource {
-    /// A `--repo <path>` flag override.
+    /// A `--path <path>` flag override (on `repo status`).
     RepoFlag,
     /// A subagent's per-worktree override.
     Subagent,
@@ -96,7 +96,19 @@ pub enum BindingSource {
     Bound,
 }
 
-/// The binding that applies, and which tier produced it: `--repo` flag →
+impl std::fmt::Display for BindingSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            BindingSource::RepoFlag => "--path override",
+            BindingSource::Subagent => "subagent worktree override",
+            BindingSource::SessionActive => "session (repo switch)",
+            BindingSource::Bound => "bound .tracevault/config.toml",
+        };
+        f.write_str(label)
+    }
+}
+
+/// The binding that applies, and which tier produced it: `--path` flag →
 /// subagent worktree override → session active → bound config → none.
 pub fn effective_binding(inputs: ResolveInputs) -> Option<(RepoBinding, BindingSource)> {
     if let Some(b) = inputs.repo_flag {
@@ -199,6 +211,23 @@ mod tests {
             bound: None,
         });
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn binding_source_display_labels() {
+        assert_eq!(BindingSource::RepoFlag.to_string(), "--path override");
+        assert_eq!(
+            BindingSource::Subagent.to_string(),
+            "subagent worktree override"
+        );
+        assert_eq!(
+            BindingSource::SessionActive.to_string(),
+            "session (repo switch)"
+        );
+        assert_eq!(
+            BindingSource::Bound.to_string(),
+            "bound .tracevault/config.toml"
+        );
     }
 
     #[test]
