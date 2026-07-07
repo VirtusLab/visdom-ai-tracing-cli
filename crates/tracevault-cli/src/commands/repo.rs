@@ -17,11 +17,13 @@ pub enum RepoCmd {
     Switch {
         /// Path to a checkout of a registered repo.
         path: String,
+        /// Session to target; defaults to $TRACEVAULT_SESSION_ID.
         #[arg(long)]
         session_id: Option<String>,
     },
     /// Show the repo the current session is bound to.
     Status {
+        /// Session to target; defaults to $TRACEVAULT_SESSION_ID.
         #[arg(long)]
         session_id: Option<String>,
         /// One-off: resolve this checkout path instead of the session binding.
@@ -30,6 +32,7 @@ pub enum RepoCmd {
     },
     /// Clear the current session's binding.
     Reset {
+        /// Session to target; defaults to $TRACEVAULT_SESSION_ID.
         #[arg(long)]
         session_id: Option<String>,
     },
