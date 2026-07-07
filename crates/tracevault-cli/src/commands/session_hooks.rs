@@ -1,8 +1,16 @@
 //! Shared helpers for the SessionStart / UserPromptSubmit hook commands
 //! (sub-plan C): the Claude Code hook-output JSON shape for injecting context,
-//! and the pure decision logic for when to inject.
+//! the pure decision logic for when to inject, and the shared
+//! resolve-binding-then-inject flow used by both hook commands.
+
+use std::path::Path;
 
 use serde::Serialize;
+
+use tracevault_protocol::hooks::HookEvent;
+
+use crate::api_client::resolve_credentials;
+use crate::resolution::{binding_from_config, effective_binding, ResolveInputs};
 
 /// Claude Code hook output. Field names are camelCase to match CC's contract
 /// (the shared protocol `HookResponse` is snake_case and server-facing; this is
@@ -72,6 +80,81 @@ pub fn should_inject(
         "SessionStart" => effective_repo_id.is_some(),
         "UserPromptSubmit" => effective_repo_id.is_some() && effective_repo_id != last_injected,
         _ => false,
+    }
+}
+
+fn print_allow() -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", serde_json::to_string(&HookOutput::allow())?);
+    Ok(())
+}
+
+/// Resolve the session's effective binding and, if `should_inject(event, ...)`,
+/// best-effort fetch + print policies as `additionalContext` and persist
+/// `last_injected_repo`. Always prints a valid `HookOutput`; never hard-fails.
+///
+/// Shared by `session-start` and `user-prompt`: both need the same
+/// resolve-binding → decide → fetch-and-inject flow, differing only in which
+/// hook-specific steps happen around it (SessionStart also writes the session
+/// env file, which stays in `session_start.rs`).
+pub async fn resolve_and_inject(
+    event: &str,
+    hook_event: &HookEvent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let hook_cwd = Path::new(&hook_event.cwd);
+    let project_root = crate::paths::resolve_project_root(hook_cwd).root;
+    let session = crate::session_state::load(&hook_event.session_id);
+    let worktree = crate::paths::worktree_toplevel(hook_cwd);
+    let bound =
+        crate::config::TracevaultConfig::load(&project_root).and_then(|c| binding_from_config(&c));
+    let binding = effective_binding(ResolveInputs {
+        repo_flag: None,
+        session: &session,
+        worktree_path: Some(&worktree),
+        bound,
+    })
+    .map(|(b, _)| b);
+
+    if !should_inject(
+        event,
+        binding.as_ref().map(|b| b.repo_id.as_str()),
+        session.last_injected_repo.as_deref(),
+    ) {
+        return print_allow();
+    }
+    // `should_inject` returning true requires `effective_repo_id.is_some()`, so
+    // `binding` is always `Some` here.
+    let Some(binding) = binding else {
+        return print_allow();
+    };
+
+    let Ok(repo_uuid) = binding.repo_id.parse::<uuid::Uuid>() else {
+        // A corrupted/hand-edited session-state or config file could contain a
+        // non-UUID repo_id — skip injection rather than fail the hook.
+        return print_allow();
+    };
+
+    let (server_url, token) = resolve_credentials(&project_root);
+    let Some(server_url) = server_url else {
+        return print_allow();
+    };
+    let client = crate::api_client::ApiClient::new(&server_url, token.as_deref());
+
+    match client
+        .get_agent_instructions(&binding.org_slug, &repo_uuid)
+        .await
+    {
+        Ok(resp) => {
+            let output = HookOutput::with_context(event, cap_context(resp.content));
+            println!("{}", serde_json::to_string(&output)?);
+            // Best-effort: persist the last-injected repo so a later
+            // UserPromptSubmit can avoid redundant re-injection. A save
+            // failure must not turn this into a hook failure.
+            let mut session = session;
+            session.last_injected_repo = Some(binding.repo_id.clone());
+            let _ = crate::session_state::save(&hook_event.session_id, &session);
+            Ok(())
+        }
+        Err(_) => print_allow(),
     }
 }
 
@@ -177,5 +260,34 @@ mod tests {
         let json = serde_json::to_string(&out).unwrap();
         assert!(!json.contains("hookSpecificOutput"));
         assert!(json.contains("\"suppressOutput\":true"));
+    }
+
+    // ── resolve_and_inject ───────────────────────────────────────────────
+    //
+    // `resolve_and_inject` is network/IO-bound, so coverage here stays thin:
+    // this exercises the no-binding path (empty session state, no
+    // `.tracevault/config.toml`, non-git cwd), which `should_inject` already
+    // proves resolves to "don't inject" — so this must return `Ok(())`
+    // without ever reaching the network. No env mutation: `cwd` is an
+    // isolated tempdir and the session id is unique to this test.
+
+    #[tokio::test]
+    async fn resolve_and_inject_allows_when_no_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hook_event = HookEvent {
+            session_id: "resolve-and-inject-no-binding-test".to_string(),
+            transcript_path: "t".to_string(),
+            cwd: tmp.path().to_string_lossy().into_owned(),
+            permission_mode: None,
+            hook_event_name: "UserPromptSubmit".to_string(),
+            tool_name: None,
+            tool_input: None,
+            tool_response: None,
+            tool_use_id: None,
+            source: None,
+        };
+
+        let result = resolve_and_inject("UserPromptSubmit", &hook_event).await;
+        assert!(result.is_ok());
     }
 }

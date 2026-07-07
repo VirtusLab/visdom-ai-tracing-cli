@@ -56,6 +56,12 @@ enum Cli {
     /// `tracevault init --global` — not intended to be run manually.
     #[command(name = "session-start", hide = true)]
     SessionStart,
+    /// UserPromptSubmit hook: reinforces the bound repo's policies as
+    /// additionalContext when the effective repo has changed since the last
+    /// injection. Installed into .claude/settings.json by
+    /// `tracevault init --global` — not intended to be run manually.
+    #[command(name = "user-prompt", hide = true)]
+    UserPrompt,
     /// Check session policies before pushing
     Check,
     /// Sync repo remote URL with the TraceVault server
@@ -296,6 +302,15 @@ async fn main() {
             // session from starting.
             if let Err(e) = commands::session_start::run().await {
                 eprintln!("SessionStart error: {e}");
+            }
+        }
+        Cli::UserPrompt => {
+            // Same reasoning as `SessionStart`: this hook always prints a
+            // valid HookOutput JSON payload before returning; an Err here
+            // must never turn into a non-zero exit, which would block the
+            // prompt from being submitted.
+            if let Err(e) = commands::user_prompt::run().await {
+                eprintln!("UserPromptSubmit error: {e}");
             }
         }
         Cli::Check => {

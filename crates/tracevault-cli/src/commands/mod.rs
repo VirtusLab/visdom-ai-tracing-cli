@@ -9,12 +9,13 @@ pub mod logout;
 pub mod proxy;
 pub mod repo;
 // Shared building blocks for the SessionStart/UserPromptSubmit hook commands
-// (sub-plan C). UserPromptSubmit is not wired up yet (later task).
+// (sub-plan C).
 pub mod session_hooks;
 pub mod session_start;
 pub mod stats;
 pub mod status;
 pub mod stream;
 pub mod sync;
+pub mod user_prompt;
 pub mod verification_phase;
 pub mod verify;

@@ -21,9 +21,7 @@ use std::path::Path;
 
 use tracevault_protocol::hooks::parse_hook_event;
 
-use crate::api_client::{resolve_credentials, ApiClient};
-use crate::commands::session_hooks::{cap_context, should_inject, HookOutput};
-use crate::resolution::{binding_from_config, effective_binding, ResolveInputs};
+use crate::commands::session_hooks::{resolve_and_inject, HookOutput};
 
 /// Append `export TRACEVAULT_SESSION_ID=<session_id>` to the Claude Code
 /// session env file. Pure I/O helper factored out so it can be unit-tested
@@ -60,65 +58,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _ = write_session_env(Path::new(&env_file), &hook_event.session_id);
     }
 
-    // 3. Resolve the effective repo binding via the same workspace-mode
-    // precedence chain the stream hook uses.
-    let hook_cwd = Path::new(&hook_event.cwd);
-    let project_root = crate::paths::resolve_project_root(hook_cwd).root;
-    let session = crate::session_state::load(&hook_event.session_id);
-    let worktree = crate::paths::worktree_toplevel(hook_cwd);
-    let bound =
-        crate::config::TracevaultConfig::load(&project_root).and_then(|c| binding_from_config(&c));
-    let binding = effective_binding(ResolveInputs {
-        repo_flag: None,
-        session: &session,
-        worktree_path: Some(&worktree),
-        bound,
-    })
-    .map(|(b, _)| b);
-
-    // 4. Inject policies, best-effort, only when a repo is bound.
-    if !should_inject(
-        "SessionStart",
-        binding.as_ref().map(|b| b.repo_id.as_str()),
-        session.last_injected_repo.as_deref(),
-    ) {
-        return print_allow();
-    }
-    // `should_inject` returning true for "SessionStart" requires
-    // `effective_repo_id.is_some()`, so `binding` is always `Some` here.
-    let Some(binding) = binding else {
-        return print_allow();
-    };
-
-    let Ok(repo_uuid) = binding.repo_id.parse::<uuid::Uuid>() else {
-        // A corrupted/hand-edited session-state or config file could contain a
-        // non-UUID repo_id — skip injection rather than fail the hook.
-        return print_allow();
-    };
-
-    let (server_url, token) = resolve_credentials(&project_root);
-    let Some(server_url) = server_url else {
-        return print_allow();
-    };
-    let client = ApiClient::new(&server_url, token.as_deref());
-
-    match client
-        .get_agent_instructions(&binding.org_slug, &repo_uuid)
-        .await
-    {
-        Ok(resp) => {
-            let output = HookOutput::with_context("SessionStart", cap_context(resp.content));
-            println!("{}", serde_json::to_string(&output)?);
-            // Best-effort: persist the last-injected repo so UserPromptSubmit
-            // (a later task) can avoid redundant re-injection. A save failure
-            // must not turn this into a hook failure.
-            let mut session = session;
-            session.last_injected_repo = Some(binding.repo_id.clone());
-            let _ = crate::session_state::save(&hook_event.session_id, &session);
-            Ok(())
-        }
-        Err(_) => print_allow(),
-    }
+    // 3. Resolve the effective repo binding and, if warranted, inject its
+    // policies. Shared with `user-prompt` (sub-plan C's UserPromptSubmit hook).
+    resolve_and_inject("SessionStart", &hook_event).await
 }
 
 #[cfg(test)]
