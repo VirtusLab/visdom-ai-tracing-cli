@@ -142,10 +142,16 @@ async fn switch(
             binding.repo_id
         )
     })?;
-    let policies = client
+    // The binding was already saved above — that's the primary effect of
+    // `switch`. A failure to fetch policies afterward shouldn't make the
+    // whole command report as an error.
+    match client
         .get_agent_instructions(&binding.org_slug, &repo_uuid)
-        .await?;
-    println!("{}", policies.content);
+        .await
+    {
+        Ok(policies) => println!("{}", policies.content),
+        Err(e) => eprintln!("warning: bound, but could not fetch policies: {e}"),
+    }
     Ok(())
 }
 

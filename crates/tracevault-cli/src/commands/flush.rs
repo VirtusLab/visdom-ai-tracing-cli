@@ -1,14 +1,19 @@
 use crate::api_client::{resolve_credentials, ApiClient};
-use crate::config::TracevaultConfig;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use tracevault_protocol::streaming::StreamEventRequest;
 
+/// Extract the repo id from a per-repo pending queue filename
+/// (`pending-<repo_id>.jsonl`). Returns None for anything else (e.g. a legacy
+/// `pending.jsonl`).
+fn repo_id_from_pending_filename(name: &str) -> Option<&str> {
+    name.strip_prefix("pending-")?.strip_suffix(".jsonl")
+}
+
 pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let config = TracevaultConfig::load(project_root).ok_or("config not found")?;
-    let org_slug = config.org_slug.ok_or("org_slug not configured")?;
-    let repo_id = config.repo_id.ok_or("repo_id not configured")?;
+    let org_slug = crate::resolution::org_slug_for(project_root)
+        .ok_or("no org configured (set TRACEVAULT_ORG_SLUG, log in, or run in a bound repo)")?;
 
     let (server_url, token) = resolve_credentials(project_root);
     let server_url = server_url.ok_or("server_url not configured")?;
@@ -23,63 +28,74 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
     let mut total_sent = 0u64;
     let mut total_failed = 0u64;
 
-    let entries: Vec<_> = fs::read_dir(&sessions_dir)?
+    let session_entries: Vec<_> = fs::read_dir(&sessions_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .collect();
 
-    for entry in entries {
-        let pending_path = entry.path().join("pending.jsonl");
-        if !pending_path.exists() {
-            continue;
-        }
+    for session_entry in session_entries {
+        // Collect (path, repo_id) pairs for every per-repo pending queue in
+        // this session directory before draining, to keep the borrow/async
+        // loop below simple.
+        let pending_queues: Vec<(std::path::PathBuf, String)> = fs::read_dir(session_entry.path())?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let path = e.path();
+                let name = path.file_name()?.to_str()?.to_string();
+                let repo_id = repo_id_from_pending_filename(&name)?.to_string();
+                Some((path, repo_id))
+            })
+            .collect();
 
-        let events = drain_pending(&pending_path)?;
-        if events.is_empty() {
-            continue;
-        }
+        for (pending_path, repo_id) in pending_queues {
+            let events = drain_pending(&pending_path)?;
+            if events.is_empty() {
+                continue;
+            }
 
-        let event_total = events.len();
-        let mut failed_events: Vec<StreamEventRequest> = Vec::new();
+            let event_total = events.len();
+            let mut failed_events: Vec<StreamEventRequest> = Vec::new();
 
-        for (i, mut event) in events.into_iter().enumerate() {
-            eprint!(
-                "\r  Session {} — event {}/{} ...",
-                &event.session_id[..8],
-                i + 1,
-                event_total
-            );
-            event.truncate_large_fields();
-            match client.stream_event(&org_slug, &repo_id, &event).await {
-                Ok(_) => {
-                    total_sent += 1;
-                }
-                Err(e) => {
-                    eprintln!();
-                    let err_str = e.to_string();
-                    if err_str.contains("413") {
-                        // Payload too large even after truncation — drop it.
-                        eprintln!(
-                            "  Warning: dropped event (session {}) — still too large after truncation",
-                            event.session_id
-                        );
-                        total_failed += 1;
-                    } else {
-                        eprintln!(
-                            "  Warning: failed to send event (session {}): {e}",
-                            event.session_id
-                        );
-                        failed_events.push(event);
-                        total_failed += 1;
+            for (i, mut event) in events.into_iter().enumerate() {
+                eprint!(
+                    "\r  Session {} — event {}/{} ...",
+                    &event.session_id[..8],
+                    i + 1,
+                    event_total
+                );
+                event.truncate_large_fields();
+                match client.stream_event(&org_slug, &repo_id, &event).await {
+                    Ok(_) => {
+                        total_sent += 1;
+                    }
+                    Err(e) => {
+                        eprintln!();
+                        let err_str = e.to_string();
+                        if err_str.contains("413") {
+                            // Payload too large even after truncation — drop it.
+                            eprintln!(
+                                "  Warning: dropped event (session {}) — still too large after truncation",
+                                event.session_id
+                            );
+                            total_failed += 1;
+                        } else {
+                            eprintln!(
+                                "  Warning: failed to send event (session {}): {e}",
+                                event.session_id
+                            );
+                            failed_events.push(event);
+                            total_failed += 1;
+                        }
                     }
                 }
             }
-        }
-        eprintln!();
+            eprintln!();
 
-        // Re-enqueue transiently failed events (not 413s)
-        if !failed_events.is_empty() {
-            append_pending(&pending_path, &failed_events)?;
+            // Re-enqueue transiently failed events (not 413s) to the SAME
+            // per-repo file.
+            if !failed_events.is_empty() {
+                append_pending(&pending_path, &failed_events)?;
+            }
         }
     }
 
@@ -137,9 +153,29 @@ fn append_pending(
 
 #[cfg(test)]
 mod tests {
+    use super::repo_id_from_pending_filename;
     use crate::paths::resolve_project_root;
     use crate::test_helpers::{add_worktree, init_git_repo};
     use std::fs;
+
+    #[test]
+    fn repo_id_from_pending_filename_extracts_id() {
+        assert_eq!(
+            repo_id_from_pending_filename("pending-abc.jsonl"),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn repo_id_from_pending_filename_none_for_legacy_name() {
+        assert_eq!(repo_id_from_pending_filename("pending.jsonl"), None);
+    }
+
+    #[test]
+    fn repo_id_from_pending_filename_none_for_unrelated_name() {
+        assert_eq!(repo_id_from_pending_filename("events.jsonl"), None);
+        assert_eq!(repo_id_from_pending_filename("pending-abc.txt"), None);
+    }
 
     /// From a sibling worktree the resolved project root must point at the
     /// PRIMARY checkout, so `flush` looks for sessions under

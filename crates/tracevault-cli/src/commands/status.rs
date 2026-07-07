@@ -408,6 +408,31 @@ async fn server_repo_checks(
 
 // --- Sessions ---
 
+/// Sum the non-empty lines across every per-repo (and legacy) pending queue
+/// file in a session directory: `pending.jsonl` and `pending-<repo_id>.jsonl`.
+fn count_pending_events(session_dir: &Path) -> usize {
+    let Ok(read) = fs::read_dir(session_dir) else {
+        return 0;
+    };
+
+    read.flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map(|name| name.starts_with("pending") && name.ends_with(".jsonl"))
+                .unwrap_or(false)
+        })
+        .map(|entry| {
+            fs::read_to_string(entry.path())
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count()
+        })
+        .sum()
+}
+
 fn session_checks(project_root: &Path) -> Vec<Check> {
     let sessions_dir = project_root.join(".tracevault/sessions");
     if !sessions_dir.exists() {
@@ -427,17 +452,10 @@ fn session_checks(project_root: &Path) -> Vec<Check> {
                 continue;
             }
             total_sessions += 1;
-            let pending_path = entry.path().join("pending.jsonl");
-            if pending_path.exists() {
-                let count = fs::read_to_string(&pending_path)
-                    .unwrap_or_default()
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .count();
-                if count > 0 {
-                    sessions_with_pending += 1;
-                    pending_event_count += count;
-                }
+            let count = count_pending_events(&entry.path());
+            if count > 0 {
+                sessions_with_pending += 1;
+                pending_event_count += count;
             }
         }
     }
@@ -620,5 +638,28 @@ mod tests {
         assert!(checks
             .iter()
             .any(|c| c.level == Level::Error && c.label == "TraceVault initialized"));
+    }
+
+    #[test]
+    fn count_pending_events_sums_across_per_repo_queues() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pending-a.jsonl"), "line1\nline2\n").unwrap();
+        std::fs::write(dir.path().join("pending-b.jsonl"), "line1\n").unwrap();
+        std::fs::write(dir.path().join("pending-c.jsonl"), "").unwrap();
+        assert_eq!(count_pending_events(dir.path()), 3);
+    }
+
+    #[test]
+    fn count_pending_events_ignores_unrelated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pending-a.jsonl"), "line1\n").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "line1\nline2\n").unwrap();
+        assert_eq!(count_pending_events(dir.path()), 1);
+    }
+
+    #[test]
+    fn count_pending_events_zero_for_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(count_pending_events(dir.path()), 0);
     }
 }
