@@ -2,7 +2,6 @@
 //! session is currently bound to. Persisted outside any repo so it survives a
 //! session that changes directories. Set by `tracevault repo switch`
 //! (sub-plan B); read by `stream`/commands as a resolution fallback.
-#![allow(dead_code)] // workspace-mode foundation; wired into commands in a follow-up sub-plan
 
 use std::collections::HashMap;
 use std::path::PathBuf;

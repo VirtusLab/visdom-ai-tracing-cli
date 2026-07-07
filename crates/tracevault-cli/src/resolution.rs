@@ -3,7 +3,6 @@
 //! effective binding for an event/command from the precedence chain
 //! (`--repo` flag → subagent worktree override → session active → bound
 //! `.tracevault/config.toml`). See design §2/§3/§4.
-#![allow(dead_code)] // workspace-mode foundation; wired into commands in a follow-up sub-plan
 
 use std::path::Path;
 
