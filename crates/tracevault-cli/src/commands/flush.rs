@@ -19,10 +19,8 @@ pub(crate) fn repo_id_from_pending_filename(name: &str) -> Option<&str> {
 fn pending_queues_in(
     session_dir: &Path,
     bound_repo_id: Option<&str>,
-) -> Vec<(std::path::PathBuf, String)> {
-    let mut pending_queues: Vec<(std::path::PathBuf, String)> = fs::read_dir(session_dir)
-        .into_iter()
-        .flatten()
+) -> std::io::Result<Vec<(std::path::PathBuf, String)>> {
+    let mut pending_queues: Vec<(std::path::PathBuf, String)> = fs::read_dir(session_dir)?
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let path = e.path();
@@ -44,7 +42,7 @@ fn pending_queues_in(
         }
     }
 
-    pending_queues
+    Ok(pending_queues)
 }
 
 /// The progress line uses a short prefix of the session id for display; guards
@@ -85,7 +83,7 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
         // Collect (path, repo_id) pairs for every pending queue in this
         // session directory before draining, to keep the borrow/async loop
         // below simple.
-        let pending_queues = pending_queues_in(&session_entry.path(), bound_repo_id.as_deref());
+        let pending_queues = pending_queues_in(&session_entry.path(), bound_repo_id.as_deref())?;
 
         for (pending_path, repo_id) in pending_queues {
             let events = drain_pending(&pending_path)?;
@@ -278,7 +276,7 @@ mod tests {
     #[test]
     fn pending_queues_in_with_bound_repo_includes_legacy() {
         let dir = setup_session_dir_with_pending_files();
-        let mut got = pending_queues_in(dir.path(), Some("cfg"));
+        let mut got = pending_queues_in(dir.path(), Some("cfg")).unwrap();
         got.sort_by(|a, b| a.1.cmp(&b.1));
 
         let repo_ids: Vec<&str> = got.iter().map(|(_, id)| id.as_str()).collect();
@@ -291,7 +289,7 @@ mod tests {
     #[test]
     fn pending_queues_in_without_bound_repo_skips_legacy() {
         let dir = setup_session_dir_with_pending_files();
-        let mut got = pending_queues_in(dir.path(), None);
+        let mut got = pending_queues_in(dir.path(), None).unwrap();
         got.sort_by(|a, b| a.1.cmp(&b.1));
 
         let repo_ids: Vec<&str> = got.iter().map(|(_, id)| id.as_str()).collect();
@@ -301,7 +299,7 @@ mod tests {
     #[test]
     fn pending_queues_in_ignores_unrelated_and_malformed_names() {
         let dir = setup_session_dir_with_pending_files();
-        let got = pending_queues_in(dir.path(), Some("cfg"));
+        let got = pending_queues_in(dir.path(), Some("cfg")).unwrap();
 
         assert!(!got.iter().any(|(p, _)| p.ends_with("notes.txt")));
         assert!(!got.iter().any(|(p, _)| p.ends_with("pending-.jsonl")));
