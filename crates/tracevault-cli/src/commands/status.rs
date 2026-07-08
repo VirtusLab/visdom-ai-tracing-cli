@@ -371,6 +371,97 @@ fn claude_hook_check_in(repo_settings: &Path, global_settings: &Path) -> Check {
     )
 }
 
+/// Severity of the "TraceVault initialized" check. A per-repo `.tracevault/`
+/// present is always Ok. Absent is EXPECTED (Skip) when the user has a global
+/// install or an active workspace binding; only a truly-unconfigured setup
+/// (none of the three) is an Error.
+#[allow(dead_code)] // wired into run_status in the status-wiring task
+fn tracevault_init_check(tv_dir_present: bool, has_global: bool, has_binding: bool) -> Check {
+    if tv_dir_present {
+        Check::ok("TraceVault initialized", ".tracevault/ present")
+    } else if has_global || has_binding {
+        Check::skip(
+            "TraceVault initialized",
+            "no per-repo .tracevault/ — global/workspace mode",
+        )
+    } else {
+        Check::err(
+            "TraceVault initialized",
+            "not set up: run `tracevault init` (per-repo) or `tracevault init --global`",
+        )
+    }
+}
+
+/// The id of the most-recently-modified `<id>.toml` session file in
+/// `sessions_dir` (ignores `.toml.tmp` and empty names). `None` if the dir is
+/// missing/empty.
+#[allow(dead_code)] // wired into run_status in the status-wiring task
+fn latest_session_id_in(sessions_dir: &Path) -> Option<String> {
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for entry in fs::read_dir(sessions_dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_str().unwrap_or("");
+        let Some(id) = name.strip_suffix(".toml") else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if newest.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+            newest = Some((mtime, id.to_string()));
+        }
+    }
+    newest.map(|(_, id)| id)
+}
+
+/// Resolve the workspace binding for `status`. Session id: the explicit arg,
+/// else the most-recently-modified session in `sessions_dir`. Returns the
+/// Check to display AND the resolved binding (so the caller can reuse it as
+/// the `has_binding` mode signal).
+#[allow(dead_code)] // wired into run_status in the status-wiring task
+fn workspace_binding_check_in(
+    sessions_dir: &Path,
+    explicit_session_id: Option<&str>,
+) -> (Check, Option<crate::session_state::RepoBinding>) {
+    let (id, scanned) = match explicit_session_id {
+        Some(id) => (Some(id.to_string()), false),
+        None => (latest_session_id_in(sessions_dir), true),
+    };
+    let Some(id) = id else {
+        return (
+            Check::skip("Workspace binding", "no workspace session bindings found"),
+            None,
+        );
+    };
+    let state = crate::session_state::load_from(sessions_dir, &id);
+    match state.active {
+        Some(b) => {
+            let detail = if scanned {
+                format!(
+                    "repo {} (org {}) via repo switch [latest session {id}]",
+                    b.repo_id, b.org_slug
+                )
+            } else {
+                format!(
+                    "repo {} (org {}) via repo switch (session {id})",
+                    b.repo_id, b.org_slug
+                )
+            };
+            (Check::ok("Workspace binding", detail), Some(b))
+        }
+        None => (
+            Check::warn(
+                "Workspace binding",
+                format!("session {id} has no active binding — run `tracevault repo switch …`"),
+            ),
+            None,
+        ),
+    }
+}
+
 // --- Server repo ---
 
 async fn server_repo_checks(
@@ -948,5 +1039,107 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = claude_hook_check_in(&dir.path().join("a.json"), &dir.path().join("b.json"));
         assert_eq!(c.level, Level::Warn);
+    }
+
+    #[test]
+    fn tracevault_init_check_severity_matrix() {
+        assert_eq!(tracevault_init_check(true, false, false).level, Level::Ok); // present → Ok
+        assert_eq!(tracevault_init_check(false, true, false).level, Level::Skip); // absent + global → Skip
+        assert_eq!(tracevault_init_check(false, false, true).level, Level::Skip); // absent + binding → Skip
+        assert_eq!(tracevault_init_check(false, true, true).level, Level::Skip);
+        assert_eq!(
+            tracevault_init_check(false, false, false).level,
+            Level::Error
+        ); // nothing → Error
+    }
+
+    #[test]
+    fn workspace_binding_explicit_id_with_binding_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = crate::session_state::SessionState {
+            active: Some(crate::session_state::RepoBinding {
+                org_slug: "acme".into(),
+                repo_id: "11111111-1111-4111-8111-111111111111".into(),
+                git_url: None,
+                updated_at: "t".into(),
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.path().join("sess-9.toml"),
+            toml::to_string(&st).unwrap(),
+        )
+        .unwrap();
+        let (check, binding) = workspace_binding_check_in(dir.path(), Some("sess-9"));
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.detail.contains("acme"), "detail: {}", check.detail);
+        assert_eq!(
+            binding.unwrap().repo_id,
+            "11111111-1111-4111-8111-111111111111"
+        );
+    }
+
+    #[test]
+    fn workspace_binding_explicit_id_without_binding_is_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("sess-empty.toml"),
+            toml::to_string(&crate::session_state::SessionState::default()).unwrap(),
+        )
+        .unwrap();
+        let (check, binding) = workspace_binding_check_in(dir.path(), Some("sess-empty"));
+        assert_eq!(check.level, Level::Warn);
+        assert!(binding.is_none());
+    }
+
+    #[test]
+    fn workspace_binding_no_id_empty_dir_is_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (check, binding) = workspace_binding_check_in(dir.path(), None);
+        assert_eq!(check.level, Level::Skip);
+        assert!(binding.is_none());
+    }
+
+    #[test]
+    fn workspace_binding_no_id_scans_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two sessions; the one written LAST should be picked by the mtime scan.
+        let older = crate::session_state::SessionState {
+            active: Some(crate::session_state::RepoBinding {
+                org_slug: "o1".into(),
+                repo_id: "aaaaaaaa-1111-4111-8111-111111111111".into(),
+                git_url: None,
+                updated_at: "t".into(),
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.path().join("old.toml"),
+            toml::to_string(&older).unwrap(),
+        )
+        .unwrap();
+        // Ensure a distinct, later mtime for the second file.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let newer = crate::session_state::SessionState {
+            active: Some(crate::session_state::RepoBinding {
+                org_slug: "o2".into(),
+                repo_id: "bbbbbbbb-2222-4222-8222-222222222222".into(),
+                git_url: None,
+                updated_at: "t".into(),
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.path().join("new.toml"),
+            toml::to_string(&newer).unwrap(),
+        )
+        .unwrap();
+        let (check, binding) = workspace_binding_check_in(dir.path(), None);
+        assert_eq!(check.level, Level::Ok);
+        assert_eq!(
+            binding.unwrap().org_slug,
+            "o2",
+            "must pick the most-recently-modified session"
+        );
     }
 }
