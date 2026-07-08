@@ -89,6 +89,35 @@ async fn resolve_switch_binding(
         })
 }
 
+/// Resolve a registered repo by its NAME (no git checkout) to a binding.
+/// Exact, case-sensitive match on `repos.name`; on no match, errors listing
+/// the available names so a typo self-corrects.
+#[allow(dead_code)] // wired into `switch` in the next task
+async fn resolve_name_to_binding(
+    name: &str,
+    org_slug: &str,
+    client: &ApiClient,
+) -> Result<RepoBinding, Box<dyn std::error::Error>> {
+    let repos = client.list_repos(org_slug).await?;
+    match repos.iter().find(|r| r.name == name) {
+        Some(repo) => Ok(RepoBinding {
+            org_slug: org_slug.to_string(),
+            repo_id: repo.id.to_string(),
+            git_url: repo.github_url.clone(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }),
+        None => {
+            let mut names: Vec<&str> = repos.iter().map(|r| r.name.as_str()).collect();
+            names.sort_unstable();
+            Err(format!(
+                "no repo named '{name}' in org {org_slug} (available: {})",
+                names.join(", ")
+            )
+            .into())
+        }
+    }
+}
+
 /// Apply a switch to session state (session-level active binding). Pure.
 fn apply_switch(state: &mut SessionState, binding: RepoBinding) {
     state.active = Some(binding);
@@ -427,6 +456,44 @@ mod tests {
         assert!(
             err.to_string().contains("not registered"),
             "unexpected error message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_name_to_binding_finds_by_name() {
+        let body = r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"visdom-orchestrator","github_url":null,"clone_status":null},{"id":"22222222-2222-4222-8222-222222222222","name":"visdom-web","github_url":"https://github.com/o/web.git","clone_status":null}]"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let base = spawn_once(Box::leak(resp.into_boxed_str()));
+        let client = ApiClient::new(&base, Some("tok"));
+        let b = resolve_name_to_binding("visdom-orchestrator", "acme", &client)
+            .await
+            .expect("expected Ok binding");
+        assert_eq!(b.repo_id, "11111111-1111-4111-8111-111111111111");
+        assert_eq!(b.org_slug, "acme");
+    }
+
+    #[tokio::test]
+    async fn resolve_name_to_binding_errors_when_absent_listing_names() {
+        let body = r#"[{"id":"22222222-2222-4222-8222-222222222222","name":"visdom-web","github_url":null,"clone_status":null}]"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let base = spawn_once(Box::leak(resp.into_boxed_str()));
+        let client = ApiClient::new(&base, Some("tok"));
+        let err = resolve_name_to_binding("visdom-orch", "acme", &client)
+            .await
+            .expect_err("expected Err for missing name")
+            .to_string();
+        assert!(err.contains("no repo named"), "got: {err}");
+        assert!(
+            err.contains("visdom-web"),
+            "error should list available names, got: {err}"
         );
     }
 }
