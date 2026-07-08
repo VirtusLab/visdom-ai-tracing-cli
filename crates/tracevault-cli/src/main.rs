@@ -59,7 +59,8 @@ enum Cli {
     /// Show current session status
     Status {
         /// Session to inspect for the workspace binding; defaults to
-        /// $TRACEVAULT_SESSION_ID, else the most recent session.
+        /// $TRACEVAULT_SESSION_ID, else the most recent session that has a
+        /// workspace binding.
         #[arg(long)]
         session_id: Option<String>,
     },
@@ -332,7 +333,9 @@ async fn main() {
         Cli::Status { session_id } => {
             let cwd = env::current_dir().expect("Cannot determine current directory");
             let project_root = crate::paths::resolve_project_root(&cwd).root;
-            let effective = session_id.or_else(|| {
+            // Filter an empty `--session-id ""` the same way as the env var, so
+            // it falls back to env/scan instead of forcing a misleading warning.
+            let effective = session_id.filter(|s| !s.is_empty()).or_else(|| {
                 std::env::var("TRACEVAULT_SESSION_ID")
                     .ok()
                     .filter(|s| !s.is_empty())

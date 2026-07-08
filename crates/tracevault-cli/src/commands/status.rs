@@ -277,10 +277,15 @@ fn project_checks(
             "post-commit",
             "# tracevault:post-commit",
         ));
-    } else {
+    } else if has_global || has_binding {
         out.push(Check::skip(
             "Git hooks",
             "not used in global/workspace mode",
+        ));
+    } else {
+        out.push(Check::skip(
+            "Git hooks",
+            "not installed (no .tracevault/ — run `tracevault init`)",
         ));
     }
 
@@ -318,39 +323,72 @@ fn settings_has_tracevault_hooks(contents: &str) -> bool {
         || contents.contains("tracevault user-prompt")
 }
 
+/// Whether a Claude `settings.json` wires tracevault hooks — distinguishing a
+/// genuinely-absent file from one that exists but can't be read, so an
+/// IO/permission error isn't silently reported as "not installed".
+enum SettingsHooks {
+    Present,
+    NoHooks,
+    Missing,
+    Unreadable(String),
+}
+
+fn read_settings_hooks(path: &Path) -> SettingsHooks {
+    match fs::read_to_string(path) {
+        Ok(s) if settings_has_tracevault_hooks(&s) => SettingsHooks::Present,
+        Ok(_) => SettingsHooks::NoHooks,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SettingsHooks::Missing,
+        Err(e) => SettingsHooks::Unreadable(e.to_string()),
+    }
+}
+
 /// Check a global `~/.claude/settings.json` for the `init --global` install.
-/// Absent / no tracevault hooks → Skip (a global install is optional).
+/// Absent / no tracevault hooks → Skip (a global install is optional); an
+/// existing-but-unreadable file → Warn (don't hide a permission/IO problem).
 fn global_hook_check_in(settings_path: &Path) -> Check {
-    match fs::read_to_string(settings_path) {
-        Ok(s) if settings_has_tracevault_hooks(&s) => Check::ok(
+    match read_settings_hooks(settings_path) {
+        SettingsHooks::Present => Check::ok(
             "Global install",
             "hooks installed in ~/.claude/settings.json",
         ),
-        Ok(_) => Check::skip(
+        SettingsHooks::NoHooks => Check::skip(
             "Global install",
             "~/.claude/settings.json has no tracevault hooks",
         ),
-        Err(_) => Check::skip("Global install", "no ~/.claude/settings.json"),
+        SettingsHooks::Missing => Check::skip("Global install", "no ~/.claude/settings.json"),
+        SettingsHooks::Unreadable(e) => Check::warn(
+            "Global install",
+            format!("cannot read ~/.claude/settings.json: {e}"),
+        ),
     }
 }
 
 /// Claude Code hooks may live per-repo (`<repo>/.claude/settings.json`) OR
 /// globally (`~/.claude/settings.json`, `init --global`). Ok if EITHER wires
-/// tracevault; Warn only if neither does.
+/// tracevault; an existing-but-unreadable settings file is surfaced as a Warn
+/// with the path (not a generic "not registered"); Warn if neither wires it.
 fn claude_hook_check_in(repo_settings: &Path, global_settings: &Path) -> Check {
-    let repo_has = fs::read_to_string(repo_settings)
-        .map(|s| settings_has_tracevault_hooks(&s))
-        .unwrap_or(false);
-    if repo_has {
+    let repo = read_settings_hooks(repo_settings);
+    if matches!(repo, SettingsHooks::Present) {
         return Check::ok("Claude Code hooks", "registered in .claude/settings.json");
     }
-    let global_has = fs::read_to_string(global_settings)
-        .map(|s| settings_has_tracevault_hooks(&s))
-        .unwrap_or(false);
-    if global_has {
+    let global = read_settings_hooks(global_settings);
+    if matches!(global, SettingsHooks::Present) {
         return Check::ok(
             "Claude Code hooks",
             "registered globally in ~/.claude/settings.json",
+        );
+    }
+    if let SettingsHooks::Unreadable(e) = &repo {
+        return Check::warn(
+            "Claude Code hooks",
+            format!("cannot read <repo>/.claude/settings.json: {e}"),
+        );
+    }
+    if let SettingsHooks::Unreadable(e) = &global {
+        return Check::warn(
+            "Claude Code hooks",
+            format!("cannot read ~/.claude/settings.json: {e}"),
         );
     }
     Check::warn(
@@ -379,9 +417,6 @@ fn tracevault_init_check(tv_dir_present: bool, has_global: bool, has_binding: bo
     }
 }
 
-/// The id of the most-recently-modified `<id>.toml` session file in
-/// `sessions_dir` (ignores `.toml.tmp` and empty names). `None` if the dir is
-/// missing/empty.
 /// The most-recently-modified session in `sessions_dir` that HAS an active
 /// binding, as `(session_id, binding)`. Scans ALL session files (newest first)
 /// rather than only the newest file, so a real binding isn't missed when the
@@ -859,6 +894,18 @@ mod tests {
         assert!(checks
             .iter()
             .any(|c| c.level == Level::Error && c.label == "TraceVault initialized"));
+        // The Git-hooks Skip must NOT claim "global/workspace mode" when the
+        // user is truly unconfigured (no global install, no binding).
+        let git_hooks = checks
+            .iter()
+            .find(|c| c.label == "Git hooks")
+            .expect("Git hooks check present");
+        assert_eq!(git_hooks.level, Level::Skip);
+        assert!(
+            !git_hooks.detail.contains("global/workspace mode"),
+            "unconfigured git-hooks detail must not claim global/workspace mode: {}",
+            git_hooks.detail
+        );
     }
 
     #[test]
@@ -1060,6 +1107,22 @@ mod tests {
         let empty = dir.path().join("empty.json");
         std::fs::write(&empty, "{}").unwrap();
         assert_eq!(global_hook_check_in(&empty).level, Level::Skip);
+    }
+
+    #[test]
+    fn global_hook_check_warns_when_unreadable() {
+        // A path that exists but isn't a readable file (a directory) yields a
+        // non-NotFound read error → Warn, not a false "no settings.json" Skip.
+        let dir = tempfile::tempdir().unwrap();
+        let as_dir = dir.path().join("settings.json");
+        std::fs::create_dir(&as_dir).unwrap();
+        let check = global_hook_check_in(&as_dir);
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("cannot read"),
+            "detail: {}",
+            check.detail
+        );
     }
 
     #[test]
