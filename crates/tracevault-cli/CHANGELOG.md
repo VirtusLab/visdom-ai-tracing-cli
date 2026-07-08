@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.21.0...v0.22.0) - 2026-07-08
+
+### Added
+
+- *(cli)* detached / user-level context ([#14](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/14))
+- *(cli)* repo switch --name binds by project name without a checkout ([#13](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/13))
+
+### Fixed
+
+- *(cli)* make tracevault status mode-aware (global install + repo switch binding) ([#16](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/16))
+
 ## [0.21.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.20.2...v0.21.0) - 2026-07-07
 
 ### Added
