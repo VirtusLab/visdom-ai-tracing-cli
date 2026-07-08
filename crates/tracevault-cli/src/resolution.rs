@@ -115,7 +115,8 @@ impl std::fmt::Display for BindingSource {
 }
 
 /// The binding that applies, and which tier produced it: `--path` flag →
-/// subagent worktree override → session active → bound config → none.
+/// subagent worktree override → session active → bound config → user
+/// default → none.
 pub fn effective_binding(inputs: ResolveInputs) -> Option<(RepoBinding, BindingSource)> {
     if let Some(b) = inputs.repo_flag {
         return Some((b, BindingSource::RepoFlag));

@@ -278,7 +278,7 @@ async fn switch(
         SwitchDest::UserDefault => {
             crate::user_default::save(&binding)?;
             println!(
-                "set user-level default repo {} (org {}); applies to new sessions without their own binding",
+                "set user-level default repo {} (org {}); applies to new sessions without their own binding (the current session, if any, is unchanged — omit --user to bind this session)",
                 binding.repo_id, binding.org_slug
             );
         }
