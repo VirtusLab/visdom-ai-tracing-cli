@@ -159,6 +159,7 @@ pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn st
         session: &session,
         worktree_path: Some(&worktree),
         bound,
+        user_default: None,
     })
     .map(|(b, _)| b);
 

@@ -81,6 +81,9 @@ pub struct ResolveInputs<'a> {
     pub session: &'a SessionState,
     pub worktree_path: Option<&'a str>,
     pub bound: Option<RepoBinding>,
+    /// Lowest-precedence, session-independent default (from `repo switch --user`
+    /// / a no-session switch). Applies when nothing more specific resolves.
+    pub user_default: Option<RepoBinding>,
 }
 
 /// Which precedence tier produced the [`effective_binding`] result.
@@ -94,6 +97,8 @@ pub enum BindingSource {
     SessionActive,
     /// A pinned `.tracevault/config.toml` (bound mode).
     Bound,
+    /// A session-independent user-level default (`repo switch --user`).
+    UserDefault,
 }
 
 impl std::fmt::Display for BindingSource {
@@ -103,6 +108,7 @@ impl std::fmt::Display for BindingSource {
             BindingSource::Subagent => "subagent worktree override",
             BindingSource::SessionActive => "session (repo switch)",
             BindingSource::Bound => "bound .tracevault/config.toml",
+            BindingSource::UserDefault => "user default (repo switch --user)",
         };
         f.write_str(label)
     }
@@ -122,7 +128,10 @@ pub fn effective_binding(inputs: ResolveInputs) -> Option<(RepoBinding, BindingS
     if let Some(b) = &inputs.session.active {
         return Some((b.clone(), BindingSource::SessionActive));
     }
-    inputs.bound.map(|b| (b, BindingSource::Bound))
+    if let Some(b) = inputs.bound {
+        return Some((b, BindingSource::Bound));
+    }
+    inputs.user_default.map(|b| (b, BindingSource::UserDefault))
 }
 
 /// A RepoBinding from a pinned `.tracevault/config.toml` (bound mode), if it has
@@ -165,51 +174,68 @@ mod tests {
             session: &session,
             worktree_path: Some("/wt/a"),
             bound: Some(binding("bound")),
+            user_default: Some(binding("userdef")),
         })
         .unwrap();
         assert_eq!(b.repo_id, "flag");
         assert_eq!(source, BindingSource::RepoFlag);
 
-        // 2. subagent override (for the worktree) wins over session active + bound.
+        // 2. subagent override wins over session active + bound + user default.
         let (b, source) = effective_binding(ResolveInputs {
             repo_flag: None,
             session: &session,
             worktree_path: Some("/wt/a"),
             bound: Some(binding("bound")),
+            user_default: Some(binding("userdef")),
         })
         .unwrap();
         assert_eq!(b.repo_id, "subagent");
         assert_eq!(source, BindingSource::Subagent);
 
-        // 3. session active wins over bound when no subagent override matches.
+        // 3. session active wins over bound + user default.
         let (b, source) = effective_binding(ResolveInputs {
             repo_flag: None,
             session: &session,
             worktree_path: Some("/wt/other"),
             bound: Some(binding("bound")),
+            user_default: Some(binding("userdef")),
         })
         .unwrap();
         assert_eq!(b.repo_id, "session");
         assert_eq!(source, BindingSource::SessionActive);
 
-        // 4. bound is last resort.
+        // 4. bound wins over user default.
         let empty = SessionState::default();
         let (b, source) = effective_binding(ResolveInputs {
             repo_flag: None,
             session: &empty,
             worktree_path: None,
             bound: Some(binding("bound")),
+            user_default: Some(binding("userdef")),
         })
         .unwrap();
         assert_eq!(b.repo_id, "bound");
         assert_eq!(source, BindingSource::Bound);
 
-        // 5. nothing → None.
+        // 5. user default is used when nothing more specific resolves.
+        let (b, source) = effective_binding(ResolveInputs {
+            repo_flag: None,
+            session: &empty,
+            worktree_path: None,
+            bound: None,
+            user_default: Some(binding("userdef")),
+        })
+        .unwrap();
+        assert_eq!(b.repo_id, "userdef");
+        assert_eq!(source, BindingSource::UserDefault);
+
+        // 6. nothing at all → None.
         let got = effective_binding(ResolveInputs {
             repo_flag: None,
             session: &empty,
             worktree_path: None,
             bound: None,
+            user_default: None,
         });
         assert!(got.is_none());
     }
@@ -228,6 +254,10 @@ mod tests {
         assert_eq!(
             BindingSource::Bound.to_string(),
             "bound .tracevault/config.toml"
+        );
+        assert_eq!(
+            BindingSource::UserDefault.to_string(),
+            "user default (repo switch --user)"
         );
     }
 

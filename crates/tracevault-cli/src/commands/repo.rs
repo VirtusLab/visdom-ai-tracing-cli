@@ -341,6 +341,7 @@ async fn status(
         session: &session,
         worktree_path: Some(&worktree),
         bound,
+        user_default: None,
     });
     println!(
         "{}",

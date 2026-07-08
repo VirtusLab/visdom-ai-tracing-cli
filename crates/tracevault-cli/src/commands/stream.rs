@@ -154,6 +154,7 @@ pub(crate) fn resolve_stream_binding(
         session,
         worktree_path: Some(worktree),
         bound,
+        user_default: None,
     })
     .map(|(b, _)| b)
 }
