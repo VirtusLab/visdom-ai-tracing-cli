@@ -154,11 +154,13 @@ pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn st
     let worktree = crate::paths::worktree_toplevel(hook_cwd);
     let bound =
         crate::config::TracevaultConfig::load(&project_root).and_then(|c| binding_from_config(&c));
+    let user_default = crate::user_default::load();
     let binding = effective_binding(ResolveInputs {
         repo_flag: None,
         session: &session,
         worktree_path: Some(&worktree),
         bound,
+        user_default,
     })
     .map(|(b, _)| b);
 

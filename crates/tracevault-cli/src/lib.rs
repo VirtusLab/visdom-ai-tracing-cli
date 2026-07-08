@@ -9,3 +9,4 @@ pub mod resolution;
 pub mod session_state;
 #[cfg(test)]
 pub(crate) mod test_helpers;
+pub mod user_default;

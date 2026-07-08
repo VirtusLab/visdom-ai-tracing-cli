@@ -148,12 +148,14 @@ pub(crate) fn resolve_stream_binding(
     session: &crate::session_state::SessionState,
     worktree: &str,
     bound: Option<crate::session_state::RepoBinding>,
+    user_default: Option<crate::session_state::RepoBinding>,
 ) -> Option<crate::session_state::RepoBinding> {
     crate::resolution::effective_binding(crate::resolution::ResolveInputs {
         repo_flag: None,
         session,
         worktree_path: Some(worktree),
         bound,
+        user_default,
     })
     .map(|(b, _)| b)
 }
@@ -319,7 +321,8 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
         .ok()
         .and_then(|opt| opt.as_ref())
         .and_then(crate::resolution::binding_from_config);
-    let binding = resolve_stream_binding(&session, &worktree_top, bound);
+    let user_default = crate::user_default::load();
+    let binding = resolve_stream_binding(&session, &worktree_top, bound, user_default);
     // Graceful no-op, exactly like the hook's normal success path. Do NOT
     // error: a failing hook would block the tool.
     let no_op_allow = || -> Result<(), Box<dyn std::error::Error>> {
@@ -678,7 +681,7 @@ mod tests {
             subagents: HashMap::new(),
             ..Default::default()
         };
-        let got = resolve_stream_binding(&session, "/wt/top", None);
+        let got = resolve_stream_binding(&session, "/wt/top", None, None);
         assert_eq!(got.unwrap().repo_id, "session-repo");
     }
 
@@ -687,7 +690,7 @@ mod tests {
     #[test]
     fn resolve_stream_binding_falls_back_to_bound_config() {
         let session = SessionState::default();
-        let got = resolve_stream_binding(&session, "/wt/top", Some(binding("bound-repo")));
+        let got = resolve_stream_binding(&session, "/wt/top", Some(binding("bound-repo")), None);
         assert_eq!(got.unwrap().repo_id, "bound-repo");
     }
 
@@ -696,7 +699,7 @@ mod tests {
     #[test]
     fn resolve_stream_binding_none_when_nothing_resolves() {
         let session = SessionState::default();
-        let got = resolve_stream_binding(&session, "/wt/top", None);
+        let got = resolve_stream_binding(&session, "/wt/top", None, None);
         assert!(got.is_none());
     }
 
@@ -709,8 +712,32 @@ mod tests {
             subagents: HashMap::from([("/wt/x".to_string(), binding("subagent-repo"))]),
             ..Default::default()
         };
-        let got = resolve_stream_binding(&session, "/wt/x", Some(binding("bound-repo")));
+        let got = resolve_stream_binding(&session, "/wt/x", Some(binding("bound-repo")), None);
         assert_eq!(got.unwrap().repo_id, "subagent-repo");
+    }
+
+    /// Workspace mode: no bound config, but a user-level default is set (e.g.
+    /// via `tracevault repo switch --user`) — the stream event attributes to
+    /// that repo when nothing more specific resolves.
+    #[test]
+    fn resolve_stream_binding_falls_back_to_user_default() {
+        let session = SessionState::default();
+        let got = resolve_stream_binding(&session, "/wt/x", None, Some(binding("userdef")));
+        assert_eq!(got.unwrap().repo_id, "userdef");
+    }
+
+    /// The user-level default is the LOWEST-precedence tier: a bound config
+    /// still wins over it.
+    #[test]
+    fn resolve_stream_binding_prefers_bound_over_user_default() {
+        let session = SessionState::default();
+        let got = resolve_stream_binding(
+            &session,
+            "/wt/x",
+            Some(binding("bound")),
+            Some(binding("userdef")),
+        );
+        assert_eq!(got.unwrap().repo_id, "bound");
     }
 
     // ── binding_repo_id_is_valid: hook-attribution UUID guard ────────────────

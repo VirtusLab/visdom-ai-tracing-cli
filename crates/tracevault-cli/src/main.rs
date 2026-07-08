@@ -12,6 +12,7 @@ mod resolution;
 mod session_state;
 #[cfg(test)]
 mod test_helpers;
+mod user_default;
 
 use commands::repo::RepoCmd;
 
