@@ -182,8 +182,9 @@ async fn switch(
     project_root: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let id = resolve_session_id(session_id)?;
-    let org_slug = org_slug_for(project_root)
-        .ok_or("no org configured: set TRACEVAULT_ORG_SLUG, log in, or run inside a bound repo")?;
+    let org_slug = org_slug_for(project_root).ok_or(
+        "no org configured: set TRACEVAULT_ORG_SLUG, log in, or run inside a bound repo checkout",
+    )?;
 
     let (server_url, token) = resolve_credentials(project_root);
     let server_url = server_url.ok_or("not logged in / no server_url; run `tracevault login`")?;
@@ -282,7 +283,7 @@ fn format_status(binding: Option<(&RepoBinding, BindingSource)>) -> String {
             b.repo_id, b.org_slug
         ),
         None => {
-            "not bound to any repo (workspace mode; run `tracevault repo switch <path>`)".into()
+            "not bound to any repo (workspace mode; run `tracevault repo switch <path>|--name <project>`)".into()
         }
     }
 }
@@ -417,7 +418,7 @@ mod tests {
     fn format_status_none() {
         assert_eq!(
             format_status(None),
-            "not bound to any repo (workspace mode; run `tracevault repo switch <path>`)"
+            "not bound to any repo (workspace mode; run `tracevault repo switch <path>|--name <project>`)"
         );
     }
 
