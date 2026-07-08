@@ -184,6 +184,9 @@ fn switch_target<'a>(
     name: Option<&'a str>,
 ) -> Result<SwitchTarget<'a>, Box<dyn std::error::Error>> {
     match (path, name) {
+        (Some(p), None) if p.trim().is_empty() => {
+            Err("repo path (<path>) must not be empty".into())
+        }
         (Some(p), None) => Ok(SwitchTarget::Path(p)),
         (None, Some(n)) if n.trim().is_empty() => {
             Err("repo name (--name) must not be empty".into())
@@ -615,6 +618,14 @@ mod tests {
         assert!(switch_target(None, Some("")).is_err());
         assert!(switch_target(None, Some("   ")).is_err());
         let err = switch_target(None, Some(" ")).unwrap_err().to_string();
+        assert!(err.contains("must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn switch_target_rejects_empty_path() {
+        assert!(switch_target(Some(""), None).is_err());
+        assert!(switch_target(Some("   "), None).is_err());
+        let err = switch_target(Some(" "), None).unwrap_err().to_string();
         assert!(err.contains("must not be empty"), "got: {err}");
     }
 
