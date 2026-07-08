@@ -75,8 +75,6 @@ pub fn tv_config_root() -> PathBuf {
 pub fn user_config_path_in(config_root: &Path) -> PathBuf {
     config_root.join("config.toml")
 }
-// consumed in the detached-context resolution task
-#[allow(dead_code)]
 pub fn user_config_path() -> PathBuf {
     user_config_path_in(&tv_config_root())
 }

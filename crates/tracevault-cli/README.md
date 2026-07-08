@@ -37,6 +37,14 @@ across ALL Claude Code sessions without per-repo setup. Does not create `.tracev
 Adds two session-level hooks: `SessionStart` exports the session ID and injects the bound repo's
 policies, and `UserPromptSubmit` re-injects policies when the session's effective repo changes.
 
+**User-level context** — `tracevault init --global` also enables a user-level context at
+`~/.config/tracevault/context.json` (an empty context is created immediately) plus
+`~/.config/tracevault/config.toml` pointing at it. This is the base layer beneath any per-repo
+context — flow/labels/params set here apply across every repo, even before you `cd` into or
+register one. Populate it with `tracevault context set --user flow=… label=…` (works with no
+checkout). Pass `--no-user-context` to `init --global` to skip enabling it, or `--user-context
+<path>` to point it at a different file instead of the default location.
+
 **Commands**
 
 - `tracevault repo switch <path>` — bind the current session's tracing to the repo at `<path>`

@@ -33,26 +33,24 @@ enum Cli {
         /// .gitignore separately or you want to commit the Claude settings files.
         #[arg(long)]
         no_gitignore: bool,
-        /// Disable the cross-repo user-level context for this project
+        /// Disable the cross-repo user-level context for this project. Also
+        /// applies to `--global`, where it disables the user-level context
+        /// instead of the per-repo one.
         #[arg(long)]
         no_user_context: bool,
         /// Enable the user-level context and read it from this explicit path
-        /// (conflicts with --no-user-context).
+        /// (conflicts with --no-user-context). Also applies to `--global`,
+        /// where it sets the path the user-level context is read from.
         #[arg(long, conflicts_with = "no_user_context")]
         user_context: Option<String>,
         /// Install TraceVault hooks once into ~/.claude/ for ALL Claude Code
         /// sessions, instead of initializing the current repo. Does not
-        /// require git. Conflicts with the per-repo-only flags below, which
-        /// this mode has no use for.
+        /// require git. Also writes a user-level context config (honoring
+        /// --no-user-context / --user-context below). Conflicts with the
+        /// per-repo-only flags below, which this mode has no use for.
         #[arg(
             long,
-            conflicts_with_all = [
-                "server_url",
-                "claude_settings",
-                "no_gitignore",
-                "no_user_context",
-                "user_context"
-            ]
+            conflicts_with_all = ["server_url", "claude_settings", "no_gitignore"]
         )]
         global: bool,
     },
@@ -289,6 +287,28 @@ async fn main() {
                         eprintln!("Error: {e}");
                         std::process::exit(1);
                     }
+                }
+
+                let user_context = match (no_user_context, user_context) {
+                    (true, _) => config::UserContext::Toggle(false),
+                    (false, Some(p)) => config::UserContext::Path(p),
+                    (false, None) => config::UserContext::Toggle(true),
+                };
+                match commands::init::write_global_user_config_in(
+                    &config::tv_config_root(),
+                    user_context,
+                ) {
+                    Ok(()) => {
+                        println!(
+                            "User-level context written to {}",
+                            config::user_config_path().display()
+                        );
+                        println!(
+                            "Edit it with `tracevault context set --user …`; disable with \
+                             `tracevault init --global --no-user-context`."
+                        );
+                    }
+                    Err(e) => eprintln!("Warning: could not write user-level context config: {e}"),
                 }
                 return;
             }

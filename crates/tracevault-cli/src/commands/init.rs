@@ -1,5 +1,8 @@
 use crate::api_client::ApiClient;
-use crate::config::{TracevaultConfig, UserContext};
+use crate::config::{
+    default_user_context_path_in, user_config_path_in, TracevaultConfig, UserContext,
+};
+use crate::context::Context;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -685,6 +688,28 @@ pub fn install_global_hooks(claude_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Write the user-level `config.toml` (under `config_root`, i.e.
+/// `~/.config/tracevault/`) carrying `user_context`, and ensure the referenced
+/// context.json exists (empty) so `context set/show --user` are coherent
+/// immediately. Used by `init --global`.
+pub fn write_global_user_config_in(
+    config_root: &Path,
+    user_context: UserContext,
+) -> io::Result<()> {
+    fs::create_dir_all(config_root)?;
+    let config = TracevaultConfig {
+        user_context: Some(user_context),
+        ..TracevaultConfig::default()
+    };
+    fs::write(user_config_path_in(config_root), config.to_toml())?;
+    // Create the default context file only if absent — never clobber an existing one.
+    let ctx_path = default_user_context_path_in(config_root);
+    if !ctx_path.exists() {
+        Context::default().save_to(&ctx_path)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1052,5 +1077,33 @@ mod tests {
         // An absolute path joined to a base will replace the base,
         // so parent will not equal base.
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn write_global_user_config_enables_and_creates_context() {
+        let root = tempfile::tempdir().unwrap();
+        write_global_user_config_in(root.path(), crate::config::UserContext::Toggle(true)).unwrap();
+        let cfg = crate::config::try_load_user_config_in(root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg.user_context.unwrap().resolve(),
+            Some(crate::config::default_user_context_path())
+        );
+        assert!(crate::config::default_user_context_path_in(root.path()).exists());
+    }
+
+    #[test]
+    fn write_global_user_config_can_disable() {
+        let root = tempfile::tempdir().unwrap();
+        write_global_user_config_in(root.path(), crate::config::UserContext::Toggle(false))
+            .unwrap();
+        let cfg = crate::config::try_load_user_config_in(root.path())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            cfg.user_context,
+            Some(crate::config::UserContext::Toggle(false))
+        ));
     }
 }
