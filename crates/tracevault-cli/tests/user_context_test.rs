@@ -75,7 +75,8 @@ fn user_context_enabled_via_source_merges_under_repo_overrides() {
     let repo_dir = tmp.path().join("repo");
     init_project(&repo_dir);
 
-    // Before enabling, the config's user-context is off (compat default).
+    // Before enabling, the config's user-context is unset (compat default) —
+    // which means it inherits the user-level config rather than being forced off.
     let config = TracevaultConfig::load(&repo_dir).unwrap();
     assert!(
         config.user_context.is_none(),

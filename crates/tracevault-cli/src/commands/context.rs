@@ -76,26 +76,8 @@ fn user_context_path_in(
         .map_err(|e| format!("cannot resolve --user path: malformed user config.toml: {e}"))?;
     Ok(user_cfg
         .and_then(|c| c.user_context)
-        .map(|uc| user_context_default_path_relative_to(&uc, config_root))
+        .map(|uc| uc.path_in(config_root))
         .unwrap_or_else(|| crate::config::default_user_context_path_in(config_root)))
-}
-
-/// Like `UserContext::path()`, but resolves the "no explicit path" case
-/// relative to `config_root` rather than the real `tv_config_root()`.
-///
-/// `UserContext::path()` always falls back to the process-global
-/// `default_user_context_path()`, which is correct for a *repo*-level
-/// `user_context` (its unconfigured default IS the shared global file). It is
-/// wrong for the *user-level* `config.toml` itself: that file's own
-/// unconfigured default is the `context.json` colocated with it under
-/// `config_root` — which may be injected (e.g. under a tempdir in tests) and
-/// need not match the real `tv_config_root()`.
-fn user_context_default_path_relative_to(uc: &UserContext, config_root: &Path) -> PathBuf {
-    match uc {
-        UserContext::Path(p) => PathBuf::from(p),
-        UserContext::Full { path: Some(p), .. } => PathBuf::from(p),
-        _ => crate::config::default_user_context_path_in(config_root),
-    }
 }
 
 /// `tracevault context set` — build a fresh Context from flags, save it.

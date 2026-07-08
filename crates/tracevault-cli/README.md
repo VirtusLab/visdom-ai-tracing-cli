@@ -41,10 +41,9 @@ policies, and `UserPromptSubmit` re-injects policies when the session's effectiv
 `~/.config/tracevault/context.json` (an empty context is created immediately) plus
 `~/.config/tracevault/config.toml` pointing at it. This is the base layer beneath any per-repo
 context — flow/labels/params set here apply across every repo, even before you `cd` into or
-register one. Populate it with `tracevault context set --user --flow <id> --label <label> --param
-<key>=<value>` (works with no checkout). Pass `--no-user-context` to `init --global` to skip
-enabling it, or `--user-context
-<path>` to point it at a different file instead of the default location.
+register one. Populate it with `tracevault context set --user --flow <id> --label <label> --param <key>=<value>`
+(works with no checkout). Pass `--no-user-context` to `init --global` to skip enabling it, or
+`--user-context <path>` to point it at a different file instead of the default location.
 
 **Commands**
 

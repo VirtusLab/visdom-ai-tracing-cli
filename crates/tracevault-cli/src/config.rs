@@ -83,6 +83,10 @@ pub fn default_user_context_path_in(config_root: &Path) -> PathBuf {
 }
 
 /// `~/.config/tracevault/context.json`, alongside credentials.json.
+/// Public path accessor (used by tests / lib consumers as the canonical default);
+/// production resolves via `UserContext::path`/`path_in`, so the bin has no direct
+/// caller.
+#[allow(dead_code)]
 pub fn default_user_context_path() -> PathBuf {
     default_user_context_path_in(&tv_config_root())
 }
@@ -139,10 +143,20 @@ impl UserContext {
     /// The file this source points at (configured path or default), regardless
     /// of whether it is enabled. Used by `--user` editing.
     pub fn path(&self) -> PathBuf {
+        self.path_in(&tv_config_root())
+    }
+
+    /// Like [`path`](Self::path), but resolves the "no explicit path" default
+    /// relative to `config_root` instead of the process-global
+    /// [`tv_config_root`]. This matters for the user-level `config.toml` (and
+    /// for tests with an injected root): its unconfigured default is the
+    /// `context.json` colocated with it under `config_root`, which need not be
+    /// the real `tv_config_root()`.
+    pub fn path_in(&self, config_root: &Path) -> PathBuf {
         match self {
             UserContext::Path(p) => PathBuf::from(p),
             UserContext::Full { path: Some(p), .. } => PathBuf::from(p),
-            _ => default_user_context_path(),
+            _ => default_user_context_path_in(config_root),
         }
     }
 

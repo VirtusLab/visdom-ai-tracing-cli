@@ -1,7 +1,5 @@
 use crate::api_client::ApiClient;
-use crate::config::{
-    default_user_context_path_in, user_config_path_in, TracevaultConfig, UserContext,
-};
+use crate::config::{user_config_path_in, TracevaultConfig, UserContext};
 use crate::context::Context;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -689,23 +687,34 @@ pub fn install_global_hooks(claude_dir: &Path) -> io::Result<()> {
 }
 
 /// Write the user-level `config.toml` (under `config_root`, i.e.
-/// `~/.config/tracevault/`) carrying `user_context`, and ensure the referenced
-/// context.json exists (empty) so `context set/show --user` are coherent
-/// immediately. Used by `init --global`.
+/// `~/.config/tracevault/`) carrying `user_context`. When the layer is enabled,
+/// also seed the context file it actually references (empty) so
+/// `context set/show --user` are coherent immediately. A disabled layer
+/// (`--no-user-context`) writes no context file; a custom `--user-context
+/// <path>` seeds THAT file, not the default. Used by `init --global`.
 pub fn write_global_user_config_in(
     config_root: &Path,
     user_context: UserContext,
 ) -> io::Result<()> {
     fs::create_dir_all(config_root)?;
+    // Resolve enablement + the referenced path (rooted at `config_root`) before
+    // moving `user_context` into the config. `resolve()` decides enablement;
+    // `path_in` gives the file the config actually points at (default under
+    // `config_root`, or an explicit custom path).
+    let referenced = user_context
+        .resolve()
+        .map(|_| user_context.path_in(config_root));
     let config = TracevaultConfig {
         user_context: Some(user_context),
         ..TracevaultConfig::default()
     };
     fs::write(user_config_path_in(config_root), config.to_toml())?;
-    // Create the default context file only if absent — never clobber an existing one.
-    let ctx_path = default_user_context_path_in(config_root);
-    if !ctx_path.exists() {
-        Context::default().save_to(&ctx_path)?;
+    // Seed the referenced context file only when enabled, and only if absent —
+    // never clobber an existing one.
+    if let Some(ctx_path) = referenced {
+        if !ctx_path.exists() {
+            Context::default().save_to(&ctx_path)?;
+        }
     }
     Ok(())
 }
@@ -1105,5 +1114,26 @@ mod tests {
             cfg.user_context,
             Some(crate::config::UserContext::Toggle(false))
         ));
+        // A disabled layer must NOT seed a context file.
+        assert!(
+            !crate::config::default_user_context_path_in(root.path()).exists(),
+            "disabled user context must not create a context.json"
+        );
+    }
+
+    #[test]
+    fn write_global_user_config_custom_path_seeds_that_file_only() {
+        let root = tempfile::tempdir().unwrap();
+        let custom = root.path().join("custom-ctx.json");
+        write_global_user_config_in(
+            root.path(),
+            crate::config::UserContext::Path(custom.to_string_lossy().into_owned()),
+        )
+        .unwrap();
+        assert!(custom.exists(), "the configured custom path must be seeded");
+        assert!(
+            !crate::config::default_user_context_path_in(root.path()).exists(),
+            "the default context.json must NOT be created when a custom path is configured"
+        );
     }
 }
