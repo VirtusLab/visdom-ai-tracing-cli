@@ -382,8 +382,15 @@ fn tracevault_init_check(tv_dir_present: bool, has_global: bool, has_binding: bo
 /// The id of the most-recently-modified `<id>.toml` session file in
 /// `sessions_dir` (ignores `.toml.tmp` and empty names). `None` if the dir is
 /// missing/empty.
-fn latest_session_id_in(sessions_dir: &Path) -> Option<String> {
-    let mut newest: Option<(std::time::SystemTime, String)> = None;
+/// The most-recently-modified session in `sessions_dir` that HAS an active
+/// binding, as `(session_id, binding)`. Scans ALL session files (newest first)
+/// rather than only the newest file, so a real binding isn't missed when the
+/// most-recently-touched session happens to have none. `None` if no session
+/// carries an active binding.
+fn latest_active_binding_in(
+    sessions_dir: &Path,
+) -> Option<(String, crate::session_state::RepoBinding)> {
+    let mut sessions: Vec<(std::time::SystemTime, String)> = Vec::new();
     for entry in fs::read_dir(sessions_dir).ok()?.flatten() {
         let name = entry.file_name();
         let name = name.to_str().unwrap_or("");
@@ -396,54 +403,68 @@ fn latest_session_id_in(sessions_dir: &Path) -> Option<String> {
         let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
             continue;
         };
-        if newest.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
-            newest = Some((mtime, id.to_string()));
+        sessions.push((mtime, id.to_string()));
+    }
+    sessions.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime)); // newest first
+    for (_, id) in sessions {
+        if let Some(b) = crate::session_state::load_from(sessions_dir, &id).active {
+            return Some((id, b));
         }
     }
-    newest.map(|(_, id)| id)
+    None
 }
 
-/// Resolve the workspace binding for `status`. Session id: the explicit arg,
-/// else the most-recently-modified session in `sessions_dir`. Returns the
-/// Check to display AND the resolved binding (so the caller can reuse it as
-/// the `has_binding` mode signal).
+/// Resolve the workspace binding for `status`. With an explicit session id the
+/// user named a target, so a missing binding is a Warn. Without one, best-effort
+/// scan across all sessions (state is global): show the most recent that HAS a
+/// binding, and stay quiet (Skip) when none does — so a bound-mode user with a
+/// stray empty session file isn't warned. Returns the Check AND the resolved
+/// binding (reused by the caller as the `has_binding` mode signal).
 fn workspace_binding_check_in(
     sessions_dir: &Path,
     explicit_session_id: Option<&str>,
 ) -> (Check, Option<crate::session_state::RepoBinding>) {
-    let (id, scanned) = match explicit_session_id {
-        Some(id) => (Some(id.to_string()), false),
-        None => (latest_session_id_in(sessions_dir), true),
-    };
-    let Some(id) = id else {
-        return (
-            Check::skip("Workspace binding", "no workspace session bindings found"),
-            None,
-        );
-    };
-    let state = crate::session_state::load_from(sessions_dir, &id);
-    match state.active {
-        Some(b) => {
-            let detail = if scanned {
-                format!(
-                    "repo {} (org {}) via repo switch [latest session {id}]",
-                    b.repo_id, b.org_slug
-                )
-            } else {
-                format!(
-                    "repo {} (org {}) via repo switch (session {id})",
-                    b.repo_id, b.org_slug
-                )
-            };
-            (Check::ok("Workspace binding", detail), Some(b))
+    match explicit_session_id {
+        Some(id) => {
+            let state = crate::session_state::load_from(sessions_dir, id);
+            match state.active {
+                Some(b) => (
+                    Check::ok(
+                        "Workspace binding",
+                        format!(
+                            "repo {} (org {}) via repo switch (session {id})",
+                            b.repo_id, b.org_slug
+                        ),
+                    ),
+                    Some(b),
+                ),
+                None => (
+                    Check::warn(
+                        "Workspace binding",
+                        format!(
+                            "session {id} has no active binding — run `tracevault repo switch …`"
+                        ),
+                    ),
+                    None,
+                ),
+            }
         }
-        None => (
-            Check::warn(
-                "Workspace binding",
-                format!("session {id} has no active binding — run `tracevault repo switch …`"),
+        None => match latest_active_binding_in(sessions_dir) {
+            Some((id, b)) => (
+                Check::ok(
+                    "Workspace binding",
+                    format!(
+                        "repo {} (org {}) via repo switch (most recent of all sessions: {id}; pass --session-id to target one)",
+                        b.repo_id, b.org_slug
+                    ),
+                ),
+                Some(b),
             ),
-            None,
-        ),
+            None => (
+                Check::skip("Workspace binding", "no active workspace binding found"),
+                None,
+            ),
+        },
     }
 }
 
@@ -1172,5 +1193,51 @@ mod tests {
             "o2",
             "must pick the most-recently-modified session"
         );
+    }
+
+    #[test]
+    fn workspace_binding_scan_skips_newest_without_binding() {
+        // The most-recently-touched session has NO active binding, but an older
+        // one does — the scan must find the older binding, not stop at the newest.
+        let dir = tempfile::tempdir().unwrap();
+        let with_binding = crate::session_state::SessionState {
+            active: Some(crate::session_state::RepoBinding {
+                org_slug: "has-it".into(),
+                repo_id: "aaaaaaaa-1111-4111-8111-111111111111".into(),
+                git_url: None,
+                updated_at: "t".into(),
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.path().join("older.toml"),
+            toml::to_string(&with_binding).unwrap(),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Newest file: no active binding.
+        std::fs::write(
+            dir.path().join("newest.toml"),
+            toml::to_string(&crate::session_state::SessionState::default()).unwrap(),
+        )
+        .unwrap();
+        let (check, binding) = workspace_binding_check_in(dir.path(), None);
+        assert_eq!(check.level, Level::Ok);
+        assert_eq!(binding.unwrap().org_slug, "has-it");
+    }
+
+    #[test]
+    fn workspace_binding_scan_no_active_binding_is_skip_not_warn() {
+        // A session file exists but has no active binding (e.g. a bound-mode
+        // user with a stray session). Scan mode must Skip, not Warn.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("stray.toml"),
+            toml::to_string(&crate::session_state::SessionState::default()).unwrap(),
+        )
+        .unwrap();
+        let (check, binding) = workspace_binding_check_in(dir.path(), None);
+        assert_eq!(check.level, Level::Skip);
+        assert!(binding.is_none());
     }
 }
