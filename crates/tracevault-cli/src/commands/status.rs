@@ -320,6 +320,57 @@ fn claude_hook_check(project_root: &Path) -> Check {
     }
 }
 
+/// True if a Claude settings.json body wires any tracevault hook command.
+#[allow(dead_code)] // wired into run_status in the status-wiring task
+fn settings_has_tracevault_hooks(contents: &str) -> bool {
+    contents.contains("tracevault stream")
+        || contents.contains("tracevault session-start")
+        || contents.contains("tracevault user-prompt")
+}
+
+/// Check a global `~/.claude/settings.json` for the `init --global` install.
+/// Absent / no tracevault hooks → Skip (a global install is optional).
+#[allow(dead_code)] // wired into run_status in the status-wiring task
+fn global_hook_check_in(settings_path: &Path) -> Check {
+    match fs::read_to_string(settings_path) {
+        Ok(s) if settings_has_tracevault_hooks(&s) => Check::ok(
+            "Global install",
+            "hooks installed in ~/.claude/settings.json",
+        ),
+        Ok(_) => Check::skip(
+            "Global install",
+            "~/.claude/settings.json has no tracevault hooks",
+        ),
+        Err(_) => Check::skip("Global install", "no ~/.claude/settings.json"),
+    }
+}
+
+/// Claude Code hooks may live per-repo (`<repo>/.claude/settings.json`) OR
+/// globally (`~/.claude/settings.json`, `init --global`). Ok if EITHER wires
+/// tracevault; Warn only if neither does.
+#[allow(dead_code)] // wired into run_status in the status-wiring task
+fn claude_hook_check_in(repo_settings: &Path, global_settings: &Path) -> Check {
+    let repo_has = fs::read_to_string(repo_settings)
+        .map(|s| settings_has_tracevault_hooks(&s))
+        .unwrap_or(false);
+    if repo_has {
+        return Check::ok("Claude Code hooks", "registered in .claude/settings.json");
+    }
+    let global_has = fs::read_to_string(global_settings)
+        .map(|s| settings_has_tracevault_hooks(&s))
+        .unwrap_or(false);
+    if global_has {
+        return Check::ok(
+            "Claude Code hooks",
+            "registered globally in ~/.claude/settings.json",
+        );
+    }
+    Check::warn(
+        "Claude Code hooks",
+        "not registered in <repo>/.claude/settings.json or ~/.claude/settings.json (capture will miss some events)",
+    )
+}
+
 // --- Server repo ---
 
 async fn server_repo_checks(
@@ -827,5 +878,75 @@ mod tests {
         std::fs::write(dir.path().join("pending-.jsonl"), "line1\n").unwrap();
         assert_eq!(count_pending_events(dir.path(), false), 0);
         assert_eq!(count_pending_events(dir.path(), true), 0);
+    }
+
+    #[test]
+    fn settings_has_tracevault_hooks_detects_commands() {
+        assert!(settings_has_tracevault_hooks(
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"tracevault stream --event pre"}]}]}}"#
+        ));
+        assert!(settings_has_tracevault_hooks(
+            r#"{"command":"tracevault session-start"}"#
+        ));
+        assert!(settings_has_tracevault_hooks(
+            r#"{"command":"tracevault user-prompt"}"#
+        ));
+        assert!(!settings_has_tracevault_hooks(
+            r#"{"hooks":{"PreToolUse":[]}}"#
+        ));
+        assert!(!settings_has_tracevault_hooks("{}"));
+    }
+
+    #[test]
+    fn global_hook_check_ok_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(
+            &p,
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"command":"tracevault session-start"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(global_hook_check_in(&p).level, Level::Ok);
+    }
+
+    #[test]
+    fn global_hook_check_skip_when_absent_or_no_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("settings.json");
+        assert_eq!(global_hook_check_in(&missing).level, Level::Skip);
+        let empty = dir.path().join("empty.json");
+        std::fs::write(&empty, "{}").unwrap();
+        assert_eq!(global_hook_check_in(&empty).level, Level::Skip);
+    }
+
+    #[test]
+    fn claude_hook_check_ok_from_global_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo-settings.json"); // does not exist
+        let global = dir.path().join("global-settings.json");
+        std::fs::write(&global, r#"{"command":"tracevault stream"}"#).unwrap();
+        let c = claude_hook_check_in(&repo, &global);
+        assert_eq!(c.level, Level::Ok);
+        assert!(
+            c.detail.to_lowercase().contains("global") || c.detail.contains("~/.claude"),
+            "detail: {}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn claude_hook_check_ok_from_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo-settings.json");
+        std::fs::write(&repo, r#"{"command":"tracevault stream"}"#).unwrap();
+        let global = dir.path().join("global-settings.json"); // does not exist
+        assert_eq!(claude_hook_check_in(&repo, &global).level, Level::Ok);
+    }
+
+    #[test]
+    fn claude_hook_check_warn_when_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = claude_hook_check_in(&dir.path().join("a.json"), &dir.path().join("b.json"));
+        assert_eq!(c.level, Level::Warn);
     }
 }
