@@ -283,7 +283,7 @@ fn format_status(binding: Option<(&RepoBinding, BindingSource)>) -> String {
             b.repo_id, b.org_slug
         ),
         None => {
-            "not bound to any repo (workspace mode; run `tracevault repo switch <path>|--name <project>`)".into()
+            "not bound to any repo (workspace mode; run `tracevault repo switch <path>` or `tracevault repo switch --name <project>`)".into()
         }
     }
 }
@@ -418,7 +418,7 @@ mod tests {
     fn format_status_none() {
         assert_eq!(
             format_status(None),
-            "not bound to any repo (workspace mode; run `tracevault repo switch <path>|--name <project>`)"
+            "not bound to any repo (workspace mode; run `tracevault repo switch <path>` or `tracevault repo switch --name <project>`)"
         );
     }
 
