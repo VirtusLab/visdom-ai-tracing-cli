@@ -22,6 +22,10 @@ pub enum RepoCmd {
         /// Bind by the repo's registered name instead of a checkout path (no checkout needed).
         #[arg(long, group = "target")]
         name: Option<String>,
+        /// Write a session-independent user-level default instead of a session
+        /// binding. Implied when no session id is available.
+        #[arg(long)]
+        user: bool,
         /// Session to target; defaults to $TRACEVAULT_SESSION_ID.
         #[arg(long)]
         session_id: Option<String>,
@@ -71,11 +75,13 @@ pub async fn run(
         RepoCmd::Switch {
             path,
             name,
+            user,
             session_id,
         } => {
             switch(
                 path.as_deref(),
                 name.as_deref(),
+                user,
                 session_id.as_deref(),
                 project_root,
             )
@@ -196,13 +202,34 @@ fn switch_target<'a>(
     }
 }
 
+/// Where a `repo switch` should persist its binding: a specific session, or the
+/// session-independent user-level default.
+#[derive(Debug)]
+enum SwitchDest {
+    Session(String),
+    UserDefault,
+}
+
+/// Pure choice of write target for `repo switch`: `--user` (or the absence of
+/// any session id) selects the user-level default; otherwise the resolved
+/// session id selects a session binding. Kept pure so it's unit-testable.
+fn switch_destination(user: bool, session_id: Option<String>) -> SwitchDest {
+    if user {
+        return SwitchDest::UserDefault;
+    }
+    match session_id {
+        Some(id) => SwitchDest::Session(id),
+        None => SwitchDest::UserDefault,
+    }
+}
+
 async fn switch(
     path: Option<&str>,
     name: Option<&str>,
+    user: bool,
     session_id: Option<&str>,
     project_root: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let id = resolve_session_id(session_id)?;
     let org_slug = org_slug_for(project_root).ok_or(
         "no org configured: set TRACEVAULT_ORG_SLUG, log in, or run inside a bound repo checkout",
     )?;
@@ -216,8 +243,8 @@ async fn switch(
         SwitchTarget::Name(n) => resolve_name_to_binding(n, &org_slug, &client).await?,
     };
 
-    // Validate the repo id BEFORE persisting anything: a malformed repo_id
-    // must not leave a persisted session binding behind.
+    // Validate the repo id BEFORE persisting anything: a malformed repo_id must
+    // not leave a persisted binding behind.
     let repo_uuid = binding.repo_id.parse::<uuid::Uuid>().map_err(|e| {
         format!(
             "server returned an invalid repo id {:?}: {e}",
@@ -225,19 +252,32 @@ async fn switch(
         )
     })?;
 
-    // NOTE: subagent worktree-override writes are handled in sub-plan C.
-    let mut state = session_state::load(&id);
-    apply_switch(&mut state, binding.clone());
-    session_state::save(&id, &state)?;
+    // A session id is optional now: with one (and no --user) we bind that
+    // session; without one (or with --user) we set the user-level default,
+    // which any new session inherits. This is what lets a container bind its
+    // repo before Claude — and its session — exists.
+    let session = resolve_session_id(session_id).ok();
+    match switch_destination(user, session) {
+        SwitchDest::Session(id) => {
+            let mut state = session_state::load(&id);
+            apply_switch(&mut state, binding.clone());
+            session_state::save(&id, &state)?;
+            println!(
+                "bound session {id} to repo {} (org {})",
+                binding.repo_id, binding.org_slug
+            );
+        }
+        SwitchDest::UserDefault => {
+            crate::user_default::save(&binding)?;
+            println!(
+                "set user-level default repo {} (org {}); applies to new sessions without their own binding",
+                binding.repo_id, binding.org_slug
+            );
+        }
+    }
 
-    println!(
-        "bound session {id} to repo {} (org {})",
-        binding.repo_id, binding.org_slug
-    );
-
-    // The binding was already saved above — that's the primary effect of
-    // `switch`. A failure to fetch policies afterward shouldn't make the
-    // whole command report as an error.
+    // Best-effort policy fetch (applies to either destination). A failure here
+    // must not make the whole command report as an error.
     match client
         .get_agent_instructions(&binding.org_slug, &repo_uuid)
         .await
@@ -370,6 +410,34 @@ mod tests {
         if std::env::var("TRACEVAULT_SESSION_ID").is_err() {
             assert!(resolve_session_id(None).is_err());
         }
+    }
+
+    #[test]
+    fn switch_destination_user_flag_forces_user_default() {
+        assert!(matches!(
+            switch_destination(true, Some("sess-1".to_string())),
+            SwitchDest::UserDefault
+        ));
+        assert!(matches!(
+            switch_destination(true, None),
+            SwitchDest::UserDefault
+        ));
+    }
+
+    #[test]
+    fn switch_destination_session_when_present_and_no_user_flag() {
+        assert!(matches!(
+            switch_destination(false, Some("sess-1".to_string())),
+            SwitchDest::Session(id) if id == "sess-1"
+        ));
+    }
+
+    #[test]
+    fn switch_destination_user_default_when_no_session() {
+        assert!(matches!(
+            switch_destination(false, None),
+            SwitchDest::UserDefault
+        ));
     }
 
     #[test]

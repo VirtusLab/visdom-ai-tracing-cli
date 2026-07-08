@@ -22,8 +22,6 @@ fn load_from(path: &Path) -> Option<RepoBinding> {
     toml::from_str(&s).ok()
 }
 
-// wired into `repo switch --user` in the next task
-#[allow(dead_code)]
 fn save_to(path: &Path, binding: &RepoBinding) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -54,8 +52,6 @@ pub fn load() -> Option<RepoBinding> {
 }
 
 /// Persist the user-level default binding, creating the config dir if needed.
-// wired into `repo switch --user` in the next task
-#[allow(dead_code)]
 pub fn save(binding: &RepoBinding) -> Result<(), Box<dyn std::error::Error>> {
     let path = default_repo_path().ok_or("cannot determine user config dir")?;
     save_to(&path, binding)
