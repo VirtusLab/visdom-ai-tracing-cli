@@ -41,6 +41,9 @@ pub enum RepoCmd {
     },
     /// Clear the current session's binding.
     Reset {
+        /// Clear the user-level default instead of the session binding.
+        #[arg(long)]
+        user: bool,
         /// Session to target; defaults to $TRACEVAULT_SESSION_ID.
         #[arg(long)]
         session_id: Option<String>,
@@ -87,7 +90,7 @@ pub async fn run(
             )
             .await
         }
-        RepoCmd::Reset { session_id } => reset(session_id.as_deref()),
+        RepoCmd::Reset { user, session_id } => reset(user, session_id.as_deref()),
     }
 }
 
@@ -162,7 +165,12 @@ fn apply_reset(state: &mut SessionState) {
     *state = SessionState::default();
 }
 
-fn reset(session_id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+fn reset(user: bool, session_id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    if user {
+        crate::user_default::clear()?;
+        println!("cleared user-level default repo binding");
+        return Ok(());
+    }
     let id = resolve_session_id(session_id)?;
     let mut state = session_state::load(&id);
     apply_reset(&mut state);
@@ -376,17 +384,31 @@ async fn status(
     // A --path override on status resolves live (needs org_slug + server).
     let repo_flag = resolve_repo_flag(repo_flag_path, project_root).await;
 
+    let user_default = crate::user_default::load();
+
     let effective = effective_binding(ResolveInputs {
         repo_flag,
         session: &session,
         worktree_path: Some(&worktree),
         bound,
-        user_default: None,
+        user_default: user_default.clone(),
     });
     println!(
         "{}",
         format_status(effective.as_ref().map(|(b, s)| (b, *s)))
     );
+
+    // Surface a configured user default even when a more specific tier won, so
+    // it's discoverable (avoids double-printing when it IS the winning tier).
+    let default_is_effective = matches!(
+        effective.as_ref().map(|(_, s)| *s),
+        Some(BindingSource::UserDefault)
+    );
+    if let Some(ud) = &user_default {
+        if !default_is_effective {
+            println!("user default: repo {} (org {})", ud.repo_id, ud.org_slug);
+        }
+    }
     Ok(())
 }
 
@@ -545,6 +567,15 @@ mod tests {
         assert_eq!(
             format_status(Some((&b, BindingSource::Bound))),
             "bound to repo r4 (org org) via bound .tracevault/config.toml"
+        );
+    }
+
+    #[test]
+    fn format_status_user_default() {
+        let b = binding("r5");
+        assert_eq!(
+            format_status(Some((&b, BindingSource::UserDefault))),
+            "bound to repo r5 (org org) via user default (repo switch --user)"
         );
     }
 

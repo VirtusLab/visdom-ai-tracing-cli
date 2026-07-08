@@ -9,14 +9,10 @@ use std::path::{Path, PathBuf};
 use crate::session_state::RepoBinding;
 
 /// `dirs::config_dir()/tracevault/default_repo.toml` — beside `credentials.json`.
-// wired into resolution's UserDefault tier in the next task
-#[allow(dead_code)]
 pub fn default_repo_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("tracevault").join("default_repo.toml"))
 }
 
-// wired into resolution's UserDefault tier in the next task
-#[allow(dead_code)]
 fn load_from(path: &Path) -> Option<RepoBinding> {
     let s = std::fs::read_to_string(path).ok()?;
     toml::from_str(&s).ok()
@@ -34,8 +30,6 @@ fn save_to(path: &Path, binding: &RepoBinding) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-// wired into `repo status`/`repo reset --user` in the next task
-#[allow(dead_code)]
 fn clear_at(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -45,8 +39,6 @@ fn clear_at(path: &Path) -> std::io::Result<()> {
 }
 
 /// Load the user-level default binding; `None` if unset or malformed.
-// wired into resolution's UserDefault tier in the next task
-#[allow(dead_code)]
 pub fn load() -> Option<RepoBinding> {
     load_from(&default_repo_path()?)
 }
@@ -58,8 +50,6 @@ pub fn save(binding: &RepoBinding) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Remove the user-level default binding (ok if already absent).
-// wired into `repo status`/`repo reset --user` in the next task
-#[allow(dead_code)]
 pub fn clear() -> Result<(), Box<dyn std::error::Error>> {
     let path = default_repo_path().ok_or("cannot determine user config dir")?;
     clear_at(&path)?;
