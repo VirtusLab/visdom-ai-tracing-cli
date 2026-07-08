@@ -70,7 +70,21 @@ fn user_context_path_in(
         Err(_) => None, // no checkout → fall through to the user-level config
     };
     if let Some(uc) = repo_uc {
-        return Ok(uc.path());
+        // A bare disable expresses no opinion about WHERE the user-context file
+        // lives — fall through to the user-level config so `--user` edits target
+        // the file the hook actually reads elsewhere. A repo that set an explicit
+        // path (even while disabled) still points the edit at that path.
+        let bare_disable = matches!(uc, UserContext::Toggle(false))
+            || matches!(
+                uc,
+                UserContext::Full {
+                    enable: false,
+                    path: None
+                }
+            );
+        if !bare_disable {
+            return Ok(uc.path());
+        }
     }
     let user_cfg = crate::config::try_load_user_config_in(config_root)
         .map_err(|e| format!("cannot resolve --user path: malformed user config.toml: {e}"))?;
@@ -262,6 +276,14 @@ fn apply_update_mutations(
 /// Prints a hint if no `.tracevault/` directory is found (i.e. `tracevault init` has
 /// not been run), using `find_project_root` for the diagnostic.
 pub fn run_show(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    run_show_in(cwd, &crate::config::tv_config_root())
+}
+
+/// [`run_show`], but resolving the user-level fallback against an injectable
+/// `config_root` instead of the process-global [`crate::config::tv_config_root`].
+/// Lets tests exercise the detached (no-checkout) path without touching the
+/// real `~/.config`.
+pub fn run_show_in(cwd: &Path, config_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve the user-level context source: a repo config that configured it
     // wins; otherwise fall back to the user-level config.toml (Task 2/3).
     // Tolerate no project root/config existing at all, same as `user_context_path`.
@@ -269,7 +291,7 @@ pub fn run_show(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|root| TracevaultConfig::load(&root))
         .and_then(|c| c.user_context);
-    let user_path = crate::config::resolve_user_context(repo_uc).resolve();
+    let user_path = crate::config::resolve_user_context_in(repo_uc, config_root).resolve();
     let user_enabled = user_path.is_some();
 
     let (paths, user, global, worktree, effective) =
@@ -790,6 +812,48 @@ mod tests {
         assert_eq!(
             p,
             crate::config::default_user_context_path_in(cfg_root.path())
+        );
+    }
+
+    #[test]
+    fn run_show_in_detached_uses_user_level_config_without_error() {
+        let cfg_root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crate::config::user_config_path_in(cfg_root.path()),
+            "user_context = true\n",
+        )
+        .unwrap();
+        // Seed the referenced default context file so the enabled layer has content.
+        let ctx = crate::config::default_user_context_path_in(cfg_root.path());
+        crate::context::Context::default().save_to(&ctx).unwrap();
+        let cwd = tempfile::tempdir().unwrap(); // no .tracevault/ anywhere above
+                                                // Must resolve against the injected root (NOT ~/.config) and not error.
+        assert!(run_show_in(cwd.path(), cfg_root.path()).is_ok());
+    }
+
+    #[test]
+    fn user_context_path_explicit_off_repo_falls_through_to_user_level() {
+        // A checkout whose repo config explicitly disables the user layer.
+        let repo = tempfile::tempdir().unwrap();
+        let tv = repo.path().join(".tracevault");
+        std::fs::create_dir_all(&tv).unwrap();
+        std::fs::write(
+            tv.join("config.toml"),
+            "agent = \"claude-code\"\nuser_context = false\n",
+        )
+        .unwrap();
+        // A user-level config that points the user context at a custom path.
+        let cfg_root = tempfile::tempdir().unwrap();
+        let custom = cfg_root.path().join("mine.json");
+        std::fs::write(
+            crate::config::user_config_path_in(cfg_root.path()),
+            format!("user_context = \"{}\"\n", custom.display()),
+        )
+        .unwrap();
+        let p = user_context_path_in(repo.path(), cfg_root.path()).unwrap();
+        assert_eq!(
+            p, custom,
+            "explicit-off repo must not hijack the --user edit to the default file"
         );
     }
 

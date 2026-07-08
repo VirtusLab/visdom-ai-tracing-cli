@@ -169,6 +169,24 @@ impl UserContext {
         };
         enabled.then(|| self.path())
     }
+
+    /// Map `init`'s `--no-user-context` / `--user-context <path>` flags to a
+    /// *requested* user-context override. `Ok(None)` means neither flag was given
+    /// (the caller decides the default/preserve behavior). Rejects an empty/blank
+    /// `--user-context` value.
+    pub fn from_init_flags(
+        no_user_context: bool,
+        user_context: Option<String>,
+    ) -> Result<Option<UserContext>, String> {
+        match (no_user_context, user_context) {
+            (true, _) => Ok(Some(UserContext::Toggle(false))),
+            (false, Some(p)) if p.trim().is_empty() => {
+                Err("--user-context path must not be empty".to_string())
+            }
+            (false, Some(p)) => Ok(Some(UserContext::Path(p))),
+            (false, None) => Ok(None),
+        }
+    }
 }
 
 impl TracevaultConfig {
@@ -506,6 +524,23 @@ mod tests {
         assert!(resolve_user_context_in(None, dir.path())
             .resolve()
             .is_none());
+    }
+
+    #[test]
+    fn from_init_flags_maps_variants() {
+        assert!(matches!(
+            UserContext::from_init_flags(true, None),
+            Ok(Some(UserContext::Toggle(false)))
+        ));
+        assert!(matches!(
+            UserContext::from_init_flags(false, None),
+            Ok(None)
+        ));
+        assert!(matches!(
+            UserContext::from_init_flags(false, Some("/p".into())),
+            Ok(Some(UserContext::Path(_)))
+        ));
+        assert!(UserContext::from_init_flags(false, Some("  ".into())).is_err());
     }
 
     #[test]

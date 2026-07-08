@@ -686,37 +686,40 @@ pub fn install_global_hooks(claude_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Write the user-level `config.toml` (under `config_root`, i.e.
-/// `~/.config/tracevault/`) carrying `user_context`. When the layer is enabled,
-/// also seed the context file it actually references (empty) so
-/// `context set/show --user` are coherent immediately. A disabled layer
-/// (`--no-user-context`) writes no context file; a custom `--user-context
-/// <path>` seeds THAT file, not the default. Used by `init --global`.
+/// Write the user-level `config.toml` (under `config_root`) carrying the
+/// user-context setting. An EXISTING user config is preserved (this mirrors the
+/// "don't clobber" contract of the global-hooks install): `requested` overrides
+/// the user_context when a flag was given; otherwise an existing value is kept,
+/// and only a first-time setup (no existing config) defaults to enabled.
+/// When the resulting layer is enabled, the referenced context file is seeded
+/// (empty) if absent — a custom `--user-context <path>` seeds THAT file, a
+/// disabled layer seeds nothing. Returns the active context file path (the file
+/// the hook will read), or `None` when the layer is disabled. Used by `init --global`.
 pub fn write_global_user_config_in(
     config_root: &Path,
-    user_context: UserContext,
-) -> io::Result<()> {
+    requested: Option<UserContext>,
+) -> io::Result<Option<PathBuf>> {
     fs::create_dir_all(config_root)?;
-    // Resolve enablement + the referenced path (rooted at `config_root`) before
-    // moving `user_context` into the config. `resolve()` decides enablement;
-    // `path_in` gives the file the config actually points at (default under
-    // `config_root`, or an explicit custom path).
-    let referenced = user_context
+    // Preserve an existing (valid) user config; malformed/missing → start fresh.
+    let mut config = crate::config::try_load_user_config_in(config_root)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    // Requested flag wins; else keep an existing value; else first-run default = enabled.
+    let user_context = requested
+        .or_else(|| config.user_context.clone())
+        .unwrap_or(UserContext::Toggle(true));
+    let active = user_context
         .resolve()
         .map(|_| user_context.path_in(config_root));
-    let config = TracevaultConfig {
-        user_context: Some(user_context),
-        ..TracevaultConfig::default()
-    };
+    config.user_context = Some(user_context);
     fs::write(user_config_path_in(config_root), config.to_toml())?;
-    // Seed the referenced context file only when enabled, and only if absent —
-    // never clobber an existing one.
-    if let Some(ctx_path) = referenced {
+    if let Some(ref ctx_path) = active {
         if !ctx_path.exists() {
-            Context::default().save_to(&ctx_path)?;
+            Context::default().save_to(ctx_path)?;
         }
     }
-    Ok(())
+    Ok(active)
 }
 
 #[cfg(test)]
@@ -1091,7 +1094,7 @@ mod tests {
     #[test]
     fn write_global_user_config_enables_and_creates_context() {
         let root = tempfile::tempdir().unwrap();
-        write_global_user_config_in(root.path(), crate::config::UserContext::Toggle(true)).unwrap();
+        let active = write_global_user_config_in(root.path(), None).unwrap();
         let cfg = crate::config::try_load_user_config_in(root.path())
             .unwrap()
             .unwrap();
@@ -1099,14 +1102,19 @@ mod tests {
             cfg.user_context.unwrap().resolve(),
             Some(crate::config::default_user_context_path())
         );
-        assert!(crate::config::default_user_context_path_in(root.path()).exists());
+        let ctx = crate::config::default_user_context_path_in(root.path());
+        assert_eq!(active, Some(ctx.clone()));
+        assert!(ctx.exists());
     }
 
     #[test]
     fn write_global_user_config_can_disable() {
         let root = tempfile::tempdir().unwrap();
-        write_global_user_config_in(root.path(), crate::config::UserContext::Toggle(false))
-            .unwrap();
+        let active = write_global_user_config_in(
+            root.path(),
+            Some(crate::config::UserContext::Toggle(false)),
+        )
+        .unwrap();
         let cfg = crate::config::try_load_user_config_in(root.path())
             .unwrap()
             .unwrap();
@@ -1114,6 +1122,7 @@ mod tests {
             cfg.user_context,
             Some(crate::config::UserContext::Toggle(false))
         ));
+        assert_eq!(active, None, "disabled → no active context path");
         // A disabled layer must NOT seed a context file.
         assert!(
             !crate::config::default_user_context_path_in(root.path()).exists(),
@@ -1125,15 +1134,43 @@ mod tests {
     fn write_global_user_config_custom_path_seeds_that_file_only() {
         let root = tempfile::tempdir().unwrap();
         let custom = root.path().join("custom-ctx.json");
-        write_global_user_config_in(
+        let active = write_global_user_config_in(
             root.path(),
-            crate::config::UserContext::Path(custom.to_string_lossy().into_owned()),
+            Some(crate::config::UserContext::Path(
+                custom.to_string_lossy().into_owned(),
+            )),
         )
         .unwrap();
+        assert_eq!(active, Some(custom.clone()));
         assert!(custom.exists(), "the configured custom path must be seeded");
         assert!(
             !crate::config::default_user_context_path_in(root.path()).exists(),
             "the default context.json must NOT be created when a custom path is configured"
         );
+    }
+
+    #[test]
+    fn write_global_user_config_preserves_existing_on_rerun_without_flags() {
+        let root = tempfile::tempdir().unwrap();
+        let custom = root.path().join("custom-ctx.json");
+        // First run pins a custom path.
+        write_global_user_config_in(
+            root.path(),
+            Some(crate::config::UserContext::Path(
+                custom.to_string_lossy().into_owned(),
+            )),
+        )
+        .unwrap();
+        // Re-run with NO flags must NOT reset it back to the default.
+        let active = write_global_user_config_in(root.path(), None).unwrap();
+        assert_eq!(
+            active,
+            Some(custom.clone()),
+            "re-run without flags must preserve the custom path"
+        );
+        let cfg = crate::config::try_load_user_config_in(root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.user_context.unwrap().path_in(root.path()), custom);
     }
 }

@@ -289,20 +289,29 @@ async fn main() {
                     }
                 }
 
-                let user_context = match (no_user_context, user_context) {
-                    (true, _) => config::UserContext::Toggle(false),
-                    (false, Some(p)) => config::UserContext::Path(p),
-                    (false, None) => config::UserContext::Toggle(true),
-                };
+                let requested =
+                    match config::UserContext::from_init_flags(no_user_context, user_context) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            std::process::exit(1);
+                        }
+                    };
                 match commands::init::write_global_user_config_in(
                     &config::tv_config_root(),
-                    user_context,
+                    requested,
                 ) {
-                    Ok(()) => {
+                    Ok(active) => {
                         println!(
-                            "User-level context written to {}",
+                            "User-level context config: {}",
                             config::user_config_path().display()
                         );
+                        match active {
+                            Some(ctx) => println!("User-level context file: {}", ctx.display()),
+                            None => {
+                                println!("User-level context is disabled (`--no-user-context`).")
+                            }
+                        }
                         println!(
                             "Edit it with `tracevault context set --user …`; disable with \
                              `tracevault init --global --no-user-context`."
@@ -314,11 +323,14 @@ async fn main() {
             }
 
             let cwd = env::current_dir().expect("Cannot determine current directory");
-            let user_context = match (no_user_context, user_context) {
-                (true, _) => config::UserContext::Toggle(false),
-                (false, Some(p)) => config::UserContext::Path(p),
-                (false, None) => config::UserContext::Toggle(true),
-            };
+            let user_context =
+                match config::UserContext::from_init_flags(no_user_context, user_context) {
+                    Ok(r) => r.unwrap_or(config::UserContext::Toggle(true)),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                };
             match commands::init::init_in_directory(
                 &cwd,
                 server_url.as_deref(),

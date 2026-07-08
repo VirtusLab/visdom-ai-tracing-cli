@@ -45,6 +45,11 @@ register one. Populate it with `tracevault context set --user --flow <id> --labe
 (works with no checkout). Pass `--no-user-context` to `init --global` to skip enabling it, or
 `--user-context <path>` to point it at a different file instead of the default location.
 
+Migration: repos initialized with `--no-user-context` before this version wrote nothing to disk,
+which is now read as "unset" (inherits the user-level context). If you want such a repo to stay
+opted out after enabling `init --global`, re-run `tracevault context source --disable` in it to
+persist the opt-out explicitly.
+
 **Commands**
 
 - `tracevault repo switch <path>` — bind the current session's tracing to the repo at `<path>`
