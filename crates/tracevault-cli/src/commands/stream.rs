@@ -245,12 +245,15 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
     // layer (matching the prior behavior of always passing `None`); the
     // org_slug/repo_id requirement is still enforced later.
     let config = crate::config::TracevaultConfig::try_load(&project_root);
-    let user_layer = config
+    // Repo config's user_context wins when the repo configured it; otherwise
+    // fall back to the user-level ~/.config/tracevault/config.toml. This is
+    // what lets a detached session (no checkout) still carry user context.
+    let repo_uc = config
         .as_ref()
         .ok()
         .and_then(|opt| opt.as_ref())
-        .and_then(|c| c.user_context.as_ref())
-        .and_then(|uc| uc.resolve());
+        .and_then(|c| c.user_context.clone());
+    let user_layer = crate::config::resolve_user_context(repo_uc).resolve();
 
     // Load the EFFECTIVE merged context (user layer, if enabled, merged with
     // global and per-worktree) and extract fields before building the
