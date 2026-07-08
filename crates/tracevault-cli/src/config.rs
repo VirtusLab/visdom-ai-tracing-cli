@@ -64,12 +64,68 @@ pub(crate) fn enable_default() -> bool {
     true
 }
 
-/// `~/.config/tracevault/context.json`, alongside credentials.json.
-pub fn default_user_context_path() -> PathBuf {
+/// Root of the user-level TraceVault config dir: `~/.config/tracevault/`
+/// (beside `credentials.json` / `context.json`). Falls back to `./tracevault`.
+pub fn tv_config_root() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("tracevault")
-        .join("context.json")
+}
+
+// consumed in the detached-context resolution task
+#[allow(dead_code)]
+pub fn user_config_path_in(config_root: &Path) -> PathBuf {
+    config_root.join("config.toml")
+}
+// consumed in the detached-context resolution task
+#[allow(dead_code)]
+pub fn user_config_path() -> PathBuf {
+    user_config_path_in(&tv_config_root())
+}
+pub fn default_user_context_path_in(config_root: &Path) -> PathBuf {
+    config_root.join("context.json")
+}
+
+/// `~/.config/tracevault/context.json`, alongside credentials.json.
+pub fn default_user_context_path() -> PathBuf {
+    default_user_context_path_in(&tv_config_root())
+}
+
+/// Load the user-level `config.toml`, distinguishing a **missing** file
+/// (`Ok(None)`) from a malformed/unreadable one (`Err`). Mirrors
+/// `TracevaultConfig::try_load` but for a direct file path (the user-level
+/// config is NOT inside a `.tracevault/` dir).
+// consumed in the detached-context resolution task
+#[allow(dead_code)]
+pub fn try_load_user_config_in(config_root: &Path) -> Result<Option<TracevaultConfig>, String> {
+    let path = user_config_path_in(config_root);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    toml::from_str(&content)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// Lenient: missing OR malformed → `TracevaultConfig::default()` (warn on malformed).
+// consumed in the detached-context resolution task
+#[allow(dead_code)]
+pub fn load_user_config_in(config_root: &Path) -> TracevaultConfig {
+    match try_load_user_config_in(config_root) {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => TracevaultConfig::default(),
+        Err(e) => {
+            eprintln!("tracevault: warning: malformed user config.toml: {e}");
+            TracevaultConfig::default()
+        }
+    }
+}
+// consumed in the detached-context resolution task
+#[allow(dead_code)]
+pub fn load_user_config() -> TracevaultConfig {
+    load_user_config_in(&tv_config_root())
 }
 
 impl UserContext {
@@ -345,6 +401,53 @@ mod tests {
             back.user_context,
             Some(UserContext::Toggle(false))
         ));
+    }
+
+    #[test]
+    fn user_config_paths_are_under_config_root() {
+        let root = std::path::Path::new("/x/tracevault");
+        assert_eq!(
+            user_config_path_in(root),
+            std::path::Path::new("/x/tracevault/config.toml")
+        );
+        assert_eq!(
+            default_user_context_path_in(root),
+            std::path::Path::new("/x/tracevault/context.json")
+        );
+    }
+
+    #[test]
+    fn try_load_user_config_missing_is_ok_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(try_load_user_config_in(dir.path()), Ok(None)));
+    }
+
+    #[test]
+    fn try_load_user_config_reads_user_context() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user_config_path_in(dir.path()),
+            "agent=\"claude-code\"\nuser_context = true\n",
+        )
+        .unwrap();
+        let cfg = try_load_user_config_in(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            cfg.user_context.unwrap().resolve(),
+            Some(default_user_context_path())
+        );
+    }
+
+    #[test]
+    fn try_load_user_config_malformed_is_err() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(user_config_path_in(dir.path()), "this is = = not toml").unwrap();
+        assert!(try_load_user_config_in(dir.path()).is_err());
+    }
+
+    #[test]
+    fn load_user_config_lenient_defaults_on_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_user_config_in(dir.path()).user_context.is_none());
     }
 
     #[test]
