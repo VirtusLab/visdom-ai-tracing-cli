@@ -75,11 +75,12 @@ fn user_context_enabled_via_source_merges_under_repo_overrides() {
     let repo_dir = tmp.path().join("repo");
     init_project(&repo_dir);
 
-    // Before enabling, the config's user-context is off (compat default).
+    // Before enabling, the config's user-context is unset (compat default) —
+    // which means it inherits the user-level config rather than being forced off.
     let config = TracevaultConfig::load(&repo_dir).unwrap();
     assert!(
-        config.user_context.resolve().is_none(),
-        "user_context must default to disabled until explicitly enabled"
+        config.user_context.is_none(),
+        "user_context must default to unset until explicitly enabled"
     );
 
     // The user-level context file lives outside the repo (cross-repo, like
@@ -98,7 +99,7 @@ fn user_context_enabled_via_source_merges_under_repo_overrides() {
 
     // config.toml now resolves the user layer to our explicit path.
     let config = TracevaultConfig::load(&repo_dir).unwrap();
-    let user_layer = config.user_context.resolve();
+    let user_layer = config.user_context.and_then(|uc| uc.resolve());
     assert_eq!(
         user_layer.as_deref(),
         Some(user_ctx_path.as_path()),
@@ -187,7 +188,7 @@ fn repo_tombstone_drops_inherited_user_param() {
     let user_layer = TracevaultConfig::load(&repo_dir)
         .unwrap()
         .user_context
-        .resolve();
+        .and_then(|uc| uc.resolve());
     assert!(user_layer.is_some(), "user layer must be enabled");
 
     // User sets a param the repo doesn't want inherited by downstream events

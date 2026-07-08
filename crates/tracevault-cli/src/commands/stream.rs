@@ -241,15 +241,20 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
     // avoids a redundant second read of the same file. `try_load` keeps the
     // missing/malformed distinction so the required-config error further down
     // can report which one it is.
-    // Best-effort here: a missing OR malformed config simply yields no user
-    // layer (matching the prior behavior of always passing `None`); the
-    // org_slug/repo_id requirement is still enforced later.
+    // Best-effort here: a missing/unconfigured repo config does NOT mean "no
+    // user context" — `resolve_user_context` below falls back to the user-level
+    // config in that case. A malformed repo config is surfaced as an error
+    // later (the required-config check), not silently dropped here.
     let config = crate::config::TracevaultConfig::try_load(&project_root);
-    let user_layer = config
+    // Repo config's user_context wins when the repo configured it; otherwise
+    // fall back to the user-level ~/.config/tracevault/config.toml. This is
+    // what lets a detached session (no checkout) still carry user context.
+    let repo_uc = config
         .as_ref()
         .ok()
         .and_then(|opt| opt.as_ref())
-        .and_then(|c| c.user_context.resolve());
+        .and_then(|c| c.user_context.clone());
+    let user_layer = crate::config::resolve_user_context(repo_uc).resolve();
 
     // Load the EFFECTIVE merged context (user layer, if enabled, merged with
     // global and per-worktree) and extract fields before building the
