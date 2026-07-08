@@ -114,11 +114,6 @@ pub fn load_user_config_in(config_root: &Path) -> TracevaultConfig {
         }
     }
 }
-// consumed in the detached-context resolution task
-#[allow(dead_code)]
-pub fn load_user_config() -> TracevaultConfig {
-    load_user_config_in(&tv_config_root())
-}
 
 /// Resolve the effective user-context source. A repo that *configured* it
 /// (`Some`) wins — including an explicit `Some(Toggle(false))` (hard-off, no
@@ -459,6 +454,15 @@ mod tests {
     #[test]
     fn load_user_config_lenient_defaults_on_missing() {
         let dir = tempfile::tempdir().unwrap();
+        assert!(load_user_config_in(dir.path()).user_context.is_none());
+    }
+
+    #[test]
+    fn load_user_config_lenient_defaults_on_malformed() {
+        // The hook depends on this fail-safe: a malformed user config.toml must
+        // degrade to a default (no user context), never propagate an error.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(user_config_path_in(dir.path()), "this is = = not toml").unwrap();
         assert!(load_user_config_in(dir.path()).user_context.is_none());
     }
 
