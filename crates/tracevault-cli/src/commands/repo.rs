@@ -12,11 +12,16 @@ use crate::session_state::{self, RepoBinding, SessionState};
 /// Sub-actions for `tracevault repo` (workspace/detached mode).
 #[derive(clap::Subcommand)]
 pub enum RepoCmd {
-    /// Bind tracing to the repo at <path> for the current session and print
-    /// its policies.
+    /// Bind tracing to a registered repo for the current session and print its
+    /// policies. Give a checkout <path> OR --name; exactly one is required.
+    #[command(group(clap::ArgGroup::new("target").required(true).multiple(false)))]
     Switch {
-        /// Path to a checkout of a registered repo.
-        path: String,
+        /// Path to a checkout of a registered repo (resolves via its git origin remote).
+        #[arg(group = "target")]
+        path: Option<String>,
+        /// Bind by the repo's registered name instead of a checkout path (no checkout needed).
+        #[arg(long, group = "target")]
+        name: Option<String>,
         /// Session to target; defaults to $TRACEVAULT_SESSION_ID.
         #[arg(long)]
         session_id: Option<String>,
@@ -63,8 +68,18 @@ pub async fn run(
         RepoCmd::Status { session_id, path } => {
             status(session_id.as_deref(), path.as_deref(), project_root, cwd).await
         }
-        RepoCmd::Switch { path, session_id } => {
-            switch(&path, session_id.as_deref(), project_root).await
+        RepoCmd::Switch {
+            path,
+            name,
+            session_id,
+        } => {
+            switch(
+                path.as_deref(),
+                name.as_deref(),
+                session_id.as_deref(),
+                project_root,
+            )
+            .await
         }
         RepoCmd::Reset { session_id } => reset(session_id.as_deref()),
     }
@@ -92,7 +107,6 @@ async fn resolve_switch_binding(
 /// Resolve a registered repo by its NAME (no git checkout) to a binding.
 /// Exact, case-sensitive match on `repos.name`; on no match, errors listing
 /// the available names so a typo self-corrects.
-#[allow(dead_code)] // wired into `switch` in the next task
 async fn resolve_name_to_binding(
     name: &str,
     org_slug: &str,
@@ -138,8 +152,32 @@ fn reset(session_id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Which target `repo switch` should resolve to a binding: a checkout path
+/// or a registered repo name. Exactly one of `path`/`name` must be given;
+/// see `switch_target`.
+enum SwitchTarget<'a> {
+    Path(&'a str),
+    Name(&'a str),
+}
+
+/// Pure exactly-one-of guard for `repo switch`'s `<path>` / `--name`
+/// arguments. Kept separate from `switch` so it can be unit-tested without
+/// spinning up a server or session state (also a safety net if the clap
+/// `ArgGroup` on the `Switch` variant is ever loosened).
+fn switch_target<'a>(
+    path: Option<&'a str>,
+    name: Option<&'a str>,
+) -> Result<SwitchTarget<'a>, Box<dyn std::error::Error>> {
+    match (path, name) {
+        (Some(p), None) => Ok(SwitchTarget::Path(p)),
+        (None, Some(n)) => Ok(SwitchTarget::Name(n)),
+        _ => Err("provide exactly one of <path> or --name".into()),
+    }
+}
+
 async fn switch(
-    path: &str,
+    path: Option<&str>,
+    name: Option<&str>,
     session_id: Option<&str>,
     project_root: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -151,7 +189,10 @@ async fn switch(
     let server_url = server_url.ok_or("not logged in / no server_url; run `tracevault login`")?;
     let client = ApiClient::new(&server_url, token.as_deref());
 
-    let binding = resolve_switch_binding(Path::new(path), &org_slug, &client).await?;
+    let binding = match switch_target(path, name)? {
+        SwitchTarget::Path(p) => resolve_switch_binding(Path::new(p), &org_slug, &client).await?,
+        SwitchTarget::Name(n) => resolve_name_to_binding(n, &org_slug, &client).await?,
+    };
 
     // Validate the repo id BEFORE persisting anything: a malformed repo_id
     // must not leave a persisted session binding behind.
@@ -306,6 +347,32 @@ mod tests {
         if std::env::var("TRACEVAULT_SESSION_ID").is_err() {
             assert!(resolve_session_id(None).is_err());
         }
+    }
+
+    #[test]
+    fn switch_target_rejects_neither() {
+        assert!(switch_target(None, None).is_err());
+    }
+
+    #[test]
+    fn switch_target_rejects_both() {
+        assert!(switch_target(Some("/p"), Some("x")).is_err());
+    }
+
+    #[test]
+    fn switch_target_accepts_path_only() {
+        assert!(matches!(
+            switch_target(Some("/p"), None),
+            Ok(SwitchTarget::Path("/p"))
+        ));
+    }
+
+    #[test]
+    fn switch_target_accepts_name_only() {
+        assert!(matches!(
+            switch_target(None, Some("proj")),
+            Ok(SwitchTarget::Name("proj"))
+        ));
     }
 
     fn binding(id: &str) -> RepoBinding {
