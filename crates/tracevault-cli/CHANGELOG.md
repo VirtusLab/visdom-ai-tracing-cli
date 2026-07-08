@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.22.0...v0.23.0) - 2026-07-08
+
+### Added
+
+- *(cli)* user-level default repo binding (switch repo before Claude launches) ([#17](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/17))
+
 ## [0.22.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.21.0...v0.22.0) - 2026-07-08
 
 ### Added
