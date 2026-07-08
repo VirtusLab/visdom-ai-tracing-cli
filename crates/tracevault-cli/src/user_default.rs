@@ -24,7 +24,7 @@ fn save_to(path: &Path, binding: &RepoBinding) -> Result<(), Box<dyn std::error:
     }
     // Atomic write: temp file in the same dir, then rename over the target so a
     // crash or concurrent reader never sees a partial file (mirrors session_state).
-    let tmp = path.with_file_name("default_repo.toml.tmp");
+    let tmp = path.with_file_name(format!("default_repo.toml.{}.tmp", std::process::id()));
     std::fs::write(&tmp, toml::to_string(binding)?)?;
     std::fs::rename(&tmp, path)?;
     Ok(())

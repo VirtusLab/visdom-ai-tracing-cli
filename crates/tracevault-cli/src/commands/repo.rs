@@ -39,7 +39,7 @@ pub enum RepoCmd {
         #[arg(long)]
         path: Option<String>,
     },
-    /// Clear the current session's binding.
+    /// Clear the current session's binding, or (with --user) the user-level default.
     Reset {
         /// Clear the user-level default instead of the session binding.
         #[arg(long)]
