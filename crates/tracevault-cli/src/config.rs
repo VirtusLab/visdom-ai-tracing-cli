@@ -162,12 +162,21 @@ impl UserContext {
 
     /// `Some(path)` when enabled (consulted by the hook); `None` when disabled.
     pub fn resolve(&self) -> Option<PathBuf> {
+        self.resolve_in(&tv_config_root())
+    }
+
+    /// Like [`resolve`](Self::resolve), but resolves the "no explicit path"
+    /// default relative to `config_root` (via [`path_in`](Self::path_in))
+    /// instead of the process-global [`tv_config_root`]. Callers that took an
+    /// injected `config_root` MUST use this — `resolve()` would leak back to
+    /// the real `~/.config` for the default-path case.
+    pub fn resolve_in(&self, config_root: &Path) -> Option<PathBuf> {
         let enabled = match self {
             UserContext::Toggle(b) => *b,
             UserContext::Path(_) => true,
             UserContext::Full { enable, .. } => *enable,
         };
-        enabled.then(|| self.path())
+        enabled.then(|| self.path_in(config_root))
     }
 
     /// Map `init`'s `--no-user-context` / `--user-context <path>` flags to a
@@ -470,9 +479,12 @@ mod tests {
         )
         .unwrap();
         let cfg = try_load_user_config_in(dir.path()).unwrap().unwrap();
+        // Validate against the INJECTED root (resolve_in), not the real
+        // tv_config_root(): `user_context = true` resolves to the default
+        // `context.json` colocated under `dir`.
         assert_eq!(
-            cfg.user_context.unwrap().resolve(),
-            Some(default_user_context_path())
+            cfg.user_context.unwrap().resolve_in(dir.path()),
+            Some(default_user_context_path_in(dir.path()))
         );
     }
 
@@ -515,7 +527,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(user_config_path_in(dir.path()), "user_context = true\n").unwrap();
         let uc = resolve_user_context_in(None, dir.path());
-        assert_eq!(uc.resolve(), Some(default_user_context_path()));
+        // Resolve against the injected root, not the real tv_config_root().
+        assert_eq!(
+            uc.resolve_in(dir.path()),
+            Some(default_user_context_path_in(dir.path()))
+        );
     }
 
     #[test]

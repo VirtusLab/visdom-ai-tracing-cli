@@ -291,7 +291,8 @@ pub fn run_show_in(cwd: &Path, config_root: &Path) -> Result<(), Box<dyn std::er
         .ok()
         .and_then(|root| TracevaultConfig::load(&root))
         .and_then(|c| c.user_context);
-    let user_path = crate::config::resolve_user_context_in(repo_uc, config_root).resolve();
+    let user_path =
+        crate::config::resolve_user_context_in(repo_uc, config_root).resolve_in(config_root);
     let user_enabled = user_path.is_some();
 
     let (paths, user, global, worktree, effective) =

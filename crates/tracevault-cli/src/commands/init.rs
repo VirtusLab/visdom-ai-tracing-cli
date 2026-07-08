@@ -1098,9 +1098,11 @@ mod tests {
         let cfg = crate::config::try_load_user_config_in(root.path())
             .unwrap()
             .unwrap();
+        // Validate against the INJECTED root (resolve_in), not tv_config_root():
+        // a first-run default enables at the `context.json` under `root`.
         assert_eq!(
-            cfg.user_context.unwrap().resolve(),
-            Some(crate::config::default_user_context_path())
+            cfg.user_context.unwrap().resolve_in(root.path()),
+            Some(crate::config::default_user_context_path_in(root.path()))
         );
         let ctx = crate::config::default_user_context_path_in(root.path());
         assert_eq!(active, Some(ctx.clone()));
