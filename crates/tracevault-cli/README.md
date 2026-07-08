@@ -41,6 +41,9 @@ policies, and `UserPromptSubmit` re-injects policies when the session's effectiv
 
 - `tracevault repo switch <path>` — bind the current session's tracing to the repo at `<path>`
   (must be pre-registered with TraceVault) and print its policies.
+- `tracevault repo switch --name <project>` — bind by the repo's registered name instead, with
+  no checkout required. Useful for headless/detached workers that don't have the target repo
+  cloned locally. Exactly one of `<path>` or `--name` must be given.
 - `tracevault repo status [--path <path>]` — show the session's effective repo binding and which
   precedence tier it came from.
 - `tracevault repo reset` — clear the session's workspace binding.
