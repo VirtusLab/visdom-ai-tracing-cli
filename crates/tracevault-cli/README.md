@@ -64,6 +64,12 @@ persist the opt-out explicitly.
 **Session identity** — these commands resolve the session via `--session-id` or the
 `TRACEVAULT_SESSION_ID` environment variable (set by `tracevault init --global`).
 
+**`tracevault status` is mode-aware** — it recognizes a global (`~/.claude`) install and shows
+the `repo switch` workspace binding alongside the usual per-repo checks. Pass
+`--session-id <id>` to inspect a specific session; otherwise it uses `$TRACEVAULT_SESSION_ID`,
+or falls back to the most recent session **that has a workspace binding** (shown for
+information — it may belong to another repo; pass `--session-id` to target one).
+
 **Precedence** (high → low): `--path` override → subagent worktree override → session binding
 (`repo switch`) → bound `.tracevault/config.toml`.
 

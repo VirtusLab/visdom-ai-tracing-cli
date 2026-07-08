@@ -99,6 +99,12 @@ pub fn save(session_id: &str, state: &SessionState) -> Result<(), Box<dyn std::e
     save_in(&dir, session_id, state)
 }
 
+/// Load a session's state from an explicit sessions dir (test seam / callers
+/// that resolve the dir themselves). Absent or malformed → default state.
+pub fn load_from(sessions_dir: &std::path::Path, session_id: &str) -> SessionState {
+    load_in(sessions_dir, session_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +151,28 @@ mod tests {
         assert_eq!(load_in(tmp.path(), "../evil"), SessionState::default());
         // A UUID-style id is accepted.
         assert!(save_in(tmp.path(), "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", &s).is_ok());
+    }
+
+    #[test]
+    fn load_from_reads_active_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        save_in(
+            dir.path(),
+            "sess-1",
+            &SessionState {
+                active: Some(binding("r1")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let st = load_from(dir.path(), "sess-1");
+        assert_eq!(st.active.unwrap().repo_id, "r1");
+    }
+
+    #[test]
+    fn load_from_missing_is_default() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_from(dir.path(), "nope"), SessionState::default());
     }
 
     #[test]
