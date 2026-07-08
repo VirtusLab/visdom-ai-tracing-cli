@@ -101,8 +101,6 @@ pub fn save(session_id: &str, state: &SessionState) -> Result<(), Box<dyn std::e
 
 /// Load a session's state from an explicit sessions dir (test seam / callers
 /// that resolve the dir themselves). Absent or malformed → default state.
-// consumed by `tracevault status` workspace-binding check
-#[allow(dead_code)]
 pub fn load_from(sessions_dir: &std::path::Path, session_id: &str) -> SessionState {
     load_in(sessions_dir, session_id)
 }

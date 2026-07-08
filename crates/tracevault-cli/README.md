@@ -51,6 +51,11 @@ policies, and `UserPromptSubmit` re-injects policies when the session's effectiv
 **Session identity** — these commands resolve the session via `--session-id` or the
 `TRACEVAULT_SESSION_ID` environment variable (set by `tracevault init --global`).
 
+**`tracevault status` is mode-aware** — it recognizes a global (`~/.claude`) install and shows
+the `repo switch` workspace binding alongside the usual per-repo checks. Pass
+`--session-id <id>` to inspect a specific session; otherwise it uses `$TRACEVAULT_SESSION_ID`
+or falls back to the most recently active session.
+
 **Precedence** (high → low): `--path` override → subagent worktree override → session binding
 (`repo switch`) → bound `.tracevault/config.toml`.
 

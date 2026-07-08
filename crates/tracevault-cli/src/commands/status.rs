@@ -8,7 +8,7 @@ use crate::api_client::{ApiClient, GetMeError};
 use crate::config::TracevaultConfig;
 use crate::credentials::Credentials;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ANSI_GREEN: &str = "\x1b[32m";
@@ -204,7 +204,12 @@ async fn auth_checks(auth: &AuthContext) -> Vec<Check> {
 
 /// Subset of project checks that don't need network. Returns the loaded
 /// config if present so later sections can reuse it.
-fn project_checks(project_root: &Path) -> (Vec<Check>, Option<TracevaultConfig>) {
+fn project_checks(
+    project_root: &Path,
+    global_settings: &Path,
+    has_global: bool,
+    has_binding: bool,
+) -> (Vec<Check>, Option<TracevaultConfig>) {
     let mut out = Vec::new();
 
     let is_git = project_root.join(".git").exists();
@@ -213,6 +218,11 @@ fn project_checks(project_root: &Path) -> (Vec<Check>, Option<TracevaultConfig>)
             "Git repository",
             project_root.display().to_string(),
         ));
+    } else if has_global || has_binding {
+        out.push(Check::skip(
+            "Git repository",
+            "not a git repo (global/workspace mode)",
+        ));
     } else {
         out.push(Check::err(
             "Git repository",
@@ -220,15 +230,8 @@ fn project_checks(project_root: &Path) -> (Vec<Check>, Option<TracevaultConfig>)
         ));
     }
 
-    let tv_dir = project_root.join(".tracevault");
-    if !tv_dir.exists() {
-        out.push(Check::err(
-            "TraceVault initialized",
-            "no .tracevault/ directory. Run `tracevault init`.",
-        ));
-        return (out, None);
-    }
-    out.push(Check::ok("TraceVault initialized", ".tracevault/ present"));
+    let tv_present = project_root.join(".tracevault").exists();
+    out.push(tracevault_init_check(tv_present, has_global, has_binding));
 
     // Distinguish "no config.toml" (expected in workspace/detached mode —
     // just a warning) from "config.toml present but malformed" (a genuine
@@ -245,10 +248,12 @@ fn project_checks(project_root: &Path) -> (Vec<Check>, Option<TracevaultConfig>)
             Some(c)
         }
         Ok(None) => {
-            out.push(Check::warn(
-                "Project config",
-                "No .tracevault/config.toml. Bound mode: run `tracevault init`. Workspace/detached mode: this is expected — use `tracevault repo status` to see the session binding.",
-            ));
+            if tv_present {
+                out.push(Check::warn(
+                    "Project config",
+                    "No .tracevault/config.toml — run `tracevault init`, or use workspace mode (`tracevault repo status`).",
+                ));
+            }
             None
         }
         Err(e) => {
@@ -260,18 +265,29 @@ fn project_checks(project_root: &Path) -> (Vec<Check>, Option<TracevaultConfig>)
         }
     };
 
-    // Hooks — presence of our markers, not just existence of the hook file.
-    out.push(git_hook_check(
-        project_root,
-        "pre-push",
-        "# tracevault:enforce",
+    if tv_present {
+        // Hooks — presence of our markers, not just existence of the hook file.
+        out.push(git_hook_check(
+            project_root,
+            "pre-push",
+            "# tracevault:enforce",
+        ));
+        out.push(git_hook_check(
+            project_root,
+            "post-commit",
+            "# tracevault:post-commit",
+        ));
+    } else {
+        out.push(Check::skip(
+            "Git hooks",
+            "not used in global/workspace mode",
+        ));
+    }
+
+    out.push(claude_hook_check_in(
+        &project_root.join(".claude/settings.json"),
+        global_settings,
     ));
-    out.push(git_hook_check(
-        project_root,
-        "post-commit",
-        "# tracevault:post-commit",
-    ));
-    out.push(claude_hook_check(project_root));
 
     (out, config)
 }
@@ -295,33 +311,7 @@ fn git_hook_check(project_root: &Path, name: &str, marker: &str) -> Check {
     }
 }
 
-fn claude_hook_check(project_root: &Path) -> Check {
-    let settings = project_root.join(".claude/settings.json");
-    if !settings.exists() {
-        // Not installed is a warning, not an error: tracevault still works
-        // without Claude Code hooks (just with less rich capture).
-        return Check::warn(
-            "Claude Code hooks",
-            ".claude/settings.json missing (capture will miss some events)",
-        );
-    }
-    match fs::read_to_string(&settings) {
-        Ok(s) if s.contains("tracevault stream") => {
-            Check::ok("Claude Code hooks", "registered in .claude/settings.json")
-        }
-        Ok(_) => Check::warn(
-            "Claude Code hooks",
-            "settings.json has no tracevault stream commands",
-        ),
-        Err(e) => Check::warn(
-            "Claude Code hooks",
-            format!("cannot read settings.json: {e}"),
-        ),
-    }
-}
-
 /// True if a Claude settings.json body wires any tracevault hook command.
-#[allow(dead_code)] // wired into run_status in the status-wiring task
 fn settings_has_tracevault_hooks(contents: &str) -> bool {
     contents.contains("tracevault stream")
         || contents.contains("tracevault session-start")
@@ -330,7 +320,6 @@ fn settings_has_tracevault_hooks(contents: &str) -> bool {
 
 /// Check a global `~/.claude/settings.json` for the `init --global` install.
 /// Absent / no tracevault hooks → Skip (a global install is optional).
-#[allow(dead_code)] // wired into run_status in the status-wiring task
 fn global_hook_check_in(settings_path: &Path) -> Check {
     match fs::read_to_string(settings_path) {
         Ok(s) if settings_has_tracevault_hooks(&s) => Check::ok(
@@ -348,7 +337,6 @@ fn global_hook_check_in(settings_path: &Path) -> Check {
 /// Claude Code hooks may live per-repo (`<repo>/.claude/settings.json`) OR
 /// globally (`~/.claude/settings.json`, `init --global`). Ok if EITHER wires
 /// tracevault; Warn only if neither does.
-#[allow(dead_code)] // wired into run_status in the status-wiring task
 fn claude_hook_check_in(repo_settings: &Path, global_settings: &Path) -> Check {
     let repo_has = fs::read_to_string(repo_settings)
         .map(|s| settings_has_tracevault_hooks(&s))
@@ -375,7 +363,6 @@ fn claude_hook_check_in(repo_settings: &Path, global_settings: &Path) -> Check {
 /// present is always Ok. Absent is EXPECTED (Skip) when the user has a global
 /// install or an active workspace binding; only a truly-unconfigured setup
 /// (none of the three) is an Error.
-#[allow(dead_code)] // wired into run_status in the status-wiring task
 fn tracevault_init_check(tv_dir_present: bool, has_global: bool, has_binding: bool) -> Check {
     if tv_dir_present {
         Check::ok("TraceVault initialized", ".tracevault/ present")
@@ -395,7 +382,6 @@ fn tracevault_init_check(tv_dir_present: bool, has_global: bool, has_binding: bo
 /// The id of the most-recently-modified `<id>.toml` session file in
 /// `sessions_dir` (ignores `.toml.tmp` and empty names). `None` if the dir is
 /// missing/empty.
-#[allow(dead_code)] // wired into run_status in the status-wiring task
 fn latest_session_id_in(sessions_dir: &Path) -> Option<String> {
     let mut newest: Option<(std::time::SystemTime, String)> = None;
     for entry in fs::read_dir(sessions_dir).ok()?.flatten() {
@@ -421,7 +407,6 @@ fn latest_session_id_in(sessions_dir: &Path) -> Option<String> {
 /// else the most-recently-modified session in `sessions_dir`. Returns the
 /// Check to display AND the resolved binding (so the caller can reuse it as
 /// the `has_binding` mode signal).
-#[allow(dead_code)] // wired into run_status in the status-wiring task
 fn workspace_binding_check_in(
     sessions_dir: &Path,
     explicit_session_id: Option<&str>,
@@ -706,22 +691,49 @@ fn normalize_remote(url: &str) -> String {
 
 // --- Entry point ---
 
-pub async fn run_status(project_root: &Path) -> i32 {
+pub async fn run_status(project_root: &Path, session_id: Option<&str>) -> i32 {
     let auth = resolve_auth();
 
+    // Production locations for the global install + workspace session state.
+    let global_settings = dirs::home_dir()
+        .map(|h| h.join(".claude").join("settings.json"))
+        .unwrap_or_else(|| PathBuf::from(".claude/settings.json"));
+    let sessions_dir = crate::session_state::sessions_dir();
+
+    let global_check = global_hook_check_in(&global_settings);
+    let has_global = global_check.level == Level::Ok;
+
+    // Resolve the workspace binding ONCE: it drives both the section and the
+    // `has_binding` mode signal used by project_checks.
+    let (binding_check, binding) = match sessions_dir.as_deref() {
+        Some(dir) => workspace_binding_check_in(dir, session_id),
+        None => (
+            Check::skip("Workspace binding", "cannot determine session state dir"),
+            None,
+        ),
+    };
+    let has_binding = binding.is_some();
+
     let auth_checks_v = auth_checks(&auth).await;
-    let (proj_checks_v, config) = project_checks(project_root);
+    let install_v = vec![global_check];
+    let (proj_checks_v, config) =
+        project_checks(project_root, &global_settings, has_global, has_binding);
+    let binding_v = vec![binding_check];
     let server_checks_v = server_repo_checks(project_root, &auth, config.as_ref()).await;
     let session_checks_v = session_checks(project_root);
 
     print_section("Authentication", &auth_checks_v);
+    print_section("Installation", &install_v);
     print_section("Project", &proj_checks_v);
+    print_section("Workspace binding", &binding_v);
     print_section("Server repo", &server_checks_v);
     print_section("Sessions", &session_checks_v);
 
     let all: Vec<&Check> = auth_checks_v
         .iter()
+        .chain(install_v.iter())
         .chain(proj_checks_v.iter())
+        .chain(binding_v.iter())
         .chain(server_checks_v.iter())
         .chain(session_checks_v.iter())
         .collect();
@@ -817,15 +829,32 @@ mod tests {
     }
 
     #[test]
-    fn project_checks_errors_without_tracevault_dir() {
+    fn project_checks_errors_without_tracevault_dir_and_no_global_or_binding() {
         let dir = tempfile::tempdir().unwrap();
-        // Create .git so the git-repo check passes, isolate the assertion.
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-        let (checks, cfg) = project_checks(dir.path());
+        let missing_global = dir.path().join("no-global.json");
+        let (checks, cfg) = project_checks(dir.path(), &missing_global, false, false);
         assert!(cfg.is_none());
         assert!(checks
             .iter()
             .any(|c| c.level == Level::Error && c.label == "TraceVault initialized"));
+    }
+
+    #[test]
+    fn project_checks_no_tracevault_dir_is_not_error_in_global_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let missing_global = dir.path().join("no-global.json");
+        let (checks, _) = project_checks(dir.path(), &missing_global, true, false);
+        let refs: Vec<&Check> = checks.iter().collect();
+        assert_eq!(
+            exit_code_for(&refs),
+            0,
+            "global mode must not force exit 1 on missing .tracevault/"
+        );
+        assert!(checks
+            .iter()
+            .any(|c| c.label == "TraceVault initialized" && c.level == Level::Skip));
     }
 
     #[test]
@@ -837,7 +866,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         std::fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
-        let (checks, cfg) = project_checks(dir.path());
+        let missing_global = dir.path().join("no-global.json");
+        let (checks, cfg) = project_checks(dir.path(), &missing_global, false, false);
         assert!(cfg.is_none());
         let project_config_check = checks
             .iter()
@@ -866,7 +896,8 @@ mod tests {
             "not valid toml {{{",
         )
         .unwrap();
-        let (checks, cfg) = project_checks(dir.path());
+        let missing_global = dir.path().join("no-global.json");
+        let (checks, cfg) = project_checks(dir.path(), &missing_global, false, false);
         assert!(cfg.is_none());
         let project_config_check = checks
             .iter()

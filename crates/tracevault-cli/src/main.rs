@@ -57,7 +57,12 @@ enum Cli {
         global: bool,
     },
     /// Show current session status
-    Status,
+    Status {
+        /// Session to inspect for the workspace binding; defaults to
+        /// $TRACEVAULT_SESSION_ID, else the most recent session.
+        #[arg(long)]
+        session_id: Option<String>,
+    },
     /// Stream hook events to server in real-time.
     /// Installed into .claude/settings.json by `tracevault init` and invoked
     /// by Claude Code on every tool event — not intended to be run manually.
@@ -324,10 +329,15 @@ async fn main() {
                 Err(e) => eprintln!("Error: {e}"),
             }
         }
-        Cli::Status => {
+        Cli::Status { session_id } => {
             let cwd = env::current_dir().expect("Cannot determine current directory");
             let project_root = crate::paths::resolve_project_root(&cwd).root;
-            let code = commands::status::run_status(&project_root).await;
+            let effective = session_id.or_else(|| {
+                std::env::var("TRACEVAULT_SESSION_ID")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            });
+            let code = commands::status::run_status(&project_root, effective.as_deref()).await;
             if code != 0 {
                 std::process::exit(code);
             }
