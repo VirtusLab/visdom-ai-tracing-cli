@@ -206,7 +206,7 @@ async fn auth_checks(auth: &AuthContext) -> Vec<Check> {
 /// config if present so later sections can reuse it.
 fn project_checks(
     project_root: &Path,
-    global_settings: &Path,
+    global_settings: Option<&Path>,
     has_global: bool,
     has_binding: bool,
 ) -> (Vec<Check>, Option<TracevaultConfig>) {
@@ -367,13 +367,13 @@ fn global_hook_check_in(settings_path: &Path) -> Check {
 /// globally (`~/.claude/settings.json`, `init --global`). Ok if EITHER wires
 /// tracevault; an existing-but-unreadable settings file is surfaced as a Warn
 /// with the path (not a generic "not registered"); Warn if neither wires it.
-fn claude_hook_check_in(repo_settings: &Path, global_settings: &Path) -> Check {
+fn claude_hook_check_in(repo_settings: &Path, global_settings: Option<&Path>) -> Check {
     let repo = read_settings_hooks(repo_settings);
     if matches!(repo, SettingsHooks::Present) {
         return Check::ok("Claude Code hooks", "registered in .claude/settings.json");
     }
-    let global = read_settings_hooks(global_settings);
-    if matches!(global, SettingsHooks::Present) {
+    let global = global_settings.map(read_settings_hooks);
+    if matches!(global, Some(SettingsHooks::Present)) {
         return Check::ok("Claude Code hooks", "via global install (see Installation)");
     }
     if let SettingsHooks::Unreadable(e) = &repo {
@@ -382,7 +382,7 @@ fn claude_hook_check_in(repo_settings: &Path, global_settings: &Path) -> Check {
             format!("cannot read <repo>/.claude/settings.json: {e}"),
         );
     }
-    if let SettingsHooks::Unreadable(e) = &global {
+    if let Some(SettingsHooks::Unreadable(e)) = &global {
         return Check::warn(
             "Claude Code hooks",
             format!("cannot read ~/.claude/settings.json: {e}"),
@@ -802,13 +802,17 @@ pub fn effective_session_id(arg: Option<String>, env: Option<String>) -> Option<
 pub async fn run_status(project_root: &Path, session_id: Option<&str>) -> i32 {
     let auth = resolve_auth();
 
-    // Production locations for the global install + workspace session state.
-    let global_settings = dirs::home_dir()
-        .map(|h| h.join(".claude").join("settings.json"))
-        .unwrap_or_else(|| PathBuf::from(".claude/settings.json"));
+    // ~/.claude/settings.json — None when the home dir can't be resolved. Do
+    // NOT fall back to a relative `.claude/settings.json`: that would read the
+    // repo's own settings and could report a false "Global install".
+    let global_settings: Option<PathBuf> =
+        dirs::home_dir().map(|h| h.join(".claude").join("settings.json"));
     let sessions_dir = crate::session_state::sessions_dir();
 
-    let global_check = global_hook_check_in(&global_settings);
+    let global_check = match global_settings.as_deref() {
+        Some(p) => global_hook_check_in(p),
+        None => Check::skip("Global install", "cannot determine home directory"),
+    };
     let has_global = global_check.level == Level::Ok;
 
     // Resolve the workspace binding ONCE: it drives both the section and the
@@ -835,8 +839,12 @@ pub async fn run_status(project_root: &Path, session_id: Option<&str>) -> i32 {
 
     let auth_checks_v = auth_checks(&auth).await;
     let install_v = vec![global_check];
-    let (proj_checks_v, config) =
-        project_checks(project_root, &global_settings, has_global, has_binding);
+    let (proj_checks_v, config) = project_checks(
+        project_root,
+        global_settings.as_deref(),
+        has_global,
+        has_binding,
+    );
     let binding_v = vec![binding_check];
     let server_checks_v =
         server_repo_checks(project_root, &auth, config.as_ref(), authoritative_binding).await;
@@ -950,7 +958,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let missing_global = dir.path().join("no-global.json");
-        let (checks, cfg) = project_checks(dir.path(), &missing_global, false, false);
+        let (checks, cfg) =
+            project_checks(dir.path(), Some(missing_global.as_path()), false, false);
         assert!(cfg.is_none());
         assert!(checks
             .iter()
@@ -974,7 +983,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let missing_global = dir.path().join("no-global.json");
-        let (checks, _) = project_checks(dir.path(), &missing_global, true, false);
+        let (checks, _) = project_checks(dir.path(), Some(missing_global.as_path()), true, false);
         let refs: Vec<&Check> = checks.iter().collect();
         assert_eq!(
             exit_code_for(&refs),
@@ -996,7 +1005,8 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         std::fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
         let missing_global = dir.path().join("no-global.json");
-        let (checks, cfg) = project_checks(dir.path(), &missing_global, false, false);
+        let (checks, cfg) =
+            project_checks(dir.path(), Some(missing_global.as_path()), false, false);
         assert!(cfg.is_none());
         let project_config_check = checks
             .iter()
@@ -1026,7 +1036,8 @@ mod tests {
         )
         .unwrap();
         let missing_global = dir.path().join("no-global.json");
-        let (checks, cfg) = project_checks(dir.path(), &missing_global, false, false);
+        let (checks, cfg) =
+            project_checks(dir.path(), Some(missing_global.as_path()), false, false);
         assert!(cfg.is_none());
         let project_config_check = checks
             .iter()
@@ -1192,7 +1203,7 @@ mod tests {
         let repo = dir.path().join("repo-settings.json"); // does not exist
         let global = dir.path().join("global-settings.json");
         std::fs::write(&global, r#"{"command":"tracevault stream"}"#).unwrap();
-        let c = claude_hook_check_in(&repo, &global);
+        let c = claude_hook_check_in(&repo, Some(global.as_path()));
         assert_eq!(c.level, Level::Ok);
         assert!(
             c.detail.to_lowercase().contains("global") || c.detail.contains("~/.claude"),
@@ -1207,13 +1218,32 @@ mod tests {
         let repo = dir.path().join("repo-settings.json");
         std::fs::write(&repo, r#"{"command":"tracevault stream"}"#).unwrap();
         let global = dir.path().join("global-settings.json"); // does not exist
-        assert_eq!(claude_hook_check_in(&repo, &global).level, Level::Ok);
+        assert_eq!(
+            claude_hook_check_in(&repo, Some(global.as_path())).level,
+            Level::Ok
+        );
+    }
+
+    #[test]
+    fn claude_hook_check_no_global_path_uses_repo_only() {
+        // When the home dir can't be resolved (global_settings = None), only the
+        // repo settings are consulted — never a relative fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo-settings.json");
+        std::fs::write(&repo, r#"{"command":"tracevault stream"}"#).unwrap();
+        assert_eq!(claude_hook_check_in(&repo, None).level, Level::Ok);
+
+        let missing = dir.path().join("nope.json");
+        assert_eq!(claude_hook_check_in(&missing, None).level, Level::Warn);
     }
 
     #[test]
     fn claude_hook_check_warn_when_neither() {
         let dir = tempfile::tempdir().unwrap();
-        let c = claude_hook_check_in(&dir.path().join("a.json"), &dir.path().join("b.json"));
+        let c = claude_hook_check_in(
+            &dir.path().join("a.json"),
+            Some(dir.path().join("b.json").as_path()),
+        );
         assert_eq!(c.level, Level::Warn);
     }
 
@@ -1223,7 +1253,7 @@ mod tests {
         let repo = dir.path().join("repo-settings.json");
         std::fs::create_dir(&repo).unwrap(); // directory-as-file → non-NotFound read error
         let global = dir.path().join("global.json"); // missing
-        let c = claude_hook_check_in(&repo, &global);
+        let c = claude_hook_check_in(&repo, Some(global.as_path()));
         assert_eq!(c.level, Level::Warn);
         assert!(c.detail.contains("cannot read"), "detail: {}", c.detail);
     }
