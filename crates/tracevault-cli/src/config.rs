@@ -72,8 +72,6 @@ pub fn tv_config_root() -> PathBuf {
         .join("tracevault")
 }
 
-// consumed in the detached-context resolution task
-#[allow(dead_code)]
 pub fn user_config_path_in(config_root: &Path) -> PathBuf {
     config_root.join("config.toml")
 }
@@ -95,8 +93,6 @@ pub fn default_user_context_path() -> PathBuf {
 /// (`Ok(None)`) from a malformed/unreadable one (`Err`). Mirrors
 /// `TracevaultConfig::try_load` but for a direct file path (the user-level
 /// config is NOT inside a `.tracevault/` dir).
-// consumed in the detached-context resolution task
-#[allow(dead_code)]
 pub fn try_load_user_config_in(config_root: &Path) -> Result<Option<TracevaultConfig>, String> {
     let path = user_config_path_in(config_root);
     let content = match std::fs::read_to_string(&path) {
@@ -110,8 +106,6 @@ pub fn try_load_user_config_in(config_root: &Path) -> Result<Option<TracevaultCo
 }
 
 /// Lenient: missing OR malformed → `TracevaultConfig::default()` (warn on malformed).
-// consumed in the detached-context resolution task
-#[allow(dead_code)]
 pub fn load_user_config_in(config_root: &Path) -> TracevaultConfig {
     match try_load_user_config_in(config_root) {
         Ok(Some(cfg)) => cfg,
@@ -126,6 +120,26 @@ pub fn load_user_config_in(config_root: &Path) -> TracevaultConfig {
 #[allow(dead_code)]
 pub fn load_user_config() -> TracevaultConfig {
     load_user_config_in(&tv_config_root())
+}
+
+/// Resolve the effective user-context source. A repo that *configured* it
+/// (`Some`) wins — including an explicit `Some(Toggle(false))` (hard-off, no
+/// fallback). Only when the repo did NOT configure it (`None`) does the
+/// user-level `config.toml` under `config_root` supply it.
+pub fn resolve_user_context_in(
+    repo_configured: Option<UserContext>,
+    config_root: &Path,
+) -> UserContext {
+    repo_configured.unwrap_or_else(|| {
+        load_user_config_in(config_root)
+            .user_context
+            .unwrap_or_default()
+    })
+}
+
+/// [`resolve_user_context_in`] rooted at [`tv_config_root`].
+pub fn resolve_user_context(repo_configured: Option<UserContext>) -> UserContext {
+    resolve_user_context_in(repo_configured, &tv_config_root())
 }
 
 impl UserContext {
@@ -448,6 +462,34 @@ mod tests {
     fn load_user_config_lenient_defaults_on_missing() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_user_config_in(dir.path()).user_context.is_none());
+    }
+
+    #[test]
+    fn resolve_user_context_prefers_repo_over_global() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(user_config_path_in(dir.path()), "user_context = true\n").unwrap();
+        // repo explicitly set (even explicit-off) → repo wins, NO global fallback
+        let uc = resolve_user_context_in(Some(UserContext::Toggle(false)), dir.path());
+        assert!(
+            uc.resolve().is_none(),
+            "explicit repo-off must hard-disable"
+        );
+    }
+
+    #[test]
+    fn resolve_user_context_falls_back_to_global_when_repo_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(user_config_path_in(dir.path()), "user_context = true\n").unwrap();
+        let uc = resolve_user_context_in(None, dir.path());
+        assert_eq!(uc.resolve(), Some(default_user_context_path()));
+    }
+
+    #[test]
+    fn resolve_user_context_off_when_neither_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_user_context_in(None, dir.path())
+            .resolve()
+            .is_none());
     }
 
     #[test]
