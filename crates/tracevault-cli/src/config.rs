@@ -18,8 +18,8 @@ pub struct TracevaultConfig {
     pub org_slug: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_id: Option<String>,
-    #[serde(default, skip_serializing_if = "is_default_user_context")]
-    pub user_context: UserContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_context: Option<UserContext>,
 }
 
 fn default_agent() -> String {
@@ -34,7 +34,7 @@ impl Default for TracevaultConfig {
             api_key: None,
             org_slug: None,
             repo_id: None,
-            user_context: UserContext::default(),
+            user_context: None,
         }
     }
 }
@@ -92,10 +92,6 @@ impl UserContext {
         };
         enabled.then(|| self.path())
     }
-}
-
-fn is_default_user_context(uc: &UserContext) -> bool {
-    matches!(uc, UserContext::Toggle(false))
 }
 
 impl TracevaultConfig {
@@ -178,13 +174,17 @@ mod tests {
             api_key: None, // api_key not included in to_toml
             org_slug: Some("my-org".into()),
             repo_id: Some("repo-1".into()),
-            user_context: UserContext::default(),
+            user_context: None,
         };
         let toml = cfg.to_toml();
         assert!(toml.contains("agent = \"claude-code\""));
         assert!(toml.contains("server_url = \"https://example.com\""));
         assert!(toml.contains("org_slug = \"my-org\""));
         assert!(toml.contains("repo_id = \"repo-1\""));
+        assert!(
+            !toml.contains("user_context"),
+            "None user_context must be omitted"
+        );
     }
 
     #[test]
@@ -274,7 +274,7 @@ mod tests {
             api_key: Some("secret".into()),
             org_slug: Some("my-org".into()),
             repo_id: None,
-            user_context: UserContext::default(),
+            user_context: None,
         };
         let toml = cfg.to_toml();
         assert!(toml.contains("agent = \"claude-code\""));
@@ -293,25 +293,29 @@ mod tests {
 
     #[test]
     fn user_context_forms_resolve_correctly() {
-        // absent ⇒ default ⇒ disabled
+        // absent ⇒ unset (never configured)
         let none_cfg: TracevaultConfig = toml::from_str("agent = \"claude-code\"").unwrap();
-        assert!(none_cfg.user_context.resolve().is_none());
+        assert!(none_cfg.user_context.is_none());
 
         // false ⇒ disabled
         let f: TracevaultConfig =
             toml::from_str("agent=\"claude-code\"\nuser_context = false").unwrap();
-        assert!(f.user_context.resolve().is_none());
+        assert!(matches!(f.user_context, Some(UserContext::Toggle(false))));
+        assert!(f.user_context.unwrap().resolve().is_none());
 
         // true ⇒ enabled at default path
         let t: TracevaultConfig =
             toml::from_str("agent=\"claude-code\"\nuser_context = true").unwrap();
-        assert_eq!(t.user_context.resolve(), Some(default_user_context_path()));
+        assert_eq!(
+            t.user_context.unwrap().resolve(),
+            Some(default_user_context_path())
+        );
 
         // "path" ⇒ enabled at that path
         let p: TracevaultConfig =
             toml::from_str("agent=\"claude-code\"\nuser_context = \"/tmp/ctx.json\"").unwrap();
         assert_eq!(
-            p.user_context.resolve(),
+            p.user_context.unwrap().resolve(),
             Some(PathBuf::from("/tmp/ctx.json"))
         );
 
@@ -320,8 +324,27 @@ mod tests {
             "agent=\"claude-code\"\n[user_context]\nenable = false\npath = \"/tmp/x.json\"",
         )
         .unwrap();
-        assert!(obj.user_context.resolve().is_none());
-        assert_eq!(obj.user_context.path(), PathBuf::from("/tmp/x.json"));
+        let obj_ctx = obj.user_context.unwrap();
+        assert!(obj_ctx.resolve().is_none());
+        assert_eq!(obj_ctx.path(), PathBuf::from("/tmp/x.json"));
+    }
+
+    #[test]
+    fn explicit_disable_is_persisted_not_skipped() {
+        let cfg = TracevaultConfig {
+            user_context: Some(UserContext::Toggle(false)),
+            ..Default::default()
+        };
+        let toml = cfg.to_toml();
+        assert!(
+            toml.contains("user_context"),
+            "explicit off must serialize, got:\n{toml}"
+        );
+        let back: TracevaultConfig = toml::from_str(&toml).unwrap();
+        assert!(matches!(
+            back.user_context,
+            Some(UserContext::Toggle(false))
+        ));
     }
 
     #[test]

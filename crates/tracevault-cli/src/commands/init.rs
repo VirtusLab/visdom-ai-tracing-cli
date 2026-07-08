@@ -181,7 +181,7 @@ pub async fn init_in_directory(
         config.server_url = Some(url.to_string());
     }
     config.org_slug = org_slug.clone();
-    config.user_context = user_context;
+    config.user_context = Some(user_context);
     fs::write(
         TracevaultConfig::config_path(project_root),
         config.to_toml(),

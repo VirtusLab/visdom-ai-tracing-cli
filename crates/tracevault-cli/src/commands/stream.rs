@@ -249,7 +249,8 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
         .as_ref()
         .ok()
         .and_then(|opt| opt.as_ref())
-        .and_then(|c| c.user_context.resolve());
+        .and_then(|c| c.user_context.as_ref())
+        .and_then(|uc| uc.resolve());
 
     // Load the EFFECTIVE merged context (user layer, if enabled, merged with
     // global and per-worktree) and extract fields before building the

@@ -57,7 +57,7 @@ fn user_context_path(cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> 
     let config = TracevaultConfig::try_load(&root)
         .map_err(|e| format!("cannot resolve --user path: malformed .tracevault/config.toml: {e}"))?
         .unwrap_or_default();
-    Ok(config.user_context.path())
+    Ok(config.user_context.unwrap_or_default().path())
 }
 
 /// `tracevault context set` — build a fresh Context from flags, save it.
@@ -249,7 +249,7 @@ pub fn run_show(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|root| TracevaultConfig::load(&root))
         .unwrap_or_default();
-    let user_path = config.user_context.resolve();
+    let user_path = config.user_context.and_then(|uc| uc.resolve());
     let user_enabled = user_path.is_some();
 
     let (paths, user, global, worktree, effective) =
@@ -544,7 +544,7 @@ pub fn run_source(
         Err(e) => return Err(format!("malformed .tracevault/config.toml: {e}").into()),
     };
 
-    config.user_context = if disable {
+    let new_user_context = if disable {
         UserContext::Toggle(false)
     } else if let Some(p) = path {
         UserContext::Path(p)
@@ -553,6 +553,7 @@ pub fn run_source(
     } else {
         return Err("specify one of --enable, --disable, --path <file>, --default".into());
     };
+    config.user_context = Some(new_user_context);
 
     std::fs::write(TracevaultConfig::config_path(&root), config.to_toml())?;
     println!("Updated user_context.");
@@ -618,16 +619,16 @@ mod tests {
 
         run_source(dir.path(), true, false, None, false).unwrap();
         let cfg = TracevaultConfig::load(dir.path()).unwrap();
-        assert!(cfg.user_context.resolve().is_some());
+        assert!(cfg.user_context.unwrap().resolve().is_some());
 
         run_source(dir.path(), false, true, None, false).unwrap();
         let cfg = TracevaultConfig::load(dir.path()).unwrap();
-        assert!(cfg.user_context.resolve().is_none());
+        assert!(cfg.user_context.unwrap().resolve().is_none());
 
         run_source(dir.path(), false, false, Some("/p".to_string()), false).unwrap();
         let cfg = TracevaultConfig::load(dir.path()).unwrap();
         assert_eq!(
-            cfg.user_context.resolve(),
+            cfg.user_context.unwrap().resolve(),
             Some(std::path::PathBuf::from("/p"))
         );
     }
@@ -637,7 +638,7 @@ mod tests {
         let dir = temp_project();
         run_source(dir.path(), false, false, None, true).unwrap();
         let cfg = TracevaultConfig::load(dir.path()).unwrap();
-        assert!(cfg.user_context.resolve().is_some());
+        assert!(cfg.user_context.unwrap().resolve().is_some());
     }
 
     #[test]
@@ -684,7 +685,7 @@ mod tests {
         let tv_dir = dir.path().join(".tracevault");
         fs::create_dir_all(&tv_dir).unwrap();
         let config = TracevaultConfig {
-            user_context: UserContext::Path(uc_path.display().to_string()),
+            user_context: Some(UserContext::Path(uc_path.display().to_string())),
             ..TracevaultConfig::default()
         };
         fs::write(tv_dir.join("config.toml"), config.to_toml()).unwrap();
