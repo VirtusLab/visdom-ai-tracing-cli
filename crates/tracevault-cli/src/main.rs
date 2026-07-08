@@ -333,13 +333,10 @@ async fn main() {
         Cli::Status { session_id } => {
             let cwd = env::current_dir().expect("Cannot determine current directory");
             let project_root = crate::paths::resolve_project_root(&cwd).root;
-            // Filter an empty `--session-id ""` the same way as the env var, so
-            // it falls back to env/scan instead of forcing a misleading warning.
-            let effective = session_id.filter(|s| !s.is_empty()).or_else(|| {
-                std::env::var("TRACEVAULT_SESSION_ID")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-            });
+            let effective = commands::status::effective_session_id(
+                session_id,
+                std::env::var("TRACEVAULT_SESSION_ID").ok(),
+            );
             let code = commands::status::run_status(&project_root, effective.as_deref()).await;
             if code != 0 {
                 std::process::exit(code);

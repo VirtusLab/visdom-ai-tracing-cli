@@ -374,10 +374,7 @@ fn claude_hook_check_in(repo_settings: &Path, global_settings: &Path) -> Check {
     }
     let global = read_settings_hooks(global_settings);
     if matches!(global, SettingsHooks::Present) {
-        return Check::ok(
-            "Claude Code hooks",
-            "registered globally in ~/.claude/settings.json",
-        );
+        return Check::ok("Claude Code hooks", "via global install (see Installation)");
     }
     if let SettingsHooks::Unreadable(e) = &repo {
         return Check::warn(
@@ -489,7 +486,7 @@ fn workspace_binding_check_in(
                 Check::ok(
                     "Workspace binding",
                     format!(
-                        "repo {} (org {}) via repo switch (most recent of all sessions: {id}; pass --session-id to target one)",
+                        "repo {} (org {}) via repo switch — most recent session with a binding: {id} (may be another repo; pass --session-id to target one)",
                         b.repo_id, b.org_slug
                     ),
                 ),
@@ -505,10 +502,36 @@ fn workspace_binding_check_in(
 
 // --- Server repo ---
 
+/// How `status` should locate the repo on the server.
+#[derive(Debug, PartialEq)]
+enum RepoMatch {
+    ByName(String),
+    ById(String),
+}
+
+/// Bound mode (config `org_slug`, match by git repo NAME) takes precedence;
+/// otherwise workspace mode (the authoritative binding's `org_slug`, match by
+/// `repo_id`). `None` when neither is available. Pure — `repo_name` is passed
+/// in so this is unit-testable without invoking git.
+fn server_repo_lookup(
+    config_org_slug: Option<&str>,
+    repo_name: &str,
+    binding: Option<&crate::session_state::RepoBinding>,
+) -> Option<(String, RepoMatch)> {
+    if let Some(slug) = config_org_slug {
+        return Some((slug.to_string(), RepoMatch::ByName(repo_name.to_string())));
+    }
+    if let Some(b) = binding {
+        return Some((b.org_slug.clone(), RepoMatch::ById(b.repo_id.clone())));
+    }
+    None
+}
+
 async fn server_repo_checks(
     project_root: &Path,
     auth: &AuthContext,
     config: Option<&TracevaultConfig>,
+    binding: Option<&crate::session_state::RepoBinding>,
 ) -> Vec<Check> {
     let mut out = Vec::new();
 
@@ -519,16 +542,22 @@ async fn server_repo_checks(
         ));
         return out;
     };
-    let Some(slug) = config.and_then(|c| c.org_slug.as_deref()) else {
+
+    let repo_name = git_repo_name(project_root);
+    let Some((slug, want)) = server_repo_lookup(
+        config.and_then(|c| c.org_slug.as_deref()),
+        &repo_name,
+        binding,
+    ) else {
         out.push(Check::skip(
             "Repo registered on server",
-            "no org_slug in config",
+            "no org (need a bound config.toml or a --session-id workspace binding)",
         ));
         return out;
     };
 
     let client = ApiClient::new(server_url, Some(token));
-    let repos = match client.list_repos(slug).await {
+    let repos = match client.list_repos(&slug).await {
         Ok(r) => r,
         Err(e) => {
             out.push(Check::warn(
@@ -539,14 +568,20 @@ async fn server_repo_checks(
         }
     };
 
-    let repo_name = git_repo_name(project_root);
-    let found = repos.iter().find(|r| r.name == repo_name);
+    let found = repos.iter().find(|r| match &want {
+        RepoMatch::ByName(name) => &r.name == name,
+        RepoMatch::ById(id) => &r.id.to_string() == id,
+    });
 
     match found {
         None => {
+            let what = match &want {
+                RepoMatch::ByName(n) => format!("'{n}'"),
+                RepoMatch::ById(id) => format!("repo id {id}"),
+            };
             out.push(Check::err(
                 "Repo registered on server",
-                format!("'{repo_name}' not found in org '{slug}'. Run `tracevault init` while logged in, or `tracevault sync`."),
+                format!("{what} not found in org '{slug}'. Run `tracevault init` while logged in, or `tracevault sync`."),
             ));
             return out;
         }
@@ -575,25 +610,35 @@ async fn server_repo_checks(
                 )),
             }
 
-            let local_remote = git_remote_url(project_root);
-            match (local_remote.as_deref(), r.github_url.as_deref()) {
-                (Some(local), Some(remote))
-                    if normalize_remote(local) == normalize_remote(remote) =>
-                {
-                    out.push(Check::ok("Remote URL matches", remote.to_string()));
+            match &want {
+                RepoMatch::ByName(_) => {
+                    let local_remote = git_remote_url(project_root);
+                    match (local_remote.as_deref(), r.github_url.as_deref()) {
+                        (Some(local), Some(remote))
+                            if normalize_remote(local) == normalize_remote(remote) =>
+                        {
+                            out.push(Check::ok("Remote URL matches", remote.to_string()));
+                        }
+                        (Some(local), Some(remote)) => out.push(Check::warn(
+                            "Remote URL matches",
+                            format!("local={local} vs server={remote} — run `tracevault sync`"),
+                        )),
+                        (Some(local), None) => out.push(Check::warn(
+                            "Remote URL matches",
+                            format!("server has no github_url; local={local}"),
+                        )),
+                        (None, _) => out.push(Check::warn(
+                            "Remote URL matches",
+                            "no local `origin` remote configured",
+                        )),
+                    }
                 }
-                (Some(local), Some(remote)) => out.push(Check::warn(
-                    "Remote URL matches",
-                    format!("local={local} vs server={remote} — run `tracevault sync`"),
-                )),
-                (Some(local), None) => out.push(Check::warn(
-                    "Remote URL matches",
-                    format!("server has no github_url; local={local}"),
-                )),
-                (None, _) => out.push(Check::warn(
-                    "Remote URL matches",
-                    "no local `origin` remote configured",
-                )),
+                RepoMatch::ById(_) => {
+                    out.push(Check::skip(
+                        "Remote URL matches",
+                        "n/a in workspace mode (bound by name/id)",
+                    ));
+                }
             }
         }
     }
@@ -652,7 +697,7 @@ fn session_checks(project_root: &Path) -> Vec<Check> {
     if !sessions_dir.exists() {
         return vec![Check::skip(
             "Pending events",
-            "no .tracevault/sessions/ yet (no captures recorded)",
+            "no .tracevault/sessions/ here (project-local check; a detached worker's queue may live under its own working dir)",
         )];
     }
 
@@ -684,7 +729,7 @@ fn session_checks(project_root: &Path) -> Vec<Check> {
     vec![if sessions_with_pending == 0 {
         Check::ok(
             "Pending events",
-            format!("{total_sessions} session(s), all synced"),
+            format!("{total_sessions} session(s), all synced (project-local)"),
         )
     } else {
         Check::warn(
@@ -747,6 +792,13 @@ fn normalize_remote(url: &str) -> String {
 
 // --- Entry point ---
 
+/// Resolve the session id for `status`: an explicit `--session-id` wins, else
+/// `$TRACEVAULT_SESSION_ID`; empty strings are ignored (fall through).
+pub fn effective_session_id(arg: Option<String>, env: Option<String>) -> Option<String> {
+    arg.filter(|s| !s.is_empty())
+        .or_else(|| env.filter(|s| !s.is_empty()))
+}
+
 pub async fn run_status(project_root: &Path, session_id: Option<&str>) -> i32 {
     let auth = resolve_auth();
 
@@ -768,31 +820,40 @@ pub async fn run_status(project_root: &Path, session_id: Option<&str>) -> i32 {
             None,
         ),
     };
-    let has_binding = binding.is_some();
+    // A binding only counts as a mode signal when the session was named
+    // explicitly (--session-id / $TRACEVAULT_SESSION_ID). A *scanned* binding
+    // (no session id) is cwd-agnostic and may belong to another repo, so it is
+    // shown for information but must NOT downgrade "not set up" severity nor
+    // drive the server-repo check.
+    let explicit_session = session_id.is_some();
+    let has_binding = binding.is_some() && explicit_session;
+    let authoritative_binding = if explicit_session {
+        binding.as_ref()
+    } else {
+        None
+    };
 
     let auth_checks_v = auth_checks(&auth).await;
     let install_v = vec![global_check];
     let (proj_checks_v, config) =
         project_checks(project_root, &global_settings, has_global, has_binding);
     let binding_v = vec![binding_check];
-    let server_checks_v = server_repo_checks(project_root, &auth, config.as_ref()).await;
+    let server_checks_v =
+        server_repo_checks(project_root, &auth, config.as_ref(), authoritative_binding).await;
     let session_checks_v = session_checks(project_root);
 
-    print_section("Authentication", &auth_checks_v);
-    print_section("Installation", &install_v);
-    print_section("Project", &proj_checks_v);
-    print_section("Workspace binding", &binding_v);
-    print_section("Server repo", &server_checks_v);
-    print_section("Sessions", &session_checks_v);
-
-    let all: Vec<&Check> = auth_checks_v
-        .iter()
-        .chain(install_v.iter())
-        .chain(proj_checks_v.iter())
-        .chain(binding_v.iter())
-        .chain(server_checks_v.iter())
-        .chain(session_checks_v.iter())
-        .collect();
+    let sections: Vec<(&str, Vec<Check>)> = vec![
+        ("Authentication", auth_checks_v),
+        ("Installation", install_v),
+        ("Project", proj_checks_v),
+        ("Workspace binding", binding_v),
+        ("Server repo", server_checks_v),
+        ("Sessions", session_checks_v),
+    ];
+    for (title, checks) in &sections {
+        print_section(title, checks);
+    }
+    let all: Vec<&Check> = sections.iter().flat_map(|(_, v)| v.iter()).collect();
 
     let errors = all.iter().filter(|c| c.level == Level::Error).count();
     let warns = all.iter().filter(|c| c.level == Level::Warn).count();
@@ -1157,6 +1218,17 @@ mod tests {
     }
 
     #[test]
+    fn claude_hook_check_warns_when_repo_settings_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo-settings.json");
+        std::fs::create_dir(&repo).unwrap(); // directory-as-file → non-NotFound read error
+        let global = dir.path().join("global.json"); // missing
+        let c = claude_hook_check_in(&repo, &global);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.detail.contains("cannot read"), "detail: {}", c.detail);
+    }
+
+    #[test]
     fn tracevault_init_check_severity_matrix() {
         assert_eq!(tracevault_init_check(true, false, false).level, Level::Ok); // present → Ok
         assert_eq!(tracevault_init_check(false, true, false).level, Level::Skip); // absent + global → Skip
@@ -1302,5 +1374,52 @@ mod tests {
         let (check, binding) = workspace_binding_check_in(dir.path(), None);
         assert_eq!(check.level, Level::Skip);
         assert!(binding.is_none());
+    }
+
+    #[test]
+    fn server_repo_lookup_prefers_config_by_name() {
+        let m = server_repo_lookup(Some("acme"), "myrepo", None).unwrap();
+        assert_eq!(
+            m,
+            ("acme".to_string(), RepoMatch::ByName("myrepo".to_string()))
+        );
+    }
+
+    #[test]
+    fn server_repo_lookup_falls_back_to_binding_by_id() {
+        let b = crate::session_state::RepoBinding {
+            org_slug: "visdom".into(),
+            repo_id: "rid-1".into(),
+            git_url: None,
+            updated_at: "t".into(),
+        };
+        let m = server_repo_lookup(None, "ignored", Some(&b)).unwrap();
+        assert_eq!(
+            m,
+            ("visdom".to_string(), RepoMatch::ById("rid-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn server_repo_lookup_none_when_neither() {
+        assert!(server_repo_lookup(None, "x", None).is_none());
+    }
+
+    #[test]
+    fn effective_session_id_arg_wins_and_filters_empty() {
+        assert_eq!(
+            effective_session_id(Some("a".into()), Some("b".into())),
+            Some("a".into())
+        );
+        assert_eq!(
+            effective_session_id(Some("".into()), Some("b".into())),
+            Some("b".into())
+        );
+        assert_eq!(
+            effective_session_id(Some("   ".into()), None).as_deref(),
+            Some("   ")
+        ); // non-empty whitespace is a real (if odd) id — NOT filtered
+        assert_eq!(effective_session_id(None, Some("".into())), None);
+        assert_eq!(effective_session_id(None, None), None);
     }
 }
