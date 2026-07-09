@@ -94,6 +94,21 @@ pub struct MeResponse {
     pub name: Option<String>,
 }
 
+/// One org the authenticated credential belongs to. `org_name` is the org
+/// slug (`orgs.name` server-side) used in URL paths; `display_name` is the
+/// human label. Wire shape of `GET /api/v1/me/orgs`.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct OrgMembership {
+    #[allow(dead_code)]
+    pub org_id: uuid::Uuid,
+    pub org_name: String,
+    #[allow(dead_code)]
+    pub display_name: Option<String>,
+    #[allow(dead_code)]
+    pub role: String,
+}
+
 #[derive(Debug)]
 pub enum GetMeError {
     /// 401 — token is missing or invalid.
@@ -271,6 +286,33 @@ impl ApiClient {
         }
 
         resp.json::<MeResponse>()
+            .await
+            .map_err(|e| GetMeError::Server(e.to_string()))
+    }
+
+    /// List the orgs the authenticated credential belongs to.
+    /// `GET /api/v1/me/orgs`. For a service-account key this is the service
+    /// user's memberships; for a user session, the user's orgs; for an
+    /// org-scoped key, an empty list.
+    #[allow(dead_code)]
+    pub async fn list_my_orgs(&self) -> Result<Vec<OrgMembership>, GetMeError> {
+        let mut builder = self.client.get(format!("{}/api/v1/me/orgs", self.base_url));
+        if let Some(key) = &self.api_key {
+            builder = builder.header("Authorization", format!("Bearer {key}"));
+        }
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| GetMeError::Network(e.to_string()))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(GetMeError::Unauthorized);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(GetMeError::Server(format!("{status}: {body}")));
+        }
+        resp.json::<Vec<OrgMembership>>()
             .await
             .map_err(|e| GetMeError::Server(e.to_string()))
     }
@@ -484,4 +526,23 @@ pub fn resolve_credentials(project_root: &Path) -> (Option<String>, Option<Strin
         .or(config_api_key);
 
     (server_url, token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn org_membership_deserializes_and_exposes_slug() {
+        let body = r#"[
+            {"org_id":"00000000-0000-0000-0000-000000000001","org_name":"acme","display_name":"Acme Inc","role":"admin"},
+            {"org_id":"00000000-0000-0000-0000-000000000002","org_name":"globex","display_name":null,"role":"member"}
+        ]"#;
+        let orgs: Vec<OrgMembership> = serde_json::from_str(body).unwrap();
+        assert_eq!(orgs.len(), 2);
+        // org_name is the slug used in URL paths.
+        assert_eq!(orgs[0].org_name, "acme");
+        assert_eq!(orgs[1].org_name, "globex");
+        assert_eq!(orgs[1].display_name, None);
+    }
 }
