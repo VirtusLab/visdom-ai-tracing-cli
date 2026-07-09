@@ -245,7 +245,8 @@ async fn switch(
 
     // Build the client first: deriving an org from the credential needs it.
     let (server_url, token) = resolve_credentials(project_root);
-    let server_url = server_url.ok_or("not logged in / no server_url; run `tracevault login`")?;
+    let server_url = server_url
+        .ok_or("no server URL configured: set TRACEVAULT_SERVER_URL or run `tracevault login`")?;
     let client = ApiClient::new(&server_url, token.as_deref());
 
     // Locally-configured org wins (env / credentials / bound config). Only when
