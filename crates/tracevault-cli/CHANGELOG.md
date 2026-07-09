@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.23.0...v0.23.1) - 2026-07-09
+
+### Added
+
+- *(cli)* derive org from credential in repo switch when unset ([#19](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/19))
+
 ## [0.23.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.22.0...v0.23.0) - 2026-07-08
 
 ### Added
