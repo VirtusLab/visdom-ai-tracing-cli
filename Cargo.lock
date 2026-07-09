@@ -1738,7 +1738,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tracevault-cli"
-version = "0.23.1"
+version = "0.23.2"
 dependencies = [
  "chrono",
  "clap",
@@ -1910,7 +1910,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "visdom-ai-tracing-protocol"
-version = "0.23.1"
+version = "0.23.2"
 dependencies = [
  "chrono",
  "hex",

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.2](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/protocol-v0.23.1...protocol-v0.23.2) - 2026-07-09
+
+### Added
+
+- *(protocol)* add optional utoipa schema feature for wire types ([#20](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/20))
+
 ## [0.21.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/protocol-v0.20.2...protocol-v0.21.0) - 2026-07-07
 
 ### Added
