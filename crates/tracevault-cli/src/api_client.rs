@@ -263,11 +263,15 @@ impl ApiClient {
         Ok(())
     }
 
-    /// GET /api/v1/auth/me — validates the bearer token and returns user
-    /// identity. Used by `tracevault status` to distinguish "logged out",
-    /// "expired token", and "server unreachable".
-    pub async fn get_me(&self) -> Result<MeResponse, GetMeError> {
-        let mut builder = self.client.get(format!("{}/api/v1/auth/me", self.base_url));
+    /// GET `{base}{path}` with the bearer token, mapping failures into
+    /// `GetMeError` (401 → `Unauthorized`, transport → `Network`, other
+    /// non-2xx or bad JSON → `Server`). Shared by the credential-scoped GETs
+    /// so auth/error handling lives in one place.
+    async fn authed_get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<T, GetMeError> {
+        let mut builder = self.client.get(format!("{}{}", self.base_url, path));
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
         }
@@ -286,9 +290,16 @@ impl ApiClient {
             return Err(GetMeError::Server(format!("{status}: {body}")));
         }
 
-        resp.json::<MeResponse>()
+        resp.json::<T>()
             .await
             .map_err(|e| GetMeError::Server(e.to_string()))
+    }
+
+    /// GET /api/v1/auth/me — validates the bearer token and returns user
+    /// identity. Used by `tracevault status` to distinguish "logged out",
+    /// "expired token", and "server unreachable".
+    pub async fn get_me(&self) -> Result<MeResponse, GetMeError> {
+        self.authed_get_json("/api/v1/auth/me").await
     }
 
     /// List the orgs the authenticated credential belongs to.
@@ -296,25 +307,7 @@ impl ApiClient {
     /// user's memberships; for a user session, the user's orgs; for an
     /// org-scoped key, an empty list.
     pub async fn list_my_orgs(&self) -> Result<Vec<OrgMembership>, GetMeError> {
-        let mut builder = self.client.get(format!("{}/api/v1/me/orgs", self.base_url));
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| GetMeError::Network(e.to_string()))?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(GetMeError::Unauthorized);
-        }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(GetMeError::Server(format!("{status}: {body}")));
-        }
-        resp.json::<Vec<OrgMembership>>()
-            .await
-            .map_err(|e| GetMeError::Server(e.to_string()))
+        self.authed_get_json("/api/v1/me/orgs").await
     }
 
     pub async fn list_repos(&self, org_slug: &str) -> Result<Vec<RepoListItem>, Box<dyn Error>> {

@@ -31,29 +31,28 @@ pub fn org_slug_for(project_root: &Path) -> Option<String> {
 }
 
 /// Pick the org slug from the credential's memberships when none is
-/// configured locally. Exactly one → that slug; zero or many → an error
-/// telling the user to set `TRACEVAULT_ORG_SLUG`. The empty case is not
-/// only "no memberships": `/me/orgs` is also empty for an org-scoped API
-/// key (which has no user), so the message names that case explicitly.
-/// Slugs are sorted and de-duplicated before listing so the multi-org
-/// message is deterministic regardless of server ordering.
+/// configured locally. The slugs are de-duplicated first (a credential can
+/// have more than one membership row for the same org, e.g. multiple roles),
+/// then: exactly one distinct org → that slug; zero or many → an error telling
+/// the user to set `TRACEVAULT_ORG_SLUG`. The empty case is not only "no
+/// memberships": `/me/orgs` is also empty for an org-scoped API key (which has
+/// no user), so the message names that case explicitly. Sorting makes the
+/// multi-org message deterministic regardless of server ordering.
 pub fn org_slug_from_slugs(slugs: &[String]) -> Result<String, String> {
-    match slugs {
+    let mut unique: Vec<&str> = slugs.iter().map(String::as_str).collect();
+    unique.sort_unstable();
+    unique.dedup();
+    match unique.as_slice() {
         [] => Err(
             "could not derive an org from this credential: it has no org membership \
-                   (org-scoped API keys are not supported here); set TRACEVAULT_ORG_SLUG"
+             (org-scoped API keys are not supported here); set TRACEVAULT_ORG_SLUG"
                 .to_string(),
         ),
-        [one] => Ok(one.clone()),
-        many => {
-            let mut slugs: Vec<&str> = many.iter().map(String::as_str).collect();
-            slugs.sort_unstable();
-            slugs.dedup();
-            Err(format!(
-                "credential belongs to multiple orgs; set TRACEVAULT_ORG_SLUG to one of: {}",
-                slugs.join(", ")
-            ))
-        }
+        [one] => Ok((*one).to_string()),
+        many => Err(format!(
+            "credential belongs to multiple orgs; set TRACEVAULT_ORG_SLUG to one of: {}",
+            many.join(", ")
+        )),
     }
 }
 
@@ -336,6 +335,15 @@ mod tests {
         assert_eq!(
             err,
             "credential belongs to multiple orgs; set TRACEVAULT_ORG_SLUG to one of: acme, globex"
+        );
+    }
+
+    #[test]
+    fn org_slug_from_slugs_single_org_duplicated_is_not_multi() {
+        // One org with two membership rows must derive, not be rejected as multi-org.
+        assert_eq!(
+            org_slug_from_slugs(&["acme".to_string(), "acme".to_string()]),
+            Ok("acme".to_string())
         );
     }
 

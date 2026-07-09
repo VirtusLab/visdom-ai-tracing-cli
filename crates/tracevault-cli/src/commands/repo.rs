@@ -238,6 +238,11 @@ async fn switch(
     session_id: Option<&str>,
     project_root: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate the target argument before any network work, so a bad/empty
+    // path or name surfaces as an argument error rather than an unrelated org
+    // or network error from the derivation step below.
+    let target = switch_target(path, name)?;
+
     // Build the client first: deriving an org from the credential needs it.
     let (server_url, token) = resolve_credentials(project_root);
     let server_url = server_url.ok_or("not logged in / no server_url; run `tracevault login`")?;
@@ -250,14 +255,17 @@ async fn switch(
         Some(s) => s,
         None => {
             let orgs = client.list_my_orgs().await.map_err(|e| {
-                format!("no org configured and could not derive it from your credential: {e}")
+                format!(
+                    "no org configured and could not derive it from your credential ({e}); \
+                     set TRACEVAULT_ORG_SLUG, log in, or run inside a bound repo checkout"
+                )
             })?;
             let slugs: Vec<String> = orgs.into_iter().map(|o| o.org_name).collect();
             crate::resolution::org_slug_from_slugs(&slugs)?
         }
     };
 
-    let binding = match switch_target(path, name)? {
+    let binding = match target {
         SwitchTarget::Path(p) => resolve_switch_binding(Path::new(p), &org_slug, &client).await?,
         SwitchTarget::Name(n) => resolve_name_to_binding(n, &org_slug, &client).await?,
     };
