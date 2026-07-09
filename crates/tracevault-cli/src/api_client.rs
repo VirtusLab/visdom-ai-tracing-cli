@@ -94,6 +94,22 @@ pub struct MeResponse {
     pub name: Option<String>,
 }
 
+/// One org the authenticated credential belongs to. `org_name` is the org
+/// slug (`orgs.name` server-side) used in URL paths; `display_name` is the
+/// human label. Wire shape of `GET /api/v1/me/orgs`.
+// Full GET /api/v1/me/orgs wire shape; only org_name (the slug) is consumed.
+// Unused fields kept for the contract, allowed like MeResponse::user_id.
+#[derive(Debug, Deserialize)]
+pub struct OrgMembership {
+    #[allow(dead_code)]
+    pub org_id: uuid::Uuid,
+    pub org_name: String,
+    #[allow(dead_code)]
+    pub display_name: Option<String>,
+    #[allow(dead_code)]
+    pub role: String,
+}
+
 #[derive(Debug)]
 pub enum GetMeError {
     /// 401 — token is missing or invalid.
@@ -247,11 +263,15 @@ impl ApiClient {
         Ok(())
     }
 
-    /// GET /api/v1/auth/me — validates the bearer token and returns user
-    /// identity. Used by `tracevault status` to distinguish "logged out",
-    /// "expired token", and "server unreachable".
-    pub async fn get_me(&self) -> Result<MeResponse, GetMeError> {
-        let mut builder = self.client.get(format!("{}/api/v1/auth/me", self.base_url));
+    /// GET `{base}{path}` with the bearer token, mapping failures into
+    /// `GetMeError` (401 → `Unauthorized`, transport → `Network`, other
+    /// non-2xx or bad JSON → `Server`). Shared by the credential-scoped GETs
+    /// so auth/error handling lives in one place.
+    async fn authed_get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<T, GetMeError> {
+        let mut builder = self.client.get(format!("{}{}", self.base_url, path));
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
         }
@@ -270,9 +290,24 @@ impl ApiClient {
             return Err(GetMeError::Server(format!("{status}: {body}")));
         }
 
-        resp.json::<MeResponse>()
+        resp.json::<T>()
             .await
             .map_err(|e| GetMeError::Server(e.to_string()))
+    }
+
+    /// GET /api/v1/auth/me — validates the bearer token and returns user
+    /// identity. Used by `tracevault status` to distinguish "logged out",
+    /// "expired token", and "server unreachable".
+    pub async fn get_me(&self) -> Result<MeResponse, GetMeError> {
+        self.authed_get_json("/api/v1/auth/me").await
+    }
+
+    /// List the orgs the authenticated credential belongs to.
+    /// `GET /api/v1/me/orgs`. For a service-account key this is the service
+    /// user's memberships; for a user session, the user's orgs; for an
+    /// org-scoped key, an empty list.
+    pub async fn list_my_orgs(&self) -> Result<Vec<OrgMembership>, GetMeError> {
+        self.authed_get_json("/api/v1/me/orgs").await
     }
 
     pub async fn list_repos(&self, org_slug: &str) -> Result<Vec<RepoListItem>, Box<dyn Error>> {
@@ -484,4 +519,23 @@ pub fn resolve_credentials(project_root: &Path) -> (Option<String>, Option<Strin
         .or(config_api_key);
 
     (server_url, token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn org_membership_deserializes_and_exposes_slug() {
+        let body = r#"[
+            {"org_id":"00000000-0000-0000-0000-000000000001","org_name":"acme","display_name":"Acme Inc","role":"admin"},
+            {"org_id":"00000000-0000-0000-0000-000000000002","org_name":"globex","display_name":null,"role":"member"}
+        ]"#;
+        let orgs: Vec<OrgMembership> = serde_json::from_str(body).unwrap();
+        assert_eq!(orgs.len(), 2);
+        // org_name is the slug used in URL paths.
+        assert_eq!(orgs[0].org_name, "acme");
+        assert_eq!(orgs[1].org_name, "globex");
+        assert_eq!(orgs[1].display_name, None);
+    }
 }

@@ -238,15 +238,35 @@ async fn switch(
     session_id: Option<&str>,
     project_root: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let org_slug = org_slug_for(project_root).ok_or(
-        "no org configured: set TRACEVAULT_ORG_SLUG, log in, or run inside a bound repo checkout",
-    )?;
+    // Validate the target argument before any network work, so a bad/empty
+    // path or name surfaces as an argument error rather than an unrelated org
+    // or network error from the derivation step below.
+    let target = switch_target(path, name)?;
 
+    // Build the client first: deriving an org from the credential needs it.
     let (server_url, token) = resolve_credentials(project_root);
-    let server_url = server_url.ok_or("not logged in / no server_url; run `tracevault login`")?;
+    let server_url = server_url
+        .ok_or("no server URL configured: set TRACEVAULT_SERVER_URL or run `tracevault login`")?;
     let client = ApiClient::new(&server_url, token.as_deref());
 
-    let binding = match switch_target(path, name)? {
+    // Locally-configured org wins (env / credentials / bound config). Only when
+    // none is set do we ask the server which org this credential belongs to —
+    // this is what lets a service-account key bind a repo before checkout.
+    let org_slug = match org_slug_for(project_root) {
+        Some(s) => s,
+        None => {
+            let orgs = client.list_my_orgs().await.map_err(|e| {
+                format!(
+                    "no org configured and could not derive it from your credential ({e}); \
+                     set TRACEVAULT_ORG_SLUG, log in, or run inside a bound repo checkout"
+                )
+            })?;
+            let slugs: Vec<String> = orgs.into_iter().map(|o| o.org_name).collect();
+            crate::resolution::org_slug_from_slugs(&slugs)?
+        }
+    };
+
+    let binding = match target {
         SwitchTarget::Path(p) => resolve_switch_binding(Path::new(p), &org_slug, &client).await?,
         SwitchTarget::Name(n) => resolve_name_to_binding(n, &org_slug, &client).await?,
     };

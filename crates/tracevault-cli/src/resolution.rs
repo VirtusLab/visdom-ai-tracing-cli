@@ -30,6 +30,32 @@ pub fn org_slug_for(project_root: &Path) -> Option<String> {
     org_slug_precedence(env, creds, bound)
 }
 
+/// Pick the org slug from the credential's memberships when none is
+/// configured locally. The slugs are de-duplicated first (a credential can
+/// have more than one membership row for the same org, e.g. multiple roles),
+/// then: exactly one distinct org → that slug; zero or many → an error telling
+/// the user to set `TRACEVAULT_ORG_SLUG`. The empty case is not only "no
+/// memberships": `/me/orgs` is also empty for an org-scoped API key (which has
+/// no user), so the message names that case explicitly. Sorting makes the
+/// multi-org message deterministic regardless of server ordering.
+pub fn org_slug_from_slugs(slugs: &[String]) -> Result<String, String> {
+    let mut unique: Vec<&str> = slugs.iter().map(String::as_str).collect();
+    unique.sort_unstable();
+    unique.dedup();
+    match unique.as_slice() {
+        [] => Err(
+            "could not derive an org from this credential: it has no org membership \
+             (org-scoped API keys are not supported here); set TRACEVAULT_ORG_SLUG"
+                .to_string(),
+        ),
+        [one] => Ok((*one).to_string()),
+        many => Err(format!(
+            "credential belongs to multiple orgs; set TRACEVAULT_ORG_SLUG to one of: {}",
+            many.join(", ")
+        )),
+    }
+}
+
 /// `git -C <path> remote get-url origin`, trimmed. `None` if git fails or there
 /// is no origin remote.
 fn git_remote_url(path: &Path) -> Option<String> {
@@ -283,5 +309,56 @@ mod tests {
         assert_eq!(org_slug_precedence(None, None, None), None);
         // empty env string is treated as unset by the caller (org_slug_for),
         // so org_slug_precedence only ever sees None or non-empty.
+    }
+
+    #[test]
+    fn org_slug_from_slugs_single() {
+        assert_eq!(
+            org_slug_from_slugs(&["acme".to_string()]),
+            Ok("acme".to_string())
+        );
+    }
+
+    #[test]
+    fn org_slug_from_slugs_none_errors() {
+        let err = org_slug_from_slugs(&[]).unwrap_err();
+        assert_eq!(
+            err,
+            "could not derive an org from this credential: it has no org membership \
+             (org-scoped API keys are not supported here); set TRACEVAULT_ORG_SLUG"
+        );
+    }
+
+    #[test]
+    fn org_slug_from_slugs_multiple_lists_them() {
+        let err = org_slug_from_slugs(&["acme".to_string(), "globex".to_string()]).unwrap_err();
+        assert_eq!(
+            err,
+            "credential belongs to multiple orgs; set TRACEVAULT_ORG_SLUG to one of: acme, globex"
+        );
+    }
+
+    #[test]
+    fn org_slug_from_slugs_single_org_duplicated_is_not_multi() {
+        // One org with two membership rows must derive, not be rejected as multi-org.
+        assert_eq!(
+            org_slug_from_slugs(&["acme".to_string(), "acme".to_string()]),
+            Ok("acme".to_string())
+        );
+    }
+
+    #[test]
+    fn org_slug_from_slugs_multiple_sorted_and_deduped() {
+        // Message must not depend on server ordering, and repeats collapse.
+        let err = org_slug_from_slugs(&[
+            "globex".to_string(),
+            "acme".to_string(),
+            "globex".to_string(),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "credential belongs to multiple orgs; set TRACEVAULT_ORG_SLUG to one of: acme, globex"
+        );
     }
 }
