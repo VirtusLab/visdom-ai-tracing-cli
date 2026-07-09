@@ -33,7 +33,6 @@ pub fn org_slug_for(project_root: &Path) -> Option<String> {
 /// Pick the org slug from the credential's memberships when none is
 /// configured locally. Exactly one → that slug; zero or many → an error
 /// message telling the user to set `TRACEVAULT_ORG_SLUG`.
-#[allow(dead_code)]
 pub fn org_slug_from_slugs(slugs: &[String]) -> Result<String, String> {
     match slugs {
         [] => {

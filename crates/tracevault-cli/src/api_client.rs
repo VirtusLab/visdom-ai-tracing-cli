@@ -97,8 +97,9 @@ pub struct MeResponse {
 /// One org the authenticated credential belongs to. `org_name` is the org
 /// slug (`orgs.name` server-side) used in URL paths; `display_name` is the
 /// human label. Wire shape of `GET /api/v1/me/orgs`.
+// Full GET /api/v1/me/orgs wire shape; only org_name (the slug) is consumed.
+// Unused fields kept for the contract, allowed like MeResponse::user_id.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct OrgMembership {
     #[allow(dead_code)]
     pub org_id: uuid::Uuid,
@@ -294,7 +295,6 @@ impl ApiClient {
     /// `GET /api/v1/me/orgs`. For a service-account key this is the service
     /// user's memberships; for a user session, the user's orgs; for an
     /// org-scoped key, an empty list.
-    #[allow(dead_code)]
     pub async fn list_my_orgs(&self) -> Result<Vec<OrgMembership>, GetMeError> {
         let mut builder = self.client.get(format!("{}/api/v1/me/orgs", self.base_url));
         if let Some(key) = &self.api_key {
