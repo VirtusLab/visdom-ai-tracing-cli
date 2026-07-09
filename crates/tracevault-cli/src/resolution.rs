@@ -30,6 +30,23 @@ pub fn org_slug_for(project_root: &Path) -> Option<String> {
     org_slug_precedence(env, creds, bound)
 }
 
+/// Pick the org slug from the credential's memberships when none is
+/// configured locally. Exactly one → that slug; zero or many → an error
+/// message telling the user to set `TRACEVAULT_ORG_SLUG`.
+#[allow(dead_code)]
+pub fn org_slug_from_slugs(slugs: &[String]) -> Result<String, String> {
+    match slugs {
+        [] => {
+            Err("this credential is not a member of any org; set TRACEVAULT_ORG_SLUG".to_string())
+        }
+        [one] => Ok(one.clone()),
+        many => Err(format!(
+            "credential belongs to multiple orgs; set TRACEVAULT_ORG_SLUG to one of: {}",
+            many.join(", ")
+        )),
+    }
+}
+
 /// `git -C <path> remote get-url origin`, trimmed. `None` if git fails or there
 /// is no origin remote.
 fn git_remote_url(path: &Path) -> Option<String> {
@@ -283,5 +300,31 @@ mod tests {
         assert_eq!(org_slug_precedence(None, None, None), None);
         // empty env string is treated as unset by the caller (org_slug_for),
         // so org_slug_precedence only ever sees None or non-empty.
+    }
+
+    #[test]
+    fn org_slug_from_slugs_single() {
+        assert_eq!(
+            org_slug_from_slugs(&["acme".to_string()]),
+            Ok("acme".to_string())
+        );
+    }
+
+    #[test]
+    fn org_slug_from_slugs_none_errors() {
+        let err = org_slug_from_slugs(&[]).unwrap_err();
+        assert_eq!(
+            err,
+            "this credential is not a member of any org; set TRACEVAULT_ORG_SLUG"
+        );
+    }
+
+    #[test]
+    fn org_slug_from_slugs_multiple_lists_them() {
+        let err = org_slug_from_slugs(&["acme".to_string(), "globex".to_string()]).unwrap_err();
+        assert_eq!(
+            err,
+            "credential belongs to multiple orgs; set TRACEVAULT_ORG_SLUG to one of: acme, globex"
+        );
     }
 }
