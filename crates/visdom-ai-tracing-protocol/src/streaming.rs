@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamEventType {
@@ -16,6 +17,7 @@ pub enum StreamEventType {
     VerificationPhaseStart,
 }
 
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamEventRequest {
     pub protocol_version: u32,
@@ -58,6 +60,7 @@ pub struct StreamEventRequest {
     pub params: Option<HashMap<String, String>>,
 }
 
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionFinalStats {
     pub duration_ms: Option<i64>,
@@ -71,6 +74,7 @@ pub struct SessionFinalStats {
     pub total_tool_calls: Option<i32>,
 }
 
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamEventResponse {
     pub session_db_id: uuid::Uuid,
@@ -78,6 +82,7 @@ pub struct StreamEventResponse {
     pub status: String,
 }
 
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitPushRequest {
     pub commit_sha: String,
@@ -88,6 +93,7 @@ pub struct CommitPushRequest {
     pub committed_at: Option<DateTime<Utc>>,
 }
 
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitPushResponse {
     pub commit_db_id: uuid::Uuid,
