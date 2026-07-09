@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookEvent {
     pub session_id: String,
@@ -24,6 +25,7 @@ pub struct HookEvent {
     pub source: Option<String>,
 }
 
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
