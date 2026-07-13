@@ -281,12 +281,11 @@ async fn main() {
             global,
             agent,
         } => {
-            // `--claude-settings` only makes sense for the Claude Code agent
-            // (it selects .claude/settings.json vs settings.local.json). With
-            // `--agent codex` the CLI always writes .codex/hooks.json, so reject
-            // the flag rather than silently ignoring it.
-            if matches!(agent, crate::agent::Agent::Codex) && claude_settings.is_some() {
-                eprintln!("Error: --claude-settings only applies to --agent claude-code");
+            // Reject flag combinations that don't apply to the selected agent
+            // (e.g. --claude-settings with --agent codex) rather than silently
+            // ignoring them.
+            if let Err(e) = commands::init::validate_init_flags(agent, claude_settings.is_some()) {
+                eprintln!("Error: {e}");
                 std::process::exit(1);
             }
             if global {
@@ -303,6 +302,10 @@ async fn main() {
                             println!(
                                 "Installed TraceVault Codex hooks in {}",
                                 codex_dir.join("hooks.json").display()
+                            );
+                            println!(
+                                "Added workspace-mode instructions to {}",
+                                codex_dir.join("AGENTS.md").display()
                             );
                             println!(
                                 "These apply to ALL Codex CLI sessions on this machine, not just this repo."
