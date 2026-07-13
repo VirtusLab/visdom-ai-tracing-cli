@@ -576,6 +576,19 @@ pub fn codex_hooks() -> serde_json::Value {
 /// existing file) it returns before writing, so the target is never clobbered
 /// and no temp file is left behind.
 fn merge_hooks_into_file(hooks_path: &Path, ours: &serde_json::Value) -> io::Result<()> {
+    // Defense-in-depth against path traversal: callers pass a constant filename
+    // joined to a home/cwd base (global callers additionally go through
+    // `safe_join`), so a `..` component should never appear — reject it outright
+    // rather than read/write through it.
+    if hooks_path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to use path with '..': {}", hooks_path.display()),
+        ));
+    }
     let mut root: serde_json::Value = if hooks_path.exists() {
         let content = fs::read_to_string(hooks_path)?;
         serde_json::from_str(&content).map_err(|e| {
@@ -642,6 +655,16 @@ already be registered with TraceVault.
 /// the Claude global install (`CLAUDE.md`) and the Codex global install
 /// (`AGENTS.md`).
 fn append_workspace_md(md_path: &Path) -> io::Result<()> {
+    // Defense-in-depth against path traversal (see `merge_hooks_into_file`).
+    if md_path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to use path with '..': {}", md_path.display()),
+        ));
+    }
     let existing = if md_path.exists() {
         fs::read_to_string(md_path)?
     } else {
@@ -1407,6 +1430,22 @@ mod tests {
     #[test]
     fn validate_init_flags_allows_claude_with_claude_settings() {
         assert!(validate_init_flags(crate::agent::Agent::ClaudeCode, true).is_ok());
+    }
+
+    #[test]
+    fn merge_hooks_into_file_rejects_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = tmp.path().join("..").join("hooks.json");
+        let err = merge_hooks_into_file(&bad, &codex_hooks()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn append_workspace_md_rejects_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = tmp.path().join("..").join("AGENTS.md");
+        let err = append_workspace_md(&bad).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[tokio::test]
