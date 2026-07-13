@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/protocol-v0.23.3...protocol-v0.24.0) - 2026-07-13
+
+### Added
+
+- *(cli)* Codex CLI agent support (init --agent codex + codex-tagged streaming) ([#24](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/24))
+
 ## [0.23.3](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/protocol-v0.23.1...protocol-v0.23.3) - 2026-07-09
 
 ### Added
