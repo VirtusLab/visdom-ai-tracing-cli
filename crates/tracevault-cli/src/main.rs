@@ -282,6 +282,32 @@ async fn main() {
             agent,
         } => {
             if global {
+                if matches!(agent, crate::agent::Agent::Codex) {
+                    let codex_dir = match dirs::home_dir() {
+                        Some(home) => home.join(".codex"),
+                        None => {
+                            eprintln!("Error: cannot determine home directory");
+                            std::process::exit(1);
+                        }
+                    };
+                    match commands::init::install_global_codex_hooks(&codex_dir) {
+                        Ok(()) => {
+                            println!(
+                                "Installed TraceVault Codex hooks in {}",
+                                codex_dir.join("hooks.json").display()
+                            );
+                            println!(
+                                "These apply to ALL Codex CLI sessions on this machine, not just this repo."
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                    return;
+                }
+
                 let claude_dir = match dirs::home_dir() {
                     Some(home) => home.join(".claude"),
                     None => {

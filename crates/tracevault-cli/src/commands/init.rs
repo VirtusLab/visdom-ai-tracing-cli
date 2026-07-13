@@ -581,6 +581,38 @@ pub fn install_codex_hooks(project_root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Install TraceVault's Codex hooks into `<codex_dir>/hooks.json`
+/// (deep-merged, never clobbering existing hooks/keys), atomically. Intended
+/// for `tracevault init --global --agent codex`. Unlike the Claude global
+/// install there is no instruction-file block — Codex receives policy text via
+/// the SessionStart injection hook.
+pub fn install_global_codex_hooks(codex_dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(codex_dir)?;
+    let base = codex_dir.canonicalize()?;
+    let hooks_path = safe_join(&base, "hooks.json")?;
+
+    let mut root: serde_json::Value = if hooks_path.exists() {
+        let content = fs::read_to_string(&hooks_path)?;
+        serde_json::from_str(&content).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse {}: {e}", hooks_path.display()),
+            )
+        })?
+    } else {
+        serde_json::json!({})
+    };
+
+    merge_hooks(&mut root, &codex_hooks(), &hooks_path)?;
+
+    let formatted = serde_json::to_string_pretty(&root)
+        .map_err(|e| io::Error::other(format!("Failed to serialize hooks.json: {e}")))?;
+    let tmp = hooks_path.with_extension("json.tmp");
+    fs::write(&tmp, formatted)?;
+    fs::rename(&tmp, &hooks_path)?;
+    Ok(())
+}
+
 const GLOBAL_CLAUDE_MD_MARKER: &str = "<!-- tracevault:workspace-mode -->";
 
 const GLOBAL_CLAUDE_MD_BLOCK: &str = "\
@@ -1250,6 +1282,35 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cfg.user_context.unwrap().path_in(root.path()), custom);
+    }
+
+    #[test]
+    fn install_global_codex_hooks_writes_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_dir = tmp.path().join(".codex");
+
+        install_global_codex_hooks(&codex_dir).unwrap();
+        install_global_codex_hooks(&codex_dir).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(codex_dir.join("hooks.json")).unwrap())
+                .unwrap();
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+        ] {
+            let arr = v["hooks"][event].as_array().unwrap();
+            assert_eq!(arr.len(), 1, "event {event} must not be duplicated");
+        }
+        // No stray temp file left behind.
+        let leftover = fs::read_dir(&codex_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover);
     }
 
     #[test]
