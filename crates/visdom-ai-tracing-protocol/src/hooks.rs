@@ -1,10 +1,24 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Deserialize a possibly-null string field to `String`, mapping JSON `null`
+/// to the empty string. `#[serde(default)]` covers the absent-key case.
+pub(crate) fn de_null_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookEvent {
     pub session_id: String,
+    /// Path to the session transcript/rollout JSONL. Codex documents this as
+    /// nullable (e.g. on `SessionStart`); a missing key or explicit `null`
+    /// deserializes to an empty string, which downstream treats as "no
+    /// transcript yet" (the incremental reader no-ops on a non-existent path).
+    #[serde(default, deserialize_with = "crate::hooks::de_null_string")]
     pub transcript_path: String,
     pub cwd: String,
     #[serde(default)]
@@ -122,5 +136,19 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json.get("suppress_output").unwrap(), true);
         assert!(json.get("continue").is_none());
+    }
+
+    #[test]
+    fn parses_with_null_transcript_path() {
+        let json = r#"{"session_id":"s","transcript_path":null,"cwd":".","hook_event_name":"SessionStart"}"#;
+        let e = parse_hook_event(json).unwrap();
+        assert_eq!(e.transcript_path, "");
+    }
+
+    #[test]
+    fn parses_with_absent_transcript_path() {
+        let json = r#"{"session_id":"s","cwd":".","hook_event_name":"SessionStart"}"#;
+        let e = parse_hook_event(json).unwrap();
+        assert_eq!(e.transcript_path, "");
     }
 }

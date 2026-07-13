@@ -1,6 +1,7 @@
 use clap::Parser;
 use std::env;
 
+mod agent;
 mod api_client;
 mod commands;
 mod config;
@@ -54,6 +55,10 @@ enum Cli {
             conflicts_with_all = ["server_url", "claude_settings", "no_gitignore"]
         )]
         global: bool,
+        /// Which agent to install hooks for. `codex` writes .codex/hooks.json;
+        /// the default installs Claude Code hooks (unchanged behaviour).
+        #[arg(long, value_enum, default_value = "claude-code")]
+        agent: crate::agent::Agent,
     },
     /// Show current session status
     Status {
@@ -70,6 +75,10 @@ enum Cli {
     Stream {
         #[arg(long)]
         event: String,
+        /// Which agent this hook belongs to (sets the request's tool + protocol
+        /// version). Defaults to claude-code so existing installs are unchanged.
+        #[arg(long, value_enum, default_value = "claude-code")]
+        agent: crate::agent::Agent,
     },
     /// SessionStart hook: exports the session id and injects the bound repo's
     /// policies as additionalContext. Installed into .claude/settings.json by
@@ -270,8 +279,83 @@ async fn main() {
             no_user_context,
             user_context,
             global,
+            agent,
         } => {
+            // Reject flag combinations that don't apply to the selected agent
+            // (e.g. --claude-settings with --agent codex) rather than silently
+            // ignoring them.
+            if let Err(e) = commands::init::validate_init_flags(agent, claude_settings.is_some()) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
             if global {
+                if matches!(agent, crate::agent::Agent::Codex) {
+                    let codex_dir = match dirs::home_dir() {
+                        Some(home) => home.join(".codex"),
+                        None => {
+                            eprintln!("Error: cannot determine home directory");
+                            std::process::exit(1);
+                        }
+                    };
+                    match commands::init::install_global_codex_hooks(&codex_dir) {
+                        Ok(()) => {
+                            println!(
+                                "Installed TraceVault Codex hooks in {}",
+                                codex_dir.join("hooks.json").display()
+                            );
+                            println!(
+                                "Added workspace-mode instructions to {}",
+                                codex_dir.join("AGENTS.md").display()
+                            );
+                            println!(
+                                "These apply to ALL Codex CLI sessions on this machine, not just this repo."
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+
+                    let requested =
+                        match config::UserContext::from_init_flags(no_user_context, user_context) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("Error: {e}");
+                                std::process::exit(1);
+                            }
+                        };
+                    match commands::init::write_global_user_config_in(
+                        &config::tv_config_root(),
+                        requested,
+                    ) {
+                        Ok(active) => {
+                            println!(
+                                "User-level context config: {}",
+                                config::user_config_path().display()
+                            );
+                            match active {
+                                Some(ctx) => {
+                                    println!("User-level context file: {}", ctx.display())
+                                }
+                                None => {
+                                    println!(
+                                        "User-level context is disabled (`--no-user-context`)."
+                                    )
+                                }
+                            }
+                            println!(
+                                "Edit it with `tracevault context set --user …`; disable with \
+                                 `tracevault init --global --no-user-context`."
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: could not write user-level context config: {e}")
+                        }
+                    }
+                    return;
+                }
+
                 let claude_dir = match dirs::home_dir() {
                     Some(home) => home.join(".claude"),
                     None => {
@@ -344,13 +428,13 @@ async fn main() {
                 claude_settings,
                 no_gitignore,
                 user_context,
+                agent,
             )
             .await
             {
-                Ok(target) => {
-                    let entry = target.gitignore_entry();
+                Ok(entry) => {
                     println!("TraceVault initialized in {}", cwd.display());
-                    println!("Claude Code hooks installed ({entry})");
+                    println!("{} hooks installed ({entry})", agent.label());
                     println!("Git hooks installed (pre-push, post-commit)");
                     println!("Added .tracevault/ and {entry} to .gitignore");
                     println!(
@@ -375,8 +459,8 @@ async fn main() {
                 std::process::exit(code);
             }
         }
-        Cli::Stream { event } => {
-            if let Err(e) = commands::stream::run_stream(&event).await {
+        Cli::Stream { event, agent } => {
+            if let Err(e) = commands::stream::run_stream(&event, agent).await {
                 eprintln!("Stream error: {e}");
             }
         }

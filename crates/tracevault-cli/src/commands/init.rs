@@ -119,13 +119,29 @@ fn linked_worktree_primary(dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Validate init flag combinations against the selected agent. `--claude-settings`
+/// selects between `.claude/settings.json` and `settings.local.json`, so it only
+/// applies to the Claude Code agent — `--agent codex` always writes
+/// `.codex/hooks.json`. Returns a human-readable error for an incompatible combo
+/// so the CLI rejects it instead of silently ignoring the flag.
+pub fn validate_init_flags(
+    agent: crate::agent::Agent,
+    claude_settings_set: bool,
+) -> Result<(), String> {
+    if matches!(agent, crate::agent::Agent::Codex) && claude_settings_set {
+        return Err("--claude-settings only applies to --agent claude-code".to_string());
+    }
+    Ok(())
+}
+
 pub async fn init_in_directory(
     project_root: &Path,
     server_url: Option<&str>,
     claude_settings: Option<ClaudeSettingsTarget>,
     no_gitignore: bool,
     user_context: UserContext,
-) -> Result<ClaudeSettingsTarget, io::Error> {
+    agent: crate::agent::Agent,
+) -> Result<String, io::Error> {
     // Check for git repository
     if !project_root.join(".git").exists() {
         return Err(io::Error::new(
@@ -150,7 +166,16 @@ pub async fn init_in_directory(
         ));
     }
 
-    let target = resolve_claude_target(claude_settings)?;
+    // Resolve the hook-file gitignore entry per agent. Claude has a
+    // shared/local settings choice; Codex has a single .codex/hooks.json.
+    let (claude_target, hook_gitignore_entry): (Option<ClaudeSettingsTarget>, String) = match agent
+    {
+        crate::agent::Agent::ClaudeCode => {
+            let target = resolve_claude_target(claude_settings)?;
+            (Some(target), target.gitignore_entry().to_string())
+        }
+        crate::agent::Agent::Codex => (None, ".codex/hooks.json".to_string()),
+    };
 
     // Create .tracevault/ directory
     let config_dir = TracevaultConfig::config_dir(project_root);
@@ -163,7 +188,7 @@ pub async fn init_in_directory(
 
     // Keep tracevault's files local — update root .gitignore (unless opted out)
     if !no_gitignore {
-        update_root_gitignore(project_root, target)?;
+        update_root_gitignore(project_root, &hook_gitignore_entry)?;
     }
 
     // Register repo on server if authenticated, server URL known, and git remote available
@@ -188,8 +213,16 @@ pub async fn init_in_directory(
         config.to_toml(),
     )?;
 
-    // Install Claude Code hooks into the chosen settings file
-    install_claude_hooks(project_root, target)?;
+    // Install the selected agent's hooks.
+    match agent {
+        crate::agent::Agent::ClaudeCode => {
+            // `claude_target` is `Some` for the Claude agent by construction above.
+            let target =
+                claude_target.expect("claude settings target is resolved for the Claude agent");
+            install_claude_hooks(project_root, target)?;
+        }
+        crate::agent::Agent::Codex => install_codex_hooks(project_root)?,
+    }
 
     // Install git hooks
     install_git_hook(project_root)?;
@@ -244,13 +277,10 @@ pub async fn init_in_directory(
         }
     }
 
-    Ok(target)
+    Ok(hook_gitignore_entry)
 }
 
-fn update_root_gitignore(
-    project_root: &Path,
-    target: ClaudeSettingsTarget,
-) -> Result<(), io::Error> {
+fn update_root_gitignore(project_root: &Path, settings_entry: &str) -> Result<(), io::Error> {
     let path = project_root.join(".gitignore");
     let existing = if path.exists() {
         fs::read_to_string(&path)?
@@ -259,9 +289,9 @@ fn update_root_gitignore(
     };
 
     // Only ignore what `init` actually creates or modifies: the `.tracevault/`
-    // directory and the single Claude settings file we wrote hooks into. The
+    // directory and the single settings file we wrote hooks into. The
     // other settings file is left untouched, so we don't add it here.
-    let needed: Vec<&str> = [".tracevault/", target.gitignore_entry()]
+    let needed: Vec<&str> = [".tracevault/", settings_entry]
         .iter()
         .copied()
         .filter(|entry| !existing.lines().any(|line| line.trim() == *entry))
@@ -505,6 +535,109 @@ pub fn tracevault_hooks() -> serde_json::Value {
     })
 }
 
+/// Codex CLI hook set, mirroring `tracevault_hooks()` but with Codex commands.
+/// Capture hooks carry `--agent codex`; the injection hooks (session-start /
+/// user-prompt) are agent-agnostic. Matchers are `""` (all tools).
+///
+/// We intentionally do NOT register a `PreToolUse` hook for Codex. Unlike Claude
+/// Code — whose `PreToolUse` is scoped to `Write|Edit|Bash` — the CLI does no
+/// Codex-specific pre-tool work, and `PostToolUse` + `Stop` already stream the
+/// (incremental, offset-tracked) rollout. A pre-tool hook on every tool call
+/// would only double the per-call streaming for no added capture. No
+/// `Notification` event either (Codex has none).
+pub fn codex_hooks() -> serde_json::Value {
+    serde_json::json!({
+        "SessionStart": [{
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "tracevault session-start", "timeout": 10, "statusMessage": "TraceVault: session start" }]
+        }],
+        "UserPromptSubmit": [{
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "tracevault user-prompt", "timeout": 10, "statusMessage": "TraceVault: policy reinforcement" }]
+        }],
+        "PostToolUse": [{
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "tracevault stream --event post-tool-use --agent codex", "timeout": 10, "statusMessage": "TraceVault: streaming post-tool event" }]
+        }],
+        "Stop": [{
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "tracevault stream --event stop --agent codex", "timeout": 10, "statusMessage": "TraceVault: finalizing session" }]
+        }]
+    })
+}
+
+/// Read `hooks_path` as a JSON object (or `{}` if absent), deep-merge `ours`
+/// into its `hooks` map via [`merge_hooks`] (idempotent, never clobbers existing
+/// hooks/keys), and write the result back atomically (sibling temp file +
+/// rename). Shared by the hook-file installers so the read → merge →
+/// atomic-write pattern lives in exactly one place. Works for both Claude's
+/// `settings.json` and Codex's `hooks.json`, whose roots are the object
+/// `merge_hooks` mutates (`root["hooks"]`). On a merge error (malformed
+/// existing file) it returns before writing, so the target is never clobbered
+/// and no temp file is left behind.
+fn merge_hooks_into_file(hooks_path: &Path, ours: &serde_json::Value) -> io::Result<()> {
+    // Defense-in-depth against path traversal: callers pass a constant filename
+    // joined to a home/cwd base (global callers additionally go through
+    // `safe_join`), so a `..` component should never appear — reject it outright
+    // rather than read/write through it.
+    if hooks_path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to use path with '..': {}", hooks_path.display()),
+        ));
+    }
+    let mut root: serde_json::Value = if hooks_path.exists() {
+        let content = fs::read_to_string(hooks_path)?;
+        serde_json::from_str(&content).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse {}: {e}", hooks_path.display()),
+            )
+        })?
+    } else {
+        serde_json::json!({})
+    };
+
+    merge_hooks(&mut root, ours, hooks_path)?;
+
+    let formatted = serde_json::to_string_pretty(&root).map_err(|e| {
+        io::Error::other(format!("Failed to serialize {}: {e}", hooks_path.display()))
+    })?;
+    let tmp = hooks_path.with_extension("json.tmp");
+    fs::write(&tmp, formatted)?;
+    fs::rename(&tmp, hooks_path)?;
+    Ok(())
+}
+
+/// Deep-merge the Codex hook set into `<project_root>/.codex/hooks.json`,
+/// creating it if absent (idempotent, never clobbers existing hooks/keys,
+/// atomic write). Repo-local counterpart of [`install_global_codex_hooks`].
+pub fn install_codex_hooks(project_root: &Path) -> io::Result<()> {
+    let codex_dir = project_root.join(".codex");
+    fs::create_dir_all(&codex_dir)?;
+    merge_hooks_into_file(&codex_dir.join("hooks.json"), &codex_hooks())
+}
+
+/// Install TraceVault's Codex hooks into `<codex_dir>/hooks.json` and append a
+/// workspace-mode instruction block to `<codex_dir>/AGENTS.md` (idempotent,
+/// atomic), mirroring the Claude global install's `settings.json` + `CLAUDE.md`.
+/// Intended for `tracevault init --global --agent codex`. Codex reads `AGENTS.md`
+/// for agent instructions, so the workspace-mode block reaches detached Codex
+/// sessions the same way the `CLAUDE.md` block reaches Claude ones.
+pub fn install_global_codex_hooks(codex_dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(codex_dir)?;
+    // Canonicalize the base so safe_join keeps target files directly within it.
+    let base = codex_dir.canonicalize()?;
+    merge_hooks_into_file(&safe_join(&base, "hooks.json")?, &codex_hooks())?;
+    append_workspace_md(&safe_join(&base, "AGENTS.md")?)
+}
+
+// Workspace-mode instruction block. Agent-agnostic (it only references
+// `tracevault repo …`), so it's shared verbatim between the Claude global
+// install's `CLAUDE.md` and the Codex global install's `AGENTS.md`.
 const GLOBAL_CLAUDE_MD_MARKER: &str = "<!-- tracevault:workspace-mode -->";
 
 const GLOBAL_CLAUDE_MD_BLOCK: &str = "\
@@ -515,6 +648,41 @@ You may be running detached from any single repository. Before working on a repo
 output as binding. Use `--path <path>` on `tracevault repo status` for a one-off. Repos must
 already be registered with TraceVault.
 ";
+
+/// Append the workspace-mode instruction block to `md_path` (creating it if
+/// absent), idempotently — guarded by [`GLOBAL_CLAUDE_MD_MARKER`], so a re-run
+/// never duplicates it and any existing user content is preserved. Shared by
+/// the Claude global install (`CLAUDE.md`) and the Codex global install
+/// (`AGENTS.md`).
+fn append_workspace_md(md_path: &Path) -> io::Result<()> {
+    // Defense-in-depth against path traversal (see `merge_hooks_into_file`).
+    if md_path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to use path with '..': {}", md_path.display()),
+        ));
+    }
+    let existing = if md_path.exists() {
+        fs::read_to_string(md_path)?
+    } else {
+        String::new()
+    };
+    if existing.contains(GLOBAL_CLAUDE_MD_MARKER) {
+        return Ok(());
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if !content.is_empty() {
+        content.push('\n');
+    }
+    content.push_str(GLOBAL_CLAUDE_MD_BLOCK);
+    fs::write(md_path, content)
+}
 
 /// Join a constant file name to `base` and confirm the result stays directly
 /// within `base` — defense-in-depth so a path derived from the environment
@@ -638,52 +806,11 @@ pub fn install_global_hooks(claude_dir: &Path) -> io::Result<()> {
     // safe_join will verify that target files stay directly within this base.
     let base = claude_dir.canonicalize()?;
 
-    // --- settings.json: deep-merge hooks ---
-    let settings_path = safe_join(&base, "settings.json")?;
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Failed to parse {}: {e}", settings_path.display()),
-            )
-        })?
-    } else {
-        serde_json::json!({})
-    };
+    // --- settings.json: deep-merge hooks (atomic) ---
+    merge_hooks_into_file(&safe_join(&base, "settings.json")?, &tracevault_hooks())?;
 
-    merge_hooks(&mut settings, &tracevault_hooks(), &settings_path)?;
-
-    let formatted = serde_json::to_string_pretty(&settings)
-        .map_err(|e| io::Error::other(format!("Failed to serialize settings: {e}")))?;
-    // Write to a temp file in the same directory, then atomically rename over
-    // the target so a crash or ENOSPC mid-write can never truncate/corrupt
-    // the user's global settings.json.
-    let tmp_settings_path = settings_path.with_extension("json.tmp");
-    fs::write(&tmp_settings_path, formatted)?;
-    fs::rename(&tmp_settings_path, &settings_path)?;
-
-    // --- CLAUDE.md: append instruction block, idempotently ---
-    let claude_md_path = safe_join(&base, "CLAUDE.md")?;
-    let existing = if claude_md_path.exists() {
-        fs::read_to_string(&claude_md_path)?
-    } else {
-        String::new()
-    };
-
-    if !existing.contains(GLOBAL_CLAUDE_MD_MARKER) {
-        let mut content = existing;
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-        }
-        if !content.is_empty() {
-            content.push('\n');
-        }
-        content.push_str(GLOBAL_CLAUDE_MD_BLOCK);
-        fs::write(&claude_md_path, content)?;
-    }
-
-    Ok(())
+    // --- CLAUDE.md: append the workspace-mode instruction block, idempotently ---
+    append_workspace_md(&safe_join(&base, "CLAUDE.md")?)
 }
 
 /// Write the user-level `config.toml` (under `config_root`) carrying the
@@ -1174,5 +1301,178 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cfg.user_context.unwrap().path_in(root.path()), custom);
+    }
+
+    #[test]
+    fn install_global_codex_hooks_writes_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_dir = tmp.path().join(".codex");
+
+        install_global_codex_hooks(&codex_dir).unwrap();
+        install_global_codex_hooks(&codex_dir).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(codex_dir.join("hooks.json")).unwrap())
+                .unwrap();
+        for event in ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"] {
+            let arr = v["hooks"][event].as_array().unwrap();
+            assert_eq!(arr.len(), 1, "event {event} must not be duplicated");
+        }
+        assert!(v["hooks"].get("PreToolUse").is_none());
+        // AGENTS.md carries the workspace-mode block exactly once across re-runs.
+        let agents_md = fs::read_to_string(codex_dir.join("AGENTS.md")).unwrap();
+        assert_eq!(
+            agents_md.matches(GLOBAL_CLAUDE_MD_MARKER).count(),
+            1,
+            "AGENTS.md workspace-mode block must appear exactly once"
+        );
+        // No stray temp file left behind.
+        let leftover = fs::read_dir(&codex_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover);
+    }
+
+    #[test]
+    fn codex_hooks_has_expected_events_and_commands() {
+        let h = codex_hooks();
+        for event in ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"] {
+            assert!(h.get(event).is_some(), "missing codex event {event}");
+        }
+        // No PreToolUse (intentionally dropped — PostToolUse + Stop capture the
+        // rollout; a pre-tool hook would only double per-call streaming) and no
+        // Notification event (Codex has none).
+        assert!(h.get("PreToolUse").is_none());
+        assert!(h.get("Notification").is_none());
+        // Capture commands carry --agent codex; injection hooks do not need it.
+        let cmd = |e: &str| h[e][0]["hooks"][0]["command"].as_str().unwrap().to_string();
+        assert_eq!(
+            cmd("PostToolUse"),
+            "tracevault stream --event post-tool-use --agent codex"
+        );
+        assert_eq!(cmd("Stop"), "tracevault stream --event stop --agent codex");
+        assert_eq!(cmd("SessionStart"), "tracevault session-start");
+        assert_eq!(cmd("UserPromptSubmit"), "tracevault user-prompt");
+        // Matchers are "" (all tools) — Codex edits arrive via the transcript.
+        assert_eq!(h["PostToolUse"][0]["matcher"].as_str().unwrap(), "");
+    }
+
+    #[test]
+    fn install_codex_hooks_writes_hooks_json_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_codex_hooks(tmp.path()).unwrap();
+        install_codex_hooks(tmp.path()).unwrap();
+
+        let content = fs::read_to_string(tmp.path().join(".codex").join("hooks.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        for event in ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"] {
+            let arr = v["hooks"][event].as_array().unwrap();
+            assert_eq!(
+                arr.len(),
+                1,
+                "event {event} must not be duplicated on re-run"
+            );
+        }
+        assert!(v["hooks"].get("PreToolUse").is_none());
+    }
+
+    #[test]
+    fn install_codex_hooks_preserves_existing_user_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_dir = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        // Seed a user hook under an event we install (PostToolUse) plus one under
+        // an event we DON'T (PreToolUse) — both must survive the merge.
+        fs::write(
+            codex_dir.join("hooks.json"),
+            r#"{"hooks":{"PostToolUse":[{"matcher":"","hooks":[{"type":"command","command":"my-own"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"user-pretool"}]}]}}"#,
+        )
+        .unwrap();
+
+        install_codex_hooks(tmp.path()).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(codex_dir.join("hooks.json")).unwrap())
+                .unwrap();
+        // Our PostToolUse command is merged in alongside the user's own.
+        let post_cmds: Vec<&str> = v["hooks"]["PostToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["hooks"][0]["command"].as_str().unwrap())
+            .collect();
+        assert!(
+            post_cmds.contains(&"my-own"),
+            "user PostToolUse hook preserved"
+        );
+        assert!(post_cmds.contains(&"tracevault stream --event post-tool-use --agent codex"));
+        // The user's PreToolUse hook is left untouched (we install no PreToolUse).
+        let pre_cmds: Vec<&str> = v["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["hooks"][0]["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(pre_cmds, vec!["user-pretool"], "unmanaged event untouched");
+    }
+
+    #[test]
+    fn validate_init_flags_rejects_claude_settings_with_codex() {
+        assert!(validate_init_flags(crate::agent::Agent::Codex, true).is_err());
+    }
+
+    #[test]
+    fn validate_init_flags_allows_codex_without_claude_settings() {
+        assert!(validate_init_flags(crate::agent::Agent::Codex, false).is_ok());
+    }
+
+    #[test]
+    fn validate_init_flags_allows_claude_with_claude_settings() {
+        assert!(validate_init_flags(crate::agent::Agent::ClaudeCode, true).is_ok());
+    }
+
+    #[test]
+    fn merge_hooks_into_file_rejects_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = tmp.path().join("..").join("hooks.json");
+        let err = merge_hooks_into_file(&bad, &codex_hooks()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn append_workspace_md_rejects_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = tmp.path().join("..").join("AGENTS.md");
+        let err = append_workspace_md(&bad).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn init_in_directory_codex_installs_codex_hooks_and_gitignores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        crate::test_helpers::init_git_repo(root);
+
+        let entry = init_in_directory(
+            root,
+            None,
+            None,
+            false,
+            crate::config::UserContext::Toggle(false),
+            crate::agent::Agent::Codex,
+        )
+        .await
+        .unwrap();
+
+        // Codex hooks file written; Claude settings NOT created.
+        assert!(root.join(".codex").join("hooks.json").exists());
+        assert!(!root.join(".claude").join("settings.json").exists());
+        assert_eq!(entry, ".codex/hooks.json");
+
+        // .gitignore covers the codex hooks file.
+        let gi = fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(gi.contains(".codex/hooks.json"));
+        assert!(gi.contains(".tracevault/"));
     }
 }

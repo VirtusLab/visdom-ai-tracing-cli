@@ -1,5 +1,6 @@
 use std::fs;
 use tempfile::TempDir;
+use tracevault_cli::agent::Agent;
 use tracevault_cli::commands::init::ClaudeSettingsTarget;
 use tracevault_cli::config::UserContext;
 
@@ -18,6 +19,7 @@ async fn init_fails_without_git() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await;
     assert!(result.is_err());
@@ -38,6 +40,7 @@ async fn init_creates_tracevault_config() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -57,6 +60,7 @@ async fn init_creates_directory_structure() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -83,6 +87,7 @@ async fn init_installs_claude_hooks() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -108,6 +113,7 @@ async fn init_installs_session_hooks() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -177,6 +183,7 @@ async fn init_merges_into_existing_settings() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -210,6 +217,7 @@ async fn init_installs_git_pre_push_hook() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -244,6 +252,7 @@ async fn init_preserves_existing_pre_push_hook() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -267,6 +276,7 @@ async fn init_does_not_duplicate_hook_on_reinit() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -276,6 +286,7 @@ async fn init_does_not_duplicate_hook_on_reinit() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -298,6 +309,7 @@ async fn init_installs_post_commit_hook() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -321,6 +333,7 @@ async fn init_does_not_duplicate_post_commit_hook_on_reinit() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -330,6 +343,7 @@ async fn init_does_not_duplicate_post_commit_hook_on_reinit() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -352,6 +366,7 @@ async fn init_local_target_writes_to_settings_local_json() {
         Some(ClaudeSettingsTarget::Local),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -379,6 +394,7 @@ async fn init_local_target_gitignores_settings_local_json() {
         Some(ClaudeSettingsTarget::Local),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -408,6 +424,7 @@ async fn init_local_target_merges_into_existing_settings_local_json() {
         Some(ClaudeSettingsTarget::Local),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -428,6 +445,7 @@ async fn init_writes_server_url_to_config() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -447,6 +465,7 @@ async fn init_no_gitignore_skips_gitignore_update() {
         Some(ClaudeSettingsTarget::Shared),
         true,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -477,6 +496,7 @@ async fn init_default_writes_user_context_true() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Toggle(true),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();
@@ -499,6 +519,7 @@ async fn init_explicit_user_context_path_written() {
         Some(ClaudeSettingsTarget::Shared),
         false,
         UserContext::Path("/tmp/my-context.json".to_string()),
+        Agent::ClaudeCode,
     )
     .await
     .unwrap();

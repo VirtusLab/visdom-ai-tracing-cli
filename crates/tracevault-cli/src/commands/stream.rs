@@ -43,7 +43,12 @@ pub fn read_new_transcript_lines(
     transcript_path: &Path,
     offset_path: &Path,
 ) -> Result<(Vec<serde_json::Value>, i64), io::Error> {
-    if !transcript_path.exists() {
+    // An empty path means "no transcript yet" — Codex documents `transcript_path`
+    // as nullable (e.g. on SessionStart before a rollout exists), and the hook
+    // payload deserializes null/absent to "". Guard explicitly so we never hand
+    // `Path::new("")` to `exists()`/`File::open` (whose behavior on an empty path
+    // is platform-dependent); treat it as a clean no-op.
+    if transcript_path.as_os_str().is_empty() || !transcript_path.exists() {
         return Ok((vec![], 0));
     }
 
@@ -160,7 +165,18 @@ pub(crate) fn resolve_stream_binding(
     .map(|(b, _)| b)
 }
 
-pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Stamp the agent identity onto a request's `tool` + `protocol_version`.
+/// Factored out so the mapping is testable without the network/FS-bound
+/// `run_stream`.
+pub fn stamp_agent(req: &mut StreamEventRequest, agent: crate::agent::Agent) {
+    req.tool = Some(agent.tool_name().to_string());
+    req.protocol_version = agent.protocol_version() as u32;
+}
+
+pub async fn run_stream(
+    event_type: &str,
+    agent: crate::agent::Agent,
+) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Read HookEvent from stdin
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
@@ -293,6 +309,8 @@ pub async fn run_stream(event_type: &str) -> Result<(), Box<dyn std::error::Erro
         labels: ctx_labels,
         params: ctx_params,
     };
+
+    stamp_agent(&mut req, agent);
 
     req.truncate_large_fields();
 
@@ -764,6 +782,43 @@ mod tests {
         assert!(!binding_repo_id_is_valid("not-a-uuid"));
     }
 
+    // ── stamp_agent: agent → tool/protocol_version mapping ───────────────────
+
+    #[test]
+    fn stamp_agent_sets_tool_and_version() {
+        use crate::agent::Agent;
+        let mut req = StreamEventRequest {
+            protocol_version: 1,
+            tool: Some("claude-code".to_string()),
+            event_type: StreamEventType::ToolUse,
+            session_id: "s".into(),
+            timestamp: chrono::Utc::now(),
+            hook_event_name: None,
+            tool_name: None,
+            tool_use_id: None,
+            tool_input: None,
+            tool_response: None,
+            tool_is_error: None,
+            event_index: None,
+            event_uuid: None,
+            transcript_lines: None,
+            transcript_offset: None,
+            model: None,
+            cwd: None,
+            final_stats: None,
+            flow_id: None,
+            labels: None,
+            params: None,
+        };
+        stamp_agent(&mut req, Agent::Codex);
+        assert_eq!(req.tool.as_deref(), Some("codex"));
+        assert_eq!(req.protocol_version, 2);
+
+        stamp_agent(&mut req, Agent::ClaudeCode);
+        assert_eq!(req.tool.as_deref(), Some("claude-code"));
+        assert_eq!(req.protocol_version, 1);
+    }
+
     // ── pending_path_for: repo-scoped offline queue ──────────────────────────
 
     #[test]
@@ -777,5 +832,23 @@ mod tests {
             pending_path_for(dir, "repo-a"),
             pending_path_for(dir, "repo-b"),
         );
+    }
+
+    // ── read_new_transcript_lines: empty transcript_path is a clean no-op ──────
+
+    #[test]
+    fn read_new_transcript_lines_empty_path_is_noop() {
+        // Codex's nullable transcript_path deserializes to "" (see HookEvent).
+        // An empty path must yield no lines and offset 0, never an error from
+        // handing `Path::new("")` to exists()/File::open.
+        let dir = tempfile::tempdir().unwrap();
+        let offset_path = dir.path().join(".stream_offset");
+        let (lines, new_offset) =
+            read_new_transcript_lines(std::path::Path::new(""), &offset_path).unwrap();
+        assert!(
+            lines.is_empty(),
+            "empty path must yield no transcript lines"
+        );
+        assert_eq!(new_offset, 0);
     }
 }
