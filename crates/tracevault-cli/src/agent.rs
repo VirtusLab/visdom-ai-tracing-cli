@@ -27,6 +27,15 @@ impl Agent {
             Agent::Codex => 2,
         }
     }
+
+    /// Human-readable label for CLI output. Preserves the original wording so
+    /// the default Claude Code path prints identically to before.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Agent::ClaudeCode => "Claude Code",
+            Agent::Codex => "Codex",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -50,5 +59,11 @@ mod tests {
         );
         assert_eq!(Agent::from_str("codex", true).unwrap(), Agent::Codex);
         assert!(Agent::from_str("cursor", true).is_err());
+    }
+
+    #[test]
+    fn label_wording() {
+        assert_eq!(Agent::ClaudeCode.label(), "Claude Code");
+        assert_eq!(Agent::Codex.label(), "Codex");
     }
 }

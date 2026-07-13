@@ -360,7 +360,7 @@ async fn main() {
             {
                 Ok(entry) => {
                     println!("TraceVault initialized in {}", cwd.display());
-                    println!("{agent:?} hooks installed ({entry})");
+                    println!("{} hooks installed ({entry})", agent.label());
                     println!("Git hooks installed (pre-push, post-commit)");
                     println!("Added .tracevault/ and {entry} to .gitignore");
                     println!(
