@@ -163,7 +163,7 @@ pub(crate) fn resolve_stream_binding(
 /// Stamp the agent identity onto a request's `tool` + `protocol_version`.
 /// Factored out so the mapping is testable without the network/FS-bound
 /// `run_stream`.
-pub(crate) fn stamp_agent(req: &mut StreamEventRequest, agent: crate::agent::Agent) {
+pub fn stamp_agent(req: &mut StreamEventRequest, agent: crate::agent::Agent) {
     req.tool = Some(agent.tool_name().to_string());
     req.protocol_version = agent.protocol_version() as u32;
 }
