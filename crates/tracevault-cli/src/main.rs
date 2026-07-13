@@ -55,6 +55,10 @@ enum Cli {
             conflicts_with_all = ["server_url", "claude_settings", "no_gitignore"]
         )]
         global: bool,
+        /// Which agent to install hooks for. `codex` writes .codex/hooks.json;
+        /// the default installs Claude Code hooks (unchanged behaviour).
+        #[arg(long, value_enum, default_value = "claude-code")]
+        agent: crate::agent::Agent,
     },
     /// Show current session status
     Status {
@@ -275,6 +279,7 @@ async fn main() {
             no_user_context,
             user_context,
             global,
+            agent,
         } => {
             if global {
                 let claude_dir = match dirs::home_dir() {
@@ -349,13 +354,13 @@ async fn main() {
                 claude_settings,
                 no_gitignore,
                 user_context,
+                agent,
             )
             .await
             {
-                Ok(target) => {
-                    let entry = target.gitignore_entry();
+                Ok(entry) => {
                     println!("TraceVault initialized in {}", cwd.display());
-                    println!("Claude Code hooks installed ({entry})");
+                    println!("{agent:?} hooks installed ({entry})");
                     println!("Git hooks installed (pre-push, post-commit)");
                     println!("Added .tracevault/ and {entry} to .gitignore");
                     println!(

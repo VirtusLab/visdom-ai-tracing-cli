@@ -125,7 +125,8 @@ pub async fn init_in_directory(
     claude_settings: Option<ClaudeSettingsTarget>,
     no_gitignore: bool,
     user_context: UserContext,
-) -> Result<ClaudeSettingsTarget, io::Error> {
+    agent: crate::agent::Agent,
+) -> Result<String, io::Error> {
     // Check for git repository
     if !project_root.join(".git").exists() {
         return Err(io::Error::new(
@@ -150,7 +151,16 @@ pub async fn init_in_directory(
         ));
     }
 
-    let target = resolve_claude_target(claude_settings)?;
+    // Resolve the hook-file gitignore entry per agent. Claude has a
+    // shared/local settings choice; Codex has a single .codex/hooks.json.
+    let (claude_target, hook_gitignore_entry): (Option<ClaudeSettingsTarget>, String) = match agent
+    {
+        crate::agent::Agent::ClaudeCode => {
+            let target = resolve_claude_target(claude_settings)?;
+            (Some(target), target.gitignore_entry().to_string())
+        }
+        crate::agent::Agent::Codex => (None, ".codex/hooks.json".to_string()),
+    };
 
     // Create .tracevault/ directory
     let config_dir = TracevaultConfig::config_dir(project_root);
@@ -163,7 +173,7 @@ pub async fn init_in_directory(
 
     // Keep tracevault's files local — update root .gitignore (unless opted out)
     if !no_gitignore {
-        update_root_gitignore(project_root, target.gitignore_entry())?;
+        update_root_gitignore(project_root, &hook_gitignore_entry)?;
     }
 
     // Register repo on server if authenticated, server URL known, and git remote available
@@ -188,8 +198,15 @@ pub async fn init_in_directory(
         config.to_toml(),
     )?;
 
-    // Install Claude Code hooks into the chosen settings file
-    install_claude_hooks(project_root, target)?;
+    // Install the selected agent's hooks.
+    match (agent, claude_target) {
+        (crate::agent::Agent::ClaudeCode, Some(target)) => {
+            install_claude_hooks(project_root, target)?
+        }
+        (crate::agent::Agent::Codex, _) => install_codex_hooks(project_root)?,
+        // ClaudeCode always resolves a target above; this arm is unreachable.
+        (crate::agent::Agent::ClaudeCode, None) => unreachable!("claude target resolved above"),
+    }
 
     // Install git hooks
     install_git_hook(project_root)?;
@@ -244,7 +261,7 @@ pub async fn init_in_directory(
         }
     }
 
-    Ok(target)
+    Ok(hook_gitignore_entry)
 }
 
 fn update_root_gitignore(project_root: &Path, settings_entry: &str) -> Result<(), io::Error> {
@@ -1314,5 +1331,33 @@ mod tests {
             .collect();
         assert!(cmds.contains(&"my-own"), "user hook preserved");
         assert!(cmds.contains(&"tracevault stream --event pre-tool-use --agent codex"));
+    }
+
+    #[tokio::test]
+    async fn init_in_directory_codex_installs_codex_hooks_and_gitignores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        crate::test_helpers::init_git_repo(root);
+
+        let entry = init_in_directory(
+            root,
+            None,
+            None,
+            false,
+            crate::config::UserContext::Toggle(false),
+            crate::agent::Agent::Codex,
+        )
+        .await
+        .unwrap();
+
+        // Codex hooks file written; Claude settings NOT created.
+        assert!(root.join(".codex").join("hooks.json").exists());
+        assert!(!root.join(".claude").join("settings.json").exists());
+        assert_eq!(entry, ".codex/hooks.json");
+
+        // .gitignore covers the codex hooks file.
+        let gi = fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(gi.contains(".codex/hooks.json"));
+        assert!(gi.contains(".tracevault/"));
     }
 }
