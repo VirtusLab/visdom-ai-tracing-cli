@@ -43,7 +43,12 @@ pub fn read_new_transcript_lines(
     transcript_path: &Path,
     offset_path: &Path,
 ) -> Result<(Vec<serde_json::Value>, i64), io::Error> {
-    if !transcript_path.exists() {
+    // An empty path means "no transcript yet" — Codex documents `transcript_path`
+    // as nullable (e.g. on SessionStart before a rollout exists), and the hook
+    // payload deserializes null/absent to "". Guard explicitly so we never hand
+    // `Path::new("")` to `exists()`/`File::open` (whose behavior on an empty path
+    // is platform-dependent); treat it as a clean no-op.
+    if transcript_path.as_os_str().is_empty() || !transcript_path.exists() {
         return Ok((vec![], 0));
     }
 
@@ -827,5 +832,23 @@ mod tests {
             pending_path_for(dir, "repo-a"),
             pending_path_for(dir, "repo-b"),
         );
+    }
+
+    // ── read_new_transcript_lines: empty transcript_path is a clean no-op ──────
+
+    #[test]
+    fn read_new_transcript_lines_empty_path_is_noop() {
+        // Codex's nullable transcript_path deserializes to "" (see HookEvent).
+        // An empty path must yield no lines and offset 0, never an error from
+        // handing `Path::new("")` to exists()/File::open.
+        let dir = tempfile::tempdir().unwrap();
+        let offset_path = dir.path().join(".stream_offset");
+        let (lines, new_offset) =
+            read_new_transcript_lines(std::path::Path::new(""), &offset_path).unwrap();
+        assert!(
+            lines.is_empty(),
+            "empty path must yield no transcript lines"
+        );
+        assert_eq!(new_offset, 0);
     }
 }

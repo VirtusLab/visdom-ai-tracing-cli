@@ -281,6 +281,14 @@ async fn main() {
             global,
             agent,
         } => {
+            // `--claude-settings` only makes sense for the Claude Code agent
+            // (it selects .claude/settings.json vs settings.local.json). With
+            // `--agent codex` the CLI always writes .codex/hooks.json, so reject
+            // the flag rather than silently ignoring it.
+            if matches!(agent, crate::agent::Agent::Codex) && claude_settings.is_some() {
+                eprintln!("Error: --claude-settings only applies to --agent claude-code");
+                std::process::exit(1);
+            }
             if global {
                 if matches!(agent, crate::agent::Agent::Codex) {
                     let codex_dir = match dirs::home_dir() {
