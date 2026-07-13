@@ -163,7 +163,7 @@ pub async fn init_in_directory(
 
     // Keep tracevault's files local — update root .gitignore (unless opted out)
     if !no_gitignore {
-        update_root_gitignore(project_root, target)?;
+        update_root_gitignore(project_root, target.gitignore_entry())?;
     }
 
     // Register repo on server if authenticated, server URL known, and git remote available
@@ -247,10 +247,7 @@ pub async fn init_in_directory(
     Ok(target)
 }
 
-fn update_root_gitignore(
-    project_root: &Path,
-    target: ClaudeSettingsTarget,
-) -> Result<(), io::Error> {
+fn update_root_gitignore(project_root: &Path, settings_entry: &str) -> Result<(), io::Error> {
     let path = project_root.join(".gitignore");
     let existing = if path.exists() {
         fs::read_to_string(&path)?
@@ -259,9 +256,9 @@ fn update_root_gitignore(
     };
 
     // Only ignore what `init` actually creates or modifies: the `.tracevault/`
-    // directory and the single Claude settings file we wrote hooks into. The
+    // directory and the single settings file we wrote hooks into. The
     // other settings file is left untouched, so we don't add it here.
-    let needed: Vec<&str> = [".tracevault/", target.gitignore_entry()]
+    let needed: Vec<&str> = [".tracevault/", settings_entry]
         .iter()
         .copied()
         .filter(|entry| !existing.lines().any(|line| line.trim() == *entry))
@@ -503,6 +500,68 @@ pub fn tracevault_hooks() -> serde_json::Value {
             }]
         }]
     })
+}
+
+/// Codex CLI hook set, mirroring `tracevault_hooks()` but with Codex commands.
+/// Capture hooks carry `--agent codex`; the injection hooks (session-start /
+/// user-prompt) are agent-agnostic. Matchers are `""` — Codex file edits arrive
+/// via the transcript (`apply_patch`), not typed hook tool names — and there is
+/// no `Notification` event in Codex.
+pub fn codex_hooks() -> serde_json::Value {
+    serde_json::json!({
+        "SessionStart": [{
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "tracevault session-start", "timeout": 10, "statusMessage": "TraceVault: session start" }]
+        }],
+        "UserPromptSubmit": [{
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "tracevault user-prompt", "timeout": 10, "statusMessage": "TraceVault: policy reinforcement" }]
+        }],
+        "PreToolUse": [{
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "tracevault stream --event pre-tool-use --agent codex", "timeout": 10, "statusMessage": "TraceVault: streaming pre-tool event" }]
+        }],
+        "PostToolUse": [{
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "tracevault stream --event post-tool-use --agent codex", "timeout": 10, "statusMessage": "TraceVault: streaming post-tool event" }]
+        }],
+        "Stop": [{
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "tracevault stream --event stop --agent codex", "timeout": 10, "statusMessage": "TraceVault: finalizing session" }]
+        }]
+    })
+}
+
+/// Deep-merge the Codex hook set into `<project_root>/.codex/hooks.json`,
+/// creating it if absent. Reuses `merge_hooks` (idempotent, never clobbers
+/// existing hooks/keys) and writes atomically via a sibling temp file.
+pub fn install_codex_hooks(project_root: &Path) -> io::Result<()> {
+    let codex_dir = project_root.join(".codex");
+    fs::create_dir_all(&codex_dir)?;
+    let hooks_path = codex_dir.join("hooks.json");
+
+    let mut root: serde_json::Value = if hooks_path.exists() {
+        let content = fs::read_to_string(&hooks_path)?;
+        serde_json::from_str(&content).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse {}: {e}", hooks_path.display()),
+            )
+        })?
+    } else {
+        serde_json::json!({})
+    };
+
+    // Codex hooks.json root is `{"hooks": {<event>: [...]}}` — the same shape
+    // `merge_hooks` manages (it operates on root["hooks"]).
+    merge_hooks(&mut root, &codex_hooks(), &hooks_path)?;
+
+    let formatted = serde_json::to_string_pretty(&root)
+        .map_err(|e| io::Error::other(format!("Failed to serialize hooks.json: {e}")))?;
+    let tmp = hooks_path.with_extension("json.tmp");
+    fs::write(&tmp, formatted)?;
+    fs::rename(&tmp, &hooks_path)?;
+    Ok(())
 }
 
 const GLOBAL_CLAUDE_MD_MARKER: &str = "<!-- tracevault:workspace-mode -->";
@@ -1174,5 +1233,86 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cfg.user_context.unwrap().path_in(root.path()), custom);
+    }
+
+    #[test]
+    fn codex_hooks_has_expected_events_and_commands() {
+        let h = codex_hooks();
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+        ] {
+            assert!(h.get(event).is_some(), "missing codex event {event}");
+        }
+        // No Notification event (Codex has none).
+        assert!(h.get("Notification").is_none());
+        // Capture commands carry --agent codex; injection hooks do not need it.
+        let cmd = |e: &str| h[e][0]["hooks"][0]["command"].as_str().unwrap().to_string();
+        assert_eq!(
+            cmd("PreToolUse"),
+            "tracevault stream --event pre-tool-use --agent codex"
+        );
+        assert_eq!(
+            cmd("PostToolUse"),
+            "tracevault stream --event post-tool-use --agent codex"
+        );
+        assert_eq!(cmd("Stop"), "tracevault stream --event stop --agent codex");
+        assert_eq!(cmd("SessionStart"), "tracevault session-start");
+        assert_eq!(cmd("UserPromptSubmit"), "tracevault user-prompt");
+        // Matchers are "" (all tools) — Codex edits arrive via the transcript.
+        assert_eq!(h["PreToolUse"][0]["matcher"].as_str().unwrap(), "");
+    }
+
+    #[test]
+    fn install_codex_hooks_writes_hooks_json_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_codex_hooks(tmp.path()).unwrap();
+        install_codex_hooks(tmp.path()).unwrap();
+
+        let content = fs::read_to_string(tmp.path().join(".codex").join("hooks.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+        ] {
+            let arr = v["hooks"][event].as_array().unwrap();
+            assert_eq!(
+                arr.len(),
+                1,
+                "event {event} must not be duplicated on re-run"
+            );
+        }
+    }
+
+    #[test]
+    fn install_codex_hooks_preserves_existing_user_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_dir = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"my-own"}]}]}}"#,
+        )
+        .unwrap();
+
+        install_codex_hooks(tmp.path()).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(codex_dir.join("hooks.json")).unwrap())
+                .unwrap();
+        let cmds: Vec<&str> = v["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["hooks"][0]["command"].as_str().unwrap())
+            .collect();
+        assert!(cmds.contains(&"my-own"), "user hook preserved");
+        assert!(cmds.contains(&"tracevault stream --event pre-tool-use --agent codex"));
     }
 }

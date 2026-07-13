@@ -18,6 +18,7 @@ pub trait HookAdapter: Send + Sync {
 pub enum DetectedTool {
     ClaudeCode,
     Cursor,
+    Codex,
 }
 
 impl DetectedTool {
@@ -25,6 +26,7 @@ impl DetectedTool {
         match self {
             DetectedTool::ClaudeCode => "claude-code",
             DetectedTool::Cursor => "cursor",
+            DetectedTool::Codex => "codex",
         }
     }
 
@@ -33,6 +35,7 @@ impl DetectedTool {
         match self {
             DetectedTool::ClaudeCode => Box::new(claude_code::ClaudeCodeAdapter),
             DetectedTool::Cursor => Box::new(cursor::CursorAdapter),
+            DetectedTool::Codex => Box::new(claude_code::ClaudeCodeAdapter),
         }
     }
 }
@@ -44,6 +47,9 @@ pub fn detect_tools(cwd: &Path) -> Vec<DetectedTool> {
     }
     if cwd.join(".cursor").exists() {
         tools.push(DetectedTool::Cursor);
+    }
+    if cwd.join(".codex").exists() {
+        tools.push(DetectedTool::Codex);
     }
     tools
 }
@@ -74,5 +80,13 @@ mod tests {
         fs::create_dir(dir.path().join(".claude")).unwrap();
         fs::create_dir(dir.path().join(".cursor")).unwrap();
         assert_eq!(detect_tools(dir.path()).len(), 2);
+    }
+
+    #[test]
+    fn detect_tools_codex() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".codex")).unwrap();
+        let tools = detect_tools(dir.path());
+        assert!(tools.iter().any(|t| matches!(t, DetectedTool::Codex)));
     }
 }
