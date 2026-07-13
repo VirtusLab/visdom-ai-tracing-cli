@@ -1,8 +1,8 @@
 use clap::Parser;
 use std::env;
 
-mod api_client;
 mod agent;
+mod api_client;
 mod commands;
 mod config;
 mod context;
