@@ -71,6 +71,10 @@ enum Cli {
     Stream {
         #[arg(long)]
         event: String,
+        /// Which agent this hook belongs to (sets the request's tool + protocol
+        /// version). Defaults to claude-code so existing installs are unchanged.
+        #[arg(long, value_enum, default_value = "claude-code")]
+        agent: crate::agent::Agent,
     },
     /// SessionStart hook: exports the session id and injects the bound repo's
     /// policies as additionalContext. Installed into .claude/settings.json by
@@ -376,8 +380,8 @@ async fn main() {
                 std::process::exit(code);
             }
         }
-        Cli::Stream { event } => {
-            if let Err(e) = commands::stream::run_stream(&event).await {
+        Cli::Stream { event, agent } => {
+            if let Err(e) = commands::stream::run_stream(&event, agent).await {
                 eprintln!("Stream error: {e}");
             }
         }
