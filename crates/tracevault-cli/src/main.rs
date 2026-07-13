@@ -305,6 +305,43 @@ async fn main() {
                             std::process::exit(1);
                         }
                     }
+
+                    let requested =
+                        match config::UserContext::from_init_flags(no_user_context, user_context) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("Error: {e}");
+                                std::process::exit(1);
+                            }
+                        };
+                    match commands::init::write_global_user_config_in(
+                        &config::tv_config_root(),
+                        requested,
+                    ) {
+                        Ok(active) => {
+                            println!(
+                                "User-level context config: {}",
+                                config::user_config_path().display()
+                            );
+                            match active {
+                                Some(ctx) => {
+                                    println!("User-level context file: {}", ctx.display())
+                                }
+                                None => {
+                                    println!(
+                                        "User-level context is disabled (`--no-user-context`)."
+                                    )
+                                }
+                            }
+                            println!(
+                                "Edit it with `tracevault context set --user …`; disable with \
+                                 `tracevault init --global --no-user-context`."
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: could not write user-level context config: {e}")
+                        }
+                    }
                     return;
                 }
 
