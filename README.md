@@ -23,6 +23,42 @@ cargo install tracevault-cli
 
 ## Usage
 
+### `tracevault init` — set up tracing in a repo
+
+`tracevault init` wires TraceVault into a repository: it installs the AI-agent hooks that
+capture sessions, adds git hooks (a pre-push policy check and a post-commit metadata push),
+creates `.tracevault/`, and registers the repo with the server. Run it once per repo, from
+the primary checkout (not a linked worktree).
+
+**Choosing the agent — `--agent`**
+
+TraceVault captures sessions from more than one coding agent. `--agent` selects which one to
+install hooks for (default `claude-code`):
+
+| Command | Installs | For |
+|---|---|---|
+| `tracevault init` | `.claude/settings.json` hooks | Claude Code (default) |
+| `tracevault init --agent codex` | `.codex/hooks.json` hooks | OpenAI Codex CLI |
+
+Both wire the same capture pipeline: the agent's hooks invoke `tracevault`, which streams the
+session (transcript, tokens, cost, file changes) to the server tagged with the agent, so
+Claude Code and Codex sessions show up side by side, each with its own badge. Codex file
+changes are read from the session rollout (`apply_patch`) rather than from typed tool events.
+
+`--claude-settings shared|local` chooses between `.claude/settings.json` (committed) and
+`.claude/settings.local.json` (git-ignored). It applies only to `--agent claude-code`; with
+`--agent codex` it is rejected (Codex always writes `.codex/hooks.json`).
+
+**Global install — `--global`**
+
+`--global` installs hooks once for every session on the machine instead of per-repo, paired
+with workspace mode (bind a repo mid-session with `tracevault repo switch`):
+
+```sh
+tracevault init --global                 # ~/.claude/settings.json + ~/.claude/CLAUDE.md
+tracevault init --global --agent codex   # ~/.codex/hooks.json  + ~/.codex/AGENTS.md
+```
+
 ### `tracevault context` — tagging events with flow and metadata
 
 `tracevault context` manages context (flow ID, labels, params) that the Claude Code hook
