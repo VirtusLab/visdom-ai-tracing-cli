@@ -509,6 +509,130 @@ async fn init_default_writes_user_context_true() {
     );
 }
 
+#[test]
+fn init_gsd_installs_extension_and_registry() {
+    let tmp = TempDir::new().unwrap();
+    let gsd_home = tmp.path().join(".gsd");
+    // Pre-seed a stale tracker (the earlier, incorrect Codex-clone shim) to
+    // prove install_gsd_extension removes it.
+    fs::create_dir_all(gsd_home.join("extensions").join("tracevault-tracker")).unwrap();
+    fs::write(
+        gsd_home.join("extensions").join("registry.json"),
+        r#"{"version":1,"entries":{"tracevault-tracker":{"id":"tracevault-tracker","enabled":true,"source":"user"}}}"#,
+    )
+    .unwrap();
+
+    tracevault_cli::commands::init::install_gsd_extension(&gsd_home).unwrap();
+
+    let ext = gsd_home.join("extensions").join("tracevault");
+    assert!(ext.join("index.ts").exists());
+    assert!(ext.join("package.json").exists());
+
+    let reg: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(gsd_home.join("extensions").join("registry.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        reg["entries"]["tracevault"]["enabled"],
+        serde_json::json!(true)
+    );
+    assert!(
+        reg["entries"].get("tracevault-tracker").is_none(),
+        "stale tracker entry removed"
+    );
+    assert!(
+        !gsd_home
+            .join("extensions")
+            .join("tracevault-tracker")
+            .exists(),
+        "stale tracker dir removed"
+    );
+}
+
+#[test]
+fn init_gsd_extension_starts_fresh_when_registry_missing_or_corrupt() {
+    let tmp = TempDir::new().unwrap();
+    let gsd_home = tmp.path().join(".gsd");
+
+    // No pre-existing registry.json at all.
+    tracevault_cli::commands::init::install_gsd_extension(&gsd_home).unwrap();
+    let reg: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(gsd_home.join("extensions").join("registry.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        reg["entries"]["tracevault"]["enabled"],
+        serde_json::json!(true)
+    );
+
+    // Corrupt registry.json on a second run must not blow up the install.
+    fs::write(
+        gsd_home.join("extensions").join("registry.json"),
+        "not valid json",
+    )
+    .unwrap();
+    tracevault_cli::commands::init::install_gsd_extension(&gsd_home).unwrap();
+    let reg: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(gsd_home.join("extensions").join("registry.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        reg["entries"]["tracevault"]["enabled"],
+        serde_json::json!(true)
+    );
+}
+
+/// `tracevault init --agent gsd` (repo-local, NOT `--global`) with `HOME`
+/// pointed at an empty tempdir. This runs the *compiled binary* (like
+/// `global_install_test.rs` does for `--global`) rather than calling
+/// `init_in_directory` in-process, specifically so `HOME` can be redirected
+/// via `Command::env` (child-process-local, race-free under parallel tests)
+/// instead of `std::env::set_var` (process-wide, which would race other
+/// tests running concurrently in this same test binary).
+#[cfg(target_os = "linux")]
+#[test]
+fn init_gsd_repo_local_installs_extension_and_skips_repo_gitignore_entry() {
+    let repo = tmp_git_repo();
+    let home = TempDir::new().unwrap();
+    let bin = env!("CARGO_BIN_EXE_tracevault");
+
+    let output = std::process::Command::new(bin)
+        .args(["init", "--agent", "gsd"])
+        .env("HOME", home.path())
+        .current_dir(repo.path())
+        .output()
+        .expect("failed to run tracevault binary");
+
+    assert!(
+        output.status.success(),
+        "tracevault init --agent gsd should succeed; stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Extension installed under the (redirected) user-global ~/.gsd/, not the repo.
+    let ext = home.path().join(".gsd/extensions/tracevault");
+    assert!(ext.join("index.ts").exists());
+    assert!(ext.join("package.json").exists());
+    assert!(
+        !repo.path().join(".gsd").exists(),
+        "gsd must not create a .gsd/ dir inside the repo"
+    );
+
+    // .gitignore has .tracevault/ but no bogus extra blank/".gsd" line.
+    // `update_root_gitignore` intentionally emits exactly one blank separator
+    // line before its "# TraceVault" comment — an unfiltered empty gitignore
+    // entry would have added a SECOND blank line.
+    let gitignore = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
+    assert!(gitignore.contains(".tracevault/"));
+    assert!(!gitignore.contains(".gsd"), "gsd writes no repo-local path");
+    let blank_lines = gitignore.lines().filter(|l| l.is_empty()).count();
+    assert_eq!(
+        blank_lines, 1,
+        "expected exactly the one intentional separator blank line, got: {gitignore:?}"
+    );
+}
+
 #[tokio::test]
 async fn init_explicit_user_context_path_written() {
     let tmp = tmp_git_repo();

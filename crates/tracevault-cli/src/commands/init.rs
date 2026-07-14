@@ -128,7 +128,8 @@ pub fn validate_init_flags(
     agent: crate::agent::Agent,
     claude_settings_set: bool,
 ) -> Result<(), String> {
-    if matches!(agent, crate::agent::Agent::Codex) && claude_settings_set {
+    if matches!(agent, crate::agent::Agent::Codex | crate::agent::Agent::Gsd) && claude_settings_set
+    {
         return Err("--claude-settings only applies to --agent claude-code".to_string());
     }
     Ok(())
@@ -175,7 +176,11 @@ pub async fn init_in_directory(
             (Some(target), target.gitignore_entry().to_string())
         }
         crate::agent::Agent::Codex => (None, ".codex/hooks.json".to_string()),
-        crate::agent::Agent::Gsd => (None, ".gsd/hooks.json".to_string()),
+        // GSD (pi) loads extensions from the user-global `~/.gsd/extensions/`
+        // directory, not from anything in the repo — nothing is written here,
+        // so there's no per-repo file to gitignore. `update_root_gitignore`
+        // treats an empty entry as "add nothing" (see there).
+        crate::agent::Agent::Gsd => (None, String::new()),
     };
 
     // Create .tracevault/ directory
@@ -223,7 +228,17 @@ pub async fn init_in_directory(
             install_claude_hooks(project_root, target)?;
         }
         crate::agent::Agent::Codex => install_codex_hooks(project_root)?,
-        crate::agent::Agent::Gsd => install_gsd_hooks(project_root)?,
+        crate::agent::Agent::Gsd => {
+            // GSD (pi) loads extensions from the user-global ~/.gsd/, not from
+            // anything in the repo, so even the repo-local `init` path installs
+            // there — the repo itself only needs the .tracevault/ binding + git
+            // hooks set up above, which the extension shells out to `tracevault`
+            // to use.
+            let gsd_home = dirs::home_dir()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home dir"))?
+                .join(".gsd");
+            install_gsd_extension(&gsd_home)?;
+        }
     }
 
     // Install git hooks
@@ -292,11 +307,14 @@ fn update_root_gitignore(project_root: &Path, settings_entry: &str) -> Result<()
 
     // Only ignore what `init` actually creates or modifies: the `.tracevault/`
     // directory and the single settings file we wrote hooks into. The
-    // other settings file is left untouched, so we don't add it here.
+    // other settings file is left untouched, so we don't add it here. An
+    // empty `settings_entry` means the agent writes nothing into the repo
+    // (e.g. GSD, whose extension lives in the user-global `~/.gsd/`) — skip
+    // it rather than appending a blank line.
     let needed: Vec<&str> = [".tracevault/", settings_entry]
         .iter()
         .copied()
-        .filter(|entry| !existing.lines().any(|line| line.trim() == *entry))
+        .filter(|entry| !entry.is_empty() && !existing.lines().any(|line| line.trim() == *entry))
         .collect();
 
     if needed.is_empty() {
@@ -568,25 +586,62 @@ pub fn codex_hooks() -> serde_json::Value {
     })
 }
 
-pub fn gsd_hooks() -> serde_json::Value {
-    serde_json::json!({
-        "SessionStart": [{
-            "matcher": "",
-            "hooks": [{ "type": "command", "command": "tracevault session-start", "timeout": 10, "statusMessage": "TraceVault: session start" }]
-        }],
-        "UserPromptSubmit": [{
-            "matcher": "",
-            "hooks": [{ "type": "command", "command": "tracevault user-prompt", "timeout": 10, "statusMessage": "TraceVault: policy reinforcement" }]
-        }],
-        "PostToolUse": [{
-            "matcher": "",
-            "hooks": [{ "type": "command", "command": "tracevault stream --event post-tool-use --agent gsd", "timeout": 10, "statusMessage": "TraceVault: streaming post-tool event" }]
-        }],
-        "Stop": [{
-            "matcher": "",
-            "hooks": [{ "type": "command", "command": "tracevault stream --event stop --agent gsd", "timeout": 10, "statusMessage": "TraceVault: finalizing session" }]
-        }]
-    })
+/// Embedded pi/GSD extension source (bundled at build time — see
+/// `assets/gsd-extension/{index.ts,package.json}`, the checked-in source this
+/// installer writes verbatim).
+const GSD_EXT_INDEX_TS: &str = include_str!("../../assets/gsd-extension/index.ts");
+const GSD_EXT_PACKAGE_JSON: &str = include_str!("../../assets/gsd-extension/package.json");
+
+/// Install the TraceVault pi/GSD extension under `<gsd_home>/extensions/tracevault/`
+/// and enable it in `<gsd_home>/extensions/registry.json`. GSD (pi) loads
+/// extensions from this user-global directory, not from a project
+/// `hooks.json` — unlike Claude Code / Codex, there is no per-repo hook file
+/// for this agent. Removes any stale `tracevault-tracker` entry + directory
+/// (an earlier, incorrect Codex-clone `hooks.json` shim that impersonated
+/// this extension under the wrong name). Idempotent + atomic registry write.
+pub fn install_gsd_extension(gsd_home: &Path) -> io::Result<()> {
+    let ext_root = gsd_home.join("extensions");
+    let dir = ext_root.join("tracevault");
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join("index.ts"), GSD_EXT_INDEX_TS)?;
+    fs::write(dir.join("package.json"), GSD_EXT_PACKAGE_JSON)?;
+
+    // Remove the stale tracker directory if present.
+    let stale = ext_root.join("tracevault-tracker");
+    if stale.exists() {
+        fs::remove_dir_all(&stale)?;
+    }
+
+    // Merge the registry: add/enable "tracevault", drop "tracevault-tracker".
+    // Absent or corrupt registry.json starts fresh rather than erroring, since
+    // a stale/malformed file must never block installing the extension.
+    let reg_path = ext_root.join("registry.json");
+    let mut reg: serde_json::Value = if reg_path.exists() {
+        fs::read_to_string(&reg_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({"version":1,"entries":{}}))
+    } else {
+        serde_json::json!({"version":1,"entries":{}})
+    };
+    if reg.get("entries").and_then(|e| e.as_object()).is_none() {
+        reg = serde_json::json!({"version":1,"entries":{}});
+    }
+    let entries = reg
+        .get_mut("entries")
+        .and_then(|e| e.as_object_mut())
+        .expect("entries object present (ensured above)");
+    entries.remove("tracevault-tracker");
+    entries.insert(
+        "tracevault".to_string(),
+        serde_json::json!({"id":"tracevault","enabled":true,"source":"user"}),
+    );
+
+    // Atomic write (temp file + rename), pretty-printed.
+    let tmp = reg_path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(&reg)?)?;
+    fs::rename(&tmp, &reg_path)?;
+    Ok(())
 }
 
 /// Read `hooks_path` as a JSON object (or `{}` if absent), deep-merge `ours`
@@ -642,15 +697,6 @@ pub fn install_codex_hooks(project_root: &Path) -> io::Result<()> {
     let codex_dir = project_root.join(".codex");
     fs::create_dir_all(&codex_dir)?;
     merge_hooks_into_file(&codex_dir.join("hooks.json"), &codex_hooks())
-}
-
-/// Deep-merge the GSD hook set into `<project_root>/.gsd/hooks.json`,
-/// creating it if absent (idempotent, never clobbers existing hooks/keys,
-/// atomic write). Repo-local counterpart of [`install_global_gsd_hooks`].
-pub fn install_gsd_hooks(project_root: &Path) -> io::Result<()> {
-    let gsd_dir = project_root.join(".gsd");
-    fs::create_dir_all(&gsd_dir)?;
-    merge_hooks_into_file(&gsd_dir.join("hooks.json"), &gsd_hooks())
 }
 
 /// Install TraceVault's Codex hooks into `<codex_dir>/hooks.json` and append a
