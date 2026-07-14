@@ -175,6 +175,7 @@ pub async fn init_in_directory(
             (Some(target), target.gitignore_entry().to_string())
         }
         crate::agent::Agent::Codex => (None, ".codex/hooks.json".to_string()),
+        crate::agent::Agent::Gsd => (None, ".gsd/hooks.json".to_string()),
     };
 
     // Create .tracevault/ directory
@@ -222,6 +223,7 @@ pub async fn init_in_directory(
             install_claude_hooks(project_root, target)?;
         }
         crate::agent::Agent::Codex => install_codex_hooks(project_root)?,
+        crate::agent::Agent::Gsd => install_gsd_hooks(project_root)?,
     }
 
     // Install git hooks
@@ -566,6 +568,27 @@ pub fn codex_hooks() -> serde_json::Value {
     })
 }
 
+pub fn gsd_hooks() -> serde_json::Value {
+    serde_json::json!({
+        "SessionStart": [{
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "tracevault session-start", "timeout": 10, "statusMessage": "TraceVault: session start" }]
+        }],
+        "UserPromptSubmit": [{
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "tracevault user-prompt", "timeout": 10, "statusMessage": "TraceVault: policy reinforcement" }]
+        }],
+        "PostToolUse": [{
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "tracevault stream --event post-tool-use --agent gsd", "timeout": 10, "statusMessage": "TraceVault: streaming post-tool event" }]
+        }],
+        "Stop": [{
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "tracevault stream --event stop --agent gsd", "timeout": 10, "statusMessage": "TraceVault: finalizing session" }]
+        }]
+    })
+}
+
 /// Read `hooks_path` as a JSON object (or `{}` if absent), deep-merge `ours`
 /// into its `hooks` map via [`merge_hooks`] (idempotent, never clobbers existing
 /// hooks/keys), and write the result back atomically (sibling temp file +
@@ -619,6 +642,15 @@ pub fn install_codex_hooks(project_root: &Path) -> io::Result<()> {
     let codex_dir = project_root.join(".codex");
     fs::create_dir_all(&codex_dir)?;
     merge_hooks_into_file(&codex_dir.join("hooks.json"), &codex_hooks())
+}
+
+/// Deep-merge the GSD hook set into `<project_root>/.gsd/hooks.json`,
+/// creating it if absent (idempotent, never clobbers existing hooks/keys,
+/// atomic write). Repo-local counterpart of [`install_global_gsd_hooks`].
+pub fn install_gsd_hooks(project_root: &Path) -> io::Result<()> {
+    let gsd_dir = project_root.join(".gsd");
+    fs::create_dir_all(&gsd_dir)?;
+    merge_hooks_into_file(&gsd_dir.join("hooks.json"), &gsd_hooks())
 }
 
 /// Install TraceVault's Codex hooks into `<codex_dir>/hooks.json` and append a
