@@ -39,17 +39,25 @@ pub fn apply_context(
     (flow_id, labels, params)
 }
 
+/// Returns `(lines, start_offset, end_offset)`: `start_offset` is the seek
+/// position read from `offset_path` (0 if absent), and `end_offset` is the
+/// byte offset after the last line read (the old `bytes_read`).
+///
+/// Callers should send `start_offset` as `StreamEventRequest::transcript_offset`
+/// (so the server's `chunk_index = transcript_offset + line_index` is stable
+/// per physical line across overlapping/retried reads) and persist
+/// `end_offset` to `.stream_offset` as the next read's seek position.
 pub fn read_new_transcript_lines(
     transcript_path: &Path,
     offset_path: &Path,
-) -> Result<(Vec<serde_json::Value>, i64), io::Error> {
+) -> Result<(Vec<serde_json::Value>, i64, i64), io::Error> {
     // An empty path means "no transcript yet" — Codex documents `transcript_path`
     // as nullable (e.g. on SessionStart before a rollout exists), and the hook
     // payload deserializes null/absent to "". Guard explicitly so we never hand
     // `Path::new("")` to `exists()`/`File::open` (whose behavior on an empty path
     // is platform-dependent); treat it as a clean no-op.
     if transcript_path.as_os_str().is_empty() || !transcript_path.exists() {
-        return Ok((vec![], 0));
+        return Ok((vec![], 0, 0));
     }
 
     let offset: i64 = if offset_path.exists() {
@@ -81,7 +89,7 @@ pub fn read_new_transcript_lines(
         }
     }
 
-    Ok((lines, bytes_read))
+    Ok((lines, offset, bytes_read))
 }
 
 pub fn append_pending(pending_path: &Path, json: &str) -> Result<(), io::Error> {
@@ -239,7 +247,11 @@ pub async fn run_stream(
     // 4. Read new transcript lines
     let transcript_path = Path::new(&hook_event.transcript_path);
     let offset_path = session_dir.join(".stream_offset");
-    let (transcript_lines, new_offset) = read_new_transcript_lines(transcript_path, &offset_path)?;
+    // transcript_offset carries the batch START byte offset so the server
+    // derives a stable per-line chunk_index across overlapping/retried reads;
+    // .stream_offset persists the END (next read position).
+    let (transcript_lines, start_offset, new_offset) =
+        read_new_transcript_lines(transcript_path, &offset_path)?;
 
     // 5. Build StreamEventRequest
     let stream_event_type = match event_type {
@@ -301,7 +313,7 @@ pub async fn run_stream(
         } else {
             Some(transcript_lines)
         },
-        transcript_offset: Some(new_offset),
+        transcript_offset: Some(start_offset),
         model: None,
         cwd: Some(hook_event.cwd.clone()),
         final_stats: None,
@@ -843,12 +855,53 @@ mod tests {
         // handing `Path::new("")` to exists()/File::open.
         let dir = tempfile::tempdir().unwrap();
         let offset_path = dir.path().join(".stream_offset");
-        let (lines, new_offset) =
+        let (lines, start_offset, end_offset) =
             read_new_transcript_lines(std::path::Path::new(""), &offset_path).unwrap();
         assert!(
             lines.is_empty(),
             "empty path must yield no transcript lines"
         );
-        assert_eq!(new_offset, 0);
+        assert_eq!(start_offset, 0);
+        assert_eq!(end_offset, 0);
+    }
+
+    // ── read_new_transcript_lines: start_offset is stable across a persisted
+    //    end_offset, and equals the previous read's end_offset ─────────────────
+
+    #[test]
+    fn read_new_transcript_lines_second_read_starts_at_previous_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript_path = dir.path().join("transcript.jsonl");
+        let offset_path = dir.path().join(".stream_offset");
+
+        fs::write(
+            &transcript_path,
+            "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n",
+        )
+        .unwrap();
+
+        let (lines, start_offset, end_offset) =
+            read_new_transcript_lines(&transcript_path, &offset_path).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(start_offset, 0, "first read starts at byte 0");
+        assert!(end_offset > 0);
+
+        fs::write(&offset_path, end_offset.to_string()).unwrap();
+
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(&transcript_path)
+            .unwrap();
+        writeln!(f, "{{\"type\":\"user\",\"message\":\"more\"}}").unwrap();
+        drop(f);
+
+        let (lines2, start_offset2, end_offset2) =
+            read_new_transcript_lines(&transcript_path, &offset_path).unwrap();
+        assert_eq!(lines2.len(), 1);
+        assert_eq!(
+            start_offset2, end_offset,
+            "second read's start_offset must equal the first read's persisted end_offset"
+        );
+        assert!(end_offset2 > start_offset2);
     }
 }

@@ -29,8 +29,10 @@ fn gsd_session_produces_gsd_tagged_request() {
     .unwrap();
     drop(f);
 
-    let (lines, new_offset) = read_new_transcript_lines(&transcript, &offset).unwrap();
+    let (lines, start_offset, new_offset) =
+        read_new_transcript_lines(&transcript, &offset).unwrap();
     assert_eq!(lines.len(), 2, "both pi session lines read");
+    assert_eq!(start_offset, 0, "first read starts at byte 0");
     assert!(new_offset > 0);
 
     let mut req = StreamEventRequest {
@@ -48,7 +50,7 @@ fn gsd_session_produces_gsd_tagged_request() {
         event_index: None,
         event_uuid: None,
         transcript_lines: Some(lines),
-        transcript_offset: Some(new_offset),
+        transcript_offset: Some(start_offset),
         model: None,
         cwd: Some(tmp.path().to_string_lossy().into_owned()),
         final_stats: None,
