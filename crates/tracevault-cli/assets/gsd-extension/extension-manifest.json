@@ -5,5 +5,5 @@
   "description": "TraceVault capture extension for pi/GSD",
   "tier": "user",
   "requires": { "platform": ">=2.29.0" },
-  "provides": { "hooks": ["session_start", "tool_execution_end", "stop"] }
+  "provides": { "hooks": ["session_start", "tool_execution_start", "tool_execution_end", "stop"] }
 }

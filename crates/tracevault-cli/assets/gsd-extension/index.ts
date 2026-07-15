@@ -34,6 +34,14 @@ function enqueue(sessionId: string, task: () => Promise<void>): Promise<void> {
   return next;
 }
 
+/**
+ * Tool arguments live only on `tool_execution_start` — `tool_execution_end`
+ * carries just the result. Both share a `toolCallId`, so we stash the args on
+ * start and attach them (as `tool_input`) on end. Entries are removed on end;
+ * a start without a matching end leaves only a tiny, bounded residue.
+ */
+const pendingToolArgs = new Map<string, unknown>();
+
 /** Spawn `tracevault <args...>`, feeding `stdinJson` on stdin. Never throws. */
 function runTracevault(args: string[], stdinJson: unknown, cwd: string): Promise<void> {
   return new Promise((resolve) => {
@@ -90,18 +98,25 @@ export default function tracevault(pi: ExtensionAPI): void {
     );
   });
 
+  // Capture tool arguments on start (the end event lacks them), keyed by
+  // toolCallId, so we can attach them as `tool_input` on the matching end.
+  pi.on("tool_execution_start", async (event) => {
+    pendingToolArgs.set(event.toolCallId, event.args);
+  });
+
   pi.on("tool_execution_end", async (event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
     if (!sessionId) return;
     const t = ctx.sessionManager.getSessionFile();
     if (!t) return; // nothing to forward yet
-    // Forward the tool arguments as `tool_input` so the server can use them —
-    // e.g. software-usage extraction from a `bash` command's `command` arg.
-    // Non-file tools (bash/read/…) are sourced from this hook event, so without
-    // the args the server would have only the tool name. (write/edit hook
-    // events are suppressed server-side in favour of the richer
-    // transcript-sourced record, so their args here are ignored — harmless.)
-    const toolInput = "args" in event ? (event as { args?: unknown }).args : undefined;
+    // Attach the tool arguments (captured on start) as `tool_input` so the
+    // server can use them — e.g. software-usage extraction from a `bash`
+    // command's `command` arg. Non-file tools (bash/read/…) are sourced from
+    // this hook event, so without the args the server would have only the tool
+    // name. (write/edit hook events are suppressed server-side in favour of the
+    // richer transcript-sourced record, so their args here are ignored.)
+    const toolInput = pendingToolArgs.get(event.toolCallId);
+    pendingToolArgs.delete(event.toolCallId);
     await enqueue(sessionId, () =>
       runTracevault(
         ["stream", "--event", "post-tool-use", "--agent", "gsd"],
