@@ -10,6 +10,8 @@ pub mod codex;
 pub mod cursor;
 #[allow(dead_code)]
 pub mod gsd;
+#[allow(dead_code)]
+pub mod opencode;
 
 #[allow(dead_code)]
 pub trait HookAdapter: Send + Sync {
@@ -24,6 +26,7 @@ pub enum DetectedTool {
     Cursor,
     Codex,
     Gsd,
+    OpenCode,
 }
 
 impl DetectedTool {
@@ -33,6 +36,7 @@ impl DetectedTool {
             DetectedTool::Cursor => "cursor",
             DetectedTool::Codex => "codex",
             DetectedTool::Gsd => "gsd",
+            DetectedTool::OpenCode => "opencode",
         }
     }
 
@@ -43,6 +47,7 @@ impl DetectedTool {
             DetectedTool::Cursor => Box::new(cursor::CursorAdapter),
             DetectedTool::Codex => Box::new(codex::CodexAdapter),
             DetectedTool::Gsd => Box::new(gsd::GsdAdapter),
+            DetectedTool::OpenCode => Box::new(opencode::OpenCodeAdapter),
         }
     }
 }
@@ -60,6 +65,9 @@ pub fn detect_tools(cwd: &Path) -> Vec<DetectedTool> {
     }
     if cwd.join(".gsd").exists() {
         tools.push(DetectedTool::Gsd);
+    }
+    if cwd.join(".opencode").exists() {
+        tools.push(DetectedTool::OpenCode);
     }
     tools
 }
@@ -122,5 +130,18 @@ mod tests {
     #[test]
     fn gsd_adapter_reports_gsd_tool_name() {
         assert_eq!(DetectedTool::Gsd.adapter().tool_name(), "gsd");
+    }
+
+    #[test]
+    fn detect_tools_opencode() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".opencode")).unwrap();
+        let tools = detect_tools(dir.path());
+        assert!(tools.iter().any(|t| matches!(t, DetectedTool::OpenCode)));
+    }
+
+    #[test]
+    fn opencode_adapter_reports_opencode_tool_name() {
+        assert_eq!(DetectedTool::OpenCode.adapter().tool_name(), "opencode");
     }
 }
