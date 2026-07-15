@@ -53,14 +53,21 @@ function runTracevault(args: string[], stdinJson: unknown, cwd: string): Promise
   });
 }
 
-function hookEvent(sessionId: string, transcriptPath: string, cwd: string, name: string, toolName?: string) {
+function hookEvent(
+  sessionId: string,
+  transcriptPath: string,
+  cwd: string,
+  name: string,
+  toolName?: string,
+  toolInput?: unknown,
+) {
   return {
     session_id: sessionId,
     transcript_path: transcriptPath,
     cwd,
     hook_event_name: name,
     tool_name: toolName ?? null,
-    tool_input: null,
+    tool_input: toolInput ?? null,
     tool_response: null,
     tool_use_id: null,
   };
@@ -88,10 +95,17 @@ export default function tracevault(pi: ExtensionAPI): void {
     if (!sessionId) return;
     const t = ctx.sessionManager.getSessionFile();
     if (!t) return; // nothing to forward yet
+    // Forward the tool arguments as `tool_input` so the server can use them —
+    // e.g. software-usage extraction from a `bash` command's `command` arg.
+    // Non-file tools (bash/read/…) are sourced from this hook event, so without
+    // the args the server would have only the tool name. (write/edit hook
+    // events are suppressed server-side in favour of the richer
+    // transcript-sourced record, so their args here are ignored — harmless.)
+    const toolInput = "args" in event ? (event as { args?: unknown }).args : undefined;
     await enqueue(sessionId, () =>
       runTracevault(
         ["stream", "--event", "post-tool-use", "--agent", "gsd"],
-        hookEvent(sessionId, t, ctx.cwd, "PostToolUse", event.toolName),
+        hookEvent(sessionId, t, ctx.cwd, "PostToolUse", event.toolName, toolInput),
         ctx.cwd,
       ),
     );
