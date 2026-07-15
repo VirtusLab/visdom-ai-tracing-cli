@@ -363,26 +363,12 @@ async fn main() {
                     }
                     crate::agent::Agent::Gsd => {
                         // GSD (pi) loads extensions from a user-global
-                        // ~/.gsd/extensions/ directory, so its "global" install is
-                        // the SAME operation as the repo-local one — there is no
-                        // separate per-repo GSD hook file to install instead.
-                        let gsd_home = match dirs::home_dir() {
-                            Some(home) => home.join(".gsd"),
-                            None => {
-                                eprintln!("Error: cannot determine home directory");
-                                std::process::exit(1);
-                            }
-                        };
-                        match commands::init::install_gsd_extension(&gsd_home) {
+                        // ~/.gsd/extensions/ directory, so a global install
+                        // just runs `gsd install` without `-l`, registering
+                        // the extension for ALL GSD sessions on this
+                        // machine rather than one repo.
+                        match commands::init::install_gsd_extension(None) {
                             Ok(()) => {
-                                println!(
-                                    "Installed TraceVault GSD extension in {}",
-                                    gsd_home.join("extensions").join("tracevault").display()
-                                );
-                                println!(
-                                    "Enabled it in {}",
-                                    gsd_home.join("extensions").join("registry.json").display()
-                                );
                                 println!(
                                     "This applies to ALL GSD sessions on this machine, not just this repo."
                                 );
