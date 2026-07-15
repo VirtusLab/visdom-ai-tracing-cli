@@ -173,6 +173,15 @@ pub(crate) fn resolve_stream_binding(
     .map(|(b, _)| b)
 }
 
+/// Record-count offset arithmetic for the inline (fileless) path, mirroring the
+/// byte-offset semantics of `read_new_transcript_lines`: returns
+/// `(send_offset, next_offset)` where `send_offset` is stamped on the request as
+/// `transcript_offset` (base for the server's per-line `chunk_index`) and
+/// `next_offset` is persisted to `.stream_offset`.
+pub fn inline_offset_bump(start_offset: i64, records_len: i64) -> (i64, i64) {
+    (start_offset, start_offset + records_len)
+}
+
 /// Stamp the agent identity onto a request's `tool` + `protocol_version`.
 /// Factored out so the mapping is testable without the network/FS-bound
 /// `run_stream`.
@@ -252,6 +261,30 @@ pub async fn run_stream(
     // .stream_offset persists the END (next read position).
     let (transcript_lines, start_offset, new_offset) =
         read_new_transcript_lines(transcript_path, &offset_path)?;
+
+    // Fileless inline path (OpenCode): a plugin-based agent with no single
+    // tailable transcript supplies records directly on the hook event. When
+    // present, they replace the (empty) file-read result. `.stream_offset` is
+    // reused as a per-session RECORD counter so the server's chunk_index stays
+    // stable/monotonic across retries, exactly as with the byte-offset path.
+    let (transcript_lines, start_offset, new_offset) = if let Some(records) = hook_event
+        .transcript_records
+        .clone()
+        .filter(|r| !r.is_empty())
+    {
+        let prior: i64 = if offset_path.exists() {
+            fs::read_to_string(&offset_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let (send_offset, next_offset) = inline_offset_bump(prior, records.len() as i64);
+        (records, send_offset, next_offset)
+    } else {
+        (transcript_lines, start_offset, new_offset)
+    };
 
     // 5. Build StreamEventRequest
     let stream_event_type = match event_type {
