@@ -128,7 +128,10 @@ pub fn validate_init_flags(
     agent: crate::agent::Agent,
     claude_settings_set: bool,
 ) -> Result<(), String> {
-    if matches!(agent, crate::agent::Agent::Codex | crate::agent::Agent::Gsd) && claude_settings_set
+    if matches!(
+        agent,
+        crate::agent::Agent::Codex | crate::agent::Agent::Gsd | crate::agent::Agent::OpenCode
+    ) && claude_settings_set
     {
         return Err("--claude-settings only applies to --agent claude-code".to_string());
     }
@@ -182,6 +185,11 @@ pub async fn init_in_directory(
         // `.claude/settings.local.json`) — that's GSD's own local install
         // state, not something the user should commit.
         crate::agent::Agent::Gsd => (None, ".gsd/".to_string()),
+        // The OpenCode plugin is installed project-locally under
+        // `.opencode/plugins/tracevault/` — ignore the whole `.opencode/`
+        // directory rather than just the plugin file, in case OpenCode
+        // itself later writes other local state there.
+        crate::agent::Agent::OpenCode => (None, ".opencode/".to_string()),
     };
 
     // Create .tracevault/ directory
@@ -238,6 +246,9 @@ pub async fn init_in_directory(
             // `gsd install -l` from this repo, registering the extension as a
             // project-local install.
             install_gsd_extension(Some(project_root))?;
+        }
+        crate::agent::Agent::OpenCode => {
+            install_opencode_plugin(Some(project_root))?;
         }
     }
 
@@ -686,6 +697,56 @@ pub fn install_gsd_extension(project_root: Option<&Path>) -> io::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// TraceVault OpenCode plugin source, embedded from the checked-in assets
+/// this installer writes verbatim (mirrors the GSD extension embeds above).
+const OPENCODE_PLUGIN_INDEX: &str = include_str!("../../assets/opencode-plugin/index.ts");
+const OPENCODE_PLUGIN_PKG: &str = include_str!("../../assets/opencode-plugin/package.json");
+
+/// Install the TraceVault OpenCode plugin. `project_root = Some(dir)` installs
+/// project-local under `<dir>/.opencode/plugins/tracevault/`; `None` installs
+/// global under `~/.config/opencode/plugins/tracevault/` (using the same
+/// config-dir resolution as `gsd_extension_source_dir` above). Unlike GSD,
+/// OpenCode auto-loads plugins from that directory — no separate "install"
+/// command to shell out to. Non-fatal: prints a hint and returns `Ok(())` on
+/// failure rather than blocking init.
+pub fn install_opencode_plugin(project_root: Option<&Path>) -> io::Result<()> {
+    let base = match project_root {
+        Some(root) => root.join(".opencode").join("plugins").join("tracevault"),
+        None => {
+            let config_dir =
+                dirs::config_dir().or_else(|| dirs::home_dir().map(|h| h.join(".config")));
+            match config_dir {
+                Some(dir) => dir.join("opencode").join("plugins").join("tracevault"),
+                None => {
+                    eprintln!(
+                        "Warning: could not determine the config directory; skipping the \
+                         OpenCode plugin install. Copy assets/opencode-plugin/ to \
+                         ~/.config/opencode/plugins/tracevault/ by hand to enable capture."
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    if let Err(e) = write_opencode_plugin_files(&base) {
+        eprintln!(
+            "Warning: could not install the OpenCode plugin to {} ({e}). Copy \
+             assets/opencode-plugin/ there by hand to enable capture.",
+            base.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn write_opencode_plugin_files(base: &Path) -> io::Result<()> {
+    fs::create_dir_all(base)?;
+    fs::write(base.join("index.ts"), OPENCODE_PLUGIN_INDEX)?;
+    fs::write(base.join("package.json"), OPENCODE_PLUGIN_PKG)?;
     Ok(())
 }
 
