@@ -5,7 +5,9 @@
 //! byte-offset semantics of `read_new_transcript_lines`.
 
 use tracevault_cli::agent::Agent;
-use tracevault_cli::commands::stream::{inline_offset_bump, stamp_agent};
+use tracevault_cli::commands::stream::{
+    inline_offset_bump, resolve_transcript_source, stamp_agent,
+};
 use tracevault_protocol::streaming::{StreamEventRequest, StreamEventType};
 
 #[test]
@@ -63,4 +65,41 @@ fn opencode_inline_records_produce_opencode_tagged_request() {
     assert_eq!(req.transcript_lines.as_ref().unwrap().len(), 2);
     assert_eq!(req.transcript_lines.as_ref().unwrap(), &records);
     assert_eq!(req.transcript_offset, Some(0));
+}
+
+// ── resolve_transcript_source: regression for the empty-inline-records bug ──
+//
+// The OpenCode plugin's `stop` (session.idle) event sends
+// `transcript_records: Some(vec![])` — an empty but present inline-records
+// vec. Before the fix, `run_stream` filtered out empty vecs with
+// `.filter(|r| !r.is_empty())`, so this case fell through to the file-read
+// result `(vec![], 0, 0)` (OpenCode's `transcript_path` is always ""), which
+// clobbered `.stream_offset` back to 0 and collided with earlier turns'
+// `transcript_offset`/`chunk_index` on the server. `resolve_transcript_source`
+// must take the inline branch for ANY `Some(..)`, including empty, so the
+// prior record-count offset is preserved instead of reset.
+
+#[test]
+fn resolve_transcript_source_empty_inline_preserves_prior_offset() {
+    // This is the regression assertion for the bug: an empty `Some(vec![])`
+    // must NOT fall through to the (zeroed) file-read result.
+    let got = resolve_transcript_source(Some(vec![]), 5, (vec![], 0, 0));
+    assert_eq!(got, (vec![], 5, 5));
+}
+
+#[test]
+fn resolve_transcript_source_nonempty_inline_bumps_offset() {
+    let record =
+        serde_json::json!({"type": "message", "message": {"role": "user", "content": "hi"}});
+    let got = resolve_transcript_source(Some(vec![record.clone()]), 5, (vec![], 0, 0));
+    assert_eq!(got, (vec![record], 5, 6));
+}
+
+#[test]
+fn resolve_transcript_source_none_passes_through_file_result_unchanged() {
+    let record =
+        serde_json::json!({"type": "message", "message": {"role": "assistant", "content": "x"}});
+    let file_result = (vec![record.clone()], 3, 4);
+    let got = resolve_transcript_source(None, 5, file_result.clone());
+    assert_eq!(got, file_result);
 }

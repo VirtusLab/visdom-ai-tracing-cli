@@ -182,6 +182,25 @@ pub fn inline_offset_bump(start_offset: i64, records_len: i64) -> (i64, i64) {
     (start_offset, start_offset + records_len)
 }
 
+/// Choose the transcript source for a stream event. Inline records (from a
+/// plugin-based agent like OpenCode) win over the file-read result whenever the
+/// hook event carries them — INCLUDING an empty vec, so an event with no new
+/// records (e.g. OpenCode `stop`) preserves the prior record-count offset
+/// instead of resetting it to the file-path's 0.
+pub fn resolve_transcript_source(
+    inline_records: Option<Vec<serde_json::Value>>,
+    prior_offset: i64,
+    file_result: (Vec<serde_json::Value>, i64, i64),
+) -> (Vec<serde_json::Value>, i64, i64) {
+    match inline_records {
+        Some(records) => {
+            let (send, next) = inline_offset_bump(prior_offset, records.len() as i64);
+            (records, send, next)
+        }
+        None => file_result,
+    }
+}
+
 /// Stamp the agent identity onto a request's `tool` + `protocol_version`.
 /// Factored out so the mapping is testable without the network/FS-bound
 /// `run_stream`.
@@ -264,27 +283,29 @@ pub async fn run_stream(
 
     // Fileless inline path (OpenCode): a plugin-based agent with no single
     // tailable transcript supplies records directly on the hook event. When
-    // present, they replace the (empty) file-read result. `.stream_offset` is
-    // reused as a per-session RECORD counter so the server's chunk_index stays
-    // stable/monotonic across retries, exactly as with the byte-offset path.
-    let (transcript_lines, start_offset, new_offset) = if let Some(records) = hook_event
-        .transcript_records
-        .clone()
-        .filter(|r| !r.is_empty())
-    {
-        let prior: i64 = if offset_path.exists() {
-            fs::read_to_string(&offset_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<i64>().ok())
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let (send_offset, next_offset) = inline_offset_bump(prior, records.len() as i64);
-        (records, send_offset, next_offset)
+    // present — INCLUDING an empty vec (OpenCode's `stop`/session.idle event
+    // sends `transcript_records: []`) — they take priority over the file-read
+    // result. `.stream_offset` is reused as a per-session RECORD counter so
+    // the server's chunk_index stays stable/monotonic across retries, exactly
+    // as with the byte-offset path. Treating an empty vec as "no new
+    // records" rather than "fall back to the file" matters: OpenCode's
+    // `transcript_path` is always "", so the file-read result is always
+    // `(vec![], 0, 0)` — falling through to it would clobber the accumulated
+    // offset back to 0 and collide with earlier turns' chunk_index on the
+    // server.
+    let prior_offset: i64 = if offset_path.exists() {
+        fs::read_to_string(&offset_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
     } else {
-        (transcript_lines, start_offset, new_offset)
+        0
     };
+    let (transcript_lines, start_offset, new_offset) = resolve_transcript_source(
+        hook_event.transcript_records.clone(),
+        prior_offset,
+        (transcript_lines, start_offset, new_offset),
+    );
 
     // 5. Build StreamEventRequest
     let stream_event_type = match event_type {
