@@ -50,12 +50,13 @@ export default function tracevault(pi: ExtensionAPI): void {
     const sessionId = ctx.sessionManager.getSessionId();
     if (!sessionId) return;
     const t = ctx.sessionManager.getSessionFile() ?? "";
-    // Bare `session-start` (no --event/--agent flags) — mirrors the Claude
-    // Code and Codex SessionStart hook wiring (see `codex_hooks()`
-    // in init.rs): it exports TRACEVAULT_SESSION_ID and
-    // injects repo policy context. It is NOT `stream --event session-start`
-    // — the `stream` subcommand's `--event` values are pre-tool-use /
-    // post-tool-use / notification / stop only.
+    // Bare `session-start` (no --event/--agent flags) mirrors the Claude Code
+    // and Codex SessionStart wiring (see `codex_hooks()` in init.rs). NOTE: its
+    // side effects — exporting TRACEVAULT_SESSION_ID and injecting repo policy
+    // context — are Claude/Codex-only (they need CLAUDE_ENV_FILE / a stdout the
+    // agent reads, neither of which pi provides). For pi this call is effectively
+    // inert; we keep it for parity. Capture does not depend on it — every stream
+    // event below carries `session_id` explicitly.
     await runTracevault(["session-start"], hookEvent(sessionId, t, ctx.cwd, "SessionStart"), ctx.cwd);
   });
 

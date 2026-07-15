@@ -514,11 +514,12 @@ fn init_gsd_installs_extension_and_registry() {
     let tmp = TempDir::new().unwrap();
     let gsd_home = tmp.path().join(".gsd");
     // Pre-seed a stale tracker (the earlier, incorrect Codex-clone shim) to
-    // prove install_gsd_extension removes it.
+    // prove install_gsd_extension removes it, and an unrelated extension to
+    // prove the merge never drops a user's existing extensions.
     fs::create_dir_all(gsd_home.join("extensions").join("tracevault-tracker")).unwrap();
     fs::write(
         gsd_home.join("extensions").join("registry.json"),
-        r#"{"version":1,"entries":{"tracevault-tracker":{"id":"tracevault-tracker","enabled":true,"source":"user"}}}"#,
+        r#"{"version":1,"entries":{"tracevault-tracker":{"id":"tracevault-tracker","enabled":true,"source":"user"},"other-ext":{"id":"other-ext","enabled":true,"source":"bundled"}}}"#,
     )
     .unwrap();
 
@@ -546,6 +547,23 @@ fn init_gsd_installs_extension_and_registry() {
             .join("tracevault-tracker")
             .exists(),
         "stale tracker dir removed"
+    );
+    // Verify unrelated extension is preserved and unchanged.
+    assert!(
+        reg["entries"].get("other-ext").is_some(),
+        "other-ext should be preserved during merge"
+    );
+    assert_eq!(
+        reg["entries"]["other-ext"]["id"],
+        serde_json::json!("other-ext")
+    );
+    assert_eq!(
+        reg["entries"]["other-ext"]["enabled"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        reg["entries"]["other-ext"]["source"],
+        serde_json::json!("bundled")
     );
 }
 
