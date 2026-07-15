@@ -702,44 +702,49 @@ pub fn install_gsd_extension(project_root: Option<&Path>) -> io::Result<()> {
 /// destroying every other extension the user has registered.
 pub fn cleanup_stale_gsd_registration(gsd_home: &Path) -> io::Result<()> {
     let ext_root = gsd_home.join("extensions");
+    let reg_path = ext_root.join("registry.json");
 
+    // Validate the registry BEFORE mutating anything under ~/.gsd. If it exists
+    // but is structurally corrupt (unparseable, or a non-object root/`entries`),
+    // leave the extensions directory entirely untouched — not even the stale
+    // tracker dir is removed — so a corrupt registry yields zero mutation.
+    let reg: Option<serde_json::Value> = if reg_path.exists() {
+        let content = fs::read_to_string(&reg_path)?;
+        let parsed: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return Ok(()), // corrupt: touch nothing
+        };
+        let corrupt = match parsed.as_object() {
+            None => true,
+            Some(obj) => matches!(obj.get("entries"), Some(v) if !v.is_object()),
+        };
+        if corrupt {
+            return Ok(()); // structurally corrupt: touch nothing
+        }
+        Some(parsed)
+    } else {
+        None
+    };
+
+    // Registry is valid or absent — now safe to remove the superseded tracker shim.
     let stale = ext_root.join("tracevault-tracker");
     if stale.exists() {
         fs::remove_dir_all(&stale)?;
     }
 
-    let reg_path = ext_root.join("registry.json");
-    if !reg_path.exists() {
-        return Ok(());
+    // Drop stale registry entries (only when a valid registry exists).
+    if let Some(mut reg) = reg {
+        if let Some(entries) = reg.get_mut("entries").and_then(|e| e.as_object_mut()) {
+            let removed_tracker = entries.remove("tracevault-tracker").is_some();
+            let removed_inert = entries.remove("tracevault").is_some();
+            if removed_tracker || removed_inert {
+                // Atomic write (temp file + rename), pretty-printed.
+                let tmp = reg_path.with_extension("json.tmp");
+                fs::write(&tmp, serde_json::to_string_pretty(&reg)?)?;
+                fs::rename(&tmp, &reg_path)?;
+            }
+        }
     }
-
-    let content = fs::read_to_string(&reg_path)?;
-    let mut reg: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return Ok(()), // corrupt: skip cleanup, leave untouched
-    };
-
-    let corrupt = match reg.as_object() {
-        None => true,
-        Some(obj) => matches!(obj.get("entries"), Some(v) if !v.is_object()),
-    };
-    if corrupt {
-        return Ok(());
-    }
-
-    let Some(entries) = reg.get_mut("entries").and_then(|e| e.as_object_mut()) else {
-        return Ok(());
-    };
-    let removed_tracker = entries.remove("tracevault-tracker").is_some();
-    let removed_inert = entries.remove("tracevault").is_some();
-    if !removed_tracker && !removed_inert {
-        return Ok(()); // nothing changed; don't rewrite the file
-    }
-
-    // Atomic write (temp file + rename), pretty-printed.
-    let tmp = reg_path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(&reg)?)?;
-    fs::rename(&tmp, &reg_path)?;
     Ok(())
 }
 

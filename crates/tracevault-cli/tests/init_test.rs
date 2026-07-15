@@ -583,6 +583,12 @@ fn cleanup_stale_gsd_registration_skips_corrupt_registry_without_overwriting() {
     fs::create_dir_all(&ext_root).unwrap();
     let reg_path = ext_root.join("registry.json");
 
+    // Seed a stale tracker dir alongside the corrupt registry to prove the
+    // corrupt path performs ZERO mutation under ~/.gsd — the registry is
+    // validated BEFORE anything is touched, so the tracker dir is NOT deleted.
+    let tracker_dir = ext_root.join("tracevault-tracker");
+    fs::create_dir_all(&tracker_dir).unwrap();
+
     // A registry.json that exists but fails to parse must NOT be silently
     // reset to an empty skeleton (that would destroy every other extension
     // the user had registered). Cleanup must skip it — leaving it untouched
@@ -601,6 +607,11 @@ fn cleanup_stale_gsd_registration_skips_corrupt_registry_without_overwriting() {
     assert_eq!(
         content_after, corrupt_content,
         "corrupt registry.json must be left byte-for-byte unchanged"
+    );
+    assert!(
+        tracker_dir.exists(),
+        "a corrupt registry must be validated before any fs mutation — the \
+         stale tracker dir must NOT be removed (zero mutation under ~/.gsd)"
     );
 }
 
