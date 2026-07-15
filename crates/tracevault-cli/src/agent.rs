@@ -10,6 +10,11 @@ pub enum Agent {
     /// GSD (Get Shit Done) — runs on the pi coding-agent framework.
     #[value(alias = "gsd2")]
     Gsd,
+    /// OpenCode. Named explicitly: clap's default kebab-case derivation
+    /// would otherwise split the CamelCase word boundary into `open-code`,
+    /// not the single-word `opencode` the server/CLI convention expects.
+    #[value(name = "opencode")]
+    OpenCode,
 }
 
 impl Agent {
@@ -20,6 +25,7 @@ impl Agent {
             Agent::ClaudeCode => "claude-code",
             Agent::Codex => "codex",
             Agent::Gsd => "gsd",
+            Agent::OpenCode => "opencode",
         }
     }
 
@@ -30,6 +36,7 @@ impl Agent {
             Agent::ClaudeCode => 1,
             Agent::Codex => 2,
             Agent::Gsd => 2,
+            Agent::OpenCode => 2,
         }
     }
 
@@ -40,6 +47,7 @@ impl Agent {
             Agent::ClaudeCode => "Claude Code",
             Agent::Codex => "Codex",
             Agent::Gsd => "GSD",
+            Agent::OpenCode => "OpenCode",
         }
     }
 }
@@ -85,5 +93,14 @@ mod tests {
         use clap::ValueEnum;
         assert_eq!(Agent::from_str("gsd", true).unwrap(), Agent::Gsd);
         assert_eq!(Agent::from_str("gsd2", true).unwrap(), Agent::Gsd);
+    }
+
+    #[test]
+    fn opencode_agent_mapping() {
+        assert_eq!(Agent::OpenCode.tool_name(), "opencode");
+        assert_eq!(Agent::OpenCode.protocol_version(), 2);
+        assert_eq!(Agent::OpenCode.label(), "OpenCode");
+        use clap::ValueEnum;
+        assert_eq!(Agent::from_str("opencode", true).unwrap(), Agent::OpenCode);
     }
 }
