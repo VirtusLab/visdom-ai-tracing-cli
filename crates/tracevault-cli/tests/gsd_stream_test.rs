@@ -24,7 +24,7 @@ fn gsd_session_produces_gsd_tagged_request() {
     .unwrap();
     writeln!(
         f,
-        r#"{{"type":"message","message":{{"role":"assistant","content":[{{"type":"toolCall","id":"t1","name":"write","arguments":{{"path":"a.rs","content":"x"}}}}],"usage":{{"input":1,"output":2,"cacheRead":0,"cacheWrite":0}}}}}}"#
+        r#"{{"type":"message","message":{{"role":"assistant","model":"claude-opus-4-7","content":[{{"type":"toolCall","id":"t1","name":"write","arguments":{{"path":"a.rs","content":"x"}}}}],"usage":{{"input":1,"output":2,"cacheRead":0,"cacheWrite":0}}}}}}"#
     )
     .unwrap();
     drop(f);
@@ -34,6 +34,14 @@ fn gsd_session_produces_gsd_tagged_request() {
     assert_eq!(lines.len(), 2, "both pi session lines read");
     assert_eq!(start_offset, 0, "first read starts at byte 0");
     assert!(new_offset > 0);
+    // Real GSD sessions always carry `message.model` on assistant message
+    // lines; keep the fixture honest so a model-attribution regression here
+    // would actually be caught.
+    assert_eq!(
+        lines[1]["message"]["model"],
+        serde_json::json!("claude-opus-4-7"),
+        "fixture assistant message must carry message.model like real GSD data"
+    );
 
     let mut req = StreamEventRequest {
         protocol_version: 1,
