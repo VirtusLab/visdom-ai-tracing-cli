@@ -22,8 +22,10 @@ fn codex_rollout_produces_codex_tagged_request() {
     writeln!(f, r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":100,"output_tokens":10}}}}}}}}"#).unwrap();
     drop(f);
 
-    let (lines, new_offset) = read_new_transcript_lines(&transcript, &offset).unwrap();
+    let (lines, start_offset, new_offset) =
+        read_new_transcript_lines(&transcript, &offset).unwrap();
     assert_eq!(lines.len(), 3, "all three rollout lines read");
+    assert_eq!(start_offset, 0, "first read starts at byte 0");
     assert!(new_offset > 0);
 
     let mut req = StreamEventRequest {
@@ -41,7 +43,7 @@ fn codex_rollout_produces_codex_tagged_request() {
         event_index: None,
         event_uuid: None,
         transcript_lines: Some(lines),
-        transcript_offset: Some(new_offset),
+        transcript_offset: Some(start_offset),
         model: None,
         cwd: Some(tmp.path().to_string_lossy().into_owned()),
         final_stats: None,

@@ -7,6 +7,9 @@
 pub enum Agent {
     ClaudeCode,
     Codex,
+    /// GSD (Get Shit Done) — runs on the pi coding-agent framework.
+    #[value(alias = "gsd2")]
+    Gsd,
 }
 
 impl Agent {
@@ -16,6 +19,7 @@ impl Agent {
         match self {
             Agent::ClaudeCode => "claude-code",
             Agent::Codex => "codex",
+            Agent::Gsd => "gsd",
         }
     }
 
@@ -25,6 +29,7 @@ impl Agent {
         match self {
             Agent::ClaudeCode => 1,
             Agent::Codex => 2,
+            Agent::Gsd => 2,
         }
     }
 
@@ -34,6 +39,7 @@ impl Agent {
         match self {
             Agent::ClaudeCode => "Claude Code",
             Agent::Codex => "Codex",
+            Agent::Gsd => "GSD",
         }
     }
 }
@@ -65,5 +71,19 @@ mod tests {
     fn label_wording() {
         assert_eq!(Agent::ClaudeCode.label(), "Claude Code");
         assert_eq!(Agent::Codex.label(), "Codex");
+    }
+
+    #[test]
+    fn gsd_agent_mapping() {
+        assert_eq!(Agent::Gsd.tool_name(), "gsd");
+        assert_eq!(Agent::Gsd.protocol_version(), 2);
+        assert_eq!(Agent::Gsd.label(), "GSD");
+    }
+
+    #[test]
+    fn gsd_parses_from_str_and_alias() {
+        use clap::ValueEnum;
+        assert_eq!(Agent::from_str("gsd", true).unwrap(), Agent::Gsd);
+        assert_eq!(Agent::from_str("gsd2", true).unwrap(), Agent::Gsd);
     }
 }

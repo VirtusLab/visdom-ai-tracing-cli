@@ -509,6 +509,178 @@ async fn init_default_writes_user_context_true() {
     );
 }
 
+#[test]
+fn cleanup_stale_gsd_registration_removes_tracker_and_inert_entries() {
+    let tmp = TempDir::new().unwrap();
+    let gsd_home = tmp.path().join(".gsd");
+    // Pre-seed a stale tracker (the earlier, incorrect Codex-clone shim) and
+    // a hand-written (inert) "tracevault" entry from an older version of
+    // this installer, plus an unrelated extension, to prove cleanup removes
+    // the stale ones while never dropping a user's other extensions.
+    fs::create_dir_all(gsd_home.join("extensions").join("tracevault-tracker")).unwrap();
+    fs::write(
+        gsd_home.join("extensions").join("registry.json"),
+        r#"{"version":1,"entries":{"tracevault-tracker":{"id":"tracevault-tracker","enabled":true,"source":"user"},"tracevault":{"id":"tracevault","enabled":true,"source":"user"},"other-ext":{"id":"other-ext","enabled":true,"source":"bundled"}}}"#,
+    )
+    .unwrap();
+
+    tracevault_cli::commands::init::cleanup_stale_gsd_registration(&gsd_home).unwrap();
+
+    let reg: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(gsd_home.join("extensions").join("registry.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        reg["entries"].get("tracevault-tracker").is_none(),
+        "stale tracker entry removed"
+    );
+    assert!(
+        reg["entries"].get("tracevault").is_none(),
+        "stale inert tracevault registry entry removed (gsd install manages registration now)"
+    );
+    assert!(
+        !gsd_home
+            .join("extensions")
+            .join("tracevault-tracker")
+            .exists(),
+        "stale tracker dir removed"
+    );
+    // Verify unrelated extension is preserved and unchanged.
+    assert!(
+        reg["entries"].get("other-ext").is_some(),
+        "other-ext should be preserved during cleanup"
+    );
+    assert_eq!(
+        reg["entries"]["other-ext"]["id"],
+        serde_json::json!("other-ext")
+    );
+    assert_eq!(
+        reg["entries"]["other-ext"]["enabled"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        reg["entries"]["other-ext"]["source"],
+        serde_json::json!("bundled")
+    );
+}
+
+#[test]
+fn cleanup_stale_gsd_registration_is_noop_when_registry_missing() {
+    let tmp = TempDir::new().unwrap();
+    let gsd_home = tmp.path().join(".gsd");
+
+    // No pre-existing registry.json (and no extensions/ dir at all): nothing
+    // to clean up, so this is a no-op that succeeds without creating one.
+    tracevault_cli::commands::init::cleanup_stale_gsd_registration(&gsd_home).unwrap();
+    assert!(!gsd_home.join("extensions").join("registry.json").exists());
+}
+
+#[test]
+fn cleanup_stale_gsd_registration_skips_corrupt_registry_without_overwriting() {
+    let tmp = TempDir::new().unwrap();
+    let gsd_home = tmp.path().join(".gsd");
+    let ext_root = gsd_home.join("extensions");
+    fs::create_dir_all(&ext_root).unwrap();
+    let reg_path = ext_root.join("registry.json");
+
+    // Seed a stale tracker dir alongside the corrupt registry to prove the
+    // corrupt path performs ZERO mutation under ~/.gsd — the registry is
+    // validated BEFORE anything is touched, so the tracker dir is NOT deleted.
+    let tracker_dir = ext_root.join("tracevault-tracker");
+    fs::create_dir_all(&tracker_dir).unwrap();
+
+    // A registry.json that exists but fails to parse must NOT be silently
+    // reset to an empty skeleton (that would destroy every other extension
+    // the user had registered). Cleanup must skip it — leaving it untouched
+    // — rather than error out or overwrite it; a corrupt registry must
+    // never block the rest of `install_gsd_extension`.
+    let corrupt_content = "{ this is not json";
+    fs::write(&reg_path, corrupt_content).unwrap();
+
+    let result = tracevault_cli::commands::init::cleanup_stale_gsd_registration(&gsd_home);
+    assert!(
+        result.is_ok(),
+        "cleanup must not fail the install on a corrupt existing registry"
+    );
+
+    let content_after = fs::read_to_string(&reg_path).unwrap();
+    assert_eq!(
+        content_after, corrupt_content,
+        "corrupt registry.json must be left byte-for-byte unchanged"
+    );
+    assert!(
+        tracker_dir.exists(),
+        "a corrupt registry must be validated before any fs mutation — the \
+         stale tracker dir must NOT be removed (zero mutation under ~/.gsd)"
+    );
+}
+
+/// `tracevault init --agent gsd` (repo-local, NOT `--global`) with `HOME`
+/// pointed at an empty tempdir. This runs the *compiled binary* (like
+/// `global_install_test.rs` does for `--global`) rather than calling
+/// `init_in_directory` in-process, specifically so `HOME` can be redirected
+/// via `Command::env` (child-process-local, race-free under parallel tests)
+/// instead of `std::env::set_var` (process-wide, which would race other
+/// tests running concurrently in this same test binary). It also means the
+/// `gsd install` shell-out inside `install_gsd_extension` (if `gsd` happens
+/// to be on PATH) is sandboxed to this fake `HOME` too.
+///
+/// The `gsd` binary is not guaranteed to be present in CI, so this only
+/// asserts what must hold either way: `init` succeeds and the extension
+/// source (all three files) is written to the stable source dir —
+/// `install_gsd_extension` must degrade gracefully (warn, still return
+/// `Ok`) rather than fail `init` when `gsd install` can't run.
+#[cfg(target_os = "linux")]
+#[test]
+fn init_gsd_repo_local_installs_extension_and_gitignores_gsd_dir() {
+    let repo = tmp_git_repo();
+    let home = TempDir::new().unwrap();
+    let bin = env!("CARGO_BIN_EXE_tracevault");
+
+    let output = std::process::Command::new(bin)
+        .args(["init", "--agent", "gsd"])
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .current_dir(repo.path())
+        .output()
+        .expect("failed to run tracevault binary");
+
+    assert!(
+        output.status.success(),
+        "tracevault init --agent gsd should succeed (even if `gsd install` itself can't run); stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Extension source written under the (redirected) user config dir, not
+    // the repo — this is what `gsd install <dir> -l` registers.
+    let source_dir = home.path().join(".config/tracevault/gsd-extension");
+    assert!(source_dir.join("index.ts").exists());
+    assert!(source_dir.join("package.json").exists());
+    assert!(
+        source_dir.join("extension-manifest.json").exists(),
+        "extension-manifest.json is required for GSD to load the extension"
+    );
+
+    // .gitignore has .tracevault/ AND .gsd/ — the latter because, when `gsd`
+    // is on PATH, `gsd install <dir> -l` itself writes a project-local
+    // `.gsd/settings.json` registration file into the repo (confirmed live:
+    // it lists the installed package path). That's GSD's own local-install
+    // state, not something a user should commit, so `init` gitignores it
+    // preemptively regardless of whether `gsd` happened to run here.
+    let gitignore = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
+    assert!(gitignore.contains(".tracevault/"));
+    assert!(
+        gitignore.contains(".gsd/"),
+        "gsd's project-local install state must be gitignored: {gitignore}"
+    );
+    let blank_lines = gitignore.lines().filter(|l| l.is_empty()).count();
+    assert_eq!(
+        blank_lines, 1,
+        "expected exactly the one intentional separator blank line, got: {gitignore:?}"
+    );
+}
+
 #[tokio::test]
 async fn init_explicit_user_context_path_written() {
     let tmp = tmp_git_repo();

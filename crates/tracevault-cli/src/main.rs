@@ -289,128 +289,202 @@ async fn main() {
                 std::process::exit(1);
             }
             if global {
-                if matches!(agent, crate::agent::Agent::Codex) {
-                    let codex_dir = match dirs::home_dir() {
-                        Some(home) => home.join(".codex"),
-                        None => {
-                            eprintln!("Error: cannot determine home directory");
-                            std::process::exit(1);
+                // Explicit match (not `matches!(.., Codex)` + fallthrough) so a
+                // future agent variant can't silently fall through to the Claude
+                // Code branch and report success while installing nothing for it.
+                match agent {
+                    crate::agent::Agent::Codex => {
+                        let codex_dir = match dirs::home_dir() {
+                            Some(home) => home.join(".codex"),
+                            None => {
+                                eprintln!("Error: cannot determine home directory");
+                                std::process::exit(1);
+                            }
+                        };
+                        match commands::init::install_global_codex_hooks(&codex_dir) {
+                            Ok(()) => {
+                                println!(
+                                    "Installed TraceVault Codex hooks in {}",
+                                    codex_dir.join("hooks.json").display()
+                                );
+                                println!(
+                                    "Added workspace-mode instructions to {}",
+                                    codex_dir.join("AGENTS.md").display()
+                                );
+                                println!(
+                                    "These apply to ALL Codex CLI sessions on this machine, not just this repo."
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {e}");
+                                std::process::exit(1);
+                            }
                         }
-                    };
-                    match commands::init::install_global_codex_hooks(&codex_dir) {
-                        Ok(()) => {
-                            println!(
-                                "Installed TraceVault Codex hooks in {}",
-                                codex_dir.join("hooks.json").display()
-                            );
-                            println!(
-                                "Added workspace-mode instructions to {}",
-                                codex_dir.join("AGENTS.md").display()
-                            );
-                            println!(
-                                "These apply to ALL Codex CLI sessions on this machine, not just this repo."
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!("Error: {e}");
-                            std::process::exit(1);
-                        }
-                    }
 
-                    let requested =
-                        match config::UserContext::from_init_flags(no_user_context, user_context) {
+                        let requested = match config::UserContext::from_init_flags(
+                            no_user_context,
+                            user_context,
+                        ) {
                             Ok(r) => r,
                             Err(e) => {
                                 eprintln!("Error: {e}");
                                 std::process::exit(1);
                             }
                         };
-                    match commands::init::write_global_user_config_in(
-                        &config::tv_config_root(),
-                        requested,
-                    ) {
-                        Ok(active) => {
-                            println!(
-                                "User-level context config: {}",
-                                config::user_config_path().display()
-                            );
-                            match active {
-                                Some(ctx) => {
-                                    println!("User-level context file: {}", ctx.display())
+                        match commands::init::write_global_user_config_in(
+                            &config::tv_config_root(),
+                            requested,
+                        ) {
+                            Ok(active) => {
+                                println!(
+                                    "User-level context config: {}",
+                                    config::user_config_path().display()
+                                );
+                                match active {
+                                    Some(ctx) => {
+                                        println!("User-level context file: {}", ctx.display())
+                                    }
+                                    None => {
+                                        println!(
+                                            "User-level context is disabled (`--no-user-context`)."
+                                        )
+                                    }
                                 }
-                                None => {
-                                    println!(
-                                        "User-level context is disabled (`--no-user-context`)."
-                                    )
-                                }
+                                println!(
+                                    "Edit it with `tracevault context set --user …`; disable with \
+                                     `tracevault init --global --no-user-context`."
+                                );
                             }
-                            println!(
-                                "Edit it with `tracevault context set --user …`; disable with \
-                                 `tracevault init --global --no-user-context`."
-                            );
+                            Err(e) => {
+                                eprintln!("Warning: could not write user-level context config: {e}")
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("Warning: could not write user-level context config: {e}")
-                        }
+                        return;
                     }
-                    return;
-                }
+                    crate::agent::Agent::Gsd => {
+                        // GSD (pi) loads extensions from a user-global
+                        // ~/.gsd/extensions/ directory, so a global install
+                        // just runs `gsd install` without `-l`, registering
+                        // the extension for ALL GSD sessions on this
+                        // machine rather than one repo.
+                        match commands::init::install_gsd_extension(None) {
+                            Ok(()) => {
+                                println!(
+                                    "This applies to ALL GSD sessions on this machine, not just this repo."
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {e}");
+                                std::process::exit(1);
+                            }
+                        }
 
-                let claude_dir = match dirs::home_dir() {
-                    Some(home) => home.join(".claude"),
-                    None => {
-                        eprintln!("Error: cannot determine home directory");
-                        std::process::exit(1);
-                    }
-                };
-                match commands::init::install_global_hooks(&claude_dir) {
-                    Ok(()) => {
-                        println!(
-                            "Installed TraceVault hooks in {}",
-                            claude_dir.join("settings.json").display()
-                        );
-                        println!("Updated {}", claude_dir.join("CLAUDE.md").display());
-                        println!(
-                            "These apply to ALL Claude Code sessions on this machine, not just this repo."
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
-                    }
-                }
-
-                let requested =
-                    match config::UserContext::from_init_flags(no_user_context, user_context) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            eprintln!("Error: {e}");
-                            std::process::exit(1);
+                        let requested = match config::UserContext::from_init_flags(
+                            no_user_context,
+                            user_context,
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("Error: {e}");
+                                std::process::exit(1);
+                            }
+                        };
+                        match commands::init::write_global_user_config_in(
+                            &config::tv_config_root(),
+                            requested,
+                        ) {
+                            Ok(active) => {
+                                println!(
+                                    "User-level context config: {}",
+                                    config::user_config_path().display()
+                                );
+                                match active {
+                                    Some(ctx) => {
+                                        println!("User-level context file: {}", ctx.display())
+                                    }
+                                    None => {
+                                        println!(
+                                            "User-level context is disabled (`--no-user-context`)."
+                                        )
+                                    }
+                                }
+                                println!(
+                                    "Edit it with `tracevault context set --user …`; disable with \
+                                     `tracevault init --global --no-user-context`."
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: could not write user-level context config: {e}")
+                            }
                         }
-                    };
-                match commands::init::write_global_user_config_in(
-                    &config::tv_config_root(),
-                    requested,
-                ) {
-                    Ok(active) => {
-                        println!(
-                            "User-level context config: {}",
-                            config::user_config_path().display()
-                        );
-                        match active {
-                            Some(ctx) => println!("User-level context file: {}", ctx.display()),
+                        return;
+                    }
+                    crate::agent::Agent::ClaudeCode => {
+                        let claude_dir = match dirs::home_dir() {
+                            Some(home) => home.join(".claude"),
                             None => {
-                                println!("User-level context is disabled (`--no-user-context`).")
+                                eprintln!("Error: cannot determine home directory");
+                                std::process::exit(1);
+                            }
+                        };
+                        match commands::init::install_global_hooks(&claude_dir) {
+                            Ok(()) => {
+                                println!(
+                                    "Installed TraceVault hooks in {}",
+                                    claude_dir.join("settings.json").display()
+                                );
+                                println!("Updated {}", claude_dir.join("CLAUDE.md").display());
+                                println!(
+                                    "These apply to ALL Claude Code sessions on this machine, not just this repo."
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {e}");
+                                std::process::exit(1);
                             }
                         }
-                        println!(
-                            "Edit it with `tracevault context set --user …`; disable with \
-                             `tracevault init --global --no-user-context`."
-                        );
+
+                        let requested = match config::UserContext::from_init_flags(
+                            no_user_context,
+                            user_context,
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("Error: {e}");
+                                std::process::exit(1);
+                            }
+                        };
+                        match commands::init::write_global_user_config_in(
+                            &config::tv_config_root(),
+                            requested,
+                        ) {
+                            Ok(active) => {
+                                println!(
+                                    "User-level context config: {}",
+                                    config::user_config_path().display()
+                                );
+                                match active {
+                                    Some(ctx) => {
+                                        println!("User-level context file: {}", ctx.display())
+                                    }
+                                    None => {
+                                        println!(
+                                            "User-level context is disabled (`--no-user-context`)."
+                                        )
+                                    }
+                                }
+                                println!(
+                                    "Edit it with `tracevault context set --user …`; disable with \
+                                     `tracevault init --global --no-user-context`."
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: could not write user-level context config: {e}")
+                            }
+                        }
+                        return;
                     }
-                    Err(e) => eprintln!("Warning: could not write user-level context config: {e}"),
                 }
-                return;
             }
 
             let cwd = env::current_dir().expect("Cannot determine current directory");
@@ -434,9 +508,21 @@ async fn main() {
             {
                 Ok(entry) => {
                     println!("TraceVault initialized in {}", cwd.display());
-                    println!("{} hooks installed ({entry})", agent.label());
-                    println!("Git hooks installed (pre-push, post-commit)");
-                    println!("Added .tracevault/ and {entry} to .gitignore");
+                    if entry.is_empty() {
+                        // GSD (pi): the extension lives in the user-global
+                        // ~/.gsd/extensions/tracevault/, not in the repo — there's
+                        // no per-repo hook file to report or gitignore.
+                        println!(
+                            "{} extension installed (~/.gsd/extensions/tracevault/)",
+                            agent.label()
+                        );
+                        println!("Git hooks installed (pre-push, post-commit)");
+                        println!("Added .tracevault/ to .gitignore");
+                    } else {
+                        println!("{} hooks installed ({entry})", agent.label());
+                        println!("Git hooks installed (pre-push, post-commit)");
+                        println!("Added .tracevault/ and {entry} to .gitignore");
+                    }
                     println!(
                         "Nothing needs to be committed — all TraceVault files are local only."
                     );

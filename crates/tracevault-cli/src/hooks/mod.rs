@@ -8,6 +8,8 @@ pub mod claude_code;
 pub mod codex;
 #[allow(dead_code)]
 pub mod cursor;
+#[allow(dead_code)]
+pub mod gsd;
 
 #[allow(dead_code)]
 pub trait HookAdapter: Send + Sync {
@@ -21,6 +23,7 @@ pub enum DetectedTool {
     ClaudeCode,
     Cursor,
     Codex,
+    Gsd,
 }
 
 impl DetectedTool {
@@ -29,6 +32,7 @@ impl DetectedTool {
             DetectedTool::ClaudeCode => "claude-code",
             DetectedTool::Cursor => "cursor",
             DetectedTool::Codex => "codex",
+            DetectedTool::Gsd => "gsd",
         }
     }
 
@@ -38,6 +42,7 @@ impl DetectedTool {
             DetectedTool::ClaudeCode => Box::new(claude_code::ClaudeCodeAdapter),
             DetectedTool::Cursor => Box::new(cursor::CursorAdapter),
             DetectedTool::Codex => Box::new(codex::CodexAdapter),
+            DetectedTool::Gsd => Box::new(gsd::GsdAdapter),
         }
     }
 }
@@ -52,6 +57,9 @@ pub fn detect_tools(cwd: &Path) -> Vec<DetectedTool> {
     }
     if cwd.join(".codex").exists() {
         tools.push(DetectedTool::Codex);
+    }
+    if cwd.join(".gsd").exists() {
+        tools.push(DetectedTool::Gsd);
     }
     tools
 }
@@ -101,5 +109,18 @@ mod tests {
             DetectedTool::ClaudeCode.adapter().tool_name(),
             "claude-code"
         );
+    }
+
+    #[test]
+    fn detect_tools_gsd() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".gsd")).unwrap();
+        let tools = detect_tools(dir.path());
+        assert!(tools.iter().any(|t| matches!(t, DetectedTool::Gsd)));
+    }
+
+    #[test]
+    fn gsd_adapter_reports_gsd_tool_name() {
+        assert_eq!(DetectedTool::Gsd.adapter().tool_name(), "gsd");
     }
 }

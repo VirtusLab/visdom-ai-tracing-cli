@@ -21,18 +21,23 @@ fn test_read_new_transcript_lines() {
     )
     .unwrap();
 
-    let (lines, new_offset) =
+    let (lines, start_offset, new_offset) =
         tracevault_cli::commands::stream::read_new_transcript_lines(&transcript_path, &offset_path)
             .unwrap();
     assert_eq!(lines.len(), 2);
+    assert_eq!(start_offset, 0, "first read starts at byte 0");
     assert!(new_offset > 0);
 
     fs::write(&offset_path, new_offset.to_string()).unwrap();
 
-    let (lines, _) =
+    let (lines, start_offset2, _) =
         tracevault_cli::commands::stream::read_new_transcript_lines(&transcript_path, &offset_path)
             .unwrap();
     assert_eq!(lines.len(), 0);
+    assert_eq!(
+        start_offset2, new_offset,
+        "second read's start_offset must equal the first read's persisted end offset"
+    );
 
     let mut f = fs::OpenOptions::new()
         .append(true)
@@ -40,10 +45,14 @@ fn test_read_new_transcript_lines() {
         .unwrap();
     writeln!(f, "{{\"type\":\"user\",\"message\":\"more\"}}").unwrap();
 
-    let (lines, _) =
+    let (lines, start_offset3, _) =
         tracevault_cli::commands::stream::read_new_transcript_lines(&transcript_path, &offset_path)
             .unwrap();
     assert_eq!(lines.len(), 1);
+    assert_eq!(
+        start_offset3, new_offset,
+        "third read's start_offset must still equal the last persisted end offset"
+    );
 }
 
 #[test]
