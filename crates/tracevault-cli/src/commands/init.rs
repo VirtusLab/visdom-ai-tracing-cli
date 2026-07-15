@@ -613,19 +613,46 @@ pub fn install_gsd_extension(gsd_home: &Path) -> io::Result<()> {
     }
 
     // Merge the registry: add/enable "tracevault", drop "tracevault-tracker".
-    // Absent or corrupt registry.json starts fresh rather than erroring, since
-    // a stale/malformed file must never block installing the extension.
+    // A MISSING registry.json starts fresh (nothing to lose). An EXISTING
+    // registry.json that fails to parse, or whose "entries" key is present
+    // but not an object, is structurally corrupt: we refuse to overwrite it
+    // (which would silently destroy every other extension the user had
+    // registered) and return an error instead.
     let reg_path = ext_root.join("registry.json");
     let mut reg: serde_json::Value = if reg_path.exists() {
-        fs::read_to_string(&reg_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| serde_json::json!({"version":1,"entries":{}}))
+        let content = fs::read_to_string(&reg_path)?;
+        serde_json::from_str(&content).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} exists but is not valid JSON; refusing to overwrite it. Fix or remove the file, then re-run.",
+                    reg_path.display()
+                ),
+            )
+        })?
     } else {
         serde_json::json!({"version":1,"entries":{}})
     };
-    if reg.get("entries").and_then(|e| e.as_object()).is_none() {
-        reg = serde_json::json!({"version":1,"entries":{}});
+    if reg_path.exists() {
+        // A parsed-but-not-an-object root (e.g. a bare array/number/string)
+        // or a non-object "entries" field is just as structurally corrupt as
+        // unparseable JSON: refuse to overwrite it.
+        let corrupt = match reg.as_object() {
+            None => true,
+            Some(obj) => matches!(obj.get("entries"), Some(v) if !v.is_object()),
+        };
+        if corrupt {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} exists but is not a valid extension registry (expected an object with an \"entries\" object); refusing to overwrite it. Fix or remove the file, then re-run.",
+                    reg_path.display()
+                ),
+            ));
+        }
+    }
+    if reg.get("entries").is_none() {
+        reg["entries"] = serde_json::json!({});
     }
     let entries = reg
         .get_mut("entries")

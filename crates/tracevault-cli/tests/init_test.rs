@@ -568,11 +568,12 @@ fn init_gsd_installs_extension_and_registry() {
 }
 
 #[test]
-fn init_gsd_extension_starts_fresh_when_registry_missing_or_corrupt() {
+fn init_gsd_extension_starts_fresh_when_registry_missing() {
     let tmp = TempDir::new().unwrap();
     let gsd_home = tmp.path().join(".gsd");
 
-    // No pre-existing registry.json at all.
+    // No pre-existing registry.json at all: nothing to lose, so install
+    // proceeds and writes a fresh skeleton.
     tracevault_cli::commands::init::install_gsd_extension(&gsd_home).unwrap();
     let reg: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(gsd_home.join("extensions").join("registry.json")).unwrap(),
@@ -582,21 +583,33 @@ fn init_gsd_extension_starts_fresh_when_registry_missing_or_corrupt() {
         reg["entries"]["tracevault"]["enabled"],
         serde_json::json!(true)
     );
+}
 
-    // Corrupt registry.json on a second run must not blow up the install.
-    fs::write(
-        gsd_home.join("extensions").join("registry.json"),
-        "not valid json",
-    )
-    .unwrap();
-    tracevault_cli::commands::init::install_gsd_extension(&gsd_home).unwrap();
-    let reg: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(gsd_home.join("extensions").join("registry.json")).unwrap(),
-    )
-    .unwrap();
+#[test]
+fn init_gsd_extension_aborts_on_corrupt_registry_without_overwriting() {
+    let tmp = TempDir::new().unwrap();
+    let gsd_home = tmp.path().join(".gsd");
+    let ext_root = gsd_home.join("extensions");
+    fs::create_dir_all(&ext_root).unwrap();
+    let reg_path = ext_root.join("registry.json");
+
+    // A registry.json that exists but fails to parse must NOT be silently
+    // reset to an empty skeleton (that would destroy every other extension
+    // the user had registered). install_gsd_extension must refuse to touch
+    // it and return an error instead.
+    let corrupt_content = "{ this is not json";
+    fs::write(&reg_path, corrupt_content).unwrap();
+
+    let result = tracevault_cli::commands::init::install_gsd_extension(&gsd_home);
+    assert!(
+        result.is_err(),
+        "install_gsd_extension must error on a corrupt existing registry"
+    );
+
+    let content_after = fs::read_to_string(&reg_path).unwrap();
     assert_eq!(
-        reg["entries"]["tracevault"]["enabled"],
-        serde_json::json!(true)
+        content_after, corrupt_content,
+        "corrupt registry.json must be left byte-for-byte unchanged"
     );
 }
 
