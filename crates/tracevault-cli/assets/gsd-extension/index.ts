@@ -51,8 +51,8 @@ export default function tracevault(pi: ExtensionAPI): void {
     if (!sessionId) return;
     const t = ctx.sessionManager.getSessionFile() ?? "";
     // Bare `session-start` (no --event/--agent flags) — mirrors the Claude
-    // Code and Codex SessionStart hook wiring (see `gsd_hooks()` /
-    // `codex_hooks()` in init.rs): it exports TRACEVAULT_SESSION_ID and
+    // Code and Codex SessionStart hook wiring (see `codex_hooks()`
+    // in init.rs): it exports TRACEVAULT_SESSION_ID and
     // injects repo policy context. It is NOT `stream --event session-start`
     // — the `stream` subcommand's `--event` values are pre-tool-use /
     // post-tool-use / notification / stop only.
