@@ -490,10 +490,7 @@ async fn main() {
                         // install writes there directly, applying to ALL
                         // OpenCode sessions on this machine rather than one
                         // repo.
-                        if let Err(e) = commands::init::install_opencode_plugin(None) {
-                            eprintln!("Error: {e}");
-                            std::process::exit(1);
-                        }
+                        commands::init::install_opencode_plugin(None);
                         println!(
                             "This applies to ALL OpenCode sessions on this machine, not just this repo."
                         );

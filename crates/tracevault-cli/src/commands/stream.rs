@@ -293,19 +293,27 @@ pub async fn run_stream(
     // `(vec![], 0, 0)` — falling through to it would clobber the accumulated
     // offset back to 0 and collide with earlier turns' chunk_index on the
     // server.
-    let prior_offset: i64 = if offset_path.exists() {
-        fs::read_to_string(&offset_path)
-            .ok()
-            .and_then(|s| s.trim().parse::<i64>().ok())
-            .unwrap_or(0)
+    // Only inline (plugin-based) events override the file-read result, and only
+    // they need `.stream_offset` re-read as a record counter. File-based agents
+    // (claude/codex/gsd) skip this entirely — no extra hook-path I/O — and keep
+    // the byte-offset values from `read_new_transcript_lines` above.
+    let (transcript_lines, start_offset, new_offset) = if hook_event.transcript_records.is_some() {
+        let prior_offset: i64 = if offset_path.exists() {
+            fs::read_to_string(&offset_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        resolve_transcript_source(
+            hook_event.transcript_records.clone(),
+            prior_offset,
+            (transcript_lines, start_offset, new_offset),
+        )
     } else {
-        0
+        (transcript_lines, start_offset, new_offset)
     };
-    let (transcript_lines, start_offset, new_offset) = resolve_transcript_source(
-        hook_event.transcript_records.clone(),
-        prior_offset,
-        (transcript_lines, start_offset, new_offset),
-    );
 
     // 5. Build StreamEventRequest
     let stream_event_type = match event_type {

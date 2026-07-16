@@ -248,7 +248,7 @@ pub async fn init_in_directory(
             install_gsd_extension(Some(project_root))?;
         }
         crate::agent::Agent::OpenCode => {
-            install_opencode_plugin(Some(project_root))?;
+            install_opencode_plugin(Some(project_root));
         }
     }
 
@@ -709,15 +709,16 @@ const OPENCODE_PLUGIN_INDEX: &str = include_str!("../../assets/opencode-plugin/i
 /// global at `~/.config/opencode/plugins/tracevault.ts` (using the same
 /// config-dir resolution as `gsd_extension_source_dir` above). OpenCode
 /// auto-loads `*.ts` modules from that directory — no separate "install"
-/// command. Non-fatal: prints a hint and returns `Ok(())` on failure rather
-/// than blocking init.
+/// command. Infallible by design: it prints a hint and returns on any failure
+/// (missing config dir, write error) rather than blocking init, so it returns
+/// `()` — callers do not need to handle an error.
 ///
 /// A FLAT `.ts` file is used rather than a `tracevault/` package directory: a
 /// package subdir (index.ts + package.json) makes OpenCode try to resolve it as
 /// an npm package and stalls at startup offline, whereas a flat module loads
 /// directly (both confirmed during the capture spike). The plugin only imports
 /// the `node:child_process` builtin, so it needs no package manifest.
-pub fn install_opencode_plugin(project_root: Option<&Path>) -> io::Result<()> {
+pub fn install_opencode_plugin(project_root: Option<&Path>) {
     let plugins_dir = match project_root {
         Some(root) => root.join(".opencode").join("plugins"),
         None => {
@@ -731,7 +732,7 @@ pub fn install_opencode_plugin(project_root: Option<&Path>) -> io::Result<()> {
                          OpenCode plugin install. Copy assets/opencode-plugin/index.ts to \
                          ~/.config/opencode/plugins/tracevault.ts by hand to enable capture."
                     );
-                    return Ok(());
+                    return;
                 }
             }
         }
@@ -744,8 +745,6 @@ pub fn install_opencode_plugin(project_root: Option<&Path>) -> io::Result<()> {
             plugins_dir.display()
         );
     }
-
-    Ok(())
 }
 
 fn write_opencode_plugin_files(plugins_dir: &Path) -> io::Result<()> {
