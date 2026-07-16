@@ -74,7 +74,7 @@ function translateToolArgs(tool: string, args: any): any {
   return args;
 }
 
-/** Build an assistant record from OpenCode's tool.execute.after event. */
+/** Build an assistant record (the tool CALL) from OpenCode's tool.execute.after event. */
 function toolCallRecord(input: any, _output: any): unknown {
   return {
     type: "message",
@@ -84,6 +84,27 @@ function toolCallRecord(input: any, _output: any): unknown {
       content: [
         { type: "toolCall", name: input.tool, arguments: translateToolArgs(input.tool, input.args) },
       ],
+    },
+  };
+}
+
+/**
+ * Build a `toolResult` record (the tool OUTPUT) from tool.execute.after, so the
+ * session timeline shows bash stdout / file-read contents, not just the call.
+ * Matches the schema the server adapter's toolResult branch parses (`toolName`,
+ * `isError`, `content[]`).
+ */
+function toolResultRecord(input: any, output: any): unknown {
+  const text = typeof output?.output === "string" ? output.output : "";
+  const isError = Boolean(output?.metadata?.error) || output?.isError === true;
+  return {
+    type: "message",
+    timestamp: isoNow(),
+    message: {
+      role: "toolResult",
+      toolName: input?.tool ?? null,
+      isError,
+      content: [{ type: "text", text }],
     },
   };
 }
@@ -104,6 +125,10 @@ function assistantRecord(msg: any): unknown {
     timestamp: isoNow(),
     message: {
       role: "assistant",
+      // Forward OpenCode's stable, globally-unique message id so the server
+      // dedups token usage on it (keyed by message.id) instead of a per-chunk
+      // synthetic fallback — robust across retries and multiple sends.
+      id: msg?.id ?? null,
       model: msg?.providerID && msg?.modelID ? `${msg.providerID}/${msg.modelID}` : (msg?.model ?? null),
       tokens: {
         input: t.input ?? 0, output: t.output ?? 0, reasoning: t.reasoning ?? 0,
@@ -128,7 +153,7 @@ export default async function tracevault(ctx: any) {
       await enqueue(sid, () => runTracevault(
         ["stream", "--event", "post-tool-use", "--agent", "opencode"],
         hookEvent(sid, cwd, "PostToolUse", input?.tool ?? null, input?.args ?? null,
-          [toolCallRecord(input, output)]), cwd));
+          [toolCallRecord(input, output), toolResultRecord(input, output)]), cwd));
     },
     event: async ({ event }: { event: any }) => {
       const type = event?.type;
