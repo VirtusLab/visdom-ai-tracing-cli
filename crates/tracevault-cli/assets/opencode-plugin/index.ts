@@ -47,18 +47,42 @@ function hookEvent(
   };
 }
 
-// --- translation to the Record Schema (adjust reads to Part-0 payloads) ---
+// --- translation to the Record Schema (field paths confirmed against a real
+// OpenCode 1.18 session) ---
 function isoNow(): string { return new Date().toISOString(); }
 
+/**
+ * Map OpenCode's tool-arg field names onto the names the server's OpenCodeAdapter
+ * reads (which mirror pi's: `path` / `oldText` / `newText`). OpenCode's `write`
+ * uses `{filePath, content}` and `edit` uses `{filePath, oldString, newString}`,
+ * so file-change extraction only works if we rename them here. Other tools
+ * (bash/read/…) are passed through unchanged — the adapter ignores them for
+ * file changes and renders the raw args for display.
+ */
+function translateToolArgs(tool: string, args: any): any {
+  if (!args || typeof args !== "object") return {};
+  if (tool === "write") {
+    return { path: args.filePath ?? args.path, content: args.content };
+  }
+  if (tool === "edit") {
+    return {
+      path: args.filePath ?? args.path,
+      oldText: args.oldString ?? args.oldText,
+      newText: args.newString ?? args.newText,
+    };
+  }
+  return args;
+}
+
 /** Build an assistant record from OpenCode's tool.execute.after event. */
-function toolCallRecord(input: any, output: any): unknown {
+function toolCallRecord(input: any, _output: any): unknown {
   return {
     type: "message",
     timestamp: isoNow(),
     message: {
       role: "assistant",
       content: [
-        { type: "toolCall", name: input.tool, arguments: input.args ?? output?.metadata ?? {} },
+        { type: "toolCall", name: input.tool, arguments: translateToolArgs(input.tool, input.args) },
       ],
     },
   };
@@ -113,10 +137,14 @@ export default async function tracevault(ctx: any) {
         if (!sid) return;
         await enqueue(sid, () => runTracevault(["session-start"],
           hookEvent(sid, cwd, "SessionStart", null, null, []), cwd));
-      } else if (type === "message.updated" || type === "message.part.updated") {
-        // Capture assistant token usage when a turn's message finalizes.
-        const msg = event?.properties?.info ?? event?.properties?.message;
-        const sid = msg?.sessionID; if (!sid || msg?.role !== "assistant" || !msg?.tokens) return;
+      } else if (type === "message.updated") {
+        // Capture assistant token/model usage, but ONLY for the finalized
+        // message. OpenCode emits many `message.updated` events per turn as
+        // token counts stream in; the completed one carries a `finish` field.
+        // Gating on it avoids spawning the CLI on every intermediate delta.
+        const msg = event?.properties?.info;
+        const sid = msg?.sessionID;
+        if (!sid || msg?.role !== "assistant" || !msg?.finish || !msg?.tokens) return;
         await enqueue(sid, () => runTracevault(
           ["stream", "--event", "post-tool-use", "--agent", "opencode"],
           hookEvent(sid, cwd, "PostToolUse", null, null, [assistantRecord(msg)]), cwd));

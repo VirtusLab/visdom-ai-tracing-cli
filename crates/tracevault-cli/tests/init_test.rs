@@ -700,9 +700,15 @@ async fn init_opencode_repo_local_installs_plugin_and_gitignores_opencode_dir() 
     .await
     .unwrap();
 
-    let plugin_dir = tmp.path().join(".opencode/plugins/tracevault");
-    assert!(plugin_dir.join("index.ts").exists());
-    assert!(plugin_dir.join("package.json").exists());
+    // Flat-file layout: OpenCode auto-loads `.opencode/plugins/*.ts` directly
+    // (a package subdir stalls OpenCode's loader offline — confirmed in the
+    // capture spike), so the plugin lands as a single `tracevault.ts`.
+    let plugin_file = tmp.path().join(".opencode/plugins/tracevault.ts");
+    assert!(
+        plugin_file.exists(),
+        "opencode plugin must be installed as a flat .ts module: {}",
+        plugin_file.display()
+    );
 
     let gitignore = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
     assert!(gitignore.contains(".tracevault/"));

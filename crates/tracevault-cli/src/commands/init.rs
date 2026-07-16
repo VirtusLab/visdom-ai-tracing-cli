@@ -185,8 +185,8 @@ pub async fn init_in_directory(
         // `.claude/settings.local.json`) — that's GSD's own local install
         // state, not something the user should commit.
         crate::agent::Agent::Gsd => (None, ".gsd/".to_string()),
-        // The OpenCode plugin is installed project-locally under
-        // `.opencode/plugins/tracevault/` — ignore the whole `.opencode/`
+        // The OpenCode plugin is installed project-locally as
+        // `.opencode/plugins/tracevault.ts` — ignore the whole `.opencode/`
         // directory rather than just the plugin file, in case OpenCode
         // itself later writes other local state there.
         crate::agent::Agent::OpenCode => (None, ".opencode/".to_string()),
@@ -703,28 +703,33 @@ pub fn install_gsd_extension(project_root: Option<&Path>) -> io::Result<()> {
 /// TraceVault OpenCode plugin source, embedded from the checked-in assets
 /// this installer writes verbatim (mirrors the GSD extension embeds above).
 const OPENCODE_PLUGIN_INDEX: &str = include_str!("../../assets/opencode-plugin/index.ts");
-const OPENCODE_PLUGIN_PKG: &str = include_str!("../../assets/opencode-plugin/package.json");
 
 /// Install the TraceVault OpenCode plugin. `project_root = Some(dir)` installs
-/// project-local under `<dir>/.opencode/plugins/tracevault/`; `None` installs
-/// global under `~/.config/opencode/plugins/tracevault/` (using the same
-/// config-dir resolution as `gsd_extension_source_dir` above). Unlike GSD,
-/// OpenCode auto-loads plugins from that directory — no separate "install"
-/// command to shell out to. Non-fatal: prints a hint and returns `Ok(())` on
-/// failure rather than blocking init.
+/// project-local at `<dir>/.opencode/plugins/tracevault.ts`; `None` installs
+/// global at `~/.config/opencode/plugins/tracevault.ts` (using the same
+/// config-dir resolution as `gsd_extension_source_dir` above). OpenCode
+/// auto-loads `*.ts` modules from that directory — no separate "install"
+/// command. Non-fatal: prints a hint and returns `Ok(())` on failure rather
+/// than blocking init.
+///
+/// A FLAT `.ts` file is used rather than a `tracevault/` package directory: a
+/// package subdir (index.ts + package.json) makes OpenCode try to resolve it as
+/// an npm package and stalls at startup offline, whereas a flat module loads
+/// directly (both confirmed during the capture spike). The plugin only imports
+/// the `node:child_process` builtin, so it needs no package manifest.
 pub fn install_opencode_plugin(project_root: Option<&Path>) -> io::Result<()> {
-    let base = match project_root {
-        Some(root) => root.join(".opencode").join("plugins").join("tracevault"),
+    let plugins_dir = match project_root {
+        Some(root) => root.join(".opencode").join("plugins"),
         None => {
             let config_dir =
                 dirs::config_dir().or_else(|| dirs::home_dir().map(|h| h.join(".config")));
             match config_dir {
-                Some(dir) => dir.join("opencode").join("plugins").join("tracevault"),
+                Some(dir) => dir.join("opencode").join("plugins"),
                 None => {
                     eprintln!(
                         "Warning: could not determine the config directory; skipping the \
-                         OpenCode plugin install. Copy assets/opencode-plugin/ to \
-                         ~/.config/opencode/plugins/tracevault/ by hand to enable capture."
+                         OpenCode plugin install. Copy assets/opencode-plugin/index.ts to \
+                         ~/.config/opencode/plugins/tracevault.ts by hand to enable capture."
                     );
                     return Ok(());
                 }
@@ -732,21 +737,20 @@ pub fn install_opencode_plugin(project_root: Option<&Path>) -> io::Result<()> {
         }
     };
 
-    if let Err(e) = write_opencode_plugin_files(&base) {
+    if let Err(e) = write_opencode_plugin_files(&plugins_dir) {
         eprintln!(
             "Warning: could not install the OpenCode plugin to {} ({e}). Copy \
-             assets/opencode-plugin/ there by hand to enable capture.",
-            base.display()
+             assets/opencode-plugin/index.ts to tracevault.ts there by hand to enable capture.",
+            plugins_dir.display()
         );
     }
 
     Ok(())
 }
 
-fn write_opencode_plugin_files(base: &Path) -> io::Result<()> {
-    fs::create_dir_all(base)?;
-    fs::write(base.join("index.ts"), OPENCODE_PLUGIN_INDEX)?;
-    fs::write(base.join("package.json"), OPENCODE_PLUGIN_PKG)?;
+fn write_opencode_plugin_files(plugins_dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(plugins_dir)?;
+    fs::write(plugins_dir.join("tracevault.ts"), OPENCODE_PLUGIN_INDEX)?;
     Ok(())
 }
 
