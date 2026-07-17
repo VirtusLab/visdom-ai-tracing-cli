@@ -6,7 +6,7 @@
 
 use tracevault_cli::agent::Agent;
 use tracevault_cli::commands::stream::{
-    inline_offset_bump, resolve_transcript_source, stamp_agent,
+    inline_offset_bump, inline_tool_is_error, resolve_transcript_source, stamp_agent,
 };
 use tracevault_protocol::streaming::{StreamEventRequest, StreamEventType};
 
@@ -102,4 +102,17 @@ fn resolve_transcript_source_none_passes_through_file_result_unchanged() {
     let file_result = (vec![record.clone()], 3, 4);
     let got = resolve_transcript_source(None, 5, file_result.clone());
     assert_eq!(got, file_result);
+}
+
+#[test]
+fn inline_tool_is_error_reads_toolresult_flag() {
+    let ok = serde_json::json!({"type": "message", "message": {"role": "toolResult", "isError": false, "content": []}});
+    let err = serde_json::json!({"type": "message", "message": {"role": "toolResult", "isError": true, "content": []}});
+    let call =
+        serde_json::json!({"type": "message", "message": {"role": "assistant", "content": []}});
+    // A failed tool result surfaces as Some(true), a successful one as Some(false).
+    assert_eq!(inline_tool_is_error(&[call.clone(), err]), Some(true));
+    assert_eq!(inline_tool_is_error(&[call.clone(), ok]), Some(false));
+    // No toolResult record → None (matches file-agent behavior for non-tool events).
+    assert_eq!(inline_tool_is_error(&[call]), None);
 }

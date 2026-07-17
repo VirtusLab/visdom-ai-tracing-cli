@@ -268,6 +268,37 @@ enum ProxyCmd {
     Info,
 }
 
+/// Write the user-level context config during a `--global` init and print the
+/// standard summary. Every agent's `--global` arm ends with this identical
+/// bootstrap, so it lives in one place. Exits the process on a fatal flag error,
+/// mirroring the per-arm behavior it replaces.
+fn finish_global_user_context(no_user_context: bool, user_context: Option<String>) {
+    let requested = match config::UserContext::from_init_flags(no_user_context, user_context) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+    match commands::init::write_global_user_config_in(&config::tv_config_root(), requested) {
+        Ok(active) => {
+            println!(
+                "User-level context config: {}",
+                config::user_config_path().display()
+            );
+            match active {
+                Some(ctx) => println!("User-level context file: {}", ctx.display()),
+                None => println!("User-level context is disabled (`--no-user-context`)."),
+            }
+            println!(
+                "Edit it with `tracevault context set --user …`; disable with \
+                 `tracevault init --global --no-user-context`."
+            );
+        }
+        Err(e) => eprintln!("Warning: could not write user-level context config: {e}"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -321,44 +352,7 @@ async fn main() {
                             }
                         }
 
-                        let requested = match config::UserContext::from_init_flags(
-                            no_user_context,
-                            user_context,
-                        ) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                eprintln!("Error: {e}");
-                                std::process::exit(1);
-                            }
-                        };
-                        match commands::init::write_global_user_config_in(
-                            &config::tv_config_root(),
-                            requested,
-                        ) {
-                            Ok(active) => {
-                                println!(
-                                    "User-level context config: {}",
-                                    config::user_config_path().display()
-                                );
-                                match active {
-                                    Some(ctx) => {
-                                        println!("User-level context file: {}", ctx.display())
-                                    }
-                                    None => {
-                                        println!(
-                                            "User-level context is disabled (`--no-user-context`)."
-                                        )
-                                    }
-                                }
-                                println!(
-                                    "Edit it with `tracevault context set --user …`; disable with \
-                                     `tracevault init --global --no-user-context`."
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("Warning: could not write user-level context config: {e}")
-                            }
-                        }
+                        finish_global_user_context(no_user_context, user_context);
                         return;
                     }
                     crate::agent::Agent::Gsd => {
@@ -379,44 +373,7 @@ async fn main() {
                             }
                         }
 
-                        let requested = match config::UserContext::from_init_flags(
-                            no_user_context,
-                            user_context,
-                        ) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                eprintln!("Error: {e}");
-                                std::process::exit(1);
-                            }
-                        };
-                        match commands::init::write_global_user_config_in(
-                            &config::tv_config_root(),
-                            requested,
-                        ) {
-                            Ok(active) => {
-                                println!(
-                                    "User-level context config: {}",
-                                    config::user_config_path().display()
-                                );
-                                match active {
-                                    Some(ctx) => {
-                                        println!("User-level context file: {}", ctx.display())
-                                    }
-                                    None => {
-                                        println!(
-                                            "User-level context is disabled (`--no-user-context`)."
-                                        )
-                                    }
-                                }
-                                println!(
-                                    "Edit it with `tracevault context set --user …`; disable with \
-                                     `tracevault init --global --no-user-context`."
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("Warning: could not write user-level context config: {e}")
-                            }
-                        }
+                        finish_global_user_context(no_user_context, user_context);
                         return;
                     }
                     crate::agent::Agent::ClaudeCode => {
@@ -444,44 +401,7 @@ async fn main() {
                             }
                         }
 
-                        let requested = match config::UserContext::from_init_flags(
-                            no_user_context,
-                            user_context,
-                        ) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                eprintln!("Error: {e}");
-                                std::process::exit(1);
-                            }
-                        };
-                        match commands::init::write_global_user_config_in(
-                            &config::tv_config_root(),
-                            requested,
-                        ) {
-                            Ok(active) => {
-                                println!(
-                                    "User-level context config: {}",
-                                    config::user_config_path().display()
-                                );
-                                match active {
-                                    Some(ctx) => {
-                                        println!("User-level context file: {}", ctx.display())
-                                    }
-                                    None => {
-                                        println!(
-                                            "User-level context is disabled (`--no-user-context`)."
-                                        )
-                                    }
-                                }
-                                println!(
-                                    "Edit it with `tracevault context set --user …`; disable with \
-                                     `tracevault init --global --no-user-context`."
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("Warning: could not write user-level context config: {e}")
-                            }
-                        }
+                        finish_global_user_context(no_user_context, user_context);
                         return;
                     }
                     crate::agent::Agent::OpenCode => {
@@ -490,49 +410,15 @@ async fn main() {
                         // install writes there directly, applying to ALL
                         // OpenCode sessions on this machine rather than one
                         // repo.
-                        commands::init::install_opencode_plugin(None);
+                        if let Err(e) = commands::init::install_opencode_plugin(None) {
+                            eprintln!("Error: {e}");
+                            std::process::exit(1);
+                        }
                         println!(
                             "This applies to ALL OpenCode sessions on this machine, not just this repo."
                         );
 
-                        let requested = match config::UserContext::from_init_flags(
-                            no_user_context,
-                            user_context,
-                        ) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                eprintln!("Error: {e}");
-                                std::process::exit(1);
-                            }
-                        };
-                        match commands::init::write_global_user_config_in(
-                            &config::tv_config_root(),
-                            requested,
-                        ) {
-                            Ok(active) => {
-                                println!(
-                                    "User-level context config: {}",
-                                    config::user_config_path().display()
-                                );
-                                match active {
-                                    Some(ctx) => {
-                                        println!("User-level context file: {}", ctx.display())
-                                    }
-                                    None => {
-                                        println!(
-                                            "User-level context is disabled (`--no-user-context`)."
-                                        )
-                                    }
-                                }
-                                println!(
-                                    "Edit it with `tracevault context set --user …`; disable with \
-                                     `tracevault init --global --no-user-context`."
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("Warning: could not write user-level context config: {e}")
-                            }
-                        }
+                        finish_global_user_context(no_user_context, user_context);
                         return;
                     }
                 }

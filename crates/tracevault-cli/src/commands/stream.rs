@@ -201,6 +201,26 @@ pub fn resolve_transcript_source(
     }
 }
 
+/// Derive the event-level tool-error flag from inline transcript records.
+/// OpenCode tool events carry no `tool_use_id`, so `extract_is_error_from_transcript`
+/// can't run; instead the plugin forwards a `toolResult` record whose `isError`
+/// signals the outcome. Returns `Some(true|false)` for the first `toolResult`
+/// record found, or `None` when there is none (non-tool events).
+pub fn inline_tool_is_error(lines: &[serde_json::Value]) -> Option<bool> {
+    lines.iter().find_map(|line| {
+        let msg = line.get("message")?;
+        if msg.get("role").and_then(|v| v.as_str()) == Some("toolResult") {
+            Some(
+                msg.get("isError")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            )
+        } else {
+            None
+        }
+    })
+}
+
 /// Stamp the agent identity onto a request's `tool` + `protocol_version`.
 /// Factored out so the mapping is testable without the network/FS-bound
 /// `run_stream`.
@@ -216,7 +236,7 @@ pub async fn run_stream(
     // 1. Read HookEvent from stdin
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
-    let hook_event = parse_hook_event(&input)?;
+    let mut hook_event = parse_hook_event(&input)?;
 
     // Resolve project_root and session_dir via the shared git-aware resolver.
     //
@@ -297,7 +317,8 @@ pub async fn run_stream(
     // they need `.stream_offset` re-read as a record counter. File-based agents
     // (claude/codex/gsd) skip this entirely — no extra hook-path I/O — and keep
     // the byte-offset values from `read_new_transcript_lines` above.
-    let (transcript_lines, start_offset, new_offset) = if hook_event.transcript_records.is_some() {
+    let is_inline = hook_event.transcript_records.is_some();
+    let (transcript_lines, start_offset, new_offset) = if is_inline {
         let prior_offset: i64 = if offset_path.exists() {
             fs::read_to_string(&offset_path)
                 .ok()
@@ -306,8 +327,11 @@ pub async fn run_stream(
         } else {
             0
         };
+        // `take()` moves the records out (nothing below reads
+        // `transcript_records` again) — avoids deep-cloning a potentially
+        // large payload (full bash stdout / file contents) on the hook path.
         resolve_transcript_source(
-            hook_event.transcript_records.clone(),
+            hook_event.transcript_records.take(),
             prior_offset,
             (transcript_lines, start_offset, new_offset),
         )
@@ -322,11 +346,15 @@ pub async fn run_stream(
         _ => StreamEventType::ToolUse,
     };
 
-    // Extract is_error from transcript for this tool_use_id
+    // Extract is_error from transcript for this tool_use_id. Inline (OpenCode)
+    // events have no tool_use_id, so fall back to a forwarded `toolResult`
+    // record's `isError` — otherwise a failed OpenCode tool would render as
+    // successful (the event-level flag file-based agents populate would be None).
     let tool_is_error = hook_event
         .tool_use_id
         .as_deref()
-        .and_then(|uid| extract_is_error_from_transcript(uid, &transcript_lines));
+        .and_then(|uid| extract_is_error_from_transcript(uid, &transcript_lines))
+        .or_else(|| inline_tool_is_error(&transcript_lines));
 
     // Load config once, up front, so it can back both the user-level context
     // layer resolution below and the org_slug/repo_id lookup further down —
@@ -467,8 +495,19 @@ pub async fn run_stream(
 
     // Send current event
     let req_json = serde_json::to_string(&req)?;
+    // The inline (OpenCode) path CONSUMES its records from the hook event — they
+    // are not re-readable like a transcript file — so its `.stream_offset` record
+    // counter must advance whenever the event is accepted for delivery, INCLUDING
+    // when it is queued after a failure. Otherwise the next inline event reuses
+    // these chunk_indexes and the server drops the overlap via ON CONFLICT. The
+    // queued request already carries this event's `transcript_offset`, so the
+    // records keep their indices on drain. (File-based agents must NOT advance on
+    // failure: their next read re-covers these lines cumulatively/idempotently.)
     if send_failed {
         append_pending(&pending_path, &req_json)?;
+        if is_inline {
+            fs::write(&offset_path, new_offset.to_string())?;
+        }
     } else {
         match client.stream_event(org_slug, repo_id, &req).await {
             Ok(_) => {
@@ -476,8 +515,12 @@ pub async fn run_stream(
                 fs::write(&offset_path, new_offset.to_string())?;
             }
             Err(_) => {
-                // 11. On failure append to pending.jsonl
+                // 11. On failure append to pending.jsonl (advance the inline
+                // record counter regardless — see the note above).
                 append_pending(&pending_path, &req_json)?;
+                if is_inline {
+                    fs::write(&offset_path, new_offset.to_string())?;
+                }
             }
         }
     }

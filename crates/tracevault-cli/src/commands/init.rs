@@ -248,7 +248,7 @@ pub async fn init_in_directory(
             install_gsd_extension(Some(project_root))?;
         }
         crate::agent::Agent::OpenCode => {
-            install_opencode_plugin(Some(project_root));
+            install_opencode_plugin(Some(project_root))?;
         }
     }
 
@@ -709,42 +709,35 @@ const OPENCODE_PLUGIN_INDEX: &str = include_str!("../../assets/opencode-plugin/i
 /// global at `~/.config/opencode/plugins/tracevault.ts` (using the same
 /// config-dir resolution as `gsd_extension_source_dir` above). OpenCode
 /// auto-loads `*.ts` modules from that directory — no separate "install"
-/// command. Infallible by design: it prints a hint and returns on any failure
-/// (missing config dir, write error) rather than blocking init, so it returns
-/// `()` — callers do not need to handle an error.
+/// command. Returns an error on failure (unresolvable config dir, or a write
+/// error) so the caller aborts init loudly, consistent with the Codex/GSD arms
+/// — a swallowed failure would make `init` report success while no plugin was
+/// written, silently disabling capture.
 ///
 /// A FLAT `.ts` file is used rather than a `tracevault/` package directory: a
 /// package subdir (index.ts + package.json) makes OpenCode try to resolve it as
 /// an npm package and stalls at startup offline, whereas a flat module loads
 /// directly (both confirmed during the capture spike). The plugin only imports
 /// the `node:child_process` builtin, so it needs no package manifest.
-pub fn install_opencode_plugin(project_root: Option<&Path>) {
+pub fn install_opencode_plugin(project_root: Option<&Path>) -> io::Result<()> {
     let plugins_dir = match project_root {
         Some(root) => root.join(".opencode").join("plugins"),
         None => {
             let config_dir =
                 dirs::config_dir().or_else(|| dirs::home_dir().map(|h| h.join(".config")));
-            match config_dir {
-                Some(dir) => dir.join("opencode").join("plugins"),
-                None => {
-                    eprintln!(
-                        "Warning: could not determine the config directory; skipping the \
-                         OpenCode plugin install. Copy assets/opencode-plugin/index.ts to \
-                         ~/.config/opencode/plugins/tracevault.ts by hand to enable capture."
-                    );
-                    return;
-                }
-            }
+            config_dir
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "could not determine the config directory for the OpenCode plugin install",
+                    )
+                })?
+                .join("opencode")
+                .join("plugins")
         }
     };
 
-    if let Err(e) = write_opencode_plugin_files(&plugins_dir) {
-        eprintln!(
-            "Warning: could not install the OpenCode plugin to {} ({e}). Copy \
-             assets/opencode-plugin/index.ts to tracevault.ts there by hand to enable capture.",
-            plugins_dir.display()
-        );
-    }
+    write_opencode_plugin_files(&plugins_dir)
 }
 
 fn write_opencode_plugin_files(plugins_dir: &Path) -> io::Result<()> {
