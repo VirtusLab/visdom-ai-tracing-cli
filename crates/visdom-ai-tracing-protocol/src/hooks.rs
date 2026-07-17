@@ -37,6 +37,13 @@ pub struct HookEvent {
     /// omit it.
     #[serde(default)]
     pub source: Option<String>,
+    /// Inline transcript records supplied directly by a plugin-based agent
+    /// (OpenCode) that has no single tailable JSONL transcript. When present,
+    /// `run_stream` uses these as `StreamEventRequest.transcript_lines` instead
+    /// of reading `transcript_path`. Additive/back-compat — file-based agents
+    /// omit it.
+    #[serde(default)]
+    pub transcript_records: Option<Vec<serde_json::Value>>,
 }
 
 #[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
@@ -100,6 +107,7 @@ mod tests {
             tool_response: None,
             tool_use_id: None,
             source: None,
+            transcript_records: None,
         }
     }
 
@@ -150,5 +158,20 @@ mod tests {
         let json = r#"{"session_id":"s","cwd":".","hook_event_name":"SessionStart"}"#;
         let e = parse_hook_event(json).unwrap();
         assert_eq!(e.transcript_path, "");
+    }
+
+    #[test]
+    fn parses_inline_transcript_records() {
+        let json = r#"{"session_id":"s","cwd":".","hook_event_name":"PostToolUse",
+            "transcript_records":[{"type":"message","message":{"role":"user","content":[]}}]}"#;
+        let e = parse_hook_event(json).unwrap();
+        assert_eq!(e.transcript_records.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn transcript_records_absent_is_none() {
+        let json = r#"{"session_id":"s","cwd":".","hook_event_name":"SessionStart"}"#;
+        let e = parse_hook_event(json).unwrap();
+        assert!(e.transcript_records.is_none());
     }
 }

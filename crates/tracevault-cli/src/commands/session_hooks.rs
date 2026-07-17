@@ -339,6 +339,7 @@ mod tests {
             tool_response: None,
             tool_use_id: None,
             source: None,
+            transcript_records: None,
         };
 
         let result = resolve_and_inject(&hook_event).await;

@@ -681,6 +681,43 @@ fn init_gsd_repo_local_installs_extension_and_gitignores_gsd_dir() {
     );
 }
 
+/// `tracevault init --agent opencode` (repo-local). Unlike GSD, the OpenCode
+/// plugin is installed project-locally under `<root>/.opencode/plugins/` —
+/// no shell-out, no `HOME` redirection needed — so this calls
+/// `init_in_directory` in-process like the Codex/Claude cases above.
+#[tokio::test]
+async fn init_opencode_repo_local_installs_plugin_and_gitignores_opencode_dir() {
+    let tmp = tmp_git_repo();
+
+    tracevault_cli::commands::init::init_in_directory(
+        tmp.path(),
+        None,
+        None,
+        false,
+        UserContext::Toggle(false),
+        Agent::OpenCode,
+    )
+    .await
+    .unwrap();
+
+    // Flat-file layout: OpenCode auto-loads `.opencode/plugins/*.ts` directly
+    // (a package subdir stalls OpenCode's loader offline — confirmed in the
+    // capture spike), so the plugin lands as a single `tracevault.ts`.
+    let plugin_file = tmp.path().join(".opencode/plugins/tracevault.ts");
+    assert!(
+        plugin_file.exists(),
+        "opencode plugin must be installed as a flat .ts module: {}",
+        plugin_file.display()
+    );
+
+    let gitignore = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+    assert!(gitignore.contains(".tracevault/"));
+    assert!(
+        gitignore.contains(".opencode/"),
+        "opencode plugin dir must be gitignored: {gitignore}"
+    );
+}
+
 #[tokio::test]
 async fn init_explicit_user_context_path_written() {
     let tmp = tmp_git_repo();
