@@ -319,11 +319,19 @@ pub async fn run_stream(
     // the byte-offset values from `read_new_transcript_lines` above.
     let is_inline = hook_event.transcript_records.is_some();
     let (transcript_lines, start_offset, new_offset) = if is_inline {
+        // Fail CLOSED, mirroring `read_new_transcript_lines`: a corrupt/unreadable
+        // `.stream_offset` must NOT silently reset to 0 — that would restart the
+        // record counter and collide with earlier turns' chunk_index on the
+        // server (the offset-clobber failure mode). Propagate the error instead;
+        // `main` treats a hook error as non-fatal (exits 0 without blocking the
+        // tool call). Negatives are clamped to 0 defensively.
         let prior_offset: i64 = if offset_path.exists() {
-            fs::read_to_string(&offset_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<i64>().ok())
-                .unwrap_or(0)
+            let content = fs::read_to_string(&offset_path)?;
+            content
+                .trim()
+                .parse::<i64>()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                .max(0)
         } else {
             0
         };
