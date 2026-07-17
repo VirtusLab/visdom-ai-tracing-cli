@@ -198,7 +198,13 @@ export default async function tracevault(ctx: any) {
       if (type === "session.created") {
         const sid = event?.properties?.info?.id ?? event?.properties?.sessionID;
         if (!sid) return;
-        await enqueue(sid, () => runTracevault(["session-start"],
+        // Emit a real SessionStart stream event (`--event notification` maps to
+        // StreamEventType::SessionStart server-side). The bare `session-start`
+        // subcommand is the Claude-only injection hook (keyed on
+        // CLAUDE_ENV_FILE) and is inert for OpenCode — it would stream nothing
+        // and just waste a spawn.
+        await enqueue(sid, () => runTracevault(
+          ["stream", "--event", "notification", "--agent", "opencode"],
           hookEvent(sid, cwd, "SessionStart", null, null, []), cwd));
       } else if (type === "message.part.updated") {
         // Accumulate assistant prose as it streams; forwarded on finish below.
