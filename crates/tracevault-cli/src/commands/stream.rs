@@ -173,6 +173,29 @@ pub(crate) fn resolve_stream_binding(
     .map(|(b, _)| b)
 }
 
+/// Resolve the capture-time project from LOCAL, UUID-bearing bindings only — no
+/// network (the hook fires per event in a short-lived process). Precedence:
+/// subagent worktree override -> session `active_project` -> user-level default.
+/// Repo config `default_project` (a name) is intentionally excluded: honoring it
+/// would need a per-event `list_projects` call. `None` -> fall back to the
+/// repo-scoped stream (server deduces).
+#[allow(dead_code)]
+fn capture_project(
+    session: &crate::session_state::SessionState,
+    worktree_path: Option<&str>,
+) -> Option<uuid::Uuid> {
+    use crate::resolution::{effective_project, ProjectResolveInputs};
+    let local = effective_project(&ProjectResolveInputs {
+        project_flag: None,
+        session,
+        worktree_path,
+        config_default: None,
+    })
+    .map(|(b, _)| b)
+    .or_else(crate::user_project_default::load)?;
+    local.project_id.parse::<uuid::Uuid>().ok()
+}
+
 /// Record-count offset arithmetic for the inline (fileless) path, mirroring the
 /// byte-offset semantics of `read_new_transcript_lines`: returns
 /// `(send_offset, next_offset)` where `send_offset` is stamped on the request as
@@ -1018,5 +1041,40 @@ mod tests {
             "second read's start_offset must equal the first read's persisted end_offset"
         );
         assert!(end_offset2 > start_offset2);
+    }
+
+    // ── capture_project: local-only project resolver ──────────────────────────
+
+    #[test]
+    fn capture_project_precedence_local_only() {
+        use crate::session_state::{ProjectBinding, SessionState};
+        let pb = |id: &str| ProjectBinding {
+            org_slug: "o".into(),
+            project_id: id.into(),
+            project_name: "n".into(),
+            updated_at: "".into(),
+        };
+        let u = uuid::Uuid::from_u128;
+        // session active only
+        let s = SessionState {
+            active_project: Some(pb(&u(2).to_string())),
+            ..Default::default()
+        };
+        assert_eq!(capture_project(&s, Some("/wt")), Some(u(2)));
+        // subagent worktree beats session
+        let mut s = s;
+        s.subagent_projects
+            .insert("/wt".into(), pb(&u(1).to_string()));
+        assert_eq!(capture_project(&s, Some("/wt")), Some(u(1)));
+        // no worktree match -> session active
+        assert_eq!(capture_project(&s, Some("/other")), Some(u(2)));
+        // empty session -> None (user-default file is not present in this unit test env)
+        assert_eq!(capture_project(&SessionState::default(), None), None);
+        // malformed stored id -> None (defensive)
+        let bad = SessionState {
+            active_project: Some(pb("not-a-uuid")),
+            ..Default::default()
+        };
+        assert_eq!(capture_project(&bad, None), None);
     }
 }
