@@ -484,8 +484,9 @@ impl ApiClient {
 
     /// Project-scoped variant of `stream_event`: posts to the project's
     /// stream endpoint with `repo_id` as a query param instead of a path
-    /// segment. `repo_id` is always a UUID string from the repo binding —
-    /// URL-safe, no percent-encoding needed.
+    /// segment. The query is built with `Url::query_pairs_mut`, mirroring
+    /// `resolve_project`'s `?git_url=`, so `repo_id` is percent-encoded
+    /// rather than string-interpolated into the URL.
     ///
     /// Called from `commands::stream::send_stream_event` when a local
     /// project binding resolves for the capturing event.
@@ -496,10 +497,12 @@ impl ApiClient {
         repo_id: &str,
         req: &tracevault_protocol::streaming::StreamEventRequest,
     ) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn Error>> {
-        let mut builder = self.client.post(format!(
-            "{}/api/v1/orgs/{}/projects/{}/stream?repo_id={}",
-            self.base_url, org_slug, project_id, repo_id
-        ));
+        let mut url = Url::parse(&format!(
+            "{}/api/v1/orgs/{}/projects/{}/stream",
+            self.base_url, org_slug, project_id
+        ))?;
+        url.query_pairs_mut().append_pair("repo_id", repo_id);
+        let mut builder = self.client.post(url);
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
         }

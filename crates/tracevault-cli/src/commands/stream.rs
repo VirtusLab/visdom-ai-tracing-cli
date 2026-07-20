@@ -1171,7 +1171,40 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    /// How long an accept loop waits for a connection that never arrives
+    /// (e.g. a regression that stops the client from making an expected
+    /// request) before giving up, so the server thread exits cleanly
+    /// instead of blocking in `accept()` forever.
+    const ACCEPT_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// Poll a non-blocking `listener` for a connection until one arrives or
+    /// `ACCEPT_DEADLINE` elapses. Returns `None` on timeout (or any non-
+    /// `WouldBlock` accept error) so callers can stop cleanly rather than
+    /// block forever.
+    fn accept_with_deadline(listener: &TcpListener) -> Option<std::net::TcpStream> {
+        let deadline = Instant::now() + ACCEPT_DEADLINE;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // The accepted stream's blocking mode isn't guaranteed to
+                    // be inherited from the (non-blocking) listener across
+                    // platforms — make it explicitly blocking so the
+                    // subsequent read/write calls behave as before.
+                    let _ = stream.set_nonblocking(false);
+                    return Some(stream);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
 
     /// How long a test waits for the captured request before failing (rather
     /// than hanging forever if the client never connects). Mirrors the
@@ -1185,10 +1218,11 @@ mod tests {
     /// `tests/resolve_remote_test.rs`.
     fn spawn_once_capturing_request(response: &'static str) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            if let Ok((stream, _)) = listener.accept() {
+            if let Some(stream) = accept_with_deadline(&listener) {
                 let mut reader = BufReader::new(stream);
                 let mut request_line = String::new();
                 let _ = reader.read_line(&mut request_line);
@@ -1439,19 +1473,25 @@ mod tests {
         responses: Vec<&'static str>,
     ) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             for response in responses {
-                if let Ok((stream, _)) = listener.accept() {
-                    let mut reader = BufReader::new(stream);
-                    let mut request_line = String::new();
-                    let _ = reader.read_line(&mut request_line);
-                    let _ = tx.send(request_line);
-                    let mut stream = reader.into_inner();
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.flush();
-                }
+                // If a regression stops the client from making this request
+                // (e.g. the expected Nth call never happens), don't block
+                // forever in `accept()` — give up after `ACCEPT_DEADLINE`
+                // and let the thread end so the test process can't hang.
+                let Some(stream) = accept_with_deadline(&listener) else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream);
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let _ = tx.send(request_line);
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
             }
             // `listener` (and `tx`) drop here, closing the socket and the
             // channel — a stray extra request gets ECONNREFUSED immediately
