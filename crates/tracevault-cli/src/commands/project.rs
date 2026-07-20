@@ -211,6 +211,31 @@ async fn switch(
     Ok(())
 }
 
+/// If `effective`'s source is `Deduced`, its binding carries an empty
+/// `project_name` (`resolve_effective_project` doesn't enrich it — see the
+/// comment there). When a projects list is already available in this scope
+/// (fetched for the `--project`/config-default lookups), use it to fill in
+/// the friendly name for display; otherwise leave it empty and
+/// `format_status` falls back to printing the id. Kept simple: this never
+/// triggers an extra API call just for cosmetic enrichment.
+fn enrich_deduced_name(
+    effective: Option<(ProjectBinding, ProjectSource)>,
+    items: Option<&[ProjectListItem]>,
+) -> Option<(ProjectBinding, ProjectSource)> {
+    effective.map(|(mut binding, source)| {
+        if source == ProjectSource::Deduced && binding.project_name.is_empty() {
+            if let Some(items) = items {
+                if let Ok(id) = binding.project_id.parse::<uuid::Uuid>() {
+                    if let Some(matched) = items.iter().find(|p| p.id == id) {
+                        binding.project_name = matched.name.clone();
+                    }
+                }
+            }
+        }
+        (binding, source)
+    })
+}
+
 /// Pure formatter for `project status`'s output: which project is
 /// attributed, and via which precedence tier. Mirrors
 /// `commands::repo::format_status`. A `Deduced` binding carries an empty
@@ -287,6 +312,13 @@ async fn status(
                 }
             }
             let config_default = config_default_name.as_deref().and_then(to_binding);
+            if let Some(name) = config_default_name.as_deref() {
+                if config_default.is_none() {
+                    eprintln!(
+                        "warning: configured default_project '{name}' could not be resolved; ignoring it"
+                    );
+                }
+            }
 
             let inputs = ProjectResolveInputs {
                 project_flag,
@@ -294,14 +326,29 @@ async fn status(
                 worktree_path: Some(&worktree),
                 config_default,
             };
-            resolve_effective_project(
+            // `status` is a read-only inspector: unlike the callers that need
+            // an authoritative binding to act on, an unresolvable rung here
+            // (notably the ambiguous/409 "belongs to multiple projects" case)
+            // is informational, not fatal — report it and exit 0 rather than
+            // propagating the error up through `run`/`main` as a hard
+            // failure. `resolve_effective_project` itself keeps returning
+            // `Err` unchanged; only this call site swallows it.
+            let resolved = match resolve_effective_project(
                 &inputs,
                 user_default,
                 &org_slug,
                 git_url.as_deref(),
                 &client,
             )
-            .await?
+            .await
+            {
+                Ok(effective) => effective,
+                Err(e) => {
+                    println!("project: unresolved — {e}");
+                    return Ok(());
+                }
+            };
+            enrich_deduced_name(resolved, items.as_deref())
         }
         Err(e) => {
             eprintln!(
@@ -576,6 +623,129 @@ mod tests {
             err.to_string()
                 .contains("does not contain the current codebase"),
             "got: {err}"
+        );
+    }
+
+    fn items() -> Vec<ProjectListItem> {
+        vec![
+            ProjectListItem {
+                id: uuid::Uuid::from_u128(1),
+                name: "payments".into(),
+            },
+            ProjectListItem {
+                id: uuid::Uuid::from_u128(2),
+                name: "web".into(),
+            },
+        ]
+    }
+
+    fn deduced(id: uuid::Uuid) -> (ProjectBinding, ProjectSource) {
+        (
+            ProjectBinding {
+                org_slug: "org".into(),
+                project_id: id.to_string(),
+                project_name: String::new(),
+                updated_at: "".into(),
+            },
+            ProjectSource::Deduced,
+        )
+    }
+
+    #[test]
+    fn enrich_deduced_name_fills_in_name_when_id_found_in_list() {
+        let effective = Some(deduced(uuid::Uuid::from_u128(2)));
+        let (b, source) = enrich_deduced_name(effective, Some(&items())).unwrap();
+        assert_eq!(b.project_name, "web");
+        assert_eq!(source, ProjectSource::Deduced);
+    }
+
+    #[test]
+    fn enrich_deduced_name_leaves_empty_when_no_list_available() {
+        let effective = Some(deduced(uuid::Uuid::from_u128(2)));
+        let (b, _source) = enrich_deduced_name(effective, None).unwrap();
+        assert_eq!(b.project_name, "");
+    }
+
+    #[test]
+    fn enrich_deduced_name_leaves_empty_when_id_not_in_list() {
+        let effective = Some(deduced(uuid::Uuid::from_u128(999)));
+        let (b, _source) = enrich_deduced_name(effective, Some(&items())).unwrap();
+        assert_eq!(b.project_name, "");
+    }
+
+    #[test]
+    fn enrich_deduced_name_leaves_non_deduced_sources_untouched() {
+        // Only the Deduced source carries an empty name by design; other
+        // sources must pass through unchanged even if a list is available.
+        let b = pb("payments");
+        let effective = Some((b.clone(), ProjectSource::SessionActive));
+        let (out, source) = enrich_deduced_name(effective, Some(&items())).unwrap();
+        assert_eq!(out, b);
+        assert_eq!(source, ProjectSource::SessionActive);
+    }
+
+    #[test]
+    fn enrich_deduced_name_passes_through_none() {
+        assert!(enrich_deduced_name(None, Some(&items())).is_none());
+    }
+
+    /// F1: an ambiguous ("this repo belongs to multiple projects") deduction
+    /// result is a hard `Err` from `resolve_effective_project` — but `status`
+    /// is a read-only inspector, so it must swallow that into an
+    /// informational line and still exit `Ok`, not propagate the error up
+    /// through `run`/`main` as a fatal exit. Mocks the `/projects/resolve`
+    /// endpoint with a 409, mirroring resolution.rs's
+    /// `ambiguous_deduction_errors_when_no_higher_rung`.
+    #[tokio::test]
+    async fn status_reports_ambiguous_deduction_as_informational_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        let ok = std::process::Command::new("git")
+            .args([
+                "-C",
+                &tmp.path().to_string_lossy(),
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:org/repo.git",
+            ])
+            .status()
+            .expect("git remote add failed")
+            .success();
+        assert!(ok, "git remote add must succeed");
+
+        let base = spawn_once(
+            "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"error\":\"multiple\"}"
+                .to_string(),
+        );
+
+        // SAFETY: test-scoped env mutation, mirroring the precedent in
+        // `commands::login`'s tests. No other test in this crate reads or
+        // sets TRACEVAULT_SERVER_URL/TRACEVAULT_ORG_SLUG/TRACEVAULT_API_KEY,
+        // so this can't race another test's expectations; restored in a
+        // guard so a panic in `status` still cleans up the process env.
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("TRACEVAULT_SERVER_URL");
+                    std::env::remove_var("TRACEVAULT_ORG_SLUG");
+                    std::env::remove_var("TRACEVAULT_API_KEY");
+                }
+            }
+        }
+        unsafe {
+            std::env::set_var("TRACEVAULT_SERVER_URL", &base);
+            std::env::set_var("TRACEVAULT_ORG_SLUG", "org");
+            std::env::set_var("TRACEVAULT_API_KEY", "tok");
+        }
+        let _guard = EnvGuard;
+
+        let result = status(None, None, tmp.path(), tmp.path()).await;
+
+        assert!(
+            result.is_ok(),
+            "status must degrade gracefully on an ambiguous deduction, not propagate the error: {result:?}"
         );
     }
 }
