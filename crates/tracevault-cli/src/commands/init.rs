@@ -271,6 +271,9 @@ pub async fn init_in_directory(
     } else if let (Some(url), Some(remote), Some(slug)) = (effective_url, remote_url, org_slug) {
         let client = ApiClient::new(&url, resolved_token.as_deref());
         let repo_name = git_repo_name(project_root);
+        // Captured before `remote` is moved into the request below, so the
+        // codebase-resolve step doesn't need to shell out to git again.
+        let origin_url = remote.clone();
 
         match client
             .register_repo(
@@ -290,19 +293,19 @@ pub async fn init_in_directory(
                     // Best-effort: resolve the codebase (deduped by normalized
                     // remote URL) and surface it to the user. Must never fail
                     // init — `repo_id` above stays authoritative for ingest;
-                    // `remote_id` here is recorded for display only.
-                    if let Some(url) = git_remote_url(project_root) {
-                        if let Ok(Some(remote)) = client.resolve_remote(&slug, &url).await {
-                            println!(
-                                "{}",
-                                codebase_line(
-                                    remote.name.as_deref(),
-                                    &remote.normalized_url,
-                                    &remote.clone_status
-                                )
-                            );
-                            cfg.remote_id = Some(remote.remote_id.to_string());
-                        }
+                    // `remote_id`/`codebase_name` here are recorded for
+                    // display only.
+                    if let Ok(Some(remote)) = client.resolve_remote(&slug, &origin_url).await {
+                        println!(
+                            "{}",
+                            codebase_line(
+                                remote.name.as_deref(),
+                                &remote.normalized_url,
+                                &remote.clone_status
+                            )
+                        );
+                        cfg.remote_id = Some(remote.remote_id.to_string());
+                        cfg.codebase_name = remote.name.clone();
                     }
                     let _ = fs::write(TracevaultConfig::config_path(project_root), cfg.to_toml());
                 }

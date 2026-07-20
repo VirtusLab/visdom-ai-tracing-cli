@@ -25,6 +25,11 @@ pub struct TracevaultConfig {
     /// for ingest — but recorded so a future caller doesn't have to re-resolve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_id: Option<String>,
+    /// The codebase's registered name, resolved by `init` alongside `remote_id`.
+    /// Display-only — lets bound-mode `status` print the codebase without an
+    /// extra network round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codebase_name: Option<String>,
 }
 
 fn default_agent() -> String {
@@ -41,6 +46,7 @@ impl Default for TracevaultConfig {
             repo_id: None,
             user_context: None,
             remote_id: None,
+            codebase_name: None,
         }
     }
 }
@@ -286,6 +292,7 @@ mod tests {
             repo_id: Some("repo-1".into()),
             user_context: None,
             remote_id: None,
+            codebase_name: None,
         };
         let toml = cfg.to_toml();
         assert!(toml.contains("agent = \"claude-code\""));
@@ -387,6 +394,7 @@ mod tests {
             repo_id: None,
             user_context: None,
             remote_id: None,
+            codebase_name: None,
         };
         let toml = cfg.to_toml();
         assert!(toml.contains("agent = \"claude-code\""));

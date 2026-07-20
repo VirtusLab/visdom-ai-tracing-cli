@@ -178,13 +178,18 @@ pub fn effective_binding(inputs: ResolveInputs) -> Option<(RepoBinding, BindingS
 
 /// A RepoBinding from a pinned `.tracevault/config.toml` (bound mode), if it has
 /// both org_slug and repo_id. Pure — caller supplies the already-loaded config.
+/// Carries through the `remote_id`/`codebase_name` `init` persisted (best-effort,
+/// display-only) so bound-mode `status` can print the codebase without an extra
+/// network round-trip; `git_url` stays `None` here — bound mode has no live
+/// origin URL to hand back (that's the older `git_url` fallback's job, covering
+/// bindings that predate `codebase_name`).
 pub fn binding_from_config(config: &crate::config::TracevaultConfig) -> Option<RepoBinding> {
     Some(RepoBinding {
         org_slug: config.org_slug.clone()?,
         repo_id: config.repo_id.clone()?,
         git_url: None,
-        remote_id: None,
-        codebase_name: None,
+        remote_id: config.remote_id.as_deref().and_then(|s| s.parse().ok()),
+        codebase_name: config.codebase_name.clone(),
         updated_at: String::new(),
     })
 }
@@ -364,6 +369,21 @@ mod tests {
             org_slug_from_slugs(&["acme".to_string(), "acme".to_string()]),
             Ok("acme".to_string())
         );
+    }
+
+    #[test]
+    fn binding_from_config_carries_remote_id_and_codebase_name() {
+        let uuid = uuid::Uuid::new_v4();
+        let config = crate::config::TracevaultConfig {
+            org_slug: Some("acme".into()),
+            repo_id: Some("repo-1".into()),
+            remote_id: Some(uuid.to_string()),
+            codebase_name: Some("acme/foo".into()),
+            ..Default::default()
+        };
+        let binding = binding_from_config(&config).expect("org_slug + repo_id present");
+        assert_eq!(binding.codebase_name, Some("acme/foo".to_string()));
+        assert_eq!(binding.remote_id, Some(uuid));
     }
 
     #[test]
