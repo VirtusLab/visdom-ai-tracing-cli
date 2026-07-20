@@ -1,8 +1,10 @@
 //! User-level default project binding: a session-independent binding any Claude
 //! Code session inherits when nothing more specific resolves. Set by
 //! `tracevault project switch --user` (or a no-session `project switch`); read by
-//! `stream`/`project status` as the lowest-precedence tier. Lets a container bind
-//! its project *before* Claude launches — no session id required.
+//! `project status` as the lowest-precedence tier. (The capture path — `stream`
+//! hooks — does not yet consume this; wiring the resolved project into ingest is
+//! future work, tracked separately from this binding store.) Lets a container
+//! bind its project *before* Claude launches — no session id required.
 
 use std::path::{Path, PathBuf};
 
