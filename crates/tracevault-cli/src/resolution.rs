@@ -162,7 +162,6 @@ pub struct ResolveInputs<'a> {
 /// Inputs for the effective-project precedence chain. `project_flag` and
 /// `config_default` are resolved by the caller; `session`/`worktree_path`
 /// come from the per-session state.
-#[allow(dead_code)]
 pub struct ProjectResolveInputs<'a> {
     pub project_flag: Option<ProjectBinding>,
     pub session: &'a SessionState,
@@ -200,7 +199,6 @@ impl std::fmt::Display for BindingSource {
 
 /// Which precedence tier produced the [`effective_project`] result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ProjectSource {
     /// A `--project <id>` flag override.
     ProjectFlag,
@@ -255,7 +253,6 @@ pub fn effective_binding(inputs: ResolveInputs) -> Option<(RepoBinding, BindingS
 /// subagent worktree override → session active → config default → none.
 /// Pure; covers rungs 1–3 only (flag → subagent → session.active_project → config_default).
 /// Deduction (rung 4) and user-default (rung 5) are applied by the async orchestrator in Task 6.
-#[allow(dead_code)]
 pub fn effective_project(inputs: &ProjectResolveInputs) -> Option<(ProjectBinding, ProjectSource)> {
     if let Some(b) = &inputs.project_flag {
         return Some((b.clone(), ProjectSource::ProjectFlag));
@@ -286,7 +283,6 @@ pub fn effective_project(inputs: &ProjectResolveInputs) -> Option<(ProjectBindin
 /// so the user knows attribution wasn't explicit. Returns `Ok(None)` only when
 /// every rung is empty — the caller turns that into a "project required"
 /// error where appropriate.
-#[allow(dead_code)]
 pub async fn resolve_effective_project(
     inputs: &ProjectResolveInputs<'_>,
     user_default: Option<ProjectBinding>,

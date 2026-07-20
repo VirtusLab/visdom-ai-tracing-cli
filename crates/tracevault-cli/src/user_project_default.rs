@@ -39,13 +39,11 @@ fn clear_at(path: &Path) -> std::io::Result<()> {
 }
 
 /// Load the user-level default binding; `None` if unset or malformed.
-#[allow(dead_code)]
 pub fn load() -> Option<ProjectBinding> {
     load_from(&default_project_path()?)
 }
 
 /// Persist the user-level default binding, creating the config dir if needed.
-#[allow(dead_code)]
 pub fn save(binding: &ProjectBinding) -> Result<(), Box<dyn std::error::Error>> {
     let path = default_project_path().ok_or("cannot determine user config dir")?;
     let dir = path.parent().ok_or("cannot determine parent directory")?;

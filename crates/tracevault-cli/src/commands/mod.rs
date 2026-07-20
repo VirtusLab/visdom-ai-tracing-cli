@@ -6,6 +6,7 @@ pub mod flush;
 pub mod init;
 pub mod login;
 pub mod logout;
+pub mod project;
 pub mod proxy;
 pub mod repo;
 // Shared building blocks for the SessionStart/UserPromptSubmit hook commands

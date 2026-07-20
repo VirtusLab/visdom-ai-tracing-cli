@@ -193,12 +193,7 @@ pub struct CiPolicyResult {
 
 /// One project in `GET /api/v1/orgs/{org}/projects`. Server sends more
 /// fields; only these two are consumed today.
-// `src/api_client.rs` is compiled both into the `tracevault_cli` lib (used by
-// the integration tests) and, via `mod api_client;`, into the `tracevault`
-// bin. Task 7 wires these into commands (bin-side); until then the bin build
-// sees them as unread/unused, hence the blanket `#[allow(dead_code)]`s below.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct ProjectListItem {
     pub id: uuid::Uuid,
     pub name: String,
@@ -206,7 +201,6 @@ pub struct ProjectListItem {
 
 /// A repo linked to a project (member of `ProjectDetail::repos`).
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct ProjectRepoRef {
     pub id: uuid::Uuid,
 }
@@ -214,7 +208,6 @@ pub struct ProjectRepoRef {
 /// Full detail for a project. Server sends more fields; only `repos` is
 /// consumed today.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct ProjectDetail {
     pub repos: Vec<ProjectRepoRef>,
 }
@@ -223,7 +216,6 @@ pub struct ProjectDetail {
 /// (404) from "ambiguous, multiple candidates" (409) — unlike
 /// `resolve_remote`, which only distinguishes found/not-found.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum ResolveProjectOutcome {
     Resolved(uuid::Uuid),
     None,
@@ -232,7 +224,6 @@ pub enum ResolveProjectOutcome {
 
 /// Wire shape of a successful `resolve_project` response.
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct ResolveProjectResponse {
     project_id: uuid::Uuid,
 }
@@ -581,7 +572,6 @@ impl ApiClient {
     }
 
     /// List the projects in an org. `GET /api/v1/orgs/{org}/projects`.
-    #[allow(dead_code)]
     pub async fn list_projects(
         &self,
         org_slug: &str,
@@ -607,7 +597,6 @@ impl ApiClient {
     }
 
     /// Full detail for a project. `GET /api/v1/orgs/{org}/projects/{id}`.
-    #[allow(dead_code)]
     pub async fn get_project(
         &self,
         org_slug: &str,
@@ -636,7 +625,6 @@ impl ApiClient {
     /// Resolve a git URL to its project, distinguishing "no project" (404)
     /// from "ambiguous, multiple candidate projects" (409).
     /// `GET /api/v1/orgs/{org}/projects/resolve?git_url=`.
-    #[allow(dead_code)]
     pub async fn resolve_project(
         &self,
         org_slug: &str,
