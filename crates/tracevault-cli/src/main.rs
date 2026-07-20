@@ -14,7 +14,9 @@ mod session_state;
 #[cfg(test)]
 mod test_helpers;
 mod user_default;
+mod user_project_default;
 
+use commands::project::ProjectCmd;
 use commands::repo::RepoCmd;
 
 #[derive(Parser)]
@@ -163,6 +165,11 @@ enum Cli {
     Repo {
         #[command(subcommand)]
         cmd: RepoCmd,
+    },
+    /// Bind/inspect the project a detached session is attributed to.
+    Project {
+        #[command(subcommand)]
+        cmd: ProjectCmd,
     },
 }
 
@@ -645,6 +652,14 @@ async fn main() {
             let project_root = crate::paths::resolve_project_root(&cwd).root;
             if let Err(e) = commands::repo::run(cmd, &project_root, &cwd).await {
                 eprintln!("Repo error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Cli::Project { cmd } => {
+            let cwd = env::current_dir().expect("Cannot determine current directory");
+            let project_root = crate::paths::resolve_project_root(&cwd).root;
+            if let Err(e) = commands::project::run(cmd, &project_root, &cwd).await {
+                eprintln!("Project error: {e}");
                 std::process::exit(1);
             }
         }

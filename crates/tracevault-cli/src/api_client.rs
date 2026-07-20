@@ -191,6 +191,43 @@ pub struct CiPolicyResult {
     pub details: String,
 }
 
+/// One project in `GET /api/v1/orgs/{org}/projects`. Server sends more
+/// fields; only these two are consumed today.
+#[derive(Debug, Deserialize)]
+pub struct ProjectListItem {
+    pub id: uuid::Uuid,
+    pub name: String,
+}
+
+/// A repo linked to a project (member of `ProjectDetail::repos`).
+#[derive(Debug, Deserialize)]
+pub struct ProjectRepoRef {
+    pub id: uuid::Uuid,
+}
+
+/// Full detail for a project. Server sends more fields; only `repos` is
+/// consumed today.
+#[derive(Debug, Deserialize)]
+pub struct ProjectDetail {
+    pub repos: Vec<ProjectRepoRef>,
+}
+
+/// Outcome of `ApiClient::resolve_project`, distinguishing "no project"
+/// (404) from "ambiguous, multiple candidates" (409) — unlike
+/// `resolve_remote`, which only distinguishes found/not-found.
+#[derive(Debug)]
+pub enum ResolveProjectOutcome {
+    Resolved(uuid::Uuid),
+    None,
+    Ambiguous,
+}
+
+/// Wire shape of a successful `resolve_project` response.
+#[derive(Deserialize)]
+struct ResolveProjectResponse {
+    project_id: uuid::Uuid,
+}
+
 impl ApiClient {
     pub fn new(base_url: &str, api_key: Option<&str>) -> Self {
         Self {
@@ -532,6 +569,90 @@ impl ApiClient {
         remote_id: uuid::Uuid,
     ) -> Result<Vec<RemoteRepoRef>, Box<dyn std::error::Error>> {
         Ok(self.get_remote_detail(org_slug, remote_id).await?.repos)
+    }
+
+    /// List the projects in an org. `GET /api/v1/orgs/{org}/projects`.
+    pub async fn list_projects(
+        &self,
+        org_slug: &str,
+    ) -> Result<Vec<ProjectListItem>, Box<dyn Error>> {
+        let mut builder = self.client.get(format!(
+            "{}/api/v1/orgs/{}/projects",
+            self.base_url, org_slug
+        ));
+        if let Some(key) = &self.api_key {
+            builder = builder.header("Authorization", format!("Bearer {key}"));
+        }
+
+        let resp = builder.send().await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Failed to list projects ({status}): {body}").into());
+        }
+
+        let projects: Vec<ProjectListItem> = resp.json().await?;
+        Ok(projects)
+    }
+
+    /// Full detail for a project. `GET /api/v1/orgs/{org}/projects/{id}`.
+    pub async fn get_project(
+        &self,
+        org_slug: &str,
+        id: uuid::Uuid,
+    ) -> Result<ProjectDetail, Box<dyn Error>> {
+        let mut builder = self.client.get(format!(
+            "{}/api/v1/orgs/{}/projects/{}",
+            self.base_url, org_slug, id
+        ));
+        if let Some(key) = &self.api_key {
+            builder = builder.header("Authorization", format!("Bearer {key}"));
+        }
+
+        let resp = builder.send().await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Failed to get project ({status}): {body}").into());
+        }
+
+        let detail: ProjectDetail = resp.json().await?;
+        Ok(detail)
+    }
+
+    /// Resolve a git URL to its project, distinguishing "no project" (404)
+    /// from "ambiguous, multiple candidate projects" (409).
+    /// `GET /api/v1/orgs/{org}/projects/resolve?git_url=`.
+    pub async fn resolve_project(
+        &self,
+        org_slug: &str,
+        git_url: &str,
+    ) -> Result<ResolveProjectOutcome, Box<dyn std::error::Error>> {
+        let mut url = Url::parse(&format!(
+            "{}/api/v1/orgs/{}/projects/resolve",
+            self.base_url, org_slug
+        ))?;
+        url.query_pairs_mut().append_pair("git_url", git_url);
+        let mut builder = self.client.get(url);
+        if let Some(key) = &self.api_key {
+            builder = builder.header("Authorization", format!("Bearer {key}"));
+        }
+        let resp = builder.send().await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(ResolveProjectOutcome::None);
+        }
+        if status == reqwest::StatusCode::CONFLICT {
+            return Ok(ResolveProjectOutcome::Ambiguous);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("resolve_project failed ({status}): {body}").into());
+        }
+        let parsed: ResolveProjectResponse = resp.json().await?;
+        Ok(ResolveProjectOutcome::Resolved(parsed.project_id))
     }
 }
 

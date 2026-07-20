@@ -30,6 +30,10 @@ pub struct TracevaultConfig {
     /// extra network round-trip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codebase_name: Option<String>,
+    /// Client-side default project **name** for this repo (no server counterpart).
+    /// Resolution precedence rung 3; resolved to an id at use time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_project: Option<String>,
 }
 
 fn default_agent() -> String {
@@ -47,6 +51,7 @@ impl Default for TracevaultConfig {
             user_context: None,
             remote_id: None,
             codebase_name: None,
+            default_project: None,
         }
     }
 }
@@ -293,6 +298,7 @@ mod tests {
             user_context: None,
             remote_id: None,
             codebase_name: None,
+            default_project: None,
         };
         let toml = cfg.to_toml();
         assert!(toml.contains("agent = \"claude-code\""));
@@ -395,6 +401,7 @@ mod tests {
             user_context: None,
             remote_id: None,
             codebase_name: None,
+            default_project: None,
         };
         let toml = cfg.to_toml();
         assert!(toml.contains("agent = \"claude-code\""));
@@ -590,5 +597,23 @@ mod tests {
             fs::read_to_string(&gitignore).unwrap(),
             "custom-user-content\n"
         );
+    }
+
+    #[test]
+    fn default_project_roundtrips_through_toml() {
+        let cfg = TracevaultConfig {
+            default_project: Some("payments-platform".into()),
+            ..Default::default()
+        };
+        let toml = cfg.to_toml();
+        assert!(toml.contains("default_project = \"payments-platform\""));
+        let parsed: TracevaultConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(parsed.default_project.as_deref(), Some("payments-platform"));
+    }
+
+    #[test]
+    fn default_project_absent_is_omitted_from_toml() {
+        let toml = TracevaultConfig::default().to_toml();
+        assert!(!toml.contains("default_project"));
     }
 }
