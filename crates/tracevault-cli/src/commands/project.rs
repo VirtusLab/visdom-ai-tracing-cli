@@ -651,17 +651,26 @@ mod tests {
     /// which closes after the first `accept()`) would fail fast, and the
     /// switch would error instead of succeeding.
     ///
-    /// Credentials/org come from a `.tracevault/config.toml` in `cwd`
-    /// (rather than `TRACEVAULT_SERVER_URL`/`_ORG_SLUG`/`_API_KEY` env vars)
-    /// so this test can't race `status_reports_ambiguous_deduction_as_
-    /// informational_not_fatal`, which already owns those three vars.
-    /// `XDG_CONFIG_HOME` is redirected so this doesn't read the developer's
-    /// real `credentials.json` (which could otherwise short-circuit
-    /// `org_slug_for`/`resolve_credentials` before the config file is
-    /// consulted, and race for real on a machine with actual TraceVault
-    /// credentials) and so the resulting user-default write lands in a
-    /// tempdir, not `~/.config`. `user_project_default`'s own real-path
-    /// round-trip test mutates the same var, so both hold
+    /// Credentials/org are supplied two ways at once: a
+    /// `.tracevault/config.toml` in `cwd`, and `TRACEVAULT_SERVER_URL`/
+    /// `_ORG_SLUG`/`_API_KEY` env vars pinned (via the guard below) at the
+    /// same mock server/values. The env vars sit above the config file in
+    /// `resolve_credentials`'s precedence, so without pinning them
+    /// explicitly, an ambient shell that already exports
+    /// `TRACEVAULT_SERVER_URL` (etc.) would leak in and point this test's
+    /// client at the wrong server — deterministic in CI (which doesn't set
+    /// them) but flaky on a developer machine that has them exported. The
+    /// guard's `set` calls make the test's behavior independent of the
+    /// ambient environment. `_env_lock` (taken below) also serializes this
+    /// against `status_reports_ambiguous_deduction_as_informational_not_
+    /// fatal`, which touches the same three vars. `XDG_CONFIG_HOME` is
+    /// redirected so this doesn't read the developer's real
+    /// `credentials.json` (which could otherwise short-circuit
+    /// `org_slug_for`/`resolve_credentials` before the config file/env vars
+    /// are consulted, and race for real on a machine with actual
+    /// TraceVault credentials) and so the resulting user-default write
+    /// lands in a tempdir, not `~/.config`. `user_project_default`'s own
+    /// real-path round-trip test mutates the same var, so both hold
     /// `test_helpers::lock_env_mutation()` for their duration.
     #[tokio::test]
     async fn switch_without_session_or_user_flag_skips_codebase_check() {
@@ -696,19 +705,25 @@ mod tests {
 
         // SAFETY: test-scoped env mutation, restored in a guard so a panic
         // in `switch` still cleans up the process env. `_env_lock` (taken
-        // above) also covers `resolve_credentials`/`org_slug_for`'s
-        // *reads* of TRACEVAULT_SERVER_URL/_ORG_SLUG/_API_KEY: this test
-        // deliberately doesn't set those three (it supplies credentials via
-        // `.tracevault/config.toml` instead, at the bottom of env-var
-        // precedence), but without the shared lock, `status_reports_
-        // ambiguous_deduction_as_informational_not_fatal` running
-        // concurrently on another thread could leak its own values into
-        // this test's `resolve_credentials` call, pointing this test's
-        // client at *that* test's mock server. Both tests now hold the same
-        // lock for their duration.
+        // above) also covers `resolve_credentials`/`org_slug_for`'s *reads*
+        // of TRACEVAULT_SERVER_URL/_ORG_SLUG/_API_KEY: those env vars sit
+        // above `.tracevault/config.toml` in precedence, so if the
+        // developer's ambient shell happens to already export them (e.g.
+        // pointing at a real server), `resolve_credentials` would pick
+        // those up instead of this test's config file and the request
+        // would go to the wrong place — deterministic in CI (which doesn't
+        // set them) but flaky locally. Pin them explicitly at this test's
+        // own mock server so behavior doesn't depend on the ambient
+        // environment, mirroring the precedent in `status_reports_
+        // ambiguous_deduction_as_informational_not_fatal`. `_env_lock`
+        // (taken above) also serializes this against that test and any
+        // other test in the crate touching the same three vars.
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.remove("TRACEVAULT_SESSION_ID");
         _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("TRACEVAULT_SERVER_URL", &base);
+        _guard.set("TRACEVAULT_ORG_SLUG", "org");
+        _guard.set("TRACEVAULT_API_KEY", "tok");
 
         let result = switch("payments", false, None, tmp.path(), tmp.path()).await;
         assert!(
