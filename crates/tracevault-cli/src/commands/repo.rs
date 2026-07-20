@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::api_client::{resolve_credentials, ApiClient, RepoListItem};
+use crate::api_client::{resolve_credentials, ApiClient};
 use crate::resolution::{
     binding_from_config, effective_binding, org_slug_for, resolve_path_to_binding, BindingSource,
     ResolveInputs,
@@ -13,13 +13,15 @@ use crate::session_state::{self, RepoBinding, SessionState};
 #[derive(clap::Subcommand)]
 pub enum RepoCmd {
     /// Bind tracing to a registered repo for the current session and print its
-    /// policies. Give a checkout <path> OR --name; exactly one is required.
+    /// policies. Give a checkout <path> — `--name` is deprecated and always
+    /// errors, telling you to bind by path instead.
     #[command(group(clap::ArgGroup::new("target").required(true).multiple(false)))]
     Switch {
         /// Path to a checkout of a registered repo (resolves via its git origin remote).
         #[arg(group = "target")]
         path: Option<String>,
-        /// Bind by the repo's registered name instead of a checkout path (no checkout needed).
+        /// Deprecated: name-only binding is no longer supported and always
+        /// errors; bind by checkout path instead (`tracevault repo switch <path>`).
         #[arg(long, group = "target")]
         name: Option<String>,
         /// Write a session-independent user-level default instead of a session
@@ -113,48 +115,6 @@ async fn resolve_switch_binding(
         })
 }
 
-/// Build the "no repo named …" error. An empty org is called out explicitly
-/// (rather than a dangling "available: "); long lists are capped so a single
-/// typo can't dump hundreds of names to stderr.
-fn name_not_found_error(name: &str, org_slug: &str, repos: &[RepoListItem]) -> String {
-    if repos.is_empty() {
-        return format!("no repo named '{name}': org {org_slug} has no registered repos");
-    }
-    const MAX: usize = 20;
-    let mut names: Vec<&str> = repos.iter().map(|r| r.name.as_str()).collect();
-    names.sort_unstable();
-    let shown = names.len().min(MAX);
-    let mut list = names[..shown].join(", ");
-    if names.len() > MAX {
-        list.push_str(&format!(", … and {} more", names.len() - MAX));
-    }
-    format!("no repo named '{name}' in org {org_slug} (available: {list})")
-}
-
-/// Resolve a registered repo by its NAME (no git checkout) to a binding.
-/// Exact, case-sensitive match on `repos.name`; on no match, errors listing
-/// the available names so a typo self-corrects. Resolution lists the org's
-/// repos and matches client-side (unlike the git-URL path's server-side
-/// `/repos/resolve`); this is safe because the server returns all repos
-/// unpaginated and `(org, name)` is unique, and it keeps the endpoint
-/// surface small.
-async fn resolve_name_to_binding(
-    name: &str,
-    org_slug: &str,
-    client: &ApiClient,
-) -> Result<RepoBinding, Box<dyn std::error::Error>> {
-    let repos = client.list_repos(org_slug).await?;
-    match repos.iter().find(|r| r.name == name) {
-        Some(repo) => Ok(RepoBinding {
-            org_slug: org_slug.to_string(),
-            repo_id: repo.id.to_string(),
-            git_url: repo.github_url.clone(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-        }),
-        None => Err(name_not_found_error(name, org_slug, &repos).into()),
-    }
-}
-
 /// Apply a switch to session state (session-level active binding). Pure.
 fn apply_switch(state: &mut SessionState, binding: RepoBinding) {
     state.active = Some(binding);
@@ -180,33 +140,36 @@ fn reset(user: bool, session_id: Option<&str>) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-/// Which target `repo switch` should resolve to a binding: a checkout path
-/// or a registered repo name. Exactly one of `path`/`name` must be given;
-/// see `switch_target`.
-#[derive(Debug)]
+/// Which target `repo switch` should resolve to a binding: a checkout path.
+/// `--name` binding is deprecated (see `switch_target`) and no longer
+/// produces a variant here.
+#[derive(Debug, PartialEq, Eq)]
 enum SwitchTarget<'a> {
     Path(&'a str),
-    Name(&'a str),
 }
 
-/// Pure exactly-one-of guard for `repo switch`'s `<path>` / `--name`
-/// arguments. Kept separate from `switch` so it can be unit-tested without
-/// spinning up a server or session state (also a safety net if the clap
-/// `ArgGroup` on the `Switch` variant is ever loosened).
+/// Pure guard for `repo switch`'s `<path>` / `--name` arguments. Kept
+/// separate from `switch` so it can be unit-tested without spinning up a
+/// server or session state (also a safety net if the clap `ArgGroup` on the
+/// `Switch` variant is ever loosened). `--name` binding is hard-deprecated:
+/// a name-only invocation errors rather than resolving by name, directing
+/// callers to bind by checkout path so the codebase is resolved from its git
+/// remote.
 fn switch_target<'a>(
     path: Option<&'a str>,
     name: Option<&'a str>,
 ) -> Result<SwitchTarget<'a>, Box<dyn std::error::Error>> {
     match (path, name) {
-        (Some(p), None) if p.trim().is_empty() => {
-            Err("repo path (<path>) must not be empty".into())
+        (Some(p), _) if !p.trim().is_empty() => Ok(SwitchTarget::Path(p)),
+        (Some(_), _) => Err("repo path must not be empty".into()),
+        (None, Some(_)) => Err(
+            "`--name` binding is deprecated and no longer supported; bind by checkout path \
+             (`tracevault repo switch <path>`) so the codebase is resolved from its git remote"
+                .into(),
+        ),
+        (None, None) => {
+            Err("provide a checkout path to bind (`tracevault repo switch <path>`)".into())
         }
-        (Some(p), None) => Ok(SwitchTarget::Path(p)),
-        (None, Some(n)) if n.trim().is_empty() => {
-            Err("repo name (--name) must not be empty".into())
-        }
-        (None, Some(n)) => Ok(SwitchTarget::Name(n)),
-        _ => Err("provide exactly one of <path> or --name".into()),
     }
 }
 
@@ -268,7 +231,6 @@ async fn switch(
 
     let binding = match target {
         SwitchTarget::Path(p) => resolve_switch_binding(Path::new(p), &org_slug, &client).await?,
-        SwitchTarget::Name(n) => resolve_name_to_binding(n, &org_slug, &client).await?,
     };
 
     // Validate the repo id BEFORE persisting anything: a malformed repo_id must
@@ -372,7 +334,7 @@ fn format_status(binding: Option<(&RepoBinding, BindingSource)>) -> String {
             b.repo_id, b.org_slug
         ),
         None => {
-            "not bound to any repo (workspace mode; run `tracevault repo switch <path>` or `tracevault repo switch --name <project>`)".into()
+            "not bound to any repo (workspace mode; run `tracevault repo switch <path>`)".into()
         }
     }
 }
@@ -417,6 +379,61 @@ async fn status(
         "{}",
         format_status(effective.as_ref().map(|(b, s)| (b, *s)))
     );
+
+    // Surface which codebase the effective binding belongs to, with live clone
+    // status when reachable. Best-effort — a failure must not fail `status`:
+    //   1. `remote_id` (persisted at init / set by switch) → fetch the remote
+    //      detail for name + clone status (works without a checkout);
+    //   2. else a `git_url` → live `resolve_remote` for name + clone status;
+    //   3. else fall back to the cached `codebase_name` (name only, offline).
+    if let Some((binding, _)) = &effective {
+        let (server_url, token) = resolve_credentials(project_root);
+        let client = server_url
+            .as_ref()
+            .map(|su| ApiClient::new(su, token.as_deref()));
+        let detail_line = if let (Some(client), Some(remote_id)) = (&client, binding.remote_id) {
+            client
+                .get_remote_detail(&binding.org_slug, remote_id)
+                .await
+                .ok()
+                .map(|d| {
+                    crate::resolution::codebase_line(
+                        d.name.as_deref(),
+                        &d.normalized_url,
+                        &d.clone_status,
+                    )
+                })
+        } else {
+            None
+        };
+        let resolved_line = if detail_line.is_none() {
+            if let (Some(client), Some(git_url)) = (&client, binding.git_url.as_deref()) {
+                client
+                    .resolve_remote(&binding.org_slug, git_url)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|r| {
+                        crate::resolution::codebase_line(
+                            r.name.as_deref(),
+                            &r.normalized_url,
+                            &r.clone_status,
+                        )
+                    })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(line) = crate::resolution::pick_status_line(
+            detail_line,
+            resolved_line,
+            binding.codebase_name.as_deref(),
+        ) {
+            println!("{line}");
+        }
+    }
 
     // Surface a configured user default even when a more specific tier won, so
     // it's discoverable (avoids double-printing when it IS the winning tier).
@@ -487,9 +504,15 @@ mod tests {
         assert!(switch_target(None, None).is_err());
     }
 
+    // The clap `ArgGroup` on `Switch` already prevents both being given
+    // together, but as a safety net at this level path wins: a non-empty
+    // path resolves the target regardless of a (deprecated) --name.
     #[test]
-    fn switch_target_rejects_both() {
-        assert!(switch_target(Some("/p"), Some("x")).is_err());
+    fn switch_target_path_wins_when_both_given() {
+        assert!(matches!(
+            switch_target(Some("/p"), Some("x")),
+            Ok(SwitchTarget::Path("/p"))
+        ));
     }
 
     #[test]
@@ -500,12 +523,15 @@ mod tests {
         ));
     }
 
+    // --name now warns and does NOT resolve by name: switch_target maps a name-only
+    // invocation to a deprecation error directing to path binding (no list_repos call).
     #[test]
-    fn switch_target_accepts_name_only() {
-        assert!(matches!(
-            switch_target(None, Some("proj")),
-            Ok(SwitchTarget::Name("proj"))
-        ));
+    fn switch_target_name_is_deprecated() {
+        let err = switch_target(None, Some("some-repo"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("deprecated"), "got: {err}");
+        assert!(err.contains("path"), "should direct to path binding: {err}");
     }
 
     fn binding(id: &str) -> RepoBinding {
@@ -513,6 +539,8 @@ mod tests {
             org_slug: "org".into(),
             repo_id: id.into(),
             git_url: None,
+            remote_id: None,
+            codebase_name: None,
             updated_at: "t".into(),
         }
     }
@@ -550,7 +578,7 @@ mod tests {
     fn format_status_none() {
         assert_eq!(
             format_status(None),
-            "not bound to any repo (workspace mode; run `tracevault repo switch <path>` or `tracevault repo switch --name <project>`)"
+            "not bound to any repo (workspace mode; run `tracevault repo switch <path>`)"
         );
     }
 
@@ -626,20 +654,56 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Format a raw HTTP/1.1 200 response with a correct `Content-Length` for
+    /// a JSON `body`.
+    fn http_200(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    /// Generalizes `spawn_once` to a listener that answers each of `responses`
+    /// in order, one per accepted connection (the resolve-by-remote flow makes
+    /// two requests: `resolve_remote` then `get_remote_repos`).
+    fn spawn_n(responses: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for response in responses {
+                let response: &'static str = Box::leak(response.into_boxed_str());
+                if let Ok((stream, _)) = listener.accept() {
+                    let mut reader = BufReader::new(stream);
+                    let mut request_line = String::new();
+                    let _ = reader.read_line(&mut request_line);
+                    let mut stream = reader.into_inner();
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
     #[tokio::test]
     async fn resolve_switch_binding_ok_for_registered_repo() {
+        // Path resolution now goes through the codebase (remote) resolver:
+        // resolve_remote finds the codebase, then get_remote_repos returns its
+        // linked repos — the switch binds to the first one.
         let tmp = tempfile::tempdir().unwrap();
         crate::test_helpers::init_git_repo(tmp.path());
         add_origin_remote(tmp.path(), "git@github.com:org/repo.git");
 
-        let repo_id = "44000761-8d22-4256-bd2c-27a0ba278c6f";
-        let body = format!(r#"{{"repo_id":"{repo_id}"}}"#);
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
+        let remote_id = "44000761-8d22-4256-bd2c-27a0ba278c6f";
+        let repo_id = "11111111-1111-4111-8111-111111111111";
+        let remote = format!(
+            r#"{{"remote_id":"{remote_id}","name":"repo","normalized_url":"github.com/org/repo","clone_status":"ready"}}"#
         );
-        let base = spawn_once(Box::leak(resp.into_boxed_str()));
+        let detail = format!(
+            r#"{{"id":"{remote_id}","name":"repo","normalized_url":"github.com/org/repo","clone_url":"https://github.com/org/repo.git","clone_status":"ready","clone_error":null,"last_fetched_at":null,"repo_count":1,"created_at":"2026-01-01T00:00:00Z","repos":[{{"id":"{repo_id}","name":"repo"}}]}}"#
+        );
+        let base = spawn_n(vec![http_200(&remote), http_200(&detail)]);
         let client = ApiClient::new(&base, Some("tok"));
 
         let got = resolve_switch_binding(tmp.path(), "org", &client)
@@ -647,6 +711,8 @@ mod tests {
             .expect("expected Ok binding");
         assert_eq!(got.repo_id, repo_id);
         assert_eq!(got.org_slug, "org");
+        assert_eq!(got.remote_id, Some(remote_id.parse().unwrap()));
+        assert_eq!(got.codebase_name.as_deref(), Some("repo"));
     }
 
     #[tokio::test]
@@ -668,77 +734,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn resolve_name_to_binding_finds_by_name() {
-        let body = r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"visdom-orchestrator","github_url":null,"clone_status":null},{"id":"22222222-2222-4222-8222-222222222222","name":"visdom-web","github_url":"https://github.com/o/web.git","clone_status":null}]"#;
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let base = spawn_once(Box::leak(resp.into_boxed_str()));
-        let client = ApiClient::new(&base, Some("tok"));
-        let b = resolve_name_to_binding("visdom-orchestrator", "acme", &client)
-            .await
-            .expect("expected Ok binding");
-        assert_eq!(b.repo_id, "11111111-1111-4111-8111-111111111111");
-        assert_eq!(b.org_slug, "acme");
-    }
-
-    #[tokio::test]
-    async fn resolve_name_to_binding_errors_when_absent_listing_names() {
-        let body = r#"[{"id":"22222222-2222-4222-8222-222222222222","name":"visdom-web","github_url":null,"clone_status":null}]"#;
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let base = spawn_once(Box::leak(resp.into_boxed_str()));
-        let client = ApiClient::new(&base, Some("tok"));
-        let err = resolve_name_to_binding("visdom-orch", "acme", &client)
-            .await
-            .expect_err("expected Err for missing name")
-            .to_string();
-        assert!(err.contains("no repo named"), "got: {err}");
-        assert!(
-            err.contains("visdom-web"),
-            "error should list available names, got: {err}"
-        );
-    }
-
-    #[test]
-    fn name_not_found_error_empty_org_is_explicit() {
-        let msg = name_not_found_error("x", "acme", &[]);
-        assert!(msg.contains("has no registered repos"), "got: {msg}");
-        assert!(
-            !msg.contains("available:"),
-            "empty org must not print a dangling list: {msg}"
-        );
-    }
-
-    #[test]
-    fn name_not_found_error_caps_long_lists() {
-        let repos: Vec<RepoListItem> = (0..25)
-            .map(|i| RepoListItem {
-                id: uuid::Uuid::nil(),
-                name: format!("repo-{i:02}"),
-                github_url: None,
-                clone_status: None,
-            })
-            .collect();
-        let msg = name_not_found_error("zzz", "acme", &repos);
-        assert!(
-            msg.contains("… and 5 more"),
-            "should cap at 20 and note the remainder: {msg}"
-        );
-    }
-
     #[test]
     fn switch_target_rejects_empty_name() {
+        // `--name` is deprecated outright, so there's no separate empty-name
+        // branch anymore — an empty name still hits the deprecation error.
         assert!(switch_target(None, Some("")).is_err());
         assert!(switch_target(None, Some("   ")).is_err());
         let err = switch_target(None, Some(" ")).unwrap_err().to_string();
-        assert!(err.contains("must not be empty"), "got: {err}");
+        assert!(err.contains("deprecated"), "got: {err}");
     }
 
     #[test]
@@ -749,38 +752,43 @@ mod tests {
         assert!(err.contains("must not be empty"), "got: {err}");
     }
 
+    // repo switch resolves by NORMALIZED url: origin spelling differs from what
+    // was registered, but resolve_remote matches, and we bind to a linked repo.
     #[tokio::test]
-    async fn resolve_name_to_binding_is_case_sensitive() {
-        let body = r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"visdom-web","github_url":null,"clone_status":null}]"#;
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let base = spawn_once(Box::leak(resp.into_boxed_str()));
+    async fn resolve_path_binds_via_remote_across_url_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        add_origin_remote(tmp.path(), "git@github.com:o/x.git"); // scp spelling
+        let remote = r#"{"remote_id":"44000761-8d22-4256-bd2c-27a0ba278c6f","name":"x","normalized_url":"github.com/o/x","clone_status":"ready"}"#;
+        let detail = r#"{"id":"44000761-8d22-4256-bd2c-27a0ba278c6f","name":"x","normalized_url":"github.com/o/x","clone_url":"https://github.com/o/x.git","clone_status":"ready","clone_error":null,"last_fetched_at":null,"repo_count":1,"created_at":"2026-01-01T00:00:00Z","repos":[{"id":"11111111-1111-4111-8111-111111111111","name":"x"}]}"#;
+        let base = spawn_n(vec![http_200(remote), http_200(detail)]);
         let client = ApiClient::new(&base, Some("tok"));
-        let err = resolve_name_to_binding("Visdom-Web", "acme", &client)
+        let b = resolve_path_to_binding(tmp.path(), "org", &client)
+            .await
+            .unwrap()
+            .expect("Some binding");
+        assert_eq!(b.repo_id, "11111111-1111-4111-8111-111111111111");
+        assert_eq!(
+            b.remote_id,
+            Some("44000761-8d22-4256-bd2c-27a0ba278c6f".parse().unwrap())
+        );
+        assert_eq!(b.codebase_name.as_deref(), Some("x"));
+    }
+
+    // A tracked codebase with no linked repos (bare remote) → explicit error.
+    #[tokio::test]
+    async fn resolve_path_bare_remote_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        add_origin_remote(tmp.path(), "git@github.com:o/x.git");
+        let remote = r#"{"remote_id":"44000761-8d22-4256-bd2c-27a0ba278c6f","name":"x","normalized_url":"github.com/o/x","clone_status":"pending"}"#;
+        let detail = r#"{"id":"44000761-8d22-4256-bd2c-27a0ba278c6f","name":"x","normalized_url":"github.com/o/x","clone_url":"https://github.com/o/x.git","clone_status":"pending","clone_error":null,"last_fetched_at":null,"repo_count":0,"created_at":"2026-01-01T00:00:00Z","repos":[]}"#;
+        let base = spawn_n(vec![http_200(remote), http_200(detail)]);
+        let client = ApiClient::new(&base, Some("tok"));
+        let err = resolve_path_to_binding(tmp.path(), "org", &client)
             .await
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("no repo named 'Visdom-Web'"),
-            "case must not match: {err}"
-        );
-    }
-
-    /// `list_repos` maps any non-2xx status (including 500) to an `Err`
-    /// (never `Ok(vec![])`), so this exercises `resolve_name_to_binding`
-    /// propagating that transport/server error via `?`, not the "no repos
-    /// registered" branch of `name_not_found_error`.
-    #[tokio::test]
-    async fn resolve_name_to_binding_propagates_list_error() {
-        let resp =
-            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        let base = spawn_once(resp);
-        let client = ApiClient::new(&base, Some("tok"));
-        assert!(resolve_name_to_binding("anything", "acme", &client)
-            .await
-            .is_err());
+        assert!(err.contains("no tracked repo"), "got: {err}");
     }
 }

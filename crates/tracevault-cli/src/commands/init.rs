@@ -1,6 +1,7 @@
 use crate::api_client::ApiClient;
 use crate::config::{user_config_path_in, TracevaultConfig, UserContext};
 use crate::context::Context;
+use crate::resolution::git_remote_url;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -58,17 +59,6 @@ fn resolve_claude_target(
         "l" | "local" => ClaudeSettingsTarget::Local,
         _ => ClaudeSettingsTarget::Shared,
     })
-}
-
-pub fn git_remote_url(project_root: &Path) -> Option<String> {
-    std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(project_root)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 fn parse_github_org(remote_url: &str) -> Option<String> {
@@ -270,6 +260,9 @@ pub async fn init_in_directory(
     } else if let (Some(url), Some(remote), Some(slug)) = (effective_url, remote_url, org_slug) {
         let client = ApiClient::new(&url, resolved_token.as_deref());
         let repo_name = git_repo_name(project_root);
+        // Captured before `remote` is moved into the request below, so the
+        // codebase-resolve step doesn't need to shell out to git again.
+        let origin_url = remote.clone();
 
         match client
             .register_repo(
@@ -286,6 +279,23 @@ pub async fn init_in_directory(
                 // Save repo_id to config
                 if let Some(mut cfg) = TracevaultConfig::load(project_root) {
                     cfg.repo_id = Some(resp.repo_id.to_string());
+                    // Best-effort: resolve the codebase (deduped by normalized
+                    // remote URL) and surface it to the user. Must never fail
+                    // init — `repo_id` above stays authoritative for ingest;
+                    // `remote_id`/`codebase_name` here are recorded for
+                    // display only.
+                    if let Ok(Some(remote)) = client.resolve_remote(&slug, &origin_url).await {
+                        println!(
+                            "{}",
+                            crate::resolution::codebase_line(
+                                remote.name.as_deref(),
+                                &remote.normalized_url,
+                                &remote.clone_status
+                            )
+                        );
+                        cfg.remote_id = Some(remote.remote_id.to_string());
+                        cfg.codebase_name = remote.name.clone();
+                    }
                     let _ = fs::write(TracevaultConfig::config_path(project_root), cfg.to_toml());
                 }
             }

@@ -7,6 +7,7 @@
 use crate::api_client::{ApiClient, GetMeError};
 use crate::config::TracevaultConfig;
 use crate::credentials::Credentials;
+use crate::resolution::git_remote_url;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -757,17 +758,6 @@ fn git_repo_name(project_root: &Path) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-fn git_remote_url(project_root: &Path) -> Option<String> {
-    Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(project_root)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 /// Make two remote URLs comparable by dropping `.git`, trailing slash, and
 /// collapsing SSH ↔ HTTPS differences for github.com specifically.
 fn normalize_remote(url: &str) -> String {
@@ -1278,6 +1268,8 @@ mod tests {
                 org_slug: "acme".into(),
                 repo_id: "11111111-1111-4111-8111-111111111111".into(),
                 git_url: None,
+                remote_id: None,
+                codebase_name: None,
                 updated_at: "t".into(),
             }),
             ..Default::default()
@@ -1326,6 +1318,8 @@ mod tests {
                 org_slug: "o1".into(),
                 repo_id: "aaaaaaaa-1111-4111-8111-111111111111".into(),
                 git_url: None,
+                remote_id: None,
+                codebase_name: None,
                 updated_at: "t".into(),
             }),
             ..Default::default()
@@ -1342,6 +1336,8 @@ mod tests {
                 org_slug: "o2".into(),
                 repo_id: "bbbbbbbb-2222-4222-8222-222222222222".into(),
                 git_url: None,
+                remote_id: None,
+                codebase_name: None,
                 updated_at: "t".into(),
             }),
             ..Default::default()
@@ -1370,6 +1366,8 @@ mod tests {
                 org_slug: "has-it".into(),
                 repo_id: "aaaaaaaa-1111-4111-8111-111111111111".into(),
                 git_url: None,
+                remote_id: None,
+                codebase_name: None,
                 updated_at: "t".into(),
             }),
             ..Default::default()
@@ -1421,6 +1419,8 @@ mod tests {
             org_slug: "visdom".into(),
             repo_id: "rid-1".into(),
             git_url: None,
+            remote_id: None,
+            codebase_name: None,
             updated_at: "t".into(),
         };
         let m = server_repo_lookup(None, "ignored", Some(&b)).unwrap();

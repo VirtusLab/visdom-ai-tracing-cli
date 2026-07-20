@@ -21,8 +21,32 @@ pub struct RegisterRepoResponse {
 }
 
 #[derive(Deserialize)]
-struct ResolveRepoResponse {
-    repo_id: uuid::Uuid,
+pub struct ResolveRemoteResponse {
+    pub remote_id: uuid::Uuid,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub normalized_url: String,
+    pub clone_status: String,
+}
+
+#[derive(Deserialize)]
+pub struct RemoteRepoRef {
+    pub id: uuid::Uuid,
+    // Reserved for display (e.g. a future `repo status`/error message listing
+    // a codebase's linked repos by name); not read by any caller yet.
+    #[allow(dead_code)]
+    pub name: String,
+}
+
+// The server's RemoteDetailResponse flattens the remote fields at top level and
+// adds a `repos` array; serde ignores any other top-level fields.
+#[derive(Deserialize)]
+pub struct RemoteDetail {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub normalized_url: String,
+    pub clone_status: String,
+    pub repos: Vec<RemoteRepoRef>,
 }
 
 #[derive(Deserialize)]
@@ -447,20 +471,19 @@ impl ApiClient {
         Ok(result)
     }
 
-    /// Resolve a git remote URL to a registered repo id within `org_slug`.
-    /// `Ok(None)` when the server has no matching repo (404). Used by
-    /// workspace/detached mode, which has no pinned repo_id in config.
-    pub async fn resolve_repo(
+    /// Resolve a git URL to its codebase (git remote) by NORMALIZED URL —
+    /// deduped, unlike an exact `github_url` match. `Ok(None)` if the
+    /// codebase isn't tracked (404).
+    pub async fn resolve_remote(
         &self,
         org_slug: &str,
         git_url: &str,
-    ) -> Result<Option<uuid::Uuid>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<ResolveRemoteResponse>, Box<dyn std::error::Error>> {
         let mut url = Url::parse(&format!(
-            "{}/api/v1/orgs/{}/repos/resolve",
+            "{}/api/v1/orgs/{}/remotes/resolve",
             self.base_url, org_slug
         ))?;
         url.query_pairs_mut().append_pair("git_url", git_url);
-
         let mut builder = self.client.get(url);
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
@@ -472,10 +495,43 @@ impl ApiClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("resolve_repo failed ({status}): {body}").into());
+            return Err(format!("resolve_remote failed ({status}): {body}").into());
         }
-        let parsed: ResolveRepoResponse = resp.json().await?;
-        Ok(Some(parsed.repo_id))
+        let parsed: ResolveRemoteResponse = resp.json().await?;
+        Ok(Some(parsed))
+    }
+
+    /// Full detail for a remote (codebase): its display name, normalized URL,
+    /// clone status, and linked repos.
+    pub async fn get_remote_detail(
+        &self,
+        org_slug: &str,
+        remote_id: uuid::Uuid,
+    ) -> Result<RemoteDetail, Box<dyn std::error::Error>> {
+        let mut builder = self.client.get(format!(
+            "{}/api/v1/orgs/{}/remotes/{}",
+            self.base_url, org_slug, remote_id
+        ));
+        if let Some(key) = &self.api_key {
+            builder = builder.header("Authorization", format!("Bearer {key}"));
+        }
+        let resp = builder.send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("get_remote_detail failed ({status}): {body}").into());
+        }
+        let detail: RemoteDetail = resp.json().await?;
+        Ok(detail)
+    }
+
+    /// The repos linked to a remote (the codebase's members).
+    pub async fn get_remote_repos(
+        &self,
+        org_slug: &str,
+        remote_id: uuid::Uuid,
+    ) -> Result<Vec<RemoteRepoRef>, Box<dyn std::error::Error>> {
+        Ok(self.get_remote_detail(org_slug, remote_id).await?.repos)
     }
 }
 

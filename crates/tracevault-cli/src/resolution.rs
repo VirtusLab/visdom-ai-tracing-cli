@@ -57,8 +57,10 @@ pub fn org_slug_from_slugs(slugs: &[String]) -> Result<String, String> {
 }
 
 /// `git -C <path> remote get-url origin`, trimmed. `None` if git fails or there
-/// is no origin remote.
-fn git_remote_url(path: &Path) -> Option<String> {
+/// is no origin remote. Shared by every caller that needs a checkout's origin
+/// remote URL (`init`, `sync`, `status`, and this module's own
+/// `resolve_path_to_binding`) — there is exactly one implementation.
+pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(path)
@@ -76,9 +78,40 @@ fn git_remote_url(path: &Path) -> Option<String> {
     }
 }
 
+/// Render a human line for a codebase resolved via `resolve_remote` /
+/// `get_remote_detail`: the registered name if the server has one, else the
+/// normalized URL, plus the server-side clone status. Shared by `init`
+/// (after registering) and `repo status` (live tiers) so the format has
+/// exactly one implementation.
+pub(crate) fn codebase_line(
+    name: Option<&str>,
+    normalized_url: &str,
+    clone_status: &str,
+) -> String {
+    format!(
+        "codebase: {} ({})",
+        name.unwrap_or(normalized_url),
+        clone_status
+    )
+}
+
+/// Choose the `repo status` codebase line from the available sources in
+/// priority order: live remote detail, live resolve-by-URL, cached name.
+/// The two live lines are pre-formatted (via `codebase_line`, so they carry
+/// clone status); the cached tier is name-only (no live status).
+pub(crate) fn pick_status_line(
+    detail_line: Option<String>,
+    resolved_line: Option<String>,
+    cached_name: Option<&str>,
+) -> Option<String> {
+    detail_line
+        .or(resolved_line)
+        .or_else(|| cached_name.map(|n| format!("codebase: {n}")))
+}
+
 /// Resolve a filesystem path to a registered-repo binding: read its origin
 /// remote URL and ask the server. `Ok(None)` when the path has no remote or
-/// the server has no matching repo (pre-registered-only).
+/// the server has no matching codebase (pre-registered-only).
 pub async fn resolve_path_to_binding(
     path: &Path,
     org_slug: &str,
@@ -87,15 +120,29 @@ pub async fn resolve_path_to_binding(
     let Some(git_url) = git_remote_url(path) else {
         return Ok(None);
     };
-    match client.resolve_repo(org_slug, &git_url).await? {
-        Some(repo_id) => Ok(Some(RepoBinding {
-            org_slug: org_slug.to_string(),
-            repo_id: repo_id.to_string(),
-            git_url: Some(git_url),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-        })),
-        None => Ok(None),
-    }
+    // Resolve the CODEBASE by normalized URL (deduped), then bind to one of its
+    // repos. Any linked repo works for ingest — every repo-keyed server read
+    // resolves codebase-wide — so the lowest-id linked repo (deterministic) is
+    // fine.
+    let Some(remote) = client.resolve_remote(org_slug, &git_url).await? else {
+        return Ok(None);
+    };
+    let repos = client.get_remote_repos(org_slug, remote.remote_id).await?;
+    let Some(first) = repos.into_iter().min_by_key(|r| r.id) else {
+        return Err(format!(
+            "codebase {} is registered but has no tracked repo; run `tracevault init` in a checkout",
+            remote.name.as_deref().unwrap_or(&remote.normalized_url)
+        )
+        .into());
+    };
+    Ok(Some(RepoBinding {
+        org_slug: org_slug.to_string(),
+        repo_id: first.id.to_string(),
+        git_url: Some(git_url),
+        remote_id: Some(remote.remote_id),
+        codebase_name: remote.name,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    }))
 }
 
 /// Inputs for the effective-binding precedence chain. `repo_flag` and `bound`
@@ -163,11 +210,18 @@ pub fn effective_binding(inputs: ResolveInputs) -> Option<(RepoBinding, BindingS
 
 /// A RepoBinding from a pinned `.tracevault/config.toml` (bound mode), if it has
 /// both org_slug and repo_id. Pure — caller supplies the already-loaded config.
+/// Carries through the `remote_id`/`codebase_name` `init` persisted (best-effort,
+/// display-only) so bound-mode `status` can print the codebase without an extra
+/// network round-trip; `git_url` stays `None` here — bound mode has no live
+/// origin URL to hand back (that's the older `git_url` fallback's job, covering
+/// bindings that predate `codebase_name`).
 pub fn binding_from_config(config: &crate::config::TracevaultConfig) -> Option<RepoBinding> {
     Some(RepoBinding {
         org_slug: config.org_slug.clone()?,
         repo_id: config.repo_id.clone()?,
         git_url: None,
+        remote_id: config.remote_id.as_deref().and_then(|s| s.parse().ok()),
+        codebase_name: config.codebase_name.clone(),
         updated_at: String::new(),
     })
 }
@@ -183,6 +237,8 @@ mod tests {
             org_slug: "org".into(),
             repo_id: id.into(),
             git_url: None,
+            remote_id: None,
+            codebase_name: None,
             updated_at: "t".into(),
         }
     }
@@ -345,6 +401,62 @@ mod tests {
             org_slug_from_slugs(&["acme".to_string(), "acme".to_string()]),
             Ok("acme".to_string())
         );
+    }
+
+    #[test]
+    fn binding_from_config_carries_remote_id_and_codebase_name() {
+        let uuid = uuid::Uuid::new_v4();
+        let config = crate::config::TracevaultConfig {
+            org_slug: Some("acme".into()),
+            repo_id: Some("repo-1".into()),
+            remote_id: Some(uuid.to_string()),
+            codebase_name: Some("acme/foo".into()),
+            ..Default::default()
+        };
+        let binding = binding_from_config(&config).expect("org_slug + repo_id present");
+        assert_eq!(binding.codebase_name, Some("acme/foo".to_string()));
+        assert_eq!(binding.remote_id, Some(uuid));
+    }
+
+    #[test]
+    fn codebase_line_formats_name_and_status() {
+        let line = codebase_line(Some("acme/foo"), "github.com/acme/foo", "ready");
+        assert_eq!(line, "codebase: acme/foo (ready)");
+        let line = codebase_line(None, "github.com/acme/foo", "pending");
+        assert_eq!(line, "codebase: github.com/acme/foo (pending)");
+    }
+
+    #[test]
+    fn pick_status_line_detail_wins_over_resolved_and_cached() {
+        assert_eq!(
+            pick_status_line(
+                Some("codebase: a (ready)".to_string()),
+                Some("codebase: b (pending)".to_string()),
+                Some("c"),
+            ),
+            Some("codebase: a (ready)".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_status_line_resolved_wins_over_cached() {
+        assert_eq!(
+            pick_status_line(None, Some("codebase: b (pending)".to_string()), Some("c"),),
+            Some("codebase: b (pending)".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_status_line_cached_only_is_name_only() {
+        assert_eq!(
+            pick_status_line(None, None, Some("c")),
+            Some("codebase: c".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_status_line_none_when_nothing_available() {
+        assert_eq!(pick_status_line(None, None, None), None);
     }
 
     #[test]

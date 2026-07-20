@@ -1,6 +1,6 @@
 use crate::api_client::{resolve_credentials, ApiClient};
-use crate::commands::init::git_remote_url;
 use crate::config::TracevaultConfig;
+use crate::resolution::git_remote_url;
 use std::path::Path;
 
 pub async fn sync_repo(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
