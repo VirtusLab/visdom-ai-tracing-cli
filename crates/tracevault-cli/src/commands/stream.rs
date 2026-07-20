@@ -1347,13 +1347,14 @@ mod tests {
         let client = crate::api_client::ApiClient::new(&base, Some("tok"));
         let req = sample_stream_event_request();
 
+        let mut fallback_warned = false;
         let got = send_stream_event(
             &client,
             "org",
             "11111111-1111-1111-1111-111111111111",
             capture_pid,
             &req,
-            &mut false,
+            &mut fallback_warned,
         )
         .await
         .expect("send_stream_event must succeed");
@@ -1393,13 +1394,14 @@ mod tests {
         let client = crate::api_client::ApiClient::new(&base, Some("tok"));
         let req = sample_stream_event_request();
 
+        let mut fallback_warned = false;
         let got = send_stream_event(
             &client,
             "org",
             "11111111-1111-1111-1111-111111111111",
             capture_pid,
             &req,
-            &mut false,
+            &mut fallback_warned,
         )
         .await
         .expect("send_stream_event must succeed");
@@ -1484,13 +1486,14 @@ mod tests {
         let client = crate::api_client::ApiClient::new(&base, Some("tok"));
         let req = sample_stream_event_request();
 
+        let mut fallback_warned = false;
         let err = send_stream_event(
             &client,
             "org",
             "11111111-1111-1111-1111-111111111111",
             None,
             &req,
-            &mut false,
+            &mut fallback_warned,
         )
         .await
         .expect_err("409 multi-project refusal must surface as Err");
@@ -1564,13 +1567,14 @@ mod tests {
         let req = sample_stream_event_request();
         let pid = uuid::Uuid::from_u128(42);
 
+        let mut fallback_warned = false;
         let got = send_stream_event(
             &client,
             "org",
             "11111111-1111-1111-1111-111111111111",
             Some(pid),
             &req,
-            &mut false,
+            &mut fallback_warned,
         )
         .await
         .expect("a deterministic 400 must fall back to repo-scoped and succeed");
@@ -1612,13 +1616,14 @@ mod tests {
         let req = sample_stream_event_request();
         let pid = uuid::Uuid::from_u128(7);
 
+        let mut fallback_warned = false;
         let err = send_stream_event(
             &client,
             "org",
             "11111111-1111-1111-1111-111111111111",
             Some(pid),
             &req,
-            &mut false,
+            &mut fallback_warned,
         )
         .await
         .expect_err("a transient 503 must propagate as Err, not be swallowed by a fallback");

@@ -510,7 +510,7 @@ impl ApiClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("stream_event_for_project failed ({status}): {body}").into());
+            return Err(format!("Project stream failed ({status}): {body}").into());
         }
         Ok(resp.json().await?)
     }
