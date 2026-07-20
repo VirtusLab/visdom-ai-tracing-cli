@@ -22,6 +22,15 @@ pub struct RepoBinding {
     pub updated_at: String,
 }
 
+/// A resolved binding to a registered project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectBinding {
+    pub org_slug: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub updated_at: String,
+}
+
 /// Session-level active binding plus per-worktree subagent overrides
 /// (keyed by the subagent's git worktree toplevel path — design §7).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -36,6 +45,10 @@ pub struct SessionState {
     /// keeps old on-disk session files (without this field) loadable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_injected_repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_project: Option<ProjectBinding>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub subagent_projects: HashMap<String, ProjectBinding>,
 }
 
 /// `$XDG_STATE_HOME/tracevault/sessions` or `~/.local/state/tracevault/sessions`.
@@ -200,5 +213,27 @@ mod tests {
             !leftover,
             "temp file should be renamed away, not left behind"
         );
+    }
+
+    #[test]
+    fn session_state_carries_project_bindings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pb = ProjectBinding {
+            org_slug: "acme".into(),
+            project_id: "11111111-1111-1111-1111-111111111111".into(),
+            project_name: "payments".into(),
+            updated_at: "t".into(),
+        };
+        let mut subagent_projects = HashMap::new();
+        subagent_projects.insert("/wt".into(), pb.clone());
+        let st = SessionState {
+            active_project: Some(pb.clone()),
+            subagent_projects,
+            ..Default::default()
+        };
+        save_in(tmp.path(), "sess-1", &st).unwrap();
+        let loaded = load_from(tmp.path(), "sess-1");
+        assert_eq!(loaded.active_project, Some(pb.clone()));
+        assert_eq!(loaded.subagent_projects.get("/wt"), Some(&pb));
     }
 }
