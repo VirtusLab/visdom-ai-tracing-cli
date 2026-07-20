@@ -487,9 +487,8 @@ impl ApiClient {
     /// segment. `repo_id` is always a UUID string from the repo binding —
     /// URL-safe, no percent-encoding needed.
     ///
-    /// Not yet called from the bin target — Task 3 wires this into the
-    /// hook/stream capture path. Exercised directly by the integration test.
-    #[allow(dead_code)]
+    /// Called from `commands::stream::send_stream_event` when a local
+    /// project binding resolves for the capturing event.
     pub async fn stream_event_for_project(
         &self,
         org_slug: &str,

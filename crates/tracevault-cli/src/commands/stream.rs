@@ -179,7 +179,6 @@ pub(crate) fn resolve_stream_binding(
 /// Repo config `default_project` (a name) is intentionally excluded: honoring it
 /// would need a per-event `list_projects` call. `None` -> fall back to the
 /// repo-scoped stream (server deduces).
-#[allow(dead_code)]
 fn capture_project(
     session: &crate::session_state::SessionState,
     worktree_path: Option<&str>,
@@ -194,6 +193,41 @@ fn capture_project(
     .map(|(b, _)| b)
     .or_else(crate::user_project_default::load)?;
     local.project_id.parse::<uuid::Uuid>().ok()
+}
+
+/// Send a single stream event, routing to the project-scoped endpoint when a
+/// local project binding resolved (`capture_pid = Some(_)`), else the
+/// repo-scoped endpoint (server-side deduction/refusal). Factored out so both
+/// the pending-flush loop and the live send share one branch.
+async fn send_stream_event(
+    client: &crate::api_client::ApiClient,
+    org_slug: &str,
+    repo_id: &str,
+    capture_pid: Option<uuid::Uuid>,
+    req: &StreamEventRequest,
+) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn std::error::Error>> {
+    match capture_pid {
+        Some(pid) => {
+            client
+                .stream_event_for_project(org_slug, pid, repo_id, req)
+                .await
+        }
+        None => client.stream_event(org_slug, repo_id, req).await,
+    }
+}
+
+/// Surface the server's ambiguous-repo refusal (a repo-only stream send with
+/// no local project binding, where the repo belongs to more than one
+/// project) as an actionable warning instead of a bare error. Only relevant
+/// when we did NOT resolve a local capture project ourselves — a resolved
+/// `capture_pid` always hits the unambiguous project-scoped endpoint, so this
+/// refusal can't occur there.
+fn warn_if_multi_project_refusal(capture_pid: Option<uuid::Uuid>, e: &dyn std::error::Error) {
+    if capture_pid.is_none() && e.to_string().contains("multiple projects") {
+        eprintln!(
+            "tracevault: warning: this repo belongs to multiple projects; capture is unattributed. Run `tracevault project switch <name>` to pick one."
+        );
+    }
 }
 
 /// Record-count offset arithmetic for the inline (fileless) path, mirroring the
@@ -496,6 +530,11 @@ pub async fn run_stream(
     let org_slug = binding.org_slug.as_str();
     let repo_id = binding.repo_id.as_str();
 
+    // Explicit local project binding (if any) overrides server-side repo
+    // deduction. Computed once, reusing the already-loaded session + worktree
+    // used just above for the repo-binding resolution.
+    let capture_pid = capture_project(&session, Some(worktree_top.as_str()));
+
     // 8. Create ApiClient
     let server_url = server_url.ok_or("server_url not configured")?;
     let client = crate::api_client::ApiClient::new(&server_url, token.as_deref());
@@ -509,11 +548,10 @@ pub async fn run_stream(
     // Send pending events first
     for pending_json in &pending_events {
         if let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(pending_json) {
-            if client
-                .stream_event(org_slug, repo_id, &pending_req)
-                .await
-                .is_err()
+            if let Err(e) =
+                send_stream_event(&client, org_slug, repo_id, capture_pid, &pending_req).await
             {
+                warn_if_multi_project_refusal(capture_pid, e.as_ref());
                 // Re-queue all remaining pending events
                 for evt in &pending_events {
                     append_pending(&pending_path, evt)?;
@@ -540,14 +578,15 @@ pub async fn run_stream(
             fs::write(&offset_path, new_offset.to_string())?;
         }
     } else {
-        match client.stream_event(org_slug, repo_id, &req).await {
+        match send_stream_event(&client, org_slug, repo_id, capture_pid, &req).await {
             Ok(_) => {
                 // 10. On success update .stream_offset
                 fs::write(&offset_path, new_offset.to_string())?;
             }
-            Err(_) => {
+            Err(e) => {
                 // 11. On failure append to pending.jsonl (advance the inline
                 // record counter regardless — see the note above).
+                warn_if_multi_project_refusal(capture_pid, e.as_ref());
                 append_pending(&pending_path, &req_json)?;
                 if is_inline {
                     fs::write(&offset_path, new_offset.to_string())?;
@@ -1076,5 +1115,182 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(capture_project(&bad, None), None);
+    }
+
+    // ── send_stream_event: endpoint routing based on capture_pid ──────────────
+
+    use std::io::BufReader;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    /// How long a test waits for the captured request before failing (rather
+    /// than hanging forever if the client never connects). Mirrors the
+    /// harness in `tests/stream_event_project_test.rs`.
+    const SEND_STREAM_EVENT_RECV_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Spawn a one-shot server that returns `response` (a full HTTP response)
+    /// to the first request. Captures the HTTP request line (method + path +
+    /// query) over the returned channel before writing the response. Mirrors
+    /// the harness in `tests/stream_event_project_test.rs` /
+    /// `tests/resolve_remote_test.rs`.
+    fn spawn_once_capturing_request(response: &'static str) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream);
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let _ = tx.send(request_line);
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    fn ok_stream_response() -> String {
+        let body = serde_json::to_string(&tracevault_protocol::streaming::StreamEventResponse {
+            session_db_id: uuid::Uuid::nil(),
+            event_db_id: Some(uuid::Uuid::nil()),
+            status: "accepted".to_string(),
+        })
+        .unwrap();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn sample_stream_event_request() -> StreamEventRequest {
+        StreamEventRequest {
+            protocol_version: 2,
+            tool: Some("claude-code".to_string()),
+            event_type: StreamEventType::ToolUse,
+            session_id: "sess-1".into(),
+            timestamp: chrono::Utc::now(),
+            hook_event_name: Some("PostToolUse".into()),
+            tool_name: None,
+            tool_use_id: None,
+            tool_input: None,
+            tool_response: None,
+            tool_is_error: None,
+            event_index: None,
+            event_uuid: None,
+            transcript_lines: None,
+            transcript_offset: None,
+            model: None,
+            cwd: None,
+            final_stats: None,
+            flow_id: None,
+            labels: None,
+            params: None,
+        }
+    }
+
+    /// With a `SessionState` whose `active_project` is set, `capture_project`
+    /// resolves a `capture_pid`, and `send_stream_event` must route to the
+    /// project-scoped endpoint (`/projects/{pid}/stream?repo_id=...`) rather
+    /// than the repo-scoped one.
+    #[tokio::test]
+    async fn send_stream_event_routes_to_project_endpoint_when_binding_active() {
+        use crate::session_state::{ProjectBinding, SessionState};
+
+        // Isolate from any ambient user-level project default so this test's
+        // `capture_project` call depends only on the SessionState below —
+        // mirrors the isolation pattern in `commands::project`'s tests.
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+
+        let pid = uuid::Uuid::from_u128(99);
+        let session = SessionState {
+            active_project: Some(ProjectBinding {
+                org_slug: "org".into(),
+                project_id: pid.to_string(),
+                project_name: "proj".into(),
+                updated_at: "".into(),
+            }),
+            ..Default::default()
+        };
+        let capture_pid = capture_project(&session, None);
+        assert_eq!(capture_pid, Some(pid));
+
+        let resp = ok_stream_response();
+        let (base, rx) = spawn_once_capturing_request(Box::leak(resp.into_boxed_str()));
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let req = sample_stream_event_request();
+
+        let got = send_stream_event(
+            &client,
+            "org",
+            "11111111-1111-1111-1111-111111111111",
+            capture_pid,
+            &req,
+        )
+        .await
+        .expect("send_stream_event must succeed");
+        assert_eq!(got.status, "accepted");
+
+        let line = rx
+            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
+            .expect("no request captured");
+        assert!(
+            line.starts_with(&format!(
+                "POST /api/v1/orgs/org/projects/{pid}/stream?repo_id=11111111-1111-1111-1111-111111111111 "
+            )),
+            "an active project binding must route to the project-scoped endpoint, got: {line}"
+        );
+    }
+
+    /// With an empty binding (default `SessionState`, no worktree override)
+    /// and no user-level default present in the test env, `capture_project`
+    /// resolves `None` and `send_stream_event` must fall back to the
+    /// repo-scoped endpoint.
+    #[tokio::test]
+    async fn send_stream_event_routes_to_repo_endpoint_when_no_binding() {
+        use crate::session_state::SessionState;
+
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        // No user_project.toml under this isolated config dir, so there is no
+        // ambient user-level default to leak in.
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+
+        let capture_pid = capture_project(&SessionState::default(), None);
+        assert_eq!(capture_pid, None);
+
+        let resp = ok_stream_response();
+        let (base, rx) = spawn_once_capturing_request(Box::leak(resp.into_boxed_str()));
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let req = sample_stream_event_request();
+
+        let got = send_stream_event(
+            &client,
+            "org",
+            "11111111-1111-1111-1111-111111111111",
+            capture_pid,
+            &req,
+        )
+        .await
+        .expect("send_stream_event must succeed");
+        assert_eq!(got.status, "accepted");
+
+        let line = rx
+            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
+            .expect("no request captured");
+        assert!(
+            line.starts_with(
+                "POST /api/v1/orgs/org/repos/11111111-1111-1111-1111-111111111111/stream "
+            ),
+            "no binding must fall back to the repo-scoped endpoint, got: {line}"
+        );
     }
 }
