@@ -2,7 +2,6 @@
 //! rendered server-side from the active policies for the current repo.
 
 use crate::api_client::{resolve_credentials, ApiClient};
-use crate::config::TracevaultConfig;
 use std::path::Path;
 use std::process::Command;
 
@@ -26,19 +25,15 @@ pub async fn run(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> 
     let server_url = server_url.ok_or("No server URL configured. Run 'tracevault login' first.")?;
     let token = token.ok_or("Not logged in. Run 'tracevault login' first.")?;
 
-    let org_slug = TracevaultConfig::load(project_root)
-        .and_then(|c| c.org_slug)
-        .ok_or("No org_slug in .tracevault/config.toml. Run 'tracevault init' first.")?;
-
     let client = ApiClient::new(&server_url, Some(&token));
 
     let repo_name = git_repo_name(project_root);
-    let repos = client.list_repos(&org_slug).await?;
+    let repos = client.list_repos().await?;
     let repo = repos.iter().find(|r| r.name == repo_name).ok_or_else(|| {
         format!("Repo '{repo_name}' not found on server. Run 'tracevault sync' first.")
     })?;
 
-    let resp = client.get_agent_instructions(&org_slug, &repo.id).await?;
+    let resp = client.get_agent_instructions(&repo.id).await?;
     print!("{}", resp.content);
     Ok(())
 }

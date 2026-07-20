@@ -44,7 +44,7 @@ async fn resolve_project_returns_resolved_on_200() {
     let (base, rx) = spawn_once(Box::leak(resp.into_boxed_str()));
     let client = ApiClient::new(&base, Some("tok"));
     let outcome = client
-        .resolve_project("org", "git@github.com:acme/app.git")
+        .resolve_project("git@github.com:acme/app.git")
         .await
         .unwrap();
     match outcome {
@@ -54,8 +54,7 @@ async fn resolve_project_returns_resolved_on_200() {
         other => panic!("expected Resolved, got {other:?}"),
     }
     let request = rx.recv_timeout(RECV_TIMEOUT).expect("no request");
-    assert!(request
-        .contains("/api/v1/orgs/org/projects/resolve?git_url=git%40github.com%3Aacme%2Fapp.git"));
+    assert!(request.contains("/api/v1/projects/resolve?git_url=git%40github.com%3Aacme%2Fapp.git"));
     assert!(
         request.contains("%40"),
         "git_url must be percent-encoded: {request}"
@@ -68,7 +67,7 @@ async fn resolve_project_returns_none_on_404() {
     let (base, rx) = spawn_once(resp);
     let client = ApiClient::new(&base, Some("tok"));
     let outcome = client
-        .resolve_project("org", "git@github.com:acme/app.git")
+        .resolve_project("git@github.com:acme/app.git")
         .await
         .unwrap();
     match outcome {
@@ -78,7 +77,7 @@ async fn resolve_project_returns_none_on_404() {
     // Assert a request actually went out (else a buggy resolve_project that
     // returned None without any I/O would still pass this test).
     let request = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
-    assert!(request.contains("/api/v1/orgs/org/projects/resolve?git_url="));
+    assert!(request.contains("/api/v1/projects/resolve?git_url="));
 }
 
 #[tokio::test]
@@ -87,7 +86,7 @@ async fn resolve_project_returns_ambiguous_on_409() {
     let (base, rx) = spawn_once(resp);
     let client = ApiClient::new(&base, Some("tok"));
     let outcome = client
-        .resolve_project("org", "git@github.com:acme/app.git")
+        .resolve_project("git@github.com:acme/app.git")
         .await
         .unwrap();
     match outcome {
@@ -95,5 +94,5 @@ async fn resolve_project_returns_ambiguous_on_409() {
         other => panic!("expected Ambiguous, got {other:?}"),
     }
     let request = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
-    assert!(request.contains("/api/v1/orgs/org/projects/resolve?git_url="));
+    assert!(request.contains("/api/v1/projects/resolve?git_url="));
 }

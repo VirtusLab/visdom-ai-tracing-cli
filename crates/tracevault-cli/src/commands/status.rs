@@ -240,12 +240,8 @@ fn project_checks(
     // both cases to `None`.
     let config = match TracevaultConfig::try_load(project_root) {
         Ok(Some(c)) => {
-            let slug = c.org_slug.as_deref().unwrap_or("<unset>");
             let url = c.server_url.as_deref().unwrap_or("<unset>");
-            out.push(Check::ok(
-                "Project config",
-                format!("org={slug}, server={url}"),
-            ));
+            out.push(Check::ok("Project config", format!("server={url}")));
             Some(c)
         }
         Ok(None) => {
@@ -464,10 +460,7 @@ fn workspace_binding_check_in(
                 Some(b) => (
                     Check::ok(
                         "Workspace binding",
-                        format!(
-                            "repo {} (org {}) via repo switch (session {id})",
-                            b.repo_id, b.org_slug
-                        ),
+                        format!("repo {} via repo switch (session {id})", b.repo_id),
                     ),
                     Some(b),
                 ),
@@ -487,8 +480,8 @@ fn workspace_binding_check_in(
                 Check::ok(
                     "Workspace binding",
                     format!(
-                        "repo {} (org {}) via repo switch — most recent session with a binding: {id} (may be another repo; pass --session-id to target one)",
-                        b.repo_id, b.org_slug
+                        "repo {} via repo switch — most recent session with a binding: {id} (may be another repo; pass --session-id to target one)",
+                        b.repo_id
                     ),
                 ),
                 Some(b),
@@ -510,20 +503,20 @@ enum RepoMatch {
     ById(String),
 }
 
-/// Bound mode (config `org_slug`, match by git repo NAME) takes precedence;
-/// otherwise workspace mode (the authoritative binding's `org_slug`, match by
+/// Bound mode (a loaded project config, match by git repo NAME) takes
+/// precedence; otherwise workspace mode (the authoritative binding, match by
 /// `repo_id`). `None` when neither is available. Pure — `repo_name` is passed
 /// in so this is unit-testable without invoking git.
 fn server_repo_lookup(
-    config_org_slug: Option<&str>,
+    config_present: bool,
     repo_name: &str,
     binding: Option<&crate::session_state::RepoBinding>,
-) -> Option<(String, RepoMatch)> {
-    if let Some(slug) = config_org_slug {
-        return Some((slug.to_string(), RepoMatch::ByName(repo_name.to_string())));
+) -> Option<RepoMatch> {
+    if config_present {
+        return Some(RepoMatch::ByName(repo_name.to_string()));
     }
     if let Some(b) = binding {
-        return Some((b.org_slug.clone(), RepoMatch::ById(b.repo_id.clone())));
+        return Some(RepoMatch::ById(b.repo_id.clone()));
     }
     None
 }
@@ -545,20 +538,16 @@ async fn server_repo_checks(
     };
 
     let repo_name = git_repo_name(project_root);
-    let Some((slug, want)) = server_repo_lookup(
-        config.and_then(|c| c.org_slug.as_deref()),
-        &repo_name,
-        binding,
-    ) else {
+    let Some(want) = server_repo_lookup(config.is_some(), &repo_name, binding) else {
         out.push(Check::skip(
             "Repo registered on server",
-            "no org (need a bound config.toml or a --session-id workspace binding)",
+            "not bound (need a project config.toml or a --session-id workspace binding)",
         ));
         return out;
     };
 
     let client = ApiClient::new(server_url, Some(token));
-    let repos = match client.list_repos(&slug).await {
+    let repos = match client.list_repos().await {
         Ok(r) => r,
         Err(e) => {
             out.push(Check::warn(
@@ -582,7 +571,7 @@ async fn server_repo_checks(
             };
             out.push(Check::err(
                 "Repo registered on server",
-                format!("{what} not found in org '{slug}'. Run `tracevault init` while logged in, or `tracevault sync`."),
+                format!("{what} not found on the server. Run `tracevault init` while logged in, or `tracevault sync`."),
             ));
             return out;
         }
@@ -1265,7 +1254,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let st = crate::session_state::SessionState {
             active: Some(crate::session_state::RepoBinding {
-                org_slug: "acme".into(),
                 repo_id: "11111111-1111-4111-8111-111111111111".into(),
                 git_url: None,
                 remote_id: None,
@@ -1281,7 +1269,13 @@ mod tests {
         .unwrap();
         let (check, binding) = workspace_binding_check_in(dir.path(), Some("sess-9"));
         assert_eq!(check.level, Level::Ok);
-        assert!(check.detail.contains("acme"), "detail: {}", check.detail);
+        assert!(
+            check
+                .detail
+                .contains("11111111-1111-4111-8111-111111111111"),
+            "detail: {}",
+            check.detail
+        );
         assert_eq!(
             binding.unwrap().repo_id,
             "11111111-1111-4111-8111-111111111111"
@@ -1315,7 +1309,6 @@ mod tests {
         // Two sessions; the one written LAST should be picked by the mtime scan.
         let older = crate::session_state::SessionState {
             active: Some(crate::session_state::RepoBinding {
-                org_slug: "o1".into(),
                 repo_id: "aaaaaaaa-1111-4111-8111-111111111111".into(),
                 git_url: None,
                 remote_id: None,
@@ -1333,7 +1326,6 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let newer = crate::session_state::SessionState {
             active: Some(crate::session_state::RepoBinding {
-                org_slug: "o2".into(),
                 repo_id: "bbbbbbbb-2222-4222-8222-222222222222".into(),
                 git_url: None,
                 remote_id: None,
@@ -1350,8 +1342,8 @@ mod tests {
         let (check, binding) = workspace_binding_check_in(dir.path(), None);
         assert_eq!(check.level, Level::Ok);
         assert_eq!(
-            binding.unwrap().org_slug,
-            "o2",
+            binding.unwrap().repo_id,
+            "bbbbbbbb-2222-4222-8222-222222222222",
             "must pick the most-recently-modified session"
         );
     }
@@ -1363,7 +1355,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let with_binding = crate::session_state::SessionState {
             active: Some(crate::session_state::RepoBinding {
-                org_slug: "has-it".into(),
                 repo_id: "aaaaaaaa-1111-4111-8111-111111111111".into(),
                 git_url: None,
                 remote_id: None,
@@ -1386,7 +1377,10 @@ mod tests {
         .unwrap();
         let (check, binding) = workspace_binding_check_in(dir.path(), None);
         assert_eq!(check.level, Level::Ok);
-        assert_eq!(binding.unwrap().org_slug, "has-it");
+        assert_eq!(
+            binding.unwrap().repo_id,
+            "aaaaaaaa-1111-4111-8111-111111111111"
+        );
     }
 
     #[test]
@@ -1406,33 +1400,26 @@ mod tests {
 
     #[test]
     fn server_repo_lookup_prefers_config_by_name() {
-        let m = server_repo_lookup(Some("acme"), "myrepo", None).unwrap();
-        assert_eq!(
-            m,
-            ("acme".to_string(), RepoMatch::ByName("myrepo".to_string()))
-        );
+        let m = server_repo_lookup(true, "myrepo", None).unwrap();
+        assert_eq!(m, RepoMatch::ByName("myrepo".to_string()));
     }
 
     #[test]
     fn server_repo_lookup_falls_back_to_binding_by_id() {
         let b = crate::session_state::RepoBinding {
-            org_slug: "visdom".into(),
             repo_id: "rid-1".into(),
             git_url: None,
             remote_id: None,
             codebase_name: None,
             updated_at: "t".into(),
         };
-        let m = server_repo_lookup(None, "ignored", Some(&b)).unwrap();
-        assert_eq!(
-            m,
-            ("visdom".to_string(), RepoMatch::ById("rid-1".to_string()))
-        );
+        let m = server_repo_lookup(false, "ignored", Some(&b)).unwrap();
+        assert_eq!(m, RepoMatch::ById("rid-1".to_string()));
     }
 
     #[test]
     fn server_repo_lookup_none_when_neither() {
-        assert!(server_repo_lookup(None, "x", None).is_none());
+        assert!(server_repo_lookup(false, "x", None).is_none());
     }
 
     #[test]

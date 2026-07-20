@@ -118,22 +118,6 @@ pub struct MeResponse {
     pub name: Option<String>,
 }
 
-/// One org the authenticated credential belongs to. `org_name` is the org
-/// slug (`orgs.name` server-side) used in URL paths; `display_name` is the
-/// human label. Wire shape of `GET /api/v1/me/orgs`.
-// Full GET /api/v1/me/orgs wire shape; only org_name (the slug) is consumed.
-// Unused fields kept for the contract, allowed like MeResponse::user_id.
-#[derive(Debug, Deserialize)]
-pub struct OrgMembership {
-    #[allow(dead_code)]
-    pub org_id: uuid::Uuid,
-    pub org_name: String,
-    #[allow(dead_code)]
-    pub display_name: Option<String>,
-    #[allow(dead_code)]
-    pub role: String,
-}
-
 #[derive(Debug)]
 pub enum GetMeError {
     /// 401 — token is missing or invalid.
@@ -191,7 +175,7 @@ pub struct CiPolicyResult {
     pub details: String,
 }
 
-/// One project in `GET /api/v1/orgs/{org}/projects`. Server sends more
+/// One project in `GET /api/v1/projects`. Server sends more
 /// fields; only these two are consumed today.
 #[derive(Debug, Deserialize)]
 pub struct ProjectListItem {
@@ -242,12 +226,9 @@ impl ApiClient {
 
     pub async fn register_repo(
         &self,
-        org_slug: &str,
         req: RegisterRepoRequest,
     ) -> Result<RegisterRepoResponse, Box<dyn Error>> {
-        let mut builder = self
-            .client
-            .post(format!("{}/api/v1/orgs/{}/repos", self.base_url, org_slug));
+        let mut builder = self.client.post(format!("{}/api/v1/repos", self.base_url));
 
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
@@ -363,18 +344,8 @@ impl ApiClient {
         self.authed_get_json("/api/v1/auth/me").await
     }
 
-    /// List the orgs the authenticated credential belongs to.
-    /// `GET /api/v1/me/orgs`. For a service-account key this is the service
-    /// user's memberships; for a user session, the user's orgs; for an
-    /// org-scoped key, an empty list.
-    pub async fn list_my_orgs(&self) -> Result<Vec<OrgMembership>, GetMeError> {
-        self.authed_get_json("/api/v1/me/orgs").await
-    }
-
-    pub async fn list_repos(&self, org_slug: &str) -> Result<Vec<RepoListItem>, Box<dyn Error>> {
-        let mut builder = self
-            .client
-            .get(format!("{}/api/v1/orgs/{}/repos", self.base_url, org_slug));
+    pub async fn list_repos(&self) -> Result<Vec<RepoListItem>, Box<dyn Error>> {
+        let mut builder = self.client.get(format!("{}/api/v1/repos", self.base_url));
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
         }
@@ -393,12 +364,11 @@ impl ApiClient {
 
     pub async fn get_agent_instructions(
         &self,
-        org_slug: &str,
         repo_id: &uuid::Uuid,
     ) -> Result<AgentInstructionsResponse, Box<dyn Error>> {
         let mut builder = self.client.get(format!(
-            "{}/api/v1/orgs/{}/repos/{}/policies/agent-instructions",
-            self.base_url, org_slug, repo_id
+            "{}/api/v1/repos/{}/policies/agent-instructions",
+            self.base_url, repo_id
         ));
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
@@ -415,13 +385,12 @@ impl ApiClient {
 
     pub async fn verify_commits(
         &self,
-        org_slug: &str,
         repo_id: &uuid::Uuid,
         req: CiVerifyRequest,
     ) -> Result<CiVerifyResponse, Box<dyn Error>> {
         let mut builder = self.client.post(format!(
-            "{}/api/v1/orgs/{}/repos/{}/ci/verify",
-            self.base_url, org_slug, repo_id
+            "{}/api/v1/repos/{}/ci/verify",
+            self.base_url, repo_id
         ));
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
@@ -440,13 +409,12 @@ impl ApiClient {
 
     pub async fn push_commit(
         &self,
-        org_slug: &str,
         repo_id: &str,
         req: &tracevault_protocol::streaming::CommitPushRequest,
     ) -> Result<tracevault_protocol::streaming::CommitPushResponse, Box<dyn Error>> {
         let mut builder = self.client.post(format!(
-            "{}/api/v1/orgs/{}/repos/{}/commits",
-            self.base_url, org_slug, repo_id
+            "{}/api/v1/repos/{}/commits",
+            self.base_url, repo_id
         ));
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
@@ -462,14 +430,12 @@ impl ApiClient {
 
     pub async fn stream_event(
         &self,
-        org_slug: &str,
         repo_id: &str,
         req: &tracevault_protocol::streaming::StreamEventRequest,
     ) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn Error>> {
-        let mut builder = self.client.post(format!(
-            "{}/api/v1/orgs/{}/repos/{}/stream",
-            self.base_url, org_slug, repo_id
-        ));
+        let mut builder = self
+            .client
+            .post(format!("{}/api/v1/repos/{}/stream", self.base_url, repo_id));
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
         }
@@ -492,14 +458,13 @@ impl ApiClient {
     /// project binding resolves for the capturing event.
     pub async fn stream_event_for_project(
         &self,
-        org_slug: &str,
         project_id: uuid::Uuid,
         repo_id: &str,
         req: &tracevault_protocol::streaming::StreamEventRequest,
     ) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn Error>> {
         let mut url = Url::parse(&format!(
-            "{}/api/v1/orgs/{}/projects/{}/stream",
-            self.base_url, org_slug, project_id
+            "{}/api/v1/projects/{}/stream",
+            self.base_url, project_id
         ))?;
         url.query_pairs_mut().append_pair("repo_id", repo_id);
         let mut builder = self.client.post(url);
@@ -517,13 +482,12 @@ impl ApiClient {
 
     pub async fn check_policies(
         &self,
-        org_slug: &str,
         repo_id: &uuid::Uuid,
         req: CheckPoliciesRequest,
     ) -> Result<CheckPoliciesResponse, Box<dyn Error>> {
         let mut builder = self.client.post(format!(
-            "{}/api/v1/orgs/{}/repos/{}/policies/check",
-            self.base_url, org_slug, repo_id
+            "{}/api/v1/repos/{}/policies/check",
+            self.base_url, repo_id
         ));
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
@@ -546,13 +510,9 @@ impl ApiClient {
     /// codebase isn't tracked (404).
     pub async fn resolve_remote(
         &self,
-        org_slug: &str,
         git_url: &str,
     ) -> Result<Option<ResolveRemoteResponse>, Box<dyn std::error::Error>> {
-        let mut url = Url::parse(&format!(
-            "{}/api/v1/orgs/{}/remotes/resolve",
-            self.base_url, org_slug
-        ))?;
+        let mut url = Url::parse(&format!("{}/api/v1/remotes/resolve", self.base_url))?;
         url.query_pairs_mut().append_pair("git_url", git_url);
         let mut builder = self.client.get(url);
         if let Some(key) = &self.api_key {
@@ -575,13 +535,11 @@ impl ApiClient {
     /// clone status, and linked repos.
     pub async fn get_remote_detail(
         &self,
-        org_slug: &str,
         remote_id: uuid::Uuid,
     ) -> Result<RemoteDetail, Box<dyn std::error::Error>> {
-        let mut builder = self.client.get(format!(
-            "{}/api/v1/orgs/{}/remotes/{}",
-            self.base_url, org_slug, remote_id
-        ));
+        let mut builder = self
+            .client
+            .get(format!("{}/api/v1/remotes/{}", self.base_url, remote_id));
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
         }
@@ -598,21 +556,16 @@ impl ApiClient {
     /// The repos linked to a remote (the codebase's members).
     pub async fn get_remote_repos(
         &self,
-        org_slug: &str,
         remote_id: uuid::Uuid,
     ) -> Result<Vec<RemoteRepoRef>, Box<dyn std::error::Error>> {
-        Ok(self.get_remote_detail(org_slug, remote_id).await?.repos)
+        Ok(self.get_remote_detail(remote_id).await?.repos)
     }
 
-    /// List the projects in an org. `GET /api/v1/orgs/{org}/projects`.
-    pub async fn list_projects(
-        &self,
-        org_slug: &str,
-    ) -> Result<Vec<ProjectListItem>, Box<dyn Error>> {
-        let mut builder = self.client.get(format!(
-            "{}/api/v1/orgs/{}/projects",
-            self.base_url, org_slug
-        ));
+    /// List all projects. `GET /api/v1/projects`.
+    pub async fn list_projects(&self) -> Result<Vec<ProjectListItem>, Box<dyn Error>> {
+        let mut builder = self
+            .client
+            .get(format!("{}/api/v1/projects", self.base_url));
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
         }
@@ -629,16 +582,11 @@ impl ApiClient {
         Ok(projects)
     }
 
-    /// Full detail for a project. `GET /api/v1/orgs/{org}/projects/{id}`.
-    pub async fn get_project(
-        &self,
-        org_slug: &str,
-        id: uuid::Uuid,
-    ) -> Result<ProjectDetail, Box<dyn Error>> {
-        let mut builder = self.client.get(format!(
-            "{}/api/v1/orgs/{}/projects/{}",
-            self.base_url, org_slug, id
-        ));
+    /// Full detail for a project. `GET /api/v1/projects/{id}`.
+    pub async fn get_project(&self, id: uuid::Uuid) -> Result<ProjectDetail, Box<dyn Error>> {
+        let mut builder = self
+            .client
+            .get(format!("{}/api/v1/projects/{}", self.base_url, id));
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", format!("Bearer {key}"));
         }
@@ -657,16 +605,12 @@ impl ApiClient {
 
     /// Resolve a git URL to its project, distinguishing "no project" (404)
     /// from "ambiguous, multiple candidate projects" (409).
-    /// `GET /api/v1/orgs/{org}/projects/resolve?git_url=`.
+    /// `GET /api/v1/projects/resolve?git_url=`.
     pub async fn resolve_project(
         &self,
-        org_slug: &str,
         git_url: &str,
     ) -> Result<ResolveProjectOutcome, Box<dyn std::error::Error>> {
-        let mut url = Url::parse(&format!(
-            "{}/api/v1/orgs/{}/projects/resolve",
-            self.base_url, org_slug
-        ))?;
+        let mut url = Url::parse(&format!("{}/api/v1/projects/resolve", self.base_url))?;
         url.query_pairs_mut().append_pair("git_url", git_url);
         let mut builder = self.client.get(url);
         if let Some(key) = &self.api_key {
@@ -729,23 +673,4 @@ pub fn resolve_credentials(project_root: &Path) -> (Option<String>, Option<Strin
         .or(config_api_key);
 
     (server_url, token)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn org_membership_deserializes_and_exposes_slug() {
-        let body = r#"[
-            {"org_id":"00000000-0000-0000-0000-000000000001","org_name":"acme","display_name":"Acme Inc","role":"admin"},
-            {"org_id":"00000000-0000-0000-0000-000000000002","org_name":"globex","display_name":null,"role":"member"}
-        ]"#;
-        let orgs: Vec<OrgMembership> = serde_json::from_str(body).unwrap();
-        assert_eq!(orgs.len(), 2);
-        // org_name is the slug used in URL paths.
-        assert_eq!(orgs[0].org_name, "acme");
-        assert_eq!(orgs[1].org_name, "globex");
-        assert_eq!(orgs[1].display_name, None);
-    }
 }

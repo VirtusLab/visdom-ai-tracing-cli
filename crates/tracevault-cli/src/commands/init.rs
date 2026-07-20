@@ -61,21 +61,6 @@ fn resolve_claude_target(
     })
 }
 
-fn parse_github_org(remote_url: &str) -> Option<String> {
-    // SSH: git@github.com:VirtusLab/visdom-ai-tracing.git
-    if let Some(path) = remote_url.strip_prefix("git@github.com:") {
-        return path.split('/').next().map(String::from);
-    }
-    // HTTPS: https://github.com/VirtusLab/visdom-ai-tracing.git
-    if let Some(path) = remote_url
-        .strip_prefix("https://github.com/")
-        .or_else(|| remote_url.strip_prefix("http://github.com/"))
-    {
-        return path.split('/').next().map(String::from);
-    }
-    None
-}
-
 /// If `dir` is inside a LINKED git worktree (not the primary checkout), return
 /// the primary worktree root. Returns `None` for the primary checkout or a
 /// non-git directory.
@@ -203,15 +188,11 @@ pub async fn init_in_directory(
         eprintln!("Run 'git remote add origin <url>' then 'tracevault sync' to register.");
     }
 
-    // Extract org slug from GitHub remote URL
-    let org_slug = remote_url.as_deref().and_then(parse_github_org);
-
-    // Write config (include server_url and org_slug if available)
+    // Write config (include server_url if available)
     let mut config = TracevaultConfig::default();
     if let Some(url) = server_url {
         config.server_url = Some(url.to_string());
     }
-    config.org_slug = org_slug.clone();
     config.user_context = Some(user_context);
     fs::write(
         TracevaultConfig::config_path(project_root),
@@ -257,7 +238,7 @@ pub async fn init_in_directory(
 
     if resolved_token.is_none() {
         eprintln!("Not logged in. Run 'tracevault login' to register this repo with the server.");
-    } else if let (Some(url), Some(remote), Some(slug)) = (effective_url, remote_url, org_slug) {
+    } else if let (Some(url), Some(remote)) = (effective_url, remote_url) {
         let client = ApiClient::new(&url, resolved_token.as_deref());
         let repo_name = git_repo_name(project_root);
         // Captured before `remote` is moved into the request below, so the
@@ -265,13 +246,10 @@ pub async fn init_in_directory(
         let origin_url = remote.clone();
 
         match client
-            .register_repo(
-                &slug,
-                crate::api_client::RegisterRepoRequest {
-                    repo_name,
-                    github_url: Some(remote),
-                },
-            )
+            .register_repo(crate::api_client::RegisterRepoRequest {
+                repo_name,
+                github_url: Some(remote),
+            })
             .await
         {
             Ok(resp) => {
@@ -284,7 +262,7 @@ pub async fn init_in_directory(
                     // init — `repo_id` above stays authoritative for ingest;
                     // `remote_id`/`codebase_name` here are recorded for
                     // display only.
-                    if let Ok(Some(remote)) = client.resolve_remote(&slug, &origin_url).await {
+                    if let Ok(Some(remote)) = client.resolve_remote(&origin_url).await {
                         println!(
                             "{}",
                             crate::resolution::codebase_line(
@@ -301,13 +279,8 @@ pub async fn init_in_directory(
             }
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("404") {
-                    eprintln!("Warning: organization '{}' not found on the server.", slug);
-                    eprintln!(
-                        "Create it first at your TraceVault instance, then run 'tracevault sync'."
-                    );
-                } else if msg.contains("403") {
-                    eprintln!("Warning: you are not a member of organization '{}'.", slug);
+                if msg.contains("403") {
+                    eprintln!("Warning: you are not authorized to register this repo.");
                 } else {
                     eprintln!("Warning: could not register repo on server: {e}");
                 }
@@ -1132,32 +1105,6 @@ mod tests {
             linked_worktree_primary(tmp.path()).is_none(),
             "a non-git directory is not a linked worktree"
         );
-    }
-
-    #[test]
-    fn parse_github_org_ssh() {
-        assert_eq!(
-            parse_github_org("git@github.com:myorg/myrepo.git"),
-            Some("myorg".into())
-        );
-    }
-
-    #[test]
-    fn parse_github_org_https() {
-        assert_eq!(
-            parse_github_org("https://github.com/myorg/myrepo"),
-            Some("myorg".into())
-        );
-    }
-
-    #[test]
-    fn parse_github_org_non_github_returns_none() {
-        assert_eq!(parse_github_org("https://gitlab.com/org/repo"), None);
-    }
-
-    #[test]
-    fn parse_github_org_invalid() {
-        assert_eq!(parse_github_org("not-a-url"), None);
     }
 
     #[test]

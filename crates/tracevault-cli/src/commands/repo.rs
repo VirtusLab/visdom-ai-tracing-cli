@@ -4,8 +4,7 @@ use std::path::Path;
 
 use crate::api_client::{resolve_credentials, ApiClient};
 use crate::resolution::{
-    binding_from_config, effective_binding, org_slug_for, resolve_path_to_binding, BindingSource,
-    ResolveInputs,
+    binding_from_config, effective_binding, resolve_path_to_binding, BindingSource, ResolveInputs,
 };
 use crate::session_state::{self, RepoBinding, SessionState};
 
@@ -101,18 +100,15 @@ pub async fn run(
 /// status override).
 async fn resolve_switch_binding(
     path: &Path,
-    org_slug: &str,
     client: &ApiClient,
 ) -> Result<RepoBinding, Box<dyn std::error::Error>> {
-    resolve_path_to_binding(path, org_slug, client)
-        .await?
-        .ok_or_else(|| {
-            format!(
-                "repo at {} is not registered with TraceVault (org {org_slug}); nothing to bind",
-                path.display()
-            )
-            .into()
-        })
+    resolve_path_to_binding(path, client).await?.ok_or_else(|| {
+        format!(
+            "repo at {} is not registered with TraceVault; nothing to bind",
+            path.display()
+        )
+        .into()
+    })
 }
 
 /// Apply a switch to session state (session-level active binding). Pure.
@@ -202,35 +198,17 @@ async fn switch(
     project_root: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate the target argument before any network work, so a bad/empty
-    // path or name surfaces as an argument error rather than an unrelated org
-    // or network error from the derivation step below.
+    // path or name surfaces as an argument error rather than an unrelated
+    // network error from the resolution step below.
     let target = switch_target(path, name)?;
 
-    // Build the client first: deriving an org from the credential needs it.
     let (server_url, token) = resolve_credentials(project_root);
     let server_url = server_url
         .ok_or("no server URL configured: set TRACEVAULT_SERVER_URL or run `tracevault login`")?;
     let client = ApiClient::new(&server_url, token.as_deref());
 
-    // Locally-configured org wins (env / credentials / bound config). Only when
-    // none is set do we ask the server which org this credential belongs to —
-    // this is what lets a service-account key bind a repo before checkout.
-    let org_slug = match org_slug_for(project_root) {
-        Some(s) => s,
-        None => {
-            let orgs = client.list_my_orgs().await.map_err(|e| {
-                format!(
-                    "no org configured and could not derive it from your credential ({e}); \
-                     set TRACEVAULT_ORG_SLUG, log in, or run inside a bound repo checkout"
-                )
-            })?;
-            let slugs: Vec<String> = orgs.into_iter().map(|o| o.org_name).collect();
-            crate::resolution::org_slug_from_slugs(&slugs)?
-        }
-    };
-
     let binding = match target {
-        SwitchTarget::Path(p) => resolve_switch_binding(Path::new(p), &org_slug, &client).await?,
+        SwitchTarget::Path(p) => resolve_switch_binding(Path::new(p), &client).await?,
     };
 
     // Validate the repo id BEFORE persisting anything: a malformed repo_id must
@@ -252,26 +230,20 @@ async fn switch(
             let mut state = session_state::load(&id);
             apply_switch(&mut state, binding.clone());
             session_state::save(&id, &state)?;
-            println!(
-                "bound session {id} to repo {} (org {})",
-                binding.repo_id, binding.org_slug
-            );
+            println!("bound session {id} to repo {}", binding.repo_id);
         }
         SwitchDest::UserDefault => {
             crate::user_default::save(&binding)?;
             println!(
-                "set user-level default repo {} (org {}); applies to new sessions without their own binding (the current session, if any, is unchanged — omit --user to bind this session)",
-                binding.repo_id, binding.org_slug
+                "set user-level default repo {}; applies to new sessions without their own binding (the current session, if any, is unchanged — omit --user to bind this session)",
+                binding.repo_id
             );
         }
     }
 
     // Best-effort policy fetch (applies to either destination). A failure here
     // must not make the whole command report as an error.
-    match client
-        .get_agent_instructions(&binding.org_slug, &repo_uuid)
-        .await
-    {
+    match client.get_agent_instructions(&repo_uuid).await {
         Ok(policies) => println!("{}", policies.content),
         Err(e) => eprintln!("warning: bound, but could not fetch policies: {e}"),
     }
@@ -280,21 +252,13 @@ async fn switch(
 
 /// Resolve a `--path <path>` override into a live `RepoBinding`, if possible.
 /// Best-effort: prints a clear message and returns `None` on any failure
-/// (missing org slug / credentials, or a server error) rather than failing
-/// the whole `status` inspector.
+/// (missing credentials, or a server error) rather than failing the whole
+/// `status` inspector.
 async fn resolve_repo_flag(
     repo_flag_path: Option<&str>,
     project_root: &Path,
 ) -> Option<RepoBinding> {
     let path = repo_flag_path?;
-
-    let Some(org_slug) = org_slug_for(project_root) else {
-        eprintln!(
-            "--path {path}: no org slug configured (set TRACEVAULT_ORG_SLUG, log in, or bind \
-             the repo); showing binding without the --path override"
-        );
-        return None;
-    };
 
     let (server_url, token) = resolve_credentials(project_root);
     let Some(server_url) = server_url else {
@@ -306,7 +270,7 @@ async fn resolve_repo_flag(
     };
 
     let client = ApiClient::new(&server_url, token.as_deref());
-    match resolve_path_to_binding(Path::new(path), &org_slug, &client).await {
+    match resolve_path_to_binding(Path::new(path), &client).await {
         Ok(Some(binding)) => Some(binding),
         Ok(None) => {
             eprintln!(
@@ -329,10 +293,7 @@ async fn resolve_repo_flag(
 /// which precedence tier. Kept separate from I/O so it can be unit-tested.
 fn format_status(binding: Option<(&RepoBinding, BindingSource)>) -> String {
     match binding {
-        Some((b, source)) => format!(
-            "bound to repo {} (org {}) via {source}",
-            b.repo_id, b.org_slug
-        ),
+        Some((b, source)) => format!("bound to repo {} via {source}", b.repo_id),
         None => {
             "not bound to any repo (workspace mode; run `tracevault repo switch <path>`)".into()
         }
@@ -363,7 +324,7 @@ async fn status(
         .as_ref()
         .and_then(binding_from_config);
 
-    // A --path override on status resolves live (needs org_slug + server).
+    // A --path override on status resolves live (needs the server).
     let repo_flag = resolve_repo_flag(repo_flag_path, project_root).await;
 
     let user_default = crate::user_default::load();
@@ -392,24 +353,20 @@ async fn status(
             .as_ref()
             .map(|su| ApiClient::new(su, token.as_deref()));
         let detail_line = if let (Some(client), Some(remote_id)) = (&client, binding.remote_id) {
-            client
-                .get_remote_detail(&binding.org_slug, remote_id)
-                .await
-                .ok()
-                .map(|d| {
-                    crate::resolution::codebase_line(
-                        d.name.as_deref(),
-                        &d.normalized_url,
-                        &d.clone_status,
-                    )
-                })
+            client.get_remote_detail(remote_id).await.ok().map(|d| {
+                crate::resolution::codebase_line(
+                    d.name.as_deref(),
+                    &d.normalized_url,
+                    &d.clone_status,
+                )
+            })
         } else {
             None
         };
         let resolved_line = if detail_line.is_none() {
             if let (Some(client), Some(git_url)) = (&client, binding.git_url.as_deref()) {
                 client
-                    .resolve_remote(&binding.org_slug, git_url)
+                    .resolve_remote(git_url)
                     .await
                     .ok()
                     .flatten()
@@ -443,7 +400,7 @@ async fn status(
     );
     if let Some(ud) = &user_default {
         if !default_is_effective {
-            println!("user default: repo {} (org {})", ud.repo_id, ud.org_slug);
+            println!("user default: repo {}", ud.repo_id);
         }
     }
     Ok(())
@@ -536,7 +493,6 @@ mod tests {
 
     fn binding(id: &str) -> RepoBinding {
         RepoBinding {
-            org_slug: "org".into(),
             repo_id: id.into(),
             git_url: None,
             remote_id: None,
@@ -587,7 +543,7 @@ mod tests {
         let b = binding("r1");
         assert_eq!(
             format_status(Some((&b, BindingSource::RepoFlag))),
-            "bound to repo r1 (org org) via --path override"
+            "bound to repo r1 via --path override"
         );
     }
 
@@ -596,7 +552,7 @@ mod tests {
         let b = binding("r2");
         assert_eq!(
             format_status(Some((&b, BindingSource::Subagent))),
-            "bound to repo r2 (org org) via subagent worktree override"
+            "bound to repo r2 via subagent worktree override"
         );
     }
 
@@ -605,7 +561,7 @@ mod tests {
         let b = binding("r3");
         assert_eq!(
             format_status(Some((&b, BindingSource::SessionActive))),
-            "bound to repo r3 (org org) via session (repo switch)"
+            "bound to repo r3 via session (repo switch)"
         );
     }
 
@@ -614,7 +570,7 @@ mod tests {
         let b = binding("r4");
         assert_eq!(
             format_status(Some((&b, BindingSource::Bound))),
-            "bound to repo r4 (org org) via bound .tracevault/config.toml"
+            "bound to repo r4 via bound .tracevault/config.toml"
         );
     }
 
@@ -623,7 +579,7 @@ mod tests {
         let b = binding("r5");
         assert_eq!(
             format_status(Some((&b, BindingSource::UserDefault))),
-            "bound to repo r5 (org org) via user default (repo switch --user)"
+            "bound to repo r5 via user default (repo switch --user)"
         );
     }
 
@@ -706,11 +662,10 @@ mod tests {
         let base = spawn_n(vec![http_200(&remote), http_200(&detail)]);
         let client = ApiClient::new(&base, Some("tok"));
 
-        let got = resolve_switch_binding(tmp.path(), "org", &client)
+        let got = resolve_switch_binding(tmp.path(), &client)
             .await
             .expect("expected Ok binding");
         assert_eq!(got.repo_id, repo_id);
-        assert_eq!(got.org_slug, "org");
         assert_eq!(got.remote_id, Some(remote_id.parse().unwrap()));
         assert_eq!(got.codebase_name.as_deref(), Some("repo"));
     }
@@ -725,7 +680,7 @@ mod tests {
         let base = spawn_once(resp);
         let client = ApiClient::new(&base, Some("tok"));
 
-        let err = resolve_switch_binding(tmp.path(), "org", &client)
+        let err = resolve_switch_binding(tmp.path(), &client)
             .await
             .expect_err("expected Err for unregistered repo");
         assert!(
@@ -763,7 +718,7 @@ mod tests {
         let detail = r#"{"id":"44000761-8d22-4256-bd2c-27a0ba278c6f","name":"x","normalized_url":"github.com/o/x","clone_url":"https://github.com/o/x.git","clone_status":"ready","clone_error":null,"last_fetched_at":null,"repo_count":1,"created_at":"2026-01-01T00:00:00Z","repos":[{"id":"11111111-1111-4111-8111-111111111111","name":"x"}]}"#;
         let base = spawn_n(vec![http_200(remote), http_200(detail)]);
         let client = ApiClient::new(&base, Some("tok"));
-        let b = resolve_path_to_binding(tmp.path(), "org", &client)
+        let b = resolve_path_to_binding(tmp.path(), &client)
             .await
             .unwrap()
             .expect("Some binding");
@@ -785,7 +740,7 @@ mod tests {
         let detail = r#"{"id":"44000761-8d22-4256-bd2c-27a0ba278c6f","name":"x","normalized_url":"github.com/o/x","clone_url":"https://github.com/o/x.git","clone_status":"pending","clone_error":null,"last_fetched_at":null,"repo_count":0,"created_at":"2026-01-01T00:00:00Z","repos":[]}"#;
         let base = spawn_n(vec![http_200(remote), http_200(detail)]);
         let client = ApiClient::new(&base, Some("tok"));
-        let err = resolve_path_to_binding(tmp.path(), "org", &client)
+        let err = resolve_path_to_binding(tmp.path(), &client)
             .await
             .unwrap_err()
             .to_string();
