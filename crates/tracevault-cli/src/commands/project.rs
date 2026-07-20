@@ -323,9 +323,7 @@ async fn status(
             enrich_deduced_name(resolved, items.as_deref())
         }
         Err(e) => {
-            eprintln!(
-                "warning: could not resolve org/credentials ({e}); showing local status only"
-            );
+            eprintln!("warning: could not resolve credentials ({e}); showing local status only");
             let inputs = ProjectResolveInputs {
                 project_flag: None,
                 session: &session,
