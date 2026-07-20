@@ -482,6 +482,39 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
+    /// Project-scoped variant of `stream_event`: posts to the project's
+    /// stream endpoint with `repo_id` as a query param instead of a path
+    /// segment. The query is built with `Url::query_pairs_mut`, mirroring
+    /// `resolve_project`'s `?git_url=`, so `repo_id` is percent-encoded
+    /// rather than string-interpolated into the URL.
+    ///
+    /// Called from `commands::stream::send_stream_event` when a local
+    /// project binding resolves for the capturing event.
+    pub async fn stream_event_for_project(
+        &self,
+        org_slug: &str,
+        project_id: uuid::Uuid,
+        repo_id: &str,
+        req: &tracevault_protocol::streaming::StreamEventRequest,
+    ) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn Error>> {
+        let mut url = Url::parse(&format!(
+            "{}/api/v1/orgs/{}/projects/{}/stream",
+            self.base_url, org_slug, project_id
+        ))?;
+        url.query_pairs_mut().append_pair("repo_id", repo_id);
+        let mut builder = self.client.post(url);
+        if let Some(key) = &self.api_key {
+            builder = builder.header("Authorization", format!("Bearer {key}"));
+        }
+        let resp = builder.json(req).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Project stream failed ({status}): {body}").into());
+        }
+        Ok(resp.json().await?)
+    }
+
     pub async fn check_policies(
         &self,
         org_slug: &str,

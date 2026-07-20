@@ -173,6 +173,129 @@ pub(crate) fn resolve_stream_binding(
     .map(|(b, _)| b)
 }
 
+/// Resolve the capture-time project from LOCAL, UUID-bearing bindings only — no
+/// network (the hook fires per event in a short-lived process). Precedence:
+/// subagent worktree override -> session `active_project` -> user-level default.
+/// Repo config `default_project` (a name) is intentionally excluded: honoring it
+/// would need a per-event `list_projects` call. `None` -> fall back to the
+/// repo-scoped stream (server deduces).
+fn capture_project(
+    session: &crate::session_state::SessionState,
+    worktree_path: Option<&str>,
+) -> Option<uuid::Uuid> {
+    use crate::resolution::{effective_project, ProjectResolveInputs};
+    let local = effective_project(&ProjectResolveInputs {
+        project_flag: None,
+        session,
+        worktree_path,
+        config_default: None,
+    })
+    .map(|(b, _)| b)
+    .or_else(crate::user_project_default::load)?;
+    local.project_id.parse::<uuid::Uuid>().ok()
+}
+
+/// True when a stream-send error's rendered message carries a `(4xx ...)`
+/// status marker — i.e. the server deterministically rejected the request in
+/// a way that will never succeed on blind retry (bad binding, missing
+/// permission, ambiguous repo, ...). Deliberately excludes 5xx and
+/// transport/network/timeout failures (which have no `(NNN ` marker at all,
+/// or a 5xx one) — those remain transient and must keep propagating so the
+/// existing buffer/retry logic in `run_stream` still applies to them.
+///
+/// Takes `&dyn Error` rather than `&Box<dyn Error>` to avoid the clippy
+/// `borrowed_box` lint at call sites that already hold a `Box<dyn Error>`.
+fn is_deterministic_client_error(e: &dyn std::error::Error) -> bool {
+    let s = e.to_string();
+    // 401 is deliberately excluded: it's an authentication failure (bad/expired
+    // token), not a project-scoping problem, and the repo-scoped fallback uses
+    // the SAME token — it would also 401, so falling back just wastes a
+    // request before the error propagates to buffer/retry. 403 stays in: it
+    // means the token is valid but lacks TracePush on the bound project, and
+    // the repo-scoped fallback (a different authorization check) can help.
+    ["(400 ", "(403 ", "(404 ", "(409 "]
+        .iter()
+        .any(|marker| s.contains(marker))
+}
+
+/// True when an error's rendered message carries the server's stable
+/// "repo/remote belongs to multiple projects" refusal token. Both the
+/// `repo_in_multiple_projects` and `remote_in_multiple_projects` error codes
+/// contain the substring `multiple_projects` (underscore) — the server never
+/// emits the space-separated phrase "multiple projects", so matching on that
+/// phrase (the pre-fix behavior) never fires.
+fn is_multi_project_refusal(e: &dyn std::error::Error) -> bool {
+    e.to_string().contains("multiple_projects")
+}
+
+/// Send a single stream event, routing to the project-scoped endpoint when a
+/// local project binding resolved (`capture_pid = Some(_)`), else the
+/// repo-scoped endpoint (server-side deduction/refusal). Factored out so both
+/// the pending-flush loop and the live send share one branch.
+///
+/// When `capture_pid` is `Some(_)` and the project-scoped send fails with a
+/// deterministic client error (the bound project doesn't apply to this repo:
+/// not a member, or the caller lacks `TracePush` on it, or — after a prior
+/// fallback — the repo-scoped 409 multi-project refusal), this falls back to
+/// the repo-scoped endpoint ONCE and lets the server deduce the repo's
+/// project, warning so the miss is visible. A transient error (5xx,
+/// network/transport, timeout) is NOT retried here — it propagates so the
+/// caller's existing buffer/retry logic runs unchanged.
+///
+/// `fallback_warned` is shared across every call made for a single hook
+/// invocation (both the pending-flush loop and the live send). The
+/// pending-flush loop only `break`s on `Err`, not on a fallback that itself
+/// returns `Ok` — so a stale binding whose repo-scoped fallback keeps
+/// succeeding would otherwise print the warning once per buffered event.
+/// Gating on `*fallback_warned` caps it at one warning per invocation while
+/// leaving the fallback behavior itself unchanged.
+async fn send_stream_event(
+    client: &crate::api_client::ApiClient,
+    org_slug: &str,
+    repo_id: &str,
+    capture_pid: Option<uuid::Uuid>,
+    req: &StreamEventRequest,
+    fallback_warned: &mut bool,
+) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn std::error::Error>> {
+    match capture_pid {
+        None => client.stream_event(org_slug, repo_id, req).await,
+        Some(pid) => match client
+            .stream_event_for_project(org_slug, pid, repo_id, req)
+            .await
+        {
+            Ok(r) => Ok(r),
+            Err(e) if is_deterministic_client_error(e.as_ref()) => {
+                if !*fallback_warned {
+                    eprintln!(
+                        "tracevault: warning: active project {pid} does not apply to this repo (not a member, or missing permission); attributing via repo deduction instead. Run `tracevault project switch <name>` to update."
+                    );
+                    *fallback_warned = true;
+                }
+                // Repo-scoped fallback: the server deduces the project itself.
+                // This can itself return the multi-project 409, which
+                // `warn_if_multi_project_refusal` surfaces at the call site.
+                client.stream_event(org_slug, repo_id, req).await
+            }
+            Err(e) => Err(e), // transient — propagate for buffer/retry
+        },
+    }
+}
+
+/// Surface the server's ambiguous-repo refusal (repo belongs to more than one
+/// project, so a repo-scoped send can't attribute unambiguously) as an
+/// actionable warning instead of a bare error. Fires on the FINAL error
+/// regardless of whether `capture_pid` was `Some` or `None`: with no local
+/// project binding this is a direct repo-scoped 409; with a binding it can
+/// still occur after `send_stream_event`'s deterministic-client-error
+/// fallback re-sends to the repo-scoped endpoint.
+fn warn_if_multi_project_refusal(e: &dyn std::error::Error) {
+    if is_multi_project_refusal(e) {
+        eprintln!(
+            "tracevault: warning: this repo belongs to multiple projects; capture is unattributed. Run `tracevault project switch <name>` to pick one."
+        );
+    }
+}
+
 /// Record-count offset arithmetic for the inline (fileless) path, mirroring the
 /// byte-offset semantics of `read_new_transcript_lines`: returns
 /// `(send_offset, next_offset)` where `send_offset` is stamped on the request as
@@ -473,6 +596,11 @@ pub async fn run_stream(
     let org_slug = binding.org_slug.as_str();
     let repo_id = binding.repo_id.as_str();
 
+    // Explicit local project binding (if any) overrides server-side repo
+    // deduction. Computed once, reusing the already-loaded session + worktree
+    // used just above for the repo-binding resolution.
+    let capture_pid = capture_project(&session, Some(worktree_top.as_str()));
+
     // 8. Create ApiClient
     let server_url = server_url.ok_or("server_url not configured")?;
     let client = crate::api_client::ApiClient::new(&server_url, token.as_deref());
@@ -482,15 +610,25 @@ pub async fn run_stream(
     let pending_events = drain_pending(&pending_path)?;
 
     let mut send_failed = false;
+    // Spans the whole invocation (pending-flush loop + live send below) so a
+    // stale binding whose repo-scoped fallback keeps succeeding warns at most
+    // once, not once per buffered event.
+    let mut fallback_warned = false;
 
     // Send pending events first
     for pending_json in &pending_events {
         if let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(pending_json) {
-            if client
-                .stream_event(org_slug, repo_id, &pending_req)
-                .await
-                .is_err()
+            if let Err(e) = send_stream_event(
+                &client,
+                org_slug,
+                repo_id,
+                capture_pid,
+                &pending_req,
+                &mut fallback_warned,
+            )
+            .await
             {
+                warn_if_multi_project_refusal(e.as_ref());
                 // Re-queue all remaining pending events
                 for evt in &pending_events {
                     append_pending(&pending_path, evt)?;
@@ -517,14 +655,24 @@ pub async fn run_stream(
             fs::write(&offset_path, new_offset.to_string())?;
         }
     } else {
-        match client.stream_event(org_slug, repo_id, &req).await {
+        match send_stream_event(
+            &client,
+            org_slug,
+            repo_id,
+            capture_pid,
+            &req,
+            &mut fallback_warned,
+        )
+        .await
+        {
             Ok(_) => {
                 // 10. On success update .stream_offset
                 fs::write(&offset_path, new_offset.to_string())?;
             }
-            Err(_) => {
+            Err(e) => {
                 // 11. On failure append to pending.jsonl (advance the inline
                 // record counter regardless — see the note above).
+                warn_if_multi_project_refusal(e.as_ref());
                 append_pending(&pending_path, &req_json)?;
                 if is_inline {
                     fs::write(&offset_path, new_offset.to_string())?;
@@ -1018,5 +1166,493 @@ mod tests {
             "second read's start_offset must equal the first read's persisted end_offset"
         );
         assert!(end_offset2 > start_offset2);
+    }
+
+    // ── capture_project: local-only project resolver ──────────────────────────
+
+    #[test]
+    fn capture_project_precedence_local_only() {
+        use crate::session_state::{ProjectBinding, SessionState};
+        let pb = |id: &str| ProjectBinding {
+            org_slug: "o".into(),
+            project_id: id.into(),
+            project_name: "n".into(),
+            updated_at: "".into(),
+        };
+        let u = uuid::Uuid::from_u128;
+        // session active only
+        let s = SessionState {
+            active_project: Some(pb(&u(2).to_string())),
+            ..Default::default()
+        };
+        assert_eq!(capture_project(&s, Some("/wt")), Some(u(2)));
+        // subagent worktree beats session
+        let mut s = s;
+        s.subagent_projects
+            .insert("/wt".into(), pb(&u(1).to_string()));
+        assert_eq!(capture_project(&s, Some("/wt")), Some(u(1)));
+        // no worktree match -> session active
+        assert_eq!(capture_project(&s, Some("/other")), Some(u(2)));
+        // empty session -> None (user-default file is not present in this unit test env)
+        assert_eq!(capture_project(&SessionState::default(), None), None);
+        // malformed stored id -> None (defensive)
+        let bad = SessionState {
+            active_project: Some(pb("not-a-uuid")),
+            ..Default::default()
+        };
+        assert_eq!(capture_project(&bad, None), None);
+    }
+
+    // ── send_stream_event: endpoint routing based on capture_pid ──────────────
+
+    use std::io::BufReader;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// How long an accept loop waits for a connection that never arrives
+    /// (e.g. a regression that stops the client from making an expected
+    /// request) before giving up, so the server thread exits cleanly
+    /// instead of blocking in `accept()` forever.
+    const ACCEPT_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// Poll a non-blocking `listener` for a connection until one arrives or
+    /// `ACCEPT_DEADLINE` elapses. Returns `None` on timeout (or any non-
+    /// `WouldBlock` accept error) so callers can stop cleanly rather than
+    /// block forever.
+    fn accept_with_deadline(listener: &TcpListener) -> Option<std::net::TcpStream> {
+        let deadline = Instant::now() + ACCEPT_DEADLINE;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // The accepted stream's blocking mode isn't guaranteed to
+                    // be inherited from the (non-blocking) listener across
+                    // platforms — make it explicitly blocking so the
+                    // subsequent read/write calls behave as before.
+                    let _ = stream.set_nonblocking(false);
+                    return Some(stream);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// How long a test waits for the captured request before failing (rather
+    /// than hanging forever if the client never connects). Mirrors the
+    /// harness in `tests/stream_event_project_test.rs`.
+    const SEND_STREAM_EVENT_RECV_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Spawn a one-shot server that returns `response` (a full HTTP response)
+    /// to the first request. Captures the HTTP request line (method + path +
+    /// query) over the returned channel before writing the response. Mirrors
+    /// the harness in `tests/stream_event_project_test.rs` /
+    /// `tests/resolve_remote_test.rs`.
+    fn spawn_once_capturing_request(response: &'static str) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            if let Some(stream) = accept_with_deadline(&listener) {
+                let mut reader = BufReader::new(stream);
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let _ = tx.send(request_line);
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    fn ok_stream_response() -> String {
+        let body = serde_json::to_string(&tracevault_protocol::streaming::StreamEventResponse {
+            session_db_id: uuid::Uuid::nil(),
+            event_db_id: Some(uuid::Uuid::nil()),
+            status: "accepted".to_string(),
+        })
+        .unwrap();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn sample_stream_event_request() -> StreamEventRequest {
+        StreamEventRequest {
+            protocol_version: 2,
+            tool: Some("claude-code".to_string()),
+            event_type: StreamEventType::ToolUse,
+            session_id: "sess-1".into(),
+            timestamp: chrono::Utc::now(),
+            hook_event_name: Some("PostToolUse".into()),
+            tool_name: None,
+            tool_use_id: None,
+            tool_input: None,
+            tool_response: None,
+            tool_is_error: None,
+            event_index: None,
+            event_uuid: None,
+            transcript_lines: None,
+            transcript_offset: None,
+            model: None,
+            cwd: None,
+            final_stats: None,
+            flow_id: None,
+            labels: None,
+            params: None,
+        }
+    }
+
+    /// With a `SessionState` whose `active_project` is set, `capture_project`
+    /// resolves a `capture_pid`, and `send_stream_event` must route to the
+    /// project-scoped endpoint (`/projects/{pid}/stream?repo_id=...`) rather
+    /// than the repo-scoped one.
+    #[tokio::test]
+    async fn send_stream_event_routes_to_project_endpoint_when_binding_active() {
+        use crate::session_state::{ProjectBinding, SessionState};
+
+        // Isolate from any ambient user-level project default so this test's
+        // `capture_project` call depends only on the SessionState below —
+        // mirrors the isolation pattern in `commands::project`'s tests.
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+
+        let pid = uuid::Uuid::from_u128(99);
+        let session = SessionState {
+            active_project: Some(ProjectBinding {
+                org_slug: "org".into(),
+                project_id: pid.to_string(),
+                project_name: "proj".into(),
+                updated_at: "".into(),
+            }),
+            ..Default::default()
+        };
+        let capture_pid = capture_project(&session, None);
+        assert_eq!(capture_pid, Some(pid));
+
+        let resp = ok_stream_response();
+        let (base, rx) = spawn_once_capturing_request(Box::leak(resp.into_boxed_str()));
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let req = sample_stream_event_request();
+
+        let mut fallback_warned = false;
+        let got = send_stream_event(
+            &client,
+            "org",
+            "11111111-1111-1111-1111-111111111111",
+            capture_pid,
+            &req,
+            &mut fallback_warned,
+        )
+        .await
+        .expect("send_stream_event must succeed");
+        assert_eq!(got.status, "accepted");
+
+        let line = rx
+            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
+            .expect("no request captured");
+        assert!(
+            line.starts_with(&format!(
+                "POST /api/v1/orgs/org/projects/{pid}/stream?repo_id=11111111-1111-1111-1111-111111111111 "
+            )),
+            "an active project binding must route to the project-scoped endpoint, got: {line}"
+        );
+    }
+
+    /// With an empty binding (default `SessionState`, no worktree override)
+    /// and no user-level default present in the test env, `capture_project`
+    /// resolves `None` and `send_stream_event` must fall back to the
+    /// repo-scoped endpoint.
+    #[tokio::test]
+    async fn send_stream_event_routes_to_repo_endpoint_when_no_binding() {
+        use crate::session_state::SessionState;
+
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        // No user_project.toml under this isolated config dir, so there is no
+        // ambient user-level default to leak in.
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+
+        let capture_pid = capture_project(&SessionState::default(), None);
+        assert_eq!(capture_pid, None);
+
+        let resp = ok_stream_response();
+        let (base, rx) = spawn_once_capturing_request(Box::leak(resp.into_boxed_str()));
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let req = sample_stream_event_request();
+
+        let mut fallback_warned = false;
+        let got = send_stream_event(
+            &client,
+            "org",
+            "11111111-1111-1111-1111-111111111111",
+            capture_pid,
+            &req,
+            &mut fallback_warned,
+        )
+        .await
+        .expect("send_stream_event must succeed");
+        assert_eq!(got.status, "accepted");
+
+        let line = rx
+            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
+            .expect("no request captured");
+        assert!(
+            line.starts_with(
+                "POST /api/v1/orgs/org/repos/11111111-1111-1111-1111-111111111111/stream "
+            ),
+            "no binding must fall back to the repo-scoped endpoint, got: {line}"
+        );
+    }
+
+    // ── is_multi_project_refusal / is_deterministic_client_error predicates ───
+
+    /// A minimal `std::error::Error` wrapping a fixed message, for exercising
+    /// the string-matching predicates against exact server-shaped text
+    /// without going over the network.
+    #[derive(Debug)]
+    struct FixedError(String);
+    impl std::fmt::Display for FixedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+    impl std::error::Error for FixedError {}
+
+    /// C1: the server's real 409 body uses `repo_in_multiple_projects` /
+    /// `remote_in_multiple_projects` (underscore) — never the space-separated
+    /// "multiple projects" phrase the pre-fix predicate matched on. Both
+    /// stable codes must be recognized; the dead space-phrase must not be
+    /// required to match.
+    #[test]
+    fn is_multi_project_refusal_matches_real_server_codes() {
+        let repo_code = FixedError(
+            "stream_event failed (409 Conflict): {\"error\":\"Repo 11111111-1111-1111-1111-111111111111 belongs to 2 projects; pass a project explicitly (--project) or set default_project.\",\"code\":\"repo_in_multiple_projects\"}"
+                .to_string(),
+        );
+        assert!(
+            is_multi_project_refusal(&repo_code),
+            "must recognize the repo_in_multiple_projects code"
+        );
+
+        let remote_code = FixedError(
+            "stream_event failed (409 Conflict): {\"error\":\"...\",\"code\":\"remote_in_multiple_projects\"}"
+                .to_string(),
+        );
+        assert!(
+            is_multi_project_refusal(&remote_code),
+            "must recognize the remote_in_multiple_projects code"
+        );
+
+        // Sanity: the OLD buggy predicate matched on the space-separated
+        // phrase, which the server never actually sends — confirm that a
+        // message containing ONLY that phrase (no underscore token) does NOT
+        // satisfy the FIXED predicate, i.e. this isn't accidentally matching
+        // on substring "multiple projects" too.
+        let space_phrase_only = FixedError("this repo belongs to multiple projects".to_string());
+        assert!(
+            !is_multi_project_refusal(&space_phrase_only),
+            "fixed predicate must key on the underscore token, not the dead space phrase"
+        );
+    }
+
+    /// C1 end-to-end: drive a REAL 409 response (repo-scoped send, no local
+    /// project binding) through `send_stream_event` and confirm the resulting
+    /// error's rendered message satisfies `is_multi_project_refusal` — i.e.
+    /// the warning `send_stream_event`'s callers rely on would actually fire
+    /// against genuine server output, not just a hand-written string.
+    #[tokio::test]
+    async fn c1_real_409_multi_project_body_triggers_refusal_predicate() {
+        let body = r#"{"error":"Repo 11111111-1111-1111-1111-111111111111 belongs to 2 projects; pass a project explicitly (--project) or set default_project.","code":"repo_in_multiple_projects"}"#;
+        let resp = format!(
+            "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (base, _rx) = spawn_once_capturing_request(Box::leak(resp.into_boxed_str()));
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let req = sample_stream_event_request();
+
+        let mut fallback_warned = false;
+        let err = send_stream_event(
+            &client,
+            "org",
+            "11111111-1111-1111-1111-111111111111",
+            None,
+            &req,
+            &mut fallback_warned,
+        )
+        .await
+        .expect_err("409 multi-project refusal must surface as Err");
+
+        assert!(
+            is_multi_project_refusal(err.as_ref()),
+            "real server 409 body must satisfy the multi-project refusal predicate, got: {err}"
+        );
+    }
+
+    // ── I1/I2: deterministic-client-error fallback + transient no-fallback ───
+
+    /// Spawn a server that replies to up to `responses.len()` sequential
+    /// connections with the given full HTTP responses, in order, capturing
+    /// each request line over the channel. The listening socket itself is
+    /// dropped (closing it) once all responses have been served, so any
+    /// further connection attempt fails fast (connection refused) rather than
+    /// hanging for the client's request timeout — this lets a test assert
+    /// "no further request was sent" cheaply.
+    fn spawn_n_capturing_requests(
+        responses: Vec<&'static str>,
+    ) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for response in responses {
+                // If a regression stops the client from making this request
+                // (e.g. the expected Nth call never happens), don't block
+                // forever in `accept()` — give up after `ACCEPT_DEADLINE`
+                // and let the thread end so the test process can't hang.
+                let Some(stream) = accept_with_deadline(&listener) else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream);
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let _ = tx.send(request_line);
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+            // `listener` (and `tx`) drop here, closing the socket and the
+            // channel — a stray extra request gets ECONNREFUSED immediately
+            // instead of hanging, and a stray extra `rx.recv` returns
+            // Disconnected immediately instead of blocking.
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// I1: a deterministic 400 ("is not a member of project ...") from the
+    /// project-scoped endpoint must fall back to the repo-scoped endpoint —
+    /// which then succeeds — rather than being buffered/retried forever. Both
+    /// endpoints must be hit, project first, then repo.
+    #[tokio::test]
+    async fn send_stream_event_falls_back_to_repo_scoped_on_deterministic_400() {
+        let body_400 = "repo 11111111-1111-1111-1111-111111111111 is not a member of project 22222222-2222-2222-2222-222222222222";
+        let resp_400 = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body_400.len(),
+            body_400
+        );
+        let resp_200 = ok_stream_response();
+
+        let (base, rx) = spawn_n_capturing_requests(vec![
+            Box::leak(resp_400.into_boxed_str()),
+            Box::leak(resp_200.into_boxed_str()),
+        ]);
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let req = sample_stream_event_request();
+        let pid = uuid::Uuid::from_u128(42);
+
+        let mut fallback_warned = false;
+        let got = send_stream_event(
+            &client,
+            "org",
+            "11111111-1111-1111-1111-111111111111",
+            Some(pid),
+            &req,
+            &mut fallback_warned,
+        )
+        .await
+        .expect("a deterministic 400 must fall back to repo-scoped and succeed");
+        assert_eq!(got.status, "accepted");
+
+        let first = rx
+            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
+            .expect("no first request captured");
+        assert!(
+            first.contains(&format!("/projects/{pid}/stream")),
+            "first request must hit the project-scoped endpoint, got: {first}"
+        );
+
+        let second = rx
+            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
+            .expect("no second (fallback) request captured");
+        assert!(
+            second.starts_with(
+                "POST /api/v1/orgs/org/repos/11111111-1111-1111-1111-111111111111/stream "
+            ),
+            "second request must fall back to the repo-scoped endpoint, got: {second}"
+        );
+    }
+
+    /// I2: a transient 503 from the project-scoped endpoint must propagate as
+    /// an `Err` WITHOUT falling back to the repo-scoped endpoint, so the
+    /// existing buffer/retry logic in `run_stream` still handles it. Only one
+    /// request (to the project endpoint) may be observed.
+    #[tokio::test]
+    async fn send_stream_event_does_not_fall_back_on_transient_503() {
+        let body_503 = "internal error";
+        let resp_503 = format!(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body_503.len(),
+            body_503
+        );
+        let (base, rx) = spawn_n_capturing_requests(vec![Box::leak(resp_503.into_boxed_str())]);
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let req = sample_stream_event_request();
+        let pid = uuid::Uuid::from_u128(7);
+
+        let mut fallback_warned = false;
+        let err = send_stream_event(
+            &client,
+            "org",
+            "11111111-1111-1111-1111-111111111111",
+            Some(pid),
+            &req,
+            &mut fallback_warned,
+        )
+        .await
+        .expect_err("a transient 503 must propagate as Err, not be swallowed by a fallback");
+        assert!(
+            err.to_string().contains("503"),
+            "propagated error must reflect the transient status, got: {err}"
+        );
+        assert!(
+            !is_deterministic_client_error(err.as_ref()),
+            "a 503 must not be classified as a deterministic client error"
+        );
+
+        let first = rx
+            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
+            .expect("no request captured");
+        assert!(
+            first.contains(&format!("/projects/{pid}/stream")),
+            "must hit the project-scoped endpoint, got: {first}"
+        );
+
+        // The mock server only serves ONE response and then drops its
+        // listener/sender — a stray fallback request would either fail the
+        // `expect_err` above (if it somehow succeeded) or, if it also failed,
+        // would still mean a second request was attempted. Confirming the
+        // channel is immediately disconnected (rather than blocking) proves
+        // no second request was ever sent.
+        assert!(
+            rx.recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT).is_err(),
+            "no second (fallback) request should have been sent for a transient error"
+        );
     }
 }
