@@ -39,10 +39,14 @@ pub struct RemoteRepoRef {
 }
 
 // The server's RemoteDetailResponse flattens the remote fields at top level and
-// adds a `repos` array; we only need the repos, so serde ignores the rest.
+// adds a `repos` array; serde ignores any other top-level fields.
 #[derive(Deserialize)]
-struct RemoteDetail {
-    repos: Vec<RemoteRepoRef>,
+pub struct RemoteDetail {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub normalized_url: String,
+    pub clone_status: String,
+    pub repos: Vec<RemoteRepoRef>,
 }
 
 #[derive(Deserialize)]
@@ -498,11 +502,13 @@ impl ApiClient {
     }
 
     /// The repos linked to a remote (the codebase's members).
-    pub async fn get_remote_repos(
+    /// Full detail for a remote (codebase): its display name, normalized URL,
+    /// clone status, and linked repos.
+    pub async fn get_remote_detail(
         &self,
         org_slug: &str,
         remote_id: uuid::Uuid,
-    ) -> Result<Vec<RemoteRepoRef>, Box<dyn std::error::Error>> {
+    ) -> Result<RemoteDetail, Box<dyn std::error::Error>> {
         let mut builder = self.client.get(format!(
             "{}/api/v1/orgs/{}/remotes/{}",
             self.base_url, org_slug, remote_id
@@ -514,10 +520,19 @@ impl ApiClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("get_remote_repos failed ({status}): {body}").into());
+            return Err(format!("get_remote_detail failed ({status}): {body}").into());
         }
         let detail: RemoteDetail = resp.json().await?;
-        Ok(detail.repos)
+        Ok(detail)
+    }
+
+    /// The repos linked to a remote (the codebase's members).
+    pub async fn get_remote_repos(
+        &self,
+        org_slug: &str,
+        remote_id: uuid::Uuid,
+    ) -> Result<Vec<RemoteRepoRef>, Box<dyn std::error::Error>> {
+        Ok(self.get_remote_detail(org_slug, remote_id).await?.repos)
     }
 }
 

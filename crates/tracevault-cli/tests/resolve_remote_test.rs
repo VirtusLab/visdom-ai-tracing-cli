@@ -67,13 +67,17 @@ async fn resolve_remote_returns_remote_on_200() {
 #[tokio::test]
 async fn resolve_remote_returns_none_on_404() {
     let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    let (base, _rx) = spawn_once(resp);
+    let (base, rx) = spawn_once(resp);
     let client = ApiClient::new(&base, Some("tok"));
     assert!(client
         .resolve_remote("org", "git@github.com:o/x.git")
         .await
         .unwrap()
         .is_none());
+    // Assert a request actually went out (else a buggy resolve_remote that
+    // returned None without any I/O would still pass this test).
+    let request = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
+    assert!(request.contains("/api/v1/orgs/org/remotes/resolve?git_url="));
 }
 
 #[tokio::test]

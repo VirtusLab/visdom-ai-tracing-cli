@@ -380,24 +380,47 @@ async fn status(
         format_status(effective.as_ref().map(|(b, s)| (b, *s)))
     );
 
-    // Surface which codebase the effective binding belongs to. Best-effort:
-    // a resolved `codebase_name` prints directly; otherwise (older bindings
-    // without one) fall back to a live `resolve_remote` lookup by the
-    // binding's git_url. A failure here must not fail `status`.
+    // Surface which codebase the effective binding belongs to, with live clone
+    // status when reachable. Best-effort — a failure must not fail `status`:
+    //   1. `remote_id` (persisted at init / set by switch) → fetch the remote
+    //      detail for name + clone status (works without a checkout);
+    //   2. else a `git_url` → live `resolve_remote` for name + clone status;
+    //   3. else fall back to the cached `codebase_name` (name only, offline).
     if let Some((binding, _)) = &effective {
-        if let Some(cb) = &binding.codebase_name {
-            println!("codebase: {cb}");
-        } else if let Some(git_url) = &binding.git_url {
-            let (server_url, token) = resolve_credentials(project_root);
-            if let Some(server_url) = server_url {
-                let client = ApiClient::new(&server_url, token.as_deref());
-                if let Ok(Some(remote)) = client.resolve_remote(&binding.org_slug, git_url).await {
+        let (server_url, token) = resolve_credentials(project_root);
+        let client = server_url
+            .as_ref()
+            .map(|su| ApiClient::new(su, token.as_deref()));
+        let mut printed = false;
+        if let Some(client) = &client {
+            if let Some(remote_id) = binding.remote_id {
+                if let Ok(detail) = client.get_remote_detail(&binding.org_slug, remote_id).await {
                     println!(
                         "codebase: {} ({})",
-                        remote.name.as_deref().unwrap_or(&remote.normalized_url),
-                        remote.clone_status
+                        detail.name.as_deref().unwrap_or(&detail.normalized_url),
+                        detail.clone_status
                     );
+                    printed = true;
                 }
+            }
+            if !printed {
+                if let Some(git_url) = &binding.git_url {
+                    if let Ok(Some(remote)) =
+                        client.resolve_remote(&binding.org_slug, git_url).await
+                    {
+                        println!(
+                            "codebase: {} ({})",
+                            remote.name.as_deref().unwrap_or(&remote.normalized_url),
+                            remote.clone_status
+                        );
+                        printed = true;
+                    }
+                }
+            }
+        }
+        if !printed {
+            if let Some(cb) = &binding.codebase_name {
+                println!("codebase: {cb}");
             }
         }
     }
