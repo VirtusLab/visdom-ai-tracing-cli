@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use crate::api_client::ApiClient;
+use crate::api_client::{ApiClient, ResolveProjectOutcome};
 use crate::session_state::{ProjectBinding, RepoBinding, SessionState};
 
 /// Pure precedence for the org slug: first non-`None` of env, credentials,
@@ -274,6 +274,60 @@ pub fn effective_project(inputs: &ProjectResolveInputs) -> Option<(ProjectBindin
         .map(|b| (b, ProjectSource::ConfigDefault))
 }
 
+/// Full project-attribution precedence chain, applying rungs 1–5: `--project`
+/// flag → subagent override → session active → config default (all pure, via
+/// [`effective_project`]; no network call) → server-side deduction from the
+/// repo's git remote → user-level default. Deduction (rung 4) outranks the
+/// user-level default (rung 5) — this falls out of the ordering below: the
+/// user default is only consulted once deduction has returned `None`.
+///
+/// An `Ambiguous` deduction result is an error (the caller can't safely guess
+/// among several candidate projects); a `Resolved` deduction emits a warning
+/// so the user knows attribution wasn't explicit. Returns `Ok(None)` only when
+/// every rung is empty — the caller turns that into a "project required"
+/// error where appropriate.
+#[allow(dead_code)]
+pub async fn resolve_effective_project(
+    inputs: &ProjectResolveInputs<'_>,
+    user_default: Option<ProjectBinding>,
+    org_slug: &str,
+    git_url: Option<&str>,
+    client: &ApiClient,
+) -> Result<Option<(ProjectBinding, ProjectSource)>, Box<dyn std::error::Error>> {
+    // rungs 1-3 (local, no network)
+    if let Some(hit) = effective_project(inputs) {
+        return Ok(Some(hit));
+    }
+    // rung 4: server deduction
+    if let Some(url) = git_url {
+        match client.resolve_project(org_slug, url).await? {
+            ResolveProjectOutcome::Resolved(pid) => {
+                eprintln!(
+                    "warning: no explicit project set; attributing to the project deduced from this repo ({pid}). Set one with `tracevault project switch <name>` or --project."
+                );
+                return Ok(Some((
+                    ProjectBinding {
+                        org_slug: org_slug.to_string(),
+                        project_id: pid.to_string(),
+                        project_name: String::new(), // enriched for display by the caller if needed
+                        updated_at: String::new(),
+                    },
+                    ProjectSource::Deduced,
+                )));
+            }
+            ResolveProjectOutcome::Ambiguous => {
+                return Err(format!(
+                    "this repo belongs to multiple projects; specify one with `--project <name>` (org {org_slug})"
+                )
+                .into());
+            }
+            ResolveProjectOutcome::None => { /* fall through */ }
+        }
+    }
+    // rung 5: user-level default
+    Ok(user_default.map(|b| (b, ProjectSource::UserDefault)))
+}
+
 /// A RepoBinding from a pinned `.tracevault/config.toml` (bound mode), if it has
 /// both org_slug and repo_id. Pure — caller supplies the already-loaded config.
 /// Carries through the `remote_id`/`codebase_name` `init` persisted (best-effort,
@@ -297,6 +351,139 @@ mod tests {
     use super::*;
     use crate::session_state::{ProjectBinding, RepoBinding, SessionState};
     use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{SocketAddr, TcpListener};
+    use std::thread;
+
+    /// Spawn a one-shot raw-HTTP server that returns a response built from
+    /// `status` (e.g. `"200 OK"`) and `body` to the first request it accepts.
+    /// Mirrors the `spawn_once`/`http_200` shape in `commands::repo`'s test
+    /// module (bind loopback, accept once on a background thread, write the
+    /// raw HTTP response, flush, close).
+    fn spawn_once(
+        status: &'static str,
+        body: &'static str,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response = http_200(status, body);
+        let handle = thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream);
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (addr, handle)
+    }
+
+    /// Format a raw HTTP/1.1 response with the given `status` line and a
+    /// correct `Content-Length` for a JSON `body`.
+    fn http_200(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            body.len(),
+            body
+        )
+    }
+
+    #[tokio::test]
+    async fn deduction_beats_user_default() {
+        // /projects/resolve -> 200 deduced; user_default present -> deduced still wins (decision 6)
+        let (addr, _h) = spawn_once(
+            "200 OK",
+            "{\"project_id\":\"22222222-2222-2222-2222-222222222222\"}",
+        );
+        let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
+        let ud = ProjectBinding {
+            org_slug: "o".into(),
+            project_id: "user".into(),
+            project_name: "u".into(),
+            updated_at: "".into(),
+        };
+        let inputs = ProjectResolveInputs {
+            project_flag: None,
+            session: &SessionState::default(),
+            worktree_path: None,
+            config_default: None,
+        };
+        let (b, src) =
+            resolve_effective_project(&inputs, Some(ud), "org", Some("git@x:y.git"), &client)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(src, ProjectSource::Deduced);
+        assert_eq!(b.project_id, "22222222-2222-2222-2222-222222222222");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_deduction_errors_when_no_higher_rung() {
+        let (addr, _h) = spawn_once("409 Conflict", "{\"error\":\"multiple\"}");
+        let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
+        let inputs = ProjectResolveInputs {
+            project_flag: None,
+            session: &SessionState::default(),
+            worktree_path: None,
+            config_default: None,
+        };
+        let err = resolve_effective_project(&inputs, None, "org", Some("git@x:y.git"), &client)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("--project"));
+    }
+
+    #[tokio::test]
+    async fn user_default_used_when_deduction_404() {
+        let (addr, _h) = spawn_once("404 Not Found", "{}");
+        let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
+        let ud = ProjectBinding {
+            org_slug: "o".into(),
+            project_id: "user".into(),
+            project_name: "u".into(),
+            updated_at: "".into(),
+        };
+        let inputs = ProjectResolveInputs {
+            project_flag: None,
+            session: &SessionState::default(),
+            worktree_path: None,
+            config_default: None,
+        };
+        let (b, src) =
+            resolve_effective_project(&inputs, Some(ud), "org", Some("git@x:y.git"), &client)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(src, ProjectSource::UserDefault);
+        assert_eq!(b.project_id, "user");
+    }
+
+    #[tokio::test]
+    async fn local_rung_skips_server_call() {
+        // no server spawned; a config_default present must resolve WITHOUT any network call
+        let client = ApiClient::new("http://127.0.0.1:0", Some("k"));
+        let cfg = ProjectBinding {
+            org_slug: "o".into(),
+            project_id: "cfg".into(),
+            project_name: "c".into(),
+            updated_at: "".into(),
+        };
+        let inputs = ProjectResolveInputs {
+            project_flag: None,
+            session: &SessionState::default(),
+            worktree_path: None,
+            config_default: Some(cfg),
+        };
+        let (_b, src) =
+            resolve_effective_project(&inputs, None, "org", Some("git@x:y.git"), &client)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(src, ProjectSource::ConfigDefault);
+    }
 
     fn binding(id: &str) -> RepoBinding {
         RepoBinding {
