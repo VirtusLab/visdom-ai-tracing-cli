@@ -207,7 +207,13 @@ fn capture_project(
 /// `borrowed_box` lint at call sites that already hold a `Box<dyn Error>`.
 fn is_deterministic_client_error(e: &dyn std::error::Error) -> bool {
     let s = e.to_string();
-    ["(400 ", "(401 ", "(403 ", "(404 ", "(409 "]
+    // 401 is deliberately excluded: it's an authentication failure (bad/expired
+    // token), not a project-scoping problem, and the repo-scoped fallback uses
+    // the SAME token — it would also 401, so falling back just wastes a
+    // request before the error propagates to buffer/retry. 403 stays in: it
+    // means the token is valid but lacks TracePush on the bound project, and
+    // the repo-scoped fallback (a different authorization check) can help.
+    ["(400 ", "(403 ", "(404 ", "(409 "]
         .iter()
         .any(|marker| s.contains(marker))
 }
@@ -235,12 +241,21 @@ fn is_multi_project_refusal(e: &dyn std::error::Error) -> bool {
 /// project, warning so the miss is visible. A transient error (5xx,
 /// network/transport, timeout) is NOT retried here — it propagates so the
 /// caller's existing buffer/retry logic runs unchanged.
+///
+/// `fallback_warned` is shared across every call made for a single hook
+/// invocation (both the pending-flush loop and the live send). The
+/// pending-flush loop only `break`s on `Err`, not on a fallback that itself
+/// returns `Ok` — so a stale binding whose repo-scoped fallback keeps
+/// succeeding would otherwise print the warning once per buffered event.
+/// Gating on `*fallback_warned` caps it at one warning per invocation while
+/// leaving the fallback behavior itself unchanged.
 async fn send_stream_event(
     client: &crate::api_client::ApiClient,
     org_slug: &str,
     repo_id: &str,
     capture_pid: Option<uuid::Uuid>,
     req: &StreamEventRequest,
+    fallback_warned: &mut bool,
 ) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn std::error::Error>> {
     match capture_pid {
         None => client.stream_event(org_slug, repo_id, req).await,
@@ -250,9 +265,12 @@ async fn send_stream_event(
         {
             Ok(r) => Ok(r),
             Err(e) if is_deterministic_client_error(e.as_ref()) => {
-                eprintln!(
-                    "tracevault: warning: active project {pid} does not apply to this repo (not a member, or missing permission); attributing via repo deduction instead. Run `tracevault project switch <name>` to update."
-                );
+                if !*fallback_warned {
+                    eprintln!(
+                        "tracevault: warning: active project {pid} does not apply to this repo (not a member, or missing permission); attributing via repo deduction instead. Run `tracevault project switch <name>` to update."
+                    );
+                    *fallback_warned = true;
+                }
                 // Repo-scoped fallback: the server deduces the project itself.
                 // This can itself return the multi-project 409, which
                 // `warn_if_multi_project_refusal` surfaces at the call site.
@@ -592,12 +610,23 @@ pub async fn run_stream(
     let pending_events = drain_pending(&pending_path)?;
 
     let mut send_failed = false;
+    // Spans the whole invocation (pending-flush loop + live send below) so a
+    // stale binding whose repo-scoped fallback keeps succeeding warns at most
+    // once, not once per buffered event.
+    let mut fallback_warned = false;
 
     // Send pending events first
     for pending_json in &pending_events {
         if let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(pending_json) {
-            if let Err(e) =
-                send_stream_event(&client, org_slug, repo_id, capture_pid, &pending_req).await
+            if let Err(e) = send_stream_event(
+                &client,
+                org_slug,
+                repo_id,
+                capture_pid,
+                &pending_req,
+                &mut fallback_warned,
+            )
+            .await
             {
                 warn_if_multi_project_refusal(e.as_ref());
                 // Re-queue all remaining pending events
@@ -626,7 +655,16 @@ pub async fn run_stream(
             fs::write(&offset_path, new_offset.to_string())?;
         }
     } else {
-        match send_stream_event(&client, org_slug, repo_id, capture_pid, &req).await {
+        match send_stream_event(
+            &client,
+            org_slug,
+            repo_id,
+            capture_pid,
+            &req,
+            &mut fallback_warned,
+        )
+        .await
+        {
             Ok(_) => {
                 // 10. On success update .stream_offset
                 fs::write(&offset_path, new_offset.to_string())?;
@@ -1315,6 +1353,7 @@ mod tests {
             "11111111-1111-1111-1111-111111111111",
             capture_pid,
             &req,
+            &mut false,
         )
         .await
         .expect("send_stream_event must succeed");
@@ -1360,6 +1399,7 @@ mod tests {
             "11111111-1111-1111-1111-111111111111",
             capture_pid,
             &req,
+            &mut false,
         )
         .await
         .expect("send_stream_event must succeed");
@@ -1450,6 +1490,7 @@ mod tests {
             "11111111-1111-1111-1111-111111111111",
             None,
             &req,
+            &mut false,
         )
         .await
         .expect_err("409 multi-project refusal must surface as Err");
@@ -1529,6 +1570,7 @@ mod tests {
             "11111111-1111-1111-1111-111111111111",
             Some(pid),
             &req,
+            &mut false,
         )
         .await
         .expect("a deterministic 400 must fall back to repo-scoped and succeed");
@@ -1576,6 +1618,7 @@ mod tests {
             "11111111-1111-1111-1111-111111111111",
             Some(pid),
             &req,
+            &mut false,
         )
         .await
         .expect_err("a transient 503 must propagate as Err, not be swallowed by a fallback");
