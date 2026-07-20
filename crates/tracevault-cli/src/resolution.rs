@@ -313,7 +313,7 @@ pub async fn resolve_effective_project(
             }
             ResolveProjectOutcome::Ambiguous => {
                 return Err(format!(
-                    "this repo belongs to multiple projects; specify one with `--project <name>` (org {org_slug})"
+                    "this repo belongs to multiple projects; select one with `tracevault project switch <name>` or the `--project` override (org {org_slug})"
                 )
                 .into());
             }

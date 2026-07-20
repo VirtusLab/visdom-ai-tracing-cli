@@ -187,10 +187,12 @@ async fn switch(
     cwd: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (org_slug, client) = resolve_org_and_client(project_root).await?;
-    let binding = resolve_switch_project(name, &org_slug, &client, !user, cwd).await?;
-
     let session = crate::commands::repo::resolve_session_id(session_id).ok();
-    match switch_destination(user, session) {
+    let dest = switch_destination(user, session);
+    let check_codebase = matches!(dest, SwitchDest::Session(_));
+    let binding = resolve_switch_project(name, &org_slug, &client, check_codebase, cwd).await?;
+
+    match dest {
         SwitchDest::Session(id) => {
             let mut state = session_state::load(&id);
             state.active_project = Some(binding.clone());
@@ -539,6 +541,30 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         crate::test_helpers::init_git_repo(tmp.path()); // no origin remote → containment check is a no-op
 
+        // C3: isolate `session_state::sessions_dir()` (which honors
+        // `$XDG_STATE_HOME`) to a tempdir for the duration of this test, so
+        // it never touches the developer's real state dir.
+        //
+        // SAFETY: test-scoped env mutation, mirroring the precedent in
+        // `commands::project`'s tests (`status_reports_ambiguous_deduction_
+        // as_informational_not_fatal`). No other test in this crate reads
+        // or sets XDG_STATE_HOME, so this can't race another test's
+        // expectations; restored in a guard so a panic mid-test still
+        // cleans up the process env.
+        let state_tmp = tempfile::tempdir().unwrap();
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("XDG_STATE_HOME");
+                }
+            }
+        }
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", state_tmp.path());
+        }
+        let _guard = EnvGuard;
+
         let list = r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"payments"},{"id":"22222222-2222-4222-8222-222222222222","name":"web"}]"#;
         let base = spawn_once(http_200(list));
         let client = ApiClient::new(&base, Some("tok"));
@@ -550,19 +576,15 @@ mod tests {
         assert_eq!(binding.project_name, "web");
         assert_eq!(binding.org_slug, "org");
 
-        // Use a unique session id so this test can't collide with any other
-        // test or real usage sharing the real global sessions dir.
         let session_id = format!("project-switch-test-{}", uuid::Uuid::new_v4());
         let mut state = session_state::load(&session_id);
         state.active_project = Some(binding.clone());
         session_state::save(&session_id, &state).expect("save must succeed");
 
         let sessions_dir = session_state::sessions_dir().expect("sessions dir must resolve");
+        assert!(sessions_dir.starts_with(state_tmp.path()));
         let loaded = session_state::load_from(&sessions_dir, &session_id);
         assert_eq!(loaded.active_project, Some(binding));
-
-        // Clean up: this test writes a real file under the user's state dir.
-        let _ = std::fs::remove_file(sessions_dir.join(format!("{session_id}.toml")));
     }
 
     #[tokio::test]
@@ -623,6 +645,103 @@ mod tests {
             err.to_string()
                 .contains("does not contain the current codebase"),
             "got: {err}"
+        );
+    }
+
+    /// Regression for C2: a no-session, non-`--user` `switch` resolves to
+    /// `SwitchDest::UserDefault` (mirroring `switch_destination`'s
+    /// no-session fallback), so the codebase-containment check must be
+    /// skipped even though `--user` wasn't passed. `cwd` has a git origin
+    /// remote, but `check_codebase` being correctly derived from the
+    /// destination (not from `!user`) means `resolve_switch_project` never
+    /// calls out to `resolve_remote`/`get_project` to check it — the mock
+    /// server below only ever answers one request (`list_projects`). If the
+    /// gating regressed back to `!user`, the second HTTP call this test
+    /// deliberately can't serve (mirrors `spawn_once`'s one-shot listener,
+    /// which closes after the first `accept()`) would fail fast, and the
+    /// switch would error instead of succeeding.
+    ///
+    /// Credentials/org come from a `.tracevault/config.toml` in `cwd`
+    /// (rather than `TRACEVAULT_SERVER_URL`/`_ORG_SLUG`/`_API_KEY` env vars)
+    /// so this test can't race `status_reports_ambiguous_deduction_as_
+    /// informational_not_fatal`, which already owns those three vars.
+    /// `XDG_CONFIG_HOME` is redirected so this doesn't read the developer's
+    /// real `credentials.json` (which could otherwise short-circuit
+    /// `org_slug_for`/`resolve_credentials` before the config file is
+    /// consulted, and race for real on a machine with actual TraceVault
+    /// credentials) and so the resulting user-default write lands in a
+    /// tempdir, not `~/.config`. `user_project_default`'s own real-path
+    /// round-trip test mutates the same var, so both hold
+    /// `test_helpers::lock_env_mutation()` for their duration.
+    #[tokio::test]
+    async fn switch_without_session_or_user_flag_skips_codebase_check() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        let ok = std::process::Command::new("git")
+            .args([
+                "-C",
+                &tmp.path().to_string_lossy(),
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:org/repo.git",
+            ])
+            .status()
+            .expect("git remote add failed")
+            .success();
+        assert!(ok, "git remote add must succeed");
+
+        let list =
+            r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"payments"}]"#.to_string();
+        let base = spawn_once(http_200(&list));
+
+        let config_dir = tmp.path().join(".tracevault");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!("agent = \"claude-code\"\nserver_url = \"{base}\"\napi_key = \"tok\"\norg_slug = \"org\"\n"),
+        )
+        .unwrap();
+
+        // SAFETY: test-scoped env mutation, restored in a guard so a panic
+        // in `switch` still cleans up the process env. `_env_lock` (taken
+        // above) also covers `resolve_credentials`/`org_slug_for`'s
+        // *reads* of TRACEVAULT_SERVER_URL/_ORG_SLUG/_API_KEY: this test
+        // deliberately doesn't set those three (it supplies credentials via
+        // `.tracevault/config.toml` instead, at the bottom of env-var
+        // precedence), but without the shared lock, `status_reports_
+        // ambiguous_deduction_as_informational_not_fatal` running
+        // concurrently on another thread could leak its own values into
+        // this test's `resolve_credentials` call, pointing this test's
+        // client at *that* test's mock server. Both tests now hold the same
+        // lock for their duration.
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("TRACEVAULT_SESSION_ID");
+                    std::env::remove_var("XDG_CONFIG_HOME");
+                }
+            }
+        }
+        unsafe {
+            std::env::remove_var("TRACEVAULT_SESSION_ID");
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        }
+        let _guard = EnvGuard;
+
+        let result = switch("payments", false, None, tmp.path(), tmp.path()).await;
+        assert!(
+            result.is_ok(),
+            "expected a no-session, non-`--user` switch to skip the codebase check: {result:?}"
+        );
+
+        let saved = crate::user_project_default::load();
+        assert_eq!(
+            saved.map(|b| b.project_name),
+            Some("payments".to_string()),
+            "no-session switch must fall back to the user-level default binding"
         );
     }
 
@@ -698,6 +817,7 @@ mod tests {
     /// `ambiguous_deduction_errors_when_no_higher_rung`.
     #[tokio::test]
     async fn status_reports_ambiguous_deduction_as_informational_not_fatal() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
         let tmp = tempfile::tempdir().unwrap();
         crate::test_helpers::init_git_repo(tmp.path());
         let ok = std::process::Command::new("git")
@@ -720,10 +840,14 @@ mod tests {
         );
 
         // SAFETY: test-scoped env mutation, mirroring the precedent in
-        // `commands::login`'s tests. No other test in this crate reads or
-        // sets TRACEVAULT_SERVER_URL/TRACEVAULT_ORG_SLUG/TRACEVAULT_API_KEY,
-        // so this can't race another test's expectations; restored in a
-        // guard so a panic in `status` still cleans up the process env.
+        // `commands::login`'s tests, restored in a guard so a panic in
+        // `status` still cleans up the process env. `_env_lock` (taken
+        // above) serializes this against any other test in the crate that
+        // reads or sets TRACEVAULT_SERVER_URL/TRACEVAULT_ORG_SLUG/
+        // TRACEVAULT_API_KEY (e.g. `switch_without_session_or_user_flag_
+        // skips_codebase_check`, whose credential resolution would
+        // otherwise observe these values while they're set here and get
+        // routed at this test's mock server instead of its own).
         struct EnvGuard;
         impl Drop for EnvGuard {
             fn drop(&mut self) {

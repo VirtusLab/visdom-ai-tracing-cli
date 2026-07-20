@@ -40,7 +40,9 @@ fn clear_at(path: &Path) -> std::io::Result<()> {
 
 /// Load the user-level default binding; `None` if unset or malformed.
 pub fn load() -> Option<ProjectBinding> {
-    load_from(&default_project_path()?)
+    let path = default_project_path()?;
+    let dir = path.parent()?;
+    load_from(dir)
 }
 
 /// Persist the user-level default binding, creating the config dir if needed.
@@ -79,5 +81,44 @@ mod tests {
     fn user_project_default_absent_is_none() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(load_from(tmp.path()), None);
+    }
+
+    #[test]
+    fn save_then_load_roundtrips_via_real_paths() {
+        // Exercises the REAL `save()`/`load()` entry points (not `save_in`/
+        // `load_from` directly) so a regression like `load()` looking for
+        // `.../user_project.toml/user_project.toml` (passing the file path
+        // instead of its parent dir into `load_from`) would be caught.
+
+        // `commands::project`'s `switch_without_session_or_user_flag_skips_
+        // codebase_check` test also redirects XDG_CONFIG_HOME (to keep its
+        // credential resolution off the developer's real config); both hold
+        // this process-wide lock for their duration so they can't interleave.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // SAFETY: test-scoped env mutation, restored in a guard so a panic
+        // in `save`/`load` still cleans up the process env.
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("XDG_CONFIG_HOME");
+                }
+            }
+        }
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        }
+        let _guard = EnvGuard;
+
+        let pb = ProjectBinding {
+            org_slug: "acme".into(),
+            project_id: "id".into(),
+            project_name: "p".into(),
+            updated_at: "t".into(),
+        };
+        save(&pb).unwrap();
+        assert_eq!(load(), Some(pb));
     }
 }
