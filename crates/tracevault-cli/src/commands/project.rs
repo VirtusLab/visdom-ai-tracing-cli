@@ -552,18 +552,8 @@ mod tests {
         // expectations; restored in a guard so a panic mid-test still
         // cleans up the process env.
         let state_tmp = tempfile::tempdir().unwrap();
-        struct EnvGuard;
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    std::env::remove_var("XDG_STATE_HOME");
-                }
-            }
-        }
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", state_tmp.path());
-        }
-        let _guard = EnvGuard;
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_STATE_HOME", state_tmp.path());
 
         let list = r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"payments"},{"id":"22222222-2222-4222-8222-222222222222","name":"web"}]"#;
         let base = spawn_once(http_200(list));
@@ -716,20 +706,9 @@ mod tests {
         // this test's `resolve_credentials` call, pointing this test's
         // client at *that* test's mock server. Both tests now hold the same
         // lock for their duration.
-        struct EnvGuard;
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    std::env::remove_var("TRACEVAULT_SESSION_ID");
-                    std::env::remove_var("XDG_CONFIG_HOME");
-                }
-            }
-        }
-        unsafe {
-            std::env::remove_var("TRACEVAULT_SESSION_ID");
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-        }
-        let _guard = EnvGuard;
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.remove("TRACEVAULT_SESSION_ID");
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
 
         let result = switch("payments", false, None, tmp.path(), tmp.path()).await;
         assert!(
@@ -848,22 +827,10 @@ mod tests {
         // skips_codebase_check`, whose credential resolution would
         // otherwise observe these values while they're set here and get
         // routed at this test's mock server instead of its own).
-        struct EnvGuard;
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    std::env::remove_var("TRACEVAULT_SERVER_URL");
-                    std::env::remove_var("TRACEVAULT_ORG_SLUG");
-                    std::env::remove_var("TRACEVAULT_API_KEY");
-                }
-            }
-        }
-        unsafe {
-            std::env::set_var("TRACEVAULT_SERVER_URL", &base);
-            std::env::set_var("TRACEVAULT_ORG_SLUG", "org");
-            std::env::set_var("TRACEVAULT_API_KEY", "tok");
-        }
-        let _guard = EnvGuard;
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("TRACEVAULT_SERVER_URL", &base);
+        _guard.set("TRACEVAULT_ORG_SLUG", "org");
+        _guard.set("TRACEVAULT_API_KEY", "tok");
 
         let result = status(None, None, tmp.path(), tmp.path()).await;
 

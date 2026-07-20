@@ -101,18 +101,8 @@ mod tests {
 
         // SAFETY: test-scoped env mutation, restored in a guard so a panic
         // in `save`/`load` still cleans up the process env.
-        struct EnvGuard;
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    std::env::remove_var("XDG_CONFIG_HOME");
-                }
-            }
-        }
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-        }
-        let _guard = EnvGuard;
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
 
         let pb = ProjectBinding {
             org_slug: "acme".into(),

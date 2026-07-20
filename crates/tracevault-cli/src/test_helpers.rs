@@ -35,6 +35,65 @@ pub fn lock_env_mutation_sync() -> MutexGuard<'static, ()> {
     ENV_MUTATION_LOCK.blocking_lock()
 }
 
+/// Test-only: set/remove env vars for the guard's lifetime and restore their
+/// PRIOR values (or absence) on drop, so a test that happens to run in a
+/// process where one of these vars is already set doesn't permanently erase
+/// it for the rest of the run. Use together with [`lock_env_mutation`]/
+/// [`lock_env_mutation_sync`] so concurrent env-mutating tests don't
+/// interleave; acquire that lock first and hold it until this guard drops.
+pub struct EnvVarGuard {
+    prev: Vec<(String, Option<String>)>,
+}
+
+impl Default for EnvVarGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EnvVarGuard {
+    pub fn new() -> Self {
+        Self { prev: Vec::new() }
+    }
+
+    /// Set `key` to `val` for the guard's lifetime, remembering whatever
+    /// value (or absence) it had beforehand.
+    pub fn set(&mut self, key: &str, val: impl AsRef<std::ffi::OsStr>) {
+        self.prev.push((key.to_string(), std::env::var(key).ok()));
+        // SAFETY: test-only env mutation; callers are expected to hold
+        // `ENV_MUTATION_LOCK` (via `lock_env_mutation`/`lock_env_mutation_sync`)
+        // for the guard's lifetime, so no other test observes this var
+        // concurrently.
+        unsafe {
+            std::env::set_var(key, val);
+        }
+    }
+
+    /// Remove `key` for the guard's lifetime, remembering whatever value (or
+    /// absence) it had beforehand.
+    pub fn remove(&mut self, key: &str) {
+        self.prev.push((key.to_string(), std::env::var(key).ok()));
+        // SAFETY: see `set` above.
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        for (k, v) in self.prev.drain(..).rev() {
+            // SAFETY: see `set` above.
+            unsafe {
+                match v {
+                    Some(val) => std::env::set_var(&k, val),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+    }
+}
+
 /// Initialise a git repo at `dir` with an empty initial commit.
 ///
 /// Configures `user.email` and `user.name` locally so the commit succeeds in

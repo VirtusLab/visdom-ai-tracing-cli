@@ -208,9 +208,11 @@ pub enum ProjectSource {
     SessionActive,
     /// A pinned `.tracevault/config.toml` default_project (bound mode).
     ConfigDefault,
-    /// Repo deduction (applied by async orchestrator in Task 6).
+    /// Repo deduction from the git remote, resolved server-side. Produced by
+    /// [`resolve_effective_project`], not [`effective_project`].
     Deduced,
-    /// A session-independent user-level default (`project switch --user`; Task 6 constructs).
+    /// A session-independent user-level default (`project switch --user`).
+    /// Produced by [`resolve_effective_project`], not [`effective_project`].
     UserDefault,
 }
 
@@ -251,8 +253,11 @@ pub fn effective_binding(inputs: ResolveInputs) -> Option<(RepoBinding, BindingS
 
 /// The project that applies, and which tier produced it: `--project` flag →
 /// subagent worktree override → session active → config default → none.
-/// Pure; covers rungs 1–3 only (flag → subagent → session.active_project → config_default).
-/// Deduction (rung 4) and user-default (rung 5) are applied by the async orchestrator in Task 6.
+/// Pure; covers only the local tiers (flag → subagent → session.active_project
+/// → config_default). Server-side deduction and the user-level default are
+/// applied afterward by [`resolve_effective_project`], which calls this
+/// function first and only falls through to those tiers when it returns
+/// `None`.
 pub fn effective_project(inputs: &ProjectResolveInputs) -> Option<(ProjectBinding, ProjectSource)> {
     if let Some(b) = &inputs.project_flag {
         return Some((b.clone(), ProjectSource::ProjectFlag));
@@ -271,18 +276,18 @@ pub fn effective_project(inputs: &ProjectResolveInputs) -> Option<(ProjectBindin
         .map(|b| (b, ProjectSource::ConfigDefault))
 }
 
-/// Full project-attribution precedence chain, applying rungs 1–5: `--project`
-/// flag → subagent override → session active → config default (all pure, via
+/// Full project-attribution precedence chain: `--project` flag → subagent
+/// override → session active → config default (all pure, via
 /// [`effective_project`]; no network call) → server-side deduction from the
-/// repo's git remote → user-level default. Deduction (rung 4) outranks the
-/// user-level default (rung 5) — this falls out of the ordering below: the
-/// user default is only consulted once deduction has returned `None`.
+/// repo's git remote → user-level default. Deduction outranks the user-level
+/// default — this falls out of the ordering below: the user default is only
+/// consulted once deduction has returned `None`.
 ///
 /// An `Ambiguous` deduction result is an error (the caller can't safely guess
 /// among several candidate projects); a `Resolved` deduction emits a warning
 /// so the user knows attribution wasn't explicit. Returns `Ok(None)` only when
-/// every rung is empty — the caller turns that into a "project required"
-/// error where appropriate.
+/// every tier in the chain is empty — the caller turns that into a "project
+/// required" error where appropriate.
 pub async fn resolve_effective_project(
     inputs: &ProjectResolveInputs<'_>,
     user_default: Option<ProjectBinding>,
@@ -290,11 +295,11 @@ pub async fn resolve_effective_project(
     git_url: Option<&str>,
     client: &ApiClient,
 ) -> Result<Option<(ProjectBinding, ProjectSource)>, Box<dyn std::error::Error>> {
-    // rungs 1-3 (local, no network)
+    // Local tiers: flag → subagent → session active → config default.
     if let Some(hit) = effective_project(inputs) {
         return Ok(Some(hit));
     }
-    // rung 4: server deduction
+    // Server-side deduction from the repo's git remote.
     if let Some(url) = git_url {
         match client.resolve_project(org_slug, url).await? {
             ResolveProjectOutcome::Resolved(pid) => {
@@ -320,7 +325,7 @@ pub async fn resolve_effective_project(
             ResolveProjectOutcome::None => { /* fall through */ }
         }
     }
-    // rung 5: user-level default
+    // User-level default (lowest tier; only consulted once deduction is empty).
     Ok(user_default.map(|b| (b, ProjectSource::UserDefault)))
 }
 
