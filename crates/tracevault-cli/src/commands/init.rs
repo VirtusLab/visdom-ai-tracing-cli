@@ -61,17 +61,6 @@ fn resolve_claude_target(
     })
 }
 
-/// Render a human line for the codebase `init` resolved via `resolve_remote`:
-/// the registered name if the server has one, else the normalized URL, plus
-/// the server-side clone status.
-fn codebase_line(name: Option<&str>, normalized_url: &str, clone_status: &str) -> String {
-    format!(
-        "codebase: {} ({})",
-        name.unwrap_or(normalized_url),
-        clone_status
-    )
-}
-
 fn parse_github_org(remote_url: &str) -> Option<String> {
     // SSH: git@github.com:VirtusLab/visdom-ai-tracing.git
     if let Some(path) = remote_url.strip_prefix("git@github.com:") {
@@ -298,7 +287,7 @@ pub async fn init_in_directory(
                     if let Ok(Some(remote)) = client.resolve_remote(&slug, &origin_url).await {
                         println!(
                             "{}",
-                            codebase_line(
+                            crate::resolution::codebase_line(
                                 remote.name.as_deref(),
                                 &remote.normalized_url,
                                 &remote.clone_status
@@ -1112,15 +1101,6 @@ pub fn write_global_user_config_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Renders a human line for the resolved codebase after init.
-    #[test]
-    fn codebase_line_formats_name_and_status() {
-        let line = codebase_line(Some("acme/foo"), "github.com/acme/foo", "ready");
-        assert_eq!(line, "codebase: acme/foo (ready)");
-        let line = codebase_line(None, "github.com/acme/foo", "pending");
-        assert_eq!(line, "codebase: github.com/acme/foo (pending)");
-    }
 
     #[test]
     fn linked_worktree_primary_detects_linked_and_primary() {

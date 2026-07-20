@@ -501,7 +501,6 @@ impl ApiClient {
         Ok(Some(parsed))
     }
 
-    /// The repos linked to a remote (the codebase's members).
     /// Full detail for a remote (codebase): its display name, normalized URL,
     /// clone status, and linked repos.
     pub async fn get_remote_detail(

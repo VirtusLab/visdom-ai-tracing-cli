@@ -78,6 +78,37 @@ pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
     }
 }
 
+/// Render a human line for a codebase resolved via `resolve_remote` /
+/// `get_remote_detail`: the registered name if the server has one, else the
+/// normalized URL, plus the server-side clone status. Shared by `init`
+/// (after registering) and `repo status` (live tiers) so the format has
+/// exactly one implementation.
+pub(crate) fn codebase_line(
+    name: Option<&str>,
+    normalized_url: &str,
+    clone_status: &str,
+) -> String {
+    format!(
+        "codebase: {} ({})",
+        name.unwrap_or(normalized_url),
+        clone_status
+    )
+}
+
+/// Choose the `repo status` codebase line from the available sources in
+/// priority order: live remote detail, live resolve-by-URL, cached name.
+/// The two live lines are pre-formatted (via `codebase_line`, so they carry
+/// clone status); the cached tier is name-only (no live status).
+pub(crate) fn pick_status_line(
+    detail_line: Option<String>,
+    resolved_line: Option<String>,
+    cached_name: Option<&str>,
+) -> Option<String> {
+    detail_line
+        .or(resolved_line)
+        .or_else(|| cached_name.map(|n| format!("codebase: {n}")))
+}
+
 /// Resolve a filesystem path to a registered-repo binding: read its origin
 /// remote URL and ask the server. `Ok(None)` when the path has no remote or
 /// the server has no matching codebase (pre-registered-only).
@@ -91,12 +122,13 @@ pub async fn resolve_path_to_binding(
     };
     // Resolve the CODEBASE by normalized URL (deduped), then bind to one of its
     // repos. Any linked repo works for ingest — every repo-keyed server read
-    // resolves codebase-wide — so the first is fine.
+    // resolves codebase-wide — so the lowest-id linked repo (deterministic) is
+    // fine.
     let Some(remote) = client.resolve_remote(org_slug, &git_url).await? else {
         return Ok(None);
     };
     let repos = client.get_remote_repos(org_slug, remote.remote_id).await?;
-    let Some(first) = repos.into_iter().next() else {
+    let Some(first) = repos.into_iter().min_by_key(|r| r.id) else {
         return Err(format!(
             "codebase {} is registered but has no tracked repo; run `tracevault init` in a checkout",
             remote.name.as_deref().unwrap_or(&remote.normalized_url)
@@ -384,6 +416,47 @@ mod tests {
         let binding = binding_from_config(&config).expect("org_slug + repo_id present");
         assert_eq!(binding.codebase_name, Some("acme/foo".to_string()));
         assert_eq!(binding.remote_id, Some(uuid));
+    }
+
+    #[test]
+    fn codebase_line_formats_name_and_status() {
+        let line = codebase_line(Some("acme/foo"), "github.com/acme/foo", "ready");
+        assert_eq!(line, "codebase: acme/foo (ready)");
+        let line = codebase_line(None, "github.com/acme/foo", "pending");
+        assert_eq!(line, "codebase: github.com/acme/foo (pending)");
+    }
+
+    #[test]
+    fn pick_status_line_detail_wins_over_resolved_and_cached() {
+        assert_eq!(
+            pick_status_line(
+                Some("codebase: a (ready)".to_string()),
+                Some("codebase: b (pending)".to_string()),
+                Some("c"),
+            ),
+            Some("codebase: a (ready)".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_status_line_resolved_wins_over_cached() {
+        assert_eq!(
+            pick_status_line(None, Some("codebase: b (pending)".to_string()), Some("c"),),
+            Some("codebase: b (pending)".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_status_line_cached_only_is_name_only() {
+        assert_eq!(
+            pick_status_line(None, None, Some("c")),
+            Some("codebase: c".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_status_line_none_when_nothing_available() {
+        assert_eq!(pick_status_line(None, None, None), None);
     }
 
     #[test]

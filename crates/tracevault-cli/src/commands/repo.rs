@@ -391,37 +391,47 @@ async fn status(
         let client = server_url
             .as_ref()
             .map(|su| ApiClient::new(su, token.as_deref()));
-        let mut printed = false;
-        if let Some(client) = &client {
-            if let Some(remote_id) = binding.remote_id {
-                if let Ok(detail) = client.get_remote_detail(&binding.org_slug, remote_id).await {
-                    println!(
-                        "codebase: {} ({})",
-                        detail.name.as_deref().unwrap_or(&detail.normalized_url),
-                        detail.clone_status
-                    );
-                    printed = true;
-                }
+        let detail_line = if let (Some(client), Some(remote_id)) = (&client, binding.remote_id) {
+            client
+                .get_remote_detail(&binding.org_slug, remote_id)
+                .await
+                .ok()
+                .map(|d| {
+                    crate::resolution::codebase_line(
+                        d.name.as_deref(),
+                        &d.normalized_url,
+                        &d.clone_status,
+                    )
+                })
+        } else {
+            None
+        };
+        let resolved_line = if detail_line.is_none() {
+            if let (Some(client), Some(git_url)) = (&client, binding.git_url.as_deref()) {
+                client
+                    .resolve_remote(&binding.org_slug, git_url)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|r| {
+                        crate::resolution::codebase_line(
+                            r.name.as_deref(),
+                            &r.normalized_url,
+                            &r.clone_status,
+                        )
+                    })
+            } else {
+                None
             }
-            if !printed {
-                if let Some(git_url) = &binding.git_url {
-                    if let Ok(Some(remote)) =
-                        client.resolve_remote(&binding.org_slug, git_url).await
-                    {
-                        println!(
-                            "codebase: {} ({})",
-                            remote.name.as_deref().unwrap_or(&remote.normalized_url),
-                            remote.clone_status
-                        );
-                        printed = true;
-                    }
-                }
-            }
-        }
-        if !printed {
-            if let Some(cb) = &binding.codebase_name {
-                println!("codebase: {cb}");
-            }
+        } else {
+            None
+        };
+        if let Some(line) = crate::resolution::pick_status_line(
+            detail_line,
+            resolved_line,
+            binding.codebase_name.as_deref(),
+        ) {
+            println!("{line}");
         }
     }
 
