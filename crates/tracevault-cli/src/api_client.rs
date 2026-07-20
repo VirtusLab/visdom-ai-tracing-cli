@@ -21,11 +21,6 @@ pub struct RegisterRepoResponse {
 }
 
 #[derive(Deserialize)]
-struct ResolveRepoResponse {
-    repo_id: uuid::Uuid,
-}
-
-#[derive(Deserialize)]
 pub struct ResolveRemoteResponse {
     pub remote_id: uuid::Uuid,
     #[serde(default)]
@@ -469,40 +464,9 @@ impl ApiClient {
         Ok(result)
     }
 
-    /// Resolve a git remote URL to a registered repo id within `org_slug`.
-    /// `Ok(None)` when the server has no matching repo (404). Used by
-    /// workspace/detached mode, which has no pinned repo_id in config.
-    pub async fn resolve_repo(
-        &self,
-        org_slug: &str,
-        git_url: &str,
-    ) -> Result<Option<uuid::Uuid>, Box<dyn std::error::Error>> {
-        let mut url = Url::parse(&format!(
-            "{}/api/v1/orgs/{}/repos/resolve",
-            self.base_url, org_slug
-        ))?;
-        url.query_pairs_mut().append_pair("git_url", git_url);
-
-        let mut builder = self.client.get(url);
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-        let resp = builder.send().await?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("resolve_repo failed ({status}): {body}").into());
-        }
-        let parsed: ResolveRepoResponse = resp.json().await?;
-        Ok(Some(parsed.repo_id))
-    }
-
     /// Resolve a git URL to its codebase (git remote) by NORMALIZED URL —
-    /// deduped, unlike `resolve_repo`'s exact `github_url` match. `Ok(None)` if
-    /// the codebase isn't tracked (404).
+    /// deduped, unlike an exact `github_url` match. `Ok(None)` if the
+    /// codebase isn't tracked (404).
     pub async fn resolve_remote(
         &self,
         org_slug: &str,

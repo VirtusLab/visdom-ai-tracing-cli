@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::api_client::{resolve_credentials, ApiClient, RepoListItem};
+use crate::api_client::{resolve_credentials, ApiClient};
 use crate::resolution::{
     binding_from_config, effective_binding, org_slug_for, resolve_path_to_binding, BindingSource,
     ResolveInputs,
@@ -113,50 +113,6 @@ async fn resolve_switch_binding(
         })
 }
 
-/// Build the "no repo named …" error. An empty org is called out explicitly
-/// (rather than a dangling "available: "); long lists are capped so a single
-/// typo can't dump hundreds of names to stderr.
-fn name_not_found_error(name: &str, org_slug: &str, repos: &[RepoListItem]) -> String {
-    if repos.is_empty() {
-        return format!("no repo named '{name}': org {org_slug} has no registered repos");
-    }
-    const MAX: usize = 20;
-    let mut names: Vec<&str> = repos.iter().map(|r| r.name.as_str()).collect();
-    names.sort_unstable();
-    let shown = names.len().min(MAX);
-    let mut list = names[..shown].join(", ");
-    if names.len() > MAX {
-        list.push_str(&format!(", … and {} more", names.len() - MAX));
-    }
-    format!("no repo named '{name}' in org {org_slug} (available: {list})")
-}
-
-/// Resolve a registered repo by its NAME (no git checkout) to a binding.
-/// Exact, case-sensitive match on `repos.name`; on no match, errors listing
-/// the available names so a typo self-corrects. Resolution lists the org's
-/// repos and matches client-side (unlike the git-URL path's server-side
-/// `/repos/resolve`); this is safe because the server returns all repos
-/// unpaginated and `(org, name)` is unique, and it keeps the endpoint
-/// surface small.
-async fn resolve_name_to_binding(
-    name: &str,
-    org_slug: &str,
-    client: &ApiClient,
-) -> Result<RepoBinding, Box<dyn std::error::Error>> {
-    let repos = client.list_repos(org_slug).await?;
-    match repos.iter().find(|r| r.name == name) {
-        Some(repo) => Ok(RepoBinding {
-            org_slug: org_slug.to_string(),
-            repo_id: repo.id.to_string(),
-            git_url: repo.github_url.clone(),
-            remote_id: None,
-            codebase_name: None,
-            updated_at: chrono::Utc::now().to_rfc3339(),
-        }),
-        None => Err(name_not_found_error(name, org_slug, &repos).into()),
-    }
-}
-
 /// Apply a switch to session state (session-level active binding). Pure.
 fn apply_switch(state: &mut SessionState, binding: RepoBinding) {
     state.active = Some(binding);
@@ -182,33 +138,36 @@ fn reset(user: bool, session_id: Option<&str>) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-/// Which target `repo switch` should resolve to a binding: a checkout path
-/// or a registered repo name. Exactly one of `path`/`name` must be given;
-/// see `switch_target`.
-#[derive(Debug)]
+/// Which target `repo switch` should resolve to a binding: a checkout path.
+/// `--name` binding is deprecated (see `switch_target`) and no longer
+/// produces a variant here.
+#[derive(Debug, PartialEq, Eq)]
 enum SwitchTarget<'a> {
     Path(&'a str),
-    Name(&'a str),
 }
 
-/// Pure exactly-one-of guard for `repo switch`'s `<path>` / `--name`
-/// arguments. Kept separate from `switch` so it can be unit-tested without
-/// spinning up a server or session state (also a safety net if the clap
-/// `ArgGroup` on the `Switch` variant is ever loosened).
+/// Pure guard for `repo switch`'s `<path>` / `--name` arguments. Kept
+/// separate from `switch` so it can be unit-tested without spinning up a
+/// server or session state (also a safety net if the clap `ArgGroup` on the
+/// `Switch` variant is ever loosened). `--name` binding is hard-deprecated:
+/// a name-only invocation errors rather than resolving by name, directing
+/// callers to bind by checkout path so the codebase is resolved from its git
+/// remote.
 fn switch_target<'a>(
     path: Option<&'a str>,
     name: Option<&'a str>,
 ) -> Result<SwitchTarget<'a>, Box<dyn std::error::Error>> {
     match (path, name) {
-        (Some(p), None) if p.trim().is_empty() => {
-            Err("repo path (<path>) must not be empty".into())
+        (Some(p), _) if !p.trim().is_empty() => Ok(SwitchTarget::Path(p)),
+        (Some(_), _) => Err("repo path must not be empty".into()),
+        (None, Some(_)) => Err(
+            "`--name` binding is deprecated and no longer supported; bind by checkout path \
+             (`tracevault repo switch <path>`) so the codebase is resolved from its git remote"
+                .into(),
+        ),
+        (None, None) => {
+            Err("provide a checkout path to bind (`tracevault repo switch <path>`)".into())
         }
-        (Some(p), None) => Ok(SwitchTarget::Path(p)),
-        (None, Some(n)) if n.trim().is_empty() => {
-            Err("repo name (--name) must not be empty".into())
-        }
-        (None, Some(n)) => Ok(SwitchTarget::Name(n)),
-        _ => Err("provide exactly one of <path> or --name".into()),
     }
 }
 
@@ -270,7 +229,6 @@ async fn switch(
 
     let binding = match target {
         SwitchTarget::Path(p) => resolve_switch_binding(Path::new(p), &org_slug, &client).await?,
-        SwitchTarget::Name(n) => resolve_name_to_binding(n, &org_slug, &client).await?,
     };
 
     // Validate the repo id BEFORE persisting anything: a malformed repo_id must
@@ -420,6 +378,28 @@ async fn status(
         format_status(effective.as_ref().map(|(b, s)| (b, *s)))
     );
 
+    // Surface which codebase the effective binding belongs to. Best-effort:
+    // a resolved `codebase_name` prints directly; otherwise (older bindings
+    // without one) fall back to a live `resolve_remote` lookup by the
+    // binding's git_url. A failure here must not fail `status`.
+    if let Some((binding, _)) = &effective {
+        if let Some(cb) = &binding.codebase_name {
+            println!("codebase: {cb}");
+        } else if let Some(git_url) = &binding.git_url {
+            let (server_url, token) = resolve_credentials(project_root);
+            if let Some(server_url) = server_url {
+                let client = ApiClient::new(&server_url, token.as_deref());
+                if let Ok(Some(remote)) = client.resolve_remote(&binding.org_slug, git_url).await {
+                    println!(
+                        "codebase: {} ({})",
+                        remote.name.as_deref().unwrap_or(&remote.normalized_url),
+                        remote.clone_status
+                    );
+                }
+            }
+        }
+    }
+
     // Surface a configured user default even when a more specific tier won, so
     // it's discoverable (avoids double-printing when it IS the winning tier).
     let default_is_effective = matches!(
@@ -489,9 +469,15 @@ mod tests {
         assert!(switch_target(None, None).is_err());
     }
 
+    // The clap `ArgGroup` on `Switch` already prevents both being given
+    // together, but as a safety net at this level path wins: a non-empty
+    // path resolves the target regardless of a (deprecated) --name.
     #[test]
-    fn switch_target_rejects_both() {
-        assert!(switch_target(Some("/p"), Some("x")).is_err());
+    fn switch_target_path_wins_when_both_given() {
+        assert!(matches!(
+            switch_target(Some("/p"), Some("x")),
+            Ok(SwitchTarget::Path("/p"))
+        ));
     }
 
     #[test]
@@ -502,12 +488,15 @@ mod tests {
         ));
     }
 
+    // --name now warns and does NOT resolve by name: switch_target maps a name-only
+    // invocation to a deprecation error directing to path binding (no list_repos call).
     #[test]
-    fn switch_target_accepts_name_only() {
-        assert!(matches!(
-            switch_target(None, Some("proj")),
-            Ok(SwitchTarget::Name("proj"))
-        ));
+    fn switch_target_name_is_deprecated() {
+        let err = switch_target(None, Some("some-repo"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("deprecated"), "got: {err}");
+        assert!(err.contains("path"), "should direct to path binding: {err}");
     }
 
     fn binding(id: &str) -> RepoBinding {
@@ -710,77 +699,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn resolve_name_to_binding_finds_by_name() {
-        let body = r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"visdom-orchestrator","github_url":null,"clone_status":null},{"id":"22222222-2222-4222-8222-222222222222","name":"visdom-web","github_url":"https://github.com/o/web.git","clone_status":null}]"#;
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let base = spawn_once(Box::leak(resp.into_boxed_str()));
-        let client = ApiClient::new(&base, Some("tok"));
-        let b = resolve_name_to_binding("visdom-orchestrator", "acme", &client)
-            .await
-            .expect("expected Ok binding");
-        assert_eq!(b.repo_id, "11111111-1111-4111-8111-111111111111");
-        assert_eq!(b.org_slug, "acme");
-    }
-
-    #[tokio::test]
-    async fn resolve_name_to_binding_errors_when_absent_listing_names() {
-        let body = r#"[{"id":"22222222-2222-4222-8222-222222222222","name":"visdom-web","github_url":null,"clone_status":null}]"#;
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let base = spawn_once(Box::leak(resp.into_boxed_str()));
-        let client = ApiClient::new(&base, Some("tok"));
-        let err = resolve_name_to_binding("visdom-orch", "acme", &client)
-            .await
-            .expect_err("expected Err for missing name")
-            .to_string();
-        assert!(err.contains("no repo named"), "got: {err}");
-        assert!(
-            err.contains("visdom-web"),
-            "error should list available names, got: {err}"
-        );
-    }
-
-    #[test]
-    fn name_not_found_error_empty_org_is_explicit() {
-        let msg = name_not_found_error("x", "acme", &[]);
-        assert!(msg.contains("has no registered repos"), "got: {msg}");
-        assert!(
-            !msg.contains("available:"),
-            "empty org must not print a dangling list: {msg}"
-        );
-    }
-
-    #[test]
-    fn name_not_found_error_caps_long_lists() {
-        let repos: Vec<RepoListItem> = (0..25)
-            .map(|i| RepoListItem {
-                id: uuid::Uuid::nil(),
-                name: format!("repo-{i:02}"),
-                github_url: None,
-                clone_status: None,
-            })
-            .collect();
-        let msg = name_not_found_error("zzz", "acme", &repos);
-        assert!(
-            msg.contains("… and 5 more"),
-            "should cap at 20 and note the remainder: {msg}"
-        );
-    }
-
     #[test]
     fn switch_target_rejects_empty_name() {
+        // `--name` is deprecated outright, so there's no separate empty-name
+        // branch anymore — an empty name still hits the deprecation error.
         assert!(switch_target(None, Some("")).is_err());
         assert!(switch_target(None, Some("   ")).is_err());
         let err = switch_target(None, Some(" ")).unwrap_err().to_string();
-        assert!(err.contains("must not be empty"), "got: {err}");
+        assert!(err.contains("deprecated"), "got: {err}");
     }
 
     #[test]
@@ -789,41 +715,6 @@ mod tests {
         assert!(switch_target(Some("   "), None).is_err());
         let err = switch_target(Some(" "), None).unwrap_err().to_string();
         assert!(err.contains("must not be empty"), "got: {err}");
-    }
-
-    #[tokio::test]
-    async fn resolve_name_to_binding_is_case_sensitive() {
-        let body = r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"visdom-web","github_url":null,"clone_status":null}]"#;
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let base = spawn_once(Box::leak(resp.into_boxed_str()));
-        let client = ApiClient::new(&base, Some("tok"));
-        let err = resolve_name_to_binding("Visdom-Web", "acme", &client)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("no repo named 'Visdom-Web'"),
-            "case must not match: {err}"
-        );
-    }
-
-    /// `list_repos` maps any non-2xx status (including 500) to an `Err`
-    /// (never `Ok(vec![])`), so this exercises `resolve_name_to_binding`
-    /// propagating that transport/server error via `?`, not the "no repos
-    /// registered" branch of `name_not_found_error`.
-    #[tokio::test]
-    async fn resolve_name_to_binding_propagates_list_error() {
-        let resp =
-            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        let base = spawn_once(resp);
-        let client = ApiClient::new(&base, Some("tok"));
-        assert!(resolve_name_to_binding("anything", "acme", &client)
-            .await
-            .is_err());
     }
 
     // repo switch resolves by NORMALIZED url: origin spelling differs from what
