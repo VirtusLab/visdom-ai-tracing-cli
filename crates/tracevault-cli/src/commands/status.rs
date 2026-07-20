@@ -7,6 +7,7 @@
 use crate::api_client::{ApiClient, GetMeError};
 use crate::config::TracevaultConfig;
 use crate::credentials::Credentials;
+use crate::resolution::git_remote_url;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -755,17 +756,6 @@ fn git_repo_name(project_root: &Path) -> String {
         .and_then(|p| p.rsplit('/').next())
         .map(String::from)
         .unwrap_or_else(|| "unknown".into())
-}
-
-fn git_remote_url(project_root: &Path) -> Option<String> {
-    Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(project_root)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 /// Make two remote URLs comparable by dropping `.git`, trailing slash, and

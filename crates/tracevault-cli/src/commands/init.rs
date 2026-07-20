@@ -1,6 +1,7 @@
 use crate::api_client::ApiClient;
 use crate::config::{user_config_path_in, TracevaultConfig, UserContext};
 use crate::context::Context;
+use crate::resolution::git_remote_url;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -60,15 +61,15 @@ fn resolve_claude_target(
     })
 }
 
-pub fn git_remote_url(project_root: &Path) -> Option<String> {
-    std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(project_root)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+/// Render a human line for the codebase `init` resolved via `resolve_remote`:
+/// the registered name if the server has one, else the normalized URL, plus
+/// the server-side clone status.
+fn codebase_line(name: Option<&str>, normalized_url: &str, clone_status: &str) -> String {
+    format!(
+        "codebase: {} ({})",
+        name.unwrap_or(normalized_url),
+        clone_status
+    )
 }
 
 fn parse_github_org(remote_url: &str) -> Option<String> {
@@ -286,6 +287,23 @@ pub async fn init_in_directory(
                 // Save repo_id to config
                 if let Some(mut cfg) = TracevaultConfig::load(project_root) {
                     cfg.repo_id = Some(resp.repo_id.to_string());
+                    // Best-effort: resolve the codebase (deduped by normalized
+                    // remote URL) and surface it to the user. Must never fail
+                    // init — `repo_id` above stays authoritative for ingest;
+                    // `remote_id` here is recorded for display only.
+                    if let Some(url) = git_remote_url(project_root) {
+                        if let Ok(Some(remote)) = client.resolve_remote(&slug, &url).await {
+                            println!(
+                                "{}",
+                                codebase_line(
+                                    remote.name.as_deref(),
+                                    &remote.normalized_url,
+                                    &remote.clone_status
+                                )
+                            );
+                            cfg.remote_id = Some(remote.remote_id.to_string());
+                        }
+                    }
                     let _ = fs::write(TracevaultConfig::config_path(project_root), cfg.to_toml());
                 }
             }
@@ -1091,6 +1109,15 @@ pub fn write_global_user_config_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Renders a human line for the resolved codebase after init.
+    #[test]
+    fn codebase_line_formats_name_and_status() {
+        let line = codebase_line(Some("acme/foo"), "github.com/acme/foo", "ready");
+        assert_eq!(line, "codebase: acme/foo (ready)");
+        let line = codebase_line(None, "github.com/acme/foo", "pending");
+        assert_eq!(line, "codebase: github.com/acme/foo (pending)");
+    }
 
     #[test]
     fn linked_worktree_primary_detects_linked_and_primary() {

@@ -13,13 +13,15 @@ use crate::session_state::{self, RepoBinding, SessionState};
 #[derive(clap::Subcommand)]
 pub enum RepoCmd {
     /// Bind tracing to a registered repo for the current session and print its
-    /// policies. Give a checkout <path> OR --name; exactly one is required.
+    /// policies. Give a checkout <path> — `--name` is deprecated and always
+    /// errors, telling you to bind by path instead.
     #[command(group(clap::ArgGroup::new("target").required(true).multiple(false)))]
     Switch {
         /// Path to a checkout of a registered repo (resolves via its git origin remote).
         #[arg(group = "target")]
         path: Option<String>,
-        /// Bind by the repo's registered name instead of a checkout path (no checkout needed).
+        /// Deprecated: name-only binding is no longer supported and always
+        /// errors; bind by checkout path instead (`tracevault repo switch <path>`).
         #[arg(long, group = "target")]
         name: Option<String>,
         /// Write a session-independent user-level default instead of a session
@@ -332,7 +334,7 @@ fn format_status(binding: Option<(&RepoBinding, BindingSource)>) -> String {
             b.repo_id, b.org_slug
         ),
         None => {
-            "not bound to any repo (workspace mode; run `tracevault repo switch <path>` or `tracevault repo switch --name <project>`)".into()
+            "not bound to any repo (workspace mode; run `tracevault repo switch <path>`)".into()
         }
     }
 }
@@ -543,7 +545,7 @@ mod tests {
     fn format_status_none() {
         assert_eq!(
             format_status(None),
-            "not bound to any repo (workspace mode; run `tracevault repo switch <path>` or `tracevault repo switch --name <project>`)"
+            "not bound to any repo (workspace mode; run `tracevault repo switch <path>`)"
         );
     }
 

@@ -57,8 +57,10 @@ pub fn org_slug_from_slugs(slugs: &[String]) -> Result<String, String> {
 }
 
 /// `git -C <path> remote get-url origin`, trimmed. `None` if git fails or there
-/// is no origin remote.
-fn git_remote_url(path: &Path) -> Option<String> {
+/// is no origin remote. Shared by every caller that needs a checkout's origin
+/// remote URL (`init`, `sync`, `status`, and this module's own
+/// `resolve_path_to_binding`) — there is exactly one implementation.
+pub fn git_remote_url(path: &Path) -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(path)
