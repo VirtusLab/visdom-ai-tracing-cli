@@ -65,6 +65,8 @@ mod tests {
             org_slug: "org".into(),
             repo_id: id.into(),
             git_url: None,
+            remote_id: None,
+            codebase_name: None,
             updated_at: "t".into(),
         }
     }

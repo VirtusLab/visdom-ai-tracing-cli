@@ -78,7 +78,7 @@ fn git_remote_url(path: &Path) -> Option<String> {
 
 /// Resolve a filesystem path to a registered-repo binding: read its origin
 /// remote URL and ask the server. `Ok(None)` when the path has no remote or
-/// the server has no matching repo (pre-registered-only).
+/// the server has no matching codebase (pre-registered-only).
 pub async fn resolve_path_to_binding(
     path: &Path,
     org_slug: &str,
@@ -87,15 +87,28 @@ pub async fn resolve_path_to_binding(
     let Some(git_url) = git_remote_url(path) else {
         return Ok(None);
     };
-    match client.resolve_repo(org_slug, &git_url).await? {
-        Some(repo_id) => Ok(Some(RepoBinding {
-            org_slug: org_slug.to_string(),
-            repo_id: repo_id.to_string(),
-            git_url: Some(git_url),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-        })),
-        None => Ok(None),
-    }
+    // Resolve the CODEBASE by normalized URL (deduped), then bind to one of its
+    // repos. Any linked repo works for ingest — every repo-keyed server read
+    // resolves codebase-wide — so the first is fine.
+    let Some(remote) = client.resolve_remote(org_slug, &git_url).await? else {
+        return Ok(None);
+    };
+    let repos = client.get_remote_repos(org_slug, remote.remote_id).await?;
+    let Some(first) = repos.into_iter().next() else {
+        return Err(format!(
+            "codebase {} is registered but has no tracked repo; run `tracevault init` in a checkout",
+            remote.name.as_deref().unwrap_or(&remote.normalized_url)
+        )
+        .into());
+    };
+    Ok(Some(RepoBinding {
+        org_slug: org_slug.to_string(),
+        repo_id: first.id.to_string(),
+        git_url: Some(git_url),
+        remote_id: Some(remote.remote_id),
+        codebase_name: remote.name,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    }))
 }
 
 /// Inputs for the effective-binding precedence chain. `repo_flag` and `bound`
@@ -168,6 +181,8 @@ pub fn binding_from_config(config: &crate::config::TracevaultConfig) -> Option<R
         org_slug: config.org_slug.clone()?,
         repo_id: config.repo_id.clone()?,
         git_url: None,
+        remote_id: None,
+        codebase_name: None,
         updated_at: String::new(),
     })
 }
@@ -183,6 +198,8 @@ mod tests {
             org_slug: "org".into(),
             repo_id: id.into(),
             git_url: None,
+            remote_id: None,
+            codebase_name: None,
             updated_at: "t".into(),
         }
     }

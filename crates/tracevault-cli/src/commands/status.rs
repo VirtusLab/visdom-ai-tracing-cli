@@ -1278,6 +1278,8 @@ mod tests {
                 org_slug: "acme".into(),
                 repo_id: "11111111-1111-4111-8111-111111111111".into(),
                 git_url: None,
+                remote_id: None,
+                codebase_name: None,
                 updated_at: "t".into(),
             }),
             ..Default::default()
@@ -1326,6 +1328,8 @@ mod tests {
                 org_slug: "o1".into(),
                 repo_id: "aaaaaaaa-1111-4111-8111-111111111111".into(),
                 git_url: None,
+                remote_id: None,
+                codebase_name: None,
                 updated_at: "t".into(),
             }),
             ..Default::default()
@@ -1342,6 +1346,8 @@ mod tests {
                 org_slug: "o2".into(),
                 repo_id: "bbbbbbbb-2222-4222-8222-222222222222".into(),
                 git_url: None,
+                remote_id: None,
+                codebase_name: None,
                 updated_at: "t".into(),
             }),
             ..Default::default()
@@ -1370,6 +1376,8 @@ mod tests {
                 org_slug: "has-it".into(),
                 repo_id: "aaaaaaaa-1111-4111-8111-111111111111".into(),
                 git_url: None,
+                remote_id: None,
+                codebase_name: None,
                 updated_at: "t".into(),
             }),
             ..Default::default()
@@ -1421,6 +1429,8 @@ mod tests {
             org_slug: "visdom".into(),
             repo_id: "rid-1".into(),
             git_url: None,
+            remote_id: None,
+            codebase_name: None,
             updated_at: "t".into(),
         };
         let m = server_repo_lookup(None, "ignored", Some(&b)).unwrap();

@@ -15,6 +15,10 @@ pub struct RepoBinding {
     pub repo_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_id: Option<uuid::Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codebase_name: Option<String>,
     pub updated_at: String,
 }
 
@@ -114,6 +118,8 @@ mod tests {
             org_slug: "org".into(),
             repo_id: id.into(),
             git_url: None,
+            remote_id: None,
+            codebase_name: None,
             updated_at: "t".into(),
         }
     }

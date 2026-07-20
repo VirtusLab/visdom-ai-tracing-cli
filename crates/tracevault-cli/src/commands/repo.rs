@@ -149,6 +149,8 @@ async fn resolve_name_to_binding(
             org_slug: org_slug.to_string(),
             repo_id: repo.id.to_string(),
             git_url: repo.github_url.clone(),
+            remote_id: None,
+            codebase_name: None,
             updated_at: chrono::Utc::now().to_rfc3339(),
         }),
         None => Err(name_not_found_error(name, org_slug, &repos).into()),
@@ -513,6 +515,8 @@ mod tests {
             org_slug: "org".into(),
             repo_id: id.into(),
             git_url: None,
+            remote_id: None,
+            codebase_name: None,
             updated_at: "t".into(),
         }
     }
@@ -626,20 +630,56 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Format a raw HTTP/1.1 200 response with a correct `Content-Length` for
+    /// a JSON `body`.
+    fn http_200(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    /// Generalizes `spawn_once` to a listener that answers each of `responses`
+    /// in order, one per accepted connection (the resolve-by-remote flow makes
+    /// two requests: `resolve_remote` then `get_remote_repos`).
+    fn spawn_n(responses: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for response in responses {
+                let response: &'static str = Box::leak(response.into_boxed_str());
+                if let Ok((stream, _)) = listener.accept() {
+                    let mut reader = BufReader::new(stream);
+                    let mut request_line = String::new();
+                    let _ = reader.read_line(&mut request_line);
+                    let mut stream = reader.into_inner();
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
     #[tokio::test]
     async fn resolve_switch_binding_ok_for_registered_repo() {
+        // Path resolution now goes through the codebase (remote) resolver:
+        // resolve_remote finds the codebase, then get_remote_repos returns its
+        // linked repos — the switch binds to the first one.
         let tmp = tempfile::tempdir().unwrap();
         crate::test_helpers::init_git_repo(tmp.path());
         add_origin_remote(tmp.path(), "git@github.com:org/repo.git");
 
-        let repo_id = "44000761-8d22-4256-bd2c-27a0ba278c6f";
-        let body = format!(r#"{{"repo_id":"{repo_id}"}}"#);
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
+        let remote_id = "44000761-8d22-4256-bd2c-27a0ba278c6f";
+        let repo_id = "11111111-1111-4111-8111-111111111111";
+        let remote = format!(
+            r#"{{"remote_id":"{remote_id}","name":"repo","normalized_url":"github.com/org/repo","clone_status":"ready"}}"#
         );
-        let base = spawn_once(Box::leak(resp.into_boxed_str()));
+        let detail = format!(
+            r#"{{"id":"{remote_id}","name":"repo","normalized_url":"github.com/org/repo","clone_url":"https://github.com/org/repo.git","clone_status":"ready","clone_error":null,"last_fetched_at":null,"repo_count":1,"created_at":"2026-01-01T00:00:00Z","repos":[{{"id":"{repo_id}","name":"repo"}}]}}"#
+        );
+        let base = spawn_n(vec![http_200(&remote), http_200(&detail)]);
         let client = ApiClient::new(&base, Some("tok"));
 
         let got = resolve_switch_binding(tmp.path(), "org", &client)
@@ -647,6 +687,8 @@ mod tests {
             .expect("expected Ok binding");
         assert_eq!(got.repo_id, repo_id);
         assert_eq!(got.org_slug, "org");
+        assert_eq!(got.remote_id, Some(remote_id.parse().unwrap()));
+        assert_eq!(got.codebase_name.as_deref(), Some("repo"));
     }
 
     #[tokio::test]
@@ -782,5 +824,45 @@ mod tests {
         assert!(resolve_name_to_binding("anything", "acme", &client)
             .await
             .is_err());
+    }
+
+    // repo switch resolves by NORMALIZED url: origin spelling differs from what
+    // was registered, but resolve_remote matches, and we bind to a linked repo.
+    #[tokio::test]
+    async fn resolve_path_binds_via_remote_across_url_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        add_origin_remote(tmp.path(), "git@github.com:o/x.git"); // scp spelling
+        let remote = r#"{"remote_id":"44000761-8d22-4256-bd2c-27a0ba278c6f","name":"x","normalized_url":"github.com/o/x","clone_status":"ready"}"#;
+        let detail = r#"{"id":"44000761-8d22-4256-bd2c-27a0ba278c6f","name":"x","normalized_url":"github.com/o/x","clone_url":"https://github.com/o/x.git","clone_status":"ready","clone_error":null,"last_fetched_at":null,"repo_count":1,"created_at":"2026-01-01T00:00:00Z","repos":[{"id":"11111111-1111-4111-8111-111111111111","name":"x"}]}"#;
+        let base = spawn_n(vec![http_200(remote), http_200(detail)]);
+        let client = ApiClient::new(&base, Some("tok"));
+        let b = resolve_path_to_binding(tmp.path(), "org", &client)
+            .await
+            .unwrap()
+            .expect("Some binding");
+        assert_eq!(b.repo_id, "11111111-1111-4111-8111-111111111111");
+        assert_eq!(
+            b.remote_id,
+            Some("44000761-8d22-4256-bd2c-27a0ba278c6f".parse().unwrap())
+        );
+        assert_eq!(b.codebase_name.as_deref(), Some("x"));
+    }
+
+    // A tracked codebase with no linked repos (bare remote) → explicit error.
+    #[tokio::test]
+    async fn resolve_path_bare_remote_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        add_origin_remote(tmp.path(), "git@github.com:o/x.git");
+        let remote = r#"{"remote_id":"44000761-8d22-4256-bd2c-27a0ba278c6f","name":"x","normalized_url":"github.com/o/x","clone_status":"pending"}"#;
+        let detail = r#"{"id":"44000761-8d22-4256-bd2c-27a0ba278c6f","name":"x","normalized_url":"github.com/o/x","clone_url":"https://github.com/o/x.git","clone_status":"pending","clone_error":null,"last_fetched_at":null,"repo_count":0,"created_at":"2026-01-01T00:00:00Z","repos":[]}"#;
+        let base = spawn_n(vec![http_200(remote), http_200(detail)]);
+        let client = ApiClient::new(&base, Some("tok"));
+        let err = resolve_path_to_binding(tmp.path(), "org", &client)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no tracked repo"), "got: {err}");
     }
 }
