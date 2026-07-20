@@ -14,6 +14,7 @@ mod session_state;
 #[cfg(test)]
 mod test_helpers;
 mod user_default;
+mod user_project_default;
 
 use commands::repo::RepoCmd;
 
