@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use crate::api_client::ApiClient;
-use crate::session_state::{RepoBinding, SessionState};
+use crate::session_state::{ProjectBinding, RepoBinding, SessionState};
 
 /// Pure precedence for the org slug: first non-`None` of env, credentials,
 /// bound config. Callers pass `None` for an env value that was empty.
@@ -159,6 +159,17 @@ pub struct ResolveInputs<'a> {
     pub user_default: Option<RepoBinding>,
 }
 
+/// Inputs for the effective-project precedence chain. `project_flag` and
+/// `config_default` are resolved by the caller; `session`/`worktree_path`
+/// come from the per-session state.
+#[allow(dead_code)]
+pub struct ProjectResolveInputs<'a> {
+    pub project_flag: Option<ProjectBinding>,
+    pub session: &'a SessionState,
+    pub worktree_path: Option<&'a str>,
+    pub config_default: Option<ProjectBinding>,
+}
+
 /// Which precedence tier produced the [`effective_binding`] result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingSource {
@@ -187,6 +198,38 @@ impl std::fmt::Display for BindingSource {
     }
 }
 
+/// Which precedence tier produced the [`effective_project`] result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ProjectSource {
+    /// A `--project <id>` flag override.
+    ProjectFlag,
+    /// A subagent's per-worktree override.
+    Subagent,
+    /// The session's project-level active binding.
+    SessionActive,
+    /// A pinned `.tracevault/config.toml` default_project (bound mode).
+    ConfigDefault,
+    /// Repo deduction (applied by async orchestrator in Task 6).
+    Deduced,
+    /// A session-independent user-level default (`project switch --user`; Task 6 constructs).
+    UserDefault,
+}
+
+impl std::fmt::Display for ProjectSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            ProjectSource::ProjectFlag => "--project override",
+            ProjectSource::Subagent => "subagent worktree override",
+            ProjectSource::SessionActive => "session (project switch)",
+            ProjectSource::ConfigDefault => "bound .tracevault/config.toml default_project",
+            ProjectSource::Deduced => "repo deduction",
+            ProjectSource::UserDefault => "user default (project switch --user)",
+        };
+        f.write_str(label)
+    }
+}
+
 /// The binding that applies, and which tier produced it: `--path` flag →
 /// subagent worktree override → session active → bound config → user
 /// default → none.
@@ -206,6 +249,29 @@ pub fn effective_binding(inputs: ResolveInputs) -> Option<(RepoBinding, BindingS
         return Some((b, BindingSource::Bound));
     }
     inputs.user_default.map(|b| (b, BindingSource::UserDefault))
+}
+
+/// The project that applies, and which tier produced it: `--project` flag →
+/// subagent worktree override → session active → config default → none.
+/// Pure; covers rungs 1–3 only (flag → subagent → session.active_project → config_default).
+/// Deduction (rung 4) and user-default (rung 5) are applied by the async orchestrator in Task 6.
+#[allow(dead_code)]
+pub fn effective_project(inputs: &ProjectResolveInputs) -> Option<(ProjectBinding, ProjectSource)> {
+    if let Some(b) = &inputs.project_flag {
+        return Some((b.clone(), ProjectSource::ProjectFlag));
+    }
+    if let Some(wt) = inputs.worktree_path {
+        if let Some(b) = inputs.session.subagent_projects.get(wt) {
+            return Some((b.clone(), ProjectSource::Subagent));
+        }
+    }
+    if let Some(b) = &inputs.session.active_project {
+        return Some((b.clone(), ProjectSource::SessionActive));
+    }
+    inputs
+        .config_default
+        .clone()
+        .map(|b| (b, ProjectSource::ConfigDefault))
 }
 
 /// A RepoBinding from a pinned `.tracevault/config.toml` (bound mode), if it has
@@ -229,7 +295,7 @@ pub fn binding_from_config(config: &crate::config::TracevaultConfig) -> Option<R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_state::{RepoBinding, SessionState};
+    use crate::session_state::{ProjectBinding, RepoBinding, SessionState};
     use std::collections::HashMap;
 
     fn binding(id: &str) -> RepoBinding {
@@ -342,6 +408,74 @@ mod tests {
             BindingSource::UserDefault.to_string(),
             "user default (repo switch --user)"
         );
+    }
+
+    #[test]
+    fn effective_project_precedence_local_rungs() {
+        let pb = |n: &str| ProjectBinding {
+            org_slug: "o".into(),
+            project_id: n.into(),
+            project_name: n.into(),
+            updated_at: "".into(),
+        };
+        let mut subagent_projects = HashMap::new();
+        subagent_projects.insert("/wt".into(), pb("subagent"));
+        let session = SessionState {
+            active_project: Some(pb("session")),
+            subagent_projects,
+            ..Default::default()
+        };
+
+        // rung 1: flag wins over everything
+        let got = effective_project(&ProjectResolveInputs {
+            project_flag: Some(pb("flag")),
+            session: &session,
+            worktree_path: Some("/wt"),
+            config_default: Some(pb("cfg")),
+        })
+        .unwrap();
+        assert_eq!(got.0.project_id, "flag");
+        assert_eq!(got.1, ProjectSource::ProjectFlag);
+
+        // rung 2: subagent (worktree) beats session.active
+        let got = effective_project(&ProjectResolveInputs {
+            project_flag: None,
+            session: &session,
+            worktree_path: Some("/wt"),
+            config_default: Some(pb("cfg")),
+        })
+        .unwrap();
+        assert_eq!(got.1, ProjectSource::Subagent);
+        assert_eq!(got.0.project_id, "subagent");
+
+        // rung 3: session.active when no subagent match
+        let got = effective_project(&ProjectResolveInputs {
+            project_flag: None,
+            session: &session,
+            worktree_path: Some("/other"),
+            config_default: Some(pb("cfg")),
+        })
+        .unwrap();
+        assert_eq!(got.1, ProjectSource::SessionActive);
+
+        // rung 3b: config_default when session empty
+        let got = effective_project(&ProjectResolveInputs {
+            project_flag: None,
+            session: &SessionState::default(),
+            worktree_path: None,
+            config_default: Some(pb("cfg")),
+        })
+        .unwrap();
+        assert_eq!(got.1, ProjectSource::ConfigDefault);
+
+        // none: nothing local
+        assert!(effective_project(&ProjectResolveInputs {
+            project_flag: None,
+            session: &SessionState::default(),
+            worktree_path: None,
+            config_default: None,
+        })
+        .is_none());
     }
 
     #[test]
