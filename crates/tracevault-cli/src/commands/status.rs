@@ -496,7 +496,7 @@ fn workspace_binding_check_in(
 // --- Server repo ---
 
 /// How `status` should locate the repo on the server.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum RepoMatch {
     ByName(String),
     ById(String),
@@ -516,6 +516,37 @@ fn server_repo_lookup(
     }
     if let Some(b) = binding {
         return Some(RepoMatch::ById(b.repo_id.clone()));
+    }
+    None
+}
+
+/// Find the repo matching `want`, retrying by workspace-binding id if a
+/// `ByName` lookup misses. A directory rename after `tracevault init`
+/// registered the repo would otherwise make the (name-based) bound-mode
+/// lookup miss even though the binding's `repo_id` still resolves — since this
+/// is a read-only inspector, a stale name should not produce a false "not
+/// found on server" negative when a binding is available to double-check
+/// against. Returns the matched repo plus the [`RepoMatch`] that actually
+/// found it, so the caller can tell a direct hit from a fallback hit (the
+/// fallback must not be treated as if the name-based lookup had succeeded —
+/// see the `RepoMatch::ById` arm of the "Remote URL matches" check below).
+/// `ById` lookups have already tried the only id available, so they are never
+/// retried.
+fn find_repo_with_fallback<'a>(
+    repos: &'a [crate::api_client::RepoListItem],
+    want: &RepoMatch,
+    binding: Option<&crate::session_state::RepoBinding>,
+) -> Option<(&'a crate::api_client::RepoListItem, RepoMatch)> {
+    if let Some(r) = repos.iter().find(|r| match want {
+        RepoMatch::ByName(name) => &r.name == name,
+        RepoMatch::ById(id) => &r.id.to_string() == id,
+    }) {
+        return Some((r, want.clone()));
+    }
+    if let RepoMatch::ByName(_) = want {
+        let b = binding?;
+        let r = repos.iter().find(|r| r.id.to_string() == b.repo_id)?;
+        return Some((r, RepoMatch::ById(b.repo_id.clone())));
     }
     None
 }
@@ -557,10 +588,7 @@ async fn server_repo_checks(
         }
     };
 
-    let found = repos.iter().find(|r| match &want {
-        RepoMatch::ByName(name) => &r.name == name,
-        RepoMatch::ById(id) => &r.id.to_string() == id,
-    });
+    let found = find_repo_with_fallback(&repos, &want, binding);
 
     match found {
         None => {
@@ -574,7 +602,7 @@ async fn server_repo_checks(
             ));
             return out;
         }
-        Some(r) => {
+        Some((r, matched_via)) => {
             out.push(Check::ok(
                 "Repo registered on server",
                 format!("id={}", r.id),
@@ -599,7 +627,7 @@ async fn server_repo_checks(
                 )),
             }
 
-            match &want {
+            match &matched_via {
                 RepoMatch::ByName(_) => {
                     let local_remote = git_remote_url(project_root);
                     match (local_remote.as_deref(), r.github_url.as_deref()) {
@@ -1381,6 +1409,84 @@ mod tests {
         let (check, binding) = workspace_binding_check_in(dir.path(), None);
         assert_eq!(check.level, Level::Skip);
         assert!(binding.is_none());
+    }
+
+    fn repo_item(id: &str, name: &str) -> crate::api_client::RepoListItem {
+        crate::api_client::RepoListItem {
+            id: id.parse().unwrap(),
+            name: name.to_string(),
+            github_url: None,
+            clone_status: None,
+        }
+    }
+
+    #[test]
+    fn find_repo_with_fallback_direct_name_hit_no_fallback_needed() {
+        let repos = vec![repo_item("11111111-1111-4111-8111-111111111111", "myrepo")];
+        let want = RepoMatch::ByName("myrepo".to_string());
+        let (r, matched_via) = find_repo_with_fallback(&repos, &want, None).unwrap();
+        assert_eq!(r.name, "myrepo");
+        assert_eq!(matched_via, want);
+    }
+
+    #[test]
+    fn find_repo_with_fallback_falls_back_to_binding_id_on_name_miss() {
+        // Local checkout directory was renamed after registration: the
+        // git-derived name ("renamed") no longer matches the server's
+        // registered name ("myrepo"), but the workspace binding still carries
+        // the correct repo_id.
+        let id = "11111111-1111-4111-8111-111111111111";
+        let repos = vec![repo_item(id, "myrepo")];
+        let binding = crate::session_state::RepoBinding {
+            repo_id: id.to_string(),
+            git_url: None,
+            remote_id: None,
+            codebase_name: None,
+            updated_at: "t".into(),
+        };
+        let want = RepoMatch::ByName("renamed".to_string());
+        let (r, matched_via) = find_repo_with_fallback(&repos, &want, Some(&binding))
+            .expect("fallback by binding id must find the repo");
+        assert_eq!(r.name, "myrepo");
+        assert_eq!(matched_via, RepoMatch::ById(id.to_string()));
+    }
+
+    #[test]
+    fn find_repo_with_fallback_none_when_name_misses_and_no_binding() {
+        let repos = vec![repo_item("11111111-1111-4111-8111-111111111111", "myrepo")];
+        let want = RepoMatch::ByName("renamed".to_string());
+        assert!(find_repo_with_fallback(&repos, &want, None).is_none());
+    }
+
+    #[test]
+    fn find_repo_with_fallback_none_when_name_and_binding_both_miss() {
+        let repos = vec![repo_item("11111111-1111-4111-8111-111111111111", "myrepo")];
+        let binding = crate::session_state::RepoBinding {
+            repo_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            git_url: None,
+            remote_id: None,
+            codebase_name: None,
+            updated_at: "t".into(),
+        };
+        let want = RepoMatch::ByName("renamed".to_string());
+        assert!(find_repo_with_fallback(&repos, &want, Some(&binding)).is_none());
+    }
+
+    #[test]
+    fn find_repo_with_fallback_by_id_miss_is_never_retried() {
+        // An ById lookup has already tried the only id available — a miss
+        // stays a miss even with a (necessarily-matching-or-irrelevant)
+        // binding present.
+        let repos = vec![repo_item("11111111-1111-4111-8111-111111111111", "myrepo")];
+        let binding = crate::session_state::RepoBinding {
+            repo_id: "99999999-9999-4999-8999-999999999999".to_string(),
+            git_url: None,
+            remote_id: None,
+            codebase_name: None,
+            updated_at: "t".into(),
+        };
+        let want = RepoMatch::ById("99999999-9999-4999-8999-999999999999".to_string());
+        assert!(find_repo_with_fallback(&repos, &want, Some(&binding)).is_none());
     }
 
     #[test]
