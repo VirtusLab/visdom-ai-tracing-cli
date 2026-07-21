@@ -1,23 +1,9 @@
 use crate::api_client::{resolve_credentials, ApiClient, CheckPoliciesRequest, SessionCheckData};
-use crate::config::TracevaultConfig;
+use crate::resolution::{resolve_repo_by_name, ResolveRepoByNameError};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-
-fn git_repo_name(project_root: &Path) -> String {
-    Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(project_root)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .as_deref()
-        .and_then(|p| p.rsplit('/').next())
-        .map(String::from)
-        .unwrap_or_else(|| "unknown".into())
-}
 
 fn git_head_sha(project_root: &Path) -> Option<String> {
     let out = Command::new("git")
@@ -196,10 +182,6 @@ pub async fn check_policies(
         );
     }
 
-    let org_slug = TracevaultConfig::load(project_root)
-        .and_then(|c| c.org_slug)
-        .ok_or("No org_slug in config. Run `tracevault init` first.")?;
-
     let client = ApiClient::new(&server_url, token.as_deref());
 
     // Resolve repo_id by name.
@@ -211,14 +193,18 @@ pub async fn check_policies(
     // point of enforcement. We attach an actionable next step to each
     // error so the user (or agent) knows the recovery command without
     // guessing — see `connectivity_message` below.
-    let repo_name = git_repo_name(project_root);
-    let repos = client
-        .list_repos(&org_slug)
-        .await
-        .map_err(|e| connectivity_message(&e.to_string()))?;
-    let repo = repos.iter().find(|r| r.name == repo_name).ok_or_else(|| {
-        format!("Repo '{repo_name}' not found on server. Run `tracevault sync` first.")
-    })?;
+    let repo = match resolve_repo_by_name(&client, project_root).await {
+        Ok(r) => r,
+        Err(ResolveRepoByNameError::Network(e)) => {
+            return Err(connectivity_message(&e.to_string()).into());
+        }
+        Err(ResolveRepoByNameError::NotFound { repo_name }) => {
+            return Err(format!(
+                "Repo '{repo_name}' not found on server. Run `tracevault sync` first."
+            )
+            .into());
+        }
+    };
 
     // Collect unpushed session dirs from the shared primary .tracevault/.
     let sessions_dir = project_root.join(".tracevault").join("sessions");
@@ -267,7 +253,6 @@ pub async fn check_policies(
     let commit_sha = git_head_sha(cwd);
     let result = client
         .check_policies(
-            &org_slug,
             &repo.id,
             CheckPoliciesRequest {
                 sessions,
@@ -318,12 +303,12 @@ fn connectivity_message(raw: &str) -> String {
             "Session token may be expired. Run `tracevault login --server-url=<server_url>` to refresh.",
         );
     }
-    // 403 — authenticated but not allowed. Re-login won't help; this is an
-    // org-membership problem.
+    // 403 — authenticated but not allowed. Re-login won't help; the token
+    // itself is not authorized for this repo's policies.
     if lower.contains("403") || lower.contains("forbidden") {
         return with_action(
             raw,
-            "Your token lacks access to this repo's policies. Check your org membership and rerun `tracevault login`.",
+            "Your token is not authorized for this repo's policies. Confirm the token/service account has access and rerun `tracevault login`.",
         );
     }
     // 5xx — server-side fault. Checked before the transport keywords below
@@ -488,10 +473,10 @@ mod tests {
     #[test]
     fn connectivity_message_does_not_collide_on_403() {
         let m = connectivity_message("403 Forbidden");
-        // 403 should suggest org membership, NOT a re-login.
+        // 403 should point at token authorization, NOT a re-login.
         assert!(
-            m.to_lowercase().contains("membership"),
-            "403 should mention membership; got: {m}"
+            m.to_lowercase().contains("authorized"),
+            "403 should mention authorization; got: {m}"
         );
     }
 

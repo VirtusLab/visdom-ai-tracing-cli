@@ -5,56 +5,10 @@
 //! `.tracevault/config.toml`). See design §2/§3/§4.
 
 use std::path::Path;
+use std::process::Command;
 
-use crate::api_client::{ApiClient, ResolveProjectOutcome};
+use crate::api_client::{ApiClient, RepoListItem, ResolveProjectOutcome};
 use crate::session_state::{ProjectBinding, RepoBinding, SessionState};
-
-/// Pure precedence for the org slug: first non-`None` of env, credentials,
-/// bound config. Callers pass `None` for an env value that was empty.
-pub fn org_slug_precedence(
-    env: Option<String>,
-    creds: Option<String>,
-    bound: Option<String>,
-) -> Option<String> {
-    env.or(creds).or(bound)
-}
-
-/// Resolve the org slug for `project_root`: `TRACEVAULT_ORG_SLUG` (non-empty)
-/// → `credentials.json` `org_slug` → bound `config.toml` `org_slug`.
-pub fn org_slug_for(project_root: &Path) -> Option<String> {
-    let env = std::env::var("TRACEVAULT_ORG_SLUG")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let creds = crate::credentials::Credentials::load().and_then(|c| c.org_slug);
-    let bound = crate::config::TracevaultConfig::load(project_root).and_then(|c| c.org_slug);
-    org_slug_precedence(env, creds, bound)
-}
-
-/// Pick the org slug from the credential's memberships when none is
-/// configured locally. The slugs are de-duplicated first (a credential can
-/// have more than one membership row for the same org, e.g. multiple roles),
-/// then: exactly one distinct org → that slug; zero or many → an error telling
-/// the user to set `TRACEVAULT_ORG_SLUG`. The empty case is not only "no
-/// memberships": `/me/orgs` is also empty for an org-scoped API key (which has
-/// no user), so the message names that case explicitly. Sorting makes the
-/// multi-org message deterministic regardless of server ordering.
-pub fn org_slug_from_slugs(slugs: &[String]) -> Result<String, String> {
-    let mut unique: Vec<&str> = slugs.iter().map(String::as_str).collect();
-    unique.sort_unstable();
-    unique.dedup();
-    match unique.as_slice() {
-        [] => Err(
-            "could not derive an org from this credential: it has no org membership \
-             (org-scoped API keys are not supported here); set TRACEVAULT_ORG_SLUG"
-                .to_string(),
-        ),
-        [one] => Ok((*one).to_string()),
-        many => Err(format!(
-            "credential belongs to multiple orgs; set TRACEVAULT_ORG_SLUG to one of: {}",
-            many.join(", ")
-        )),
-    }
-}
 
 /// `git -C <path> remote get-url origin`, trimmed. `None` if git fails or there
 /// is no origin remote. Shared by every caller that needs a checkout's origin
@@ -76,6 +30,60 @@ pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
     } else {
         Some(url)
     }
+}
+
+/// Basename of the git repository's toplevel directory — the convention used
+/// as the server-registered repo name by `verify`/`check`/`agent-policies`/
+/// `status`. Falls back to `"unknown"` if git fails (no repo, not a git
+/// checkout, etc.), mirroring what each of those commands' own
+/// now-removed copy of this function did.
+pub(crate) fn git_repo_name(project_root: &Path) -> String {
+    Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(project_root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            // `git --show-toplevel` emits forward slashes on all platforms, but
+            // Path::file_name is the OS-appropriate way to take the basename
+            // (also tolerant of a trailing separator / native-Windows backslash).
+            let toplevel = String::from_utf8_lossy(&o.stdout);
+            Path::new(toplevel.trim())
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Either half of [`resolve_repo_by_name`]'s failure: the `list_repos` call
+/// itself failed (network/API error, returned raw so a caller can add its own
+/// actionable wrapping — e.g. `check`'s `connectivity_message`), or the call
+/// succeeded but no repo's name matched (so callers can phrase their own
+/// "not found" message/next-step).
+pub(crate) enum ResolveRepoByNameError {
+    Network(Box<dyn std::error::Error>),
+    NotFound { repo_name: String },
+}
+
+/// Resolve the server-registered repo matching `project_root`'s git-toplevel
+/// basename: derive the name via [`git_repo_name`], call `GET /repos`, and
+/// find the matching entry. Shared by `verify`/`agent-policies` (and, via the
+/// `Network`/`NotFound` split, `check`), which previously each duplicated
+/// this name-derive → list → find sequence with their own `fn git_repo_name`.
+pub(crate) async fn resolve_repo_by_name(
+    client: &ApiClient,
+    project_root: &Path,
+) -> Result<RepoListItem, ResolveRepoByNameError> {
+    let repo_name = git_repo_name(project_root);
+    let repos = client
+        .list_repos()
+        .await
+        .map_err(ResolveRepoByNameError::Network)?;
+    repos
+        .into_iter()
+        .find(|r| r.name == repo_name)
+        .ok_or(ResolveRepoByNameError::NotFound { repo_name })
 }
 
 /// Render a human line for a codebase resolved via `resolve_remote` /
@@ -114,7 +122,6 @@ pub(crate) fn pick_status_line(
 /// the server has no matching codebase (pre-registered-only).
 pub async fn resolve_path_to_binding(
     path: &Path,
-    org_slug: &str,
     client: &ApiClient,
 ) -> Result<Option<RepoBinding>, Box<dyn std::error::Error>> {
     let Some(git_url) = git_remote_url(path) else {
@@ -124,10 +131,10 @@ pub async fn resolve_path_to_binding(
     // repos. Any linked repo works for ingest — every repo-keyed server read
     // resolves codebase-wide — so the lowest-id linked repo (deterministic) is
     // fine.
-    let Some(remote) = client.resolve_remote(org_slug, &git_url).await? else {
+    let Some(remote) = client.resolve_remote(&git_url).await? else {
         return Ok(None);
     };
-    let repos = client.get_remote_repos(org_slug, remote.remote_id).await?;
+    let repos = client.get_remote_repos(remote.remote_id).await?;
     let Some(first) = repos.into_iter().min_by_key(|r| r.id) else {
         return Err(format!(
             "codebase {} is registered but has no tracked repo; run `tracevault init` in a checkout",
@@ -136,7 +143,6 @@ pub async fn resolve_path_to_binding(
         .into());
     };
     Ok(Some(RepoBinding {
-        org_slug: org_slug.to_string(),
         repo_id: first.id.to_string(),
         git_url: Some(git_url),
         remote_id: Some(remote.remote_id),
@@ -291,7 +297,6 @@ pub fn effective_project(inputs: &ProjectResolveInputs) -> Option<(ProjectBindin
 pub async fn resolve_effective_project(
     inputs: &ProjectResolveInputs<'_>,
     user_default: Option<ProjectBinding>,
-    org_slug: &str,
     git_url: Option<&str>,
     client: &ApiClient,
 ) -> Result<Option<(ProjectBinding, ProjectSource)>, Box<dyn std::error::Error>> {
@@ -301,14 +306,13 @@ pub async fn resolve_effective_project(
     }
     // Server-side deduction from the repo's git remote.
     if let Some(url) = git_url {
-        match client.resolve_project(org_slug, url).await? {
+        match client.resolve_project(url).await? {
             ResolveProjectOutcome::Resolved(pid) => {
                 eprintln!(
                     "warning: no explicit project set; attributing to the project deduced from this repo ({pid}). Set one with `tracevault project switch <name>` or --project."
                 );
                 return Ok(Some((
                     ProjectBinding {
-                        org_slug: org_slug.to_string(),
                         project_id: pid.to_string(),
                         project_name: String::new(), // enriched for display by the caller if needed
                         updated_at: String::new(),
@@ -317,10 +321,11 @@ pub async fn resolve_effective_project(
                 )));
             }
             ResolveProjectOutcome::Ambiguous => {
-                return Err(format!(
-                    "this repo belongs to multiple projects; select one with `tracevault project switch <name>` or the `--project` override (org {org_slug})"
-                )
-                .into());
+                return Err(
+                    "this repo belongs to multiple projects; select one with `tracevault project switch <name>` or the `--project` override"
+                        .to_string()
+                        .into(),
+                );
             }
             ResolveProjectOutcome::None => { /* fall through */ }
         }
@@ -330,7 +335,7 @@ pub async fn resolve_effective_project(
 }
 
 /// A RepoBinding from a pinned `.tracevault/config.toml` (bound mode), if it has
-/// both org_slug and repo_id. Pure — caller supplies the already-loaded config.
+/// a repo_id. Pure — caller supplies the already-loaded config.
 /// Carries through the `remote_id`/`codebase_name` `init` persisted (best-effort,
 /// display-only) so bound-mode `status` can print the codebase without an extra
 /// network round-trip; `git_url` stays `None` here — bound mode has no live
@@ -338,7 +343,6 @@ pub async fn resolve_effective_project(
 /// bindings that predate `codebase_name`).
 pub fn binding_from_config(config: &crate::config::TracevaultConfig) -> Option<RepoBinding> {
     Some(RepoBinding {
-        org_slug: config.org_slug.clone()?,
         repo_id: config.repo_id.clone()?,
         git_url: None,
         remote_id: config.remote_id.as_deref().and_then(|s| s.parse().ok()),
@@ -401,7 +405,6 @@ mod tests {
         );
         let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
         let ud = ProjectBinding {
-            org_slug: "o".into(),
             project_id: "user".into(),
             project_name: "u".into(),
             updated_at: "".into(),
@@ -412,11 +415,10 @@ mod tests {
             worktree_path: None,
             config_default: None,
         };
-        let (b, src) =
-            resolve_effective_project(&inputs, Some(ud), "org", Some("git@x:y.git"), &client)
-                .await
-                .unwrap()
-                .unwrap();
+        let (b, src) = resolve_effective_project(&inputs, Some(ud), Some("git@x:y.git"), &client)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(src, ProjectSource::Deduced);
         assert_eq!(b.project_id, "22222222-2222-2222-2222-222222222222");
     }
@@ -431,7 +433,7 @@ mod tests {
             worktree_path: None,
             config_default: None,
         };
-        let err = resolve_effective_project(&inputs, None, "org", Some("git@x:y.git"), &client)
+        let err = resolve_effective_project(&inputs, None, Some("git@x:y.git"), &client)
             .await
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("--project"));
@@ -442,7 +444,6 @@ mod tests {
         let (addr, _h) = spawn_once("404 Not Found", "{}");
         let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
         let ud = ProjectBinding {
-            org_slug: "o".into(),
             project_id: "user".into(),
             project_name: "u".into(),
             updated_at: "".into(),
@@ -453,11 +454,10 @@ mod tests {
             worktree_path: None,
             config_default: None,
         };
-        let (b, src) =
-            resolve_effective_project(&inputs, Some(ud), "org", Some("git@x:y.git"), &client)
-                .await
-                .unwrap()
-                .unwrap();
+        let (b, src) = resolve_effective_project(&inputs, Some(ud), Some("git@x:y.git"), &client)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(src, ProjectSource::UserDefault);
         assert_eq!(b.project_id, "user");
     }
@@ -467,7 +467,6 @@ mod tests {
         // no server spawned; a config_default present must resolve WITHOUT any network call
         let client = ApiClient::new("http://127.0.0.1:0", Some("k"));
         let cfg = ProjectBinding {
-            org_slug: "o".into(),
             project_id: "cfg".into(),
             project_name: "c".into(),
             updated_at: "".into(),
@@ -478,17 +477,15 @@ mod tests {
             worktree_path: None,
             config_default: Some(cfg),
         };
-        let (_b, src) =
-            resolve_effective_project(&inputs, None, "org", Some("git@x:y.git"), &client)
-                .await
-                .unwrap()
-                .unwrap();
+        let (_b, src) = resolve_effective_project(&inputs, None, Some("git@x:y.git"), &client)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(src, ProjectSource::ConfigDefault);
     }
 
     fn binding(id: &str) -> RepoBinding {
         RepoBinding {
-            org_slug: "org".into(),
             repo_id: id.into(),
             git_url: None,
             remote_id: None,
@@ -601,7 +598,6 @@ mod tests {
     #[test]
     fn effective_project_precedence_local_rungs() {
         let pb = |n: &str| ProjectBinding {
-            org_slug: "o".into(),
             project_id: n.into(),
             project_name: n.into(),
             updated_at: "".into(),
@@ -667,75 +663,15 @@ mod tests {
     }
 
     #[test]
-    fn org_slug_precedence_order() {
-        assert_eq!(
-            org_slug_precedence(
-                Some("envorg".into()),
-                Some("creds".into()),
-                Some("bound".into())
-            ),
-            Some("envorg".into())
-        );
-        assert_eq!(
-            org_slug_precedence(None, Some("creds".into()), Some("bound".into())),
-            Some("creds".into())
-        );
-        assert_eq!(
-            org_slug_precedence(None, None, Some("bound".into())),
-            Some("bound".into())
-        );
-        assert_eq!(org_slug_precedence(None, None, None), None);
-        // empty env string is treated as unset by the caller (org_slug_for),
-        // so org_slug_precedence only ever sees None or non-empty.
-    }
-
-    #[test]
-    fn org_slug_from_slugs_single() {
-        assert_eq!(
-            org_slug_from_slugs(&["acme".to_string()]),
-            Ok("acme".to_string())
-        );
-    }
-
-    #[test]
-    fn org_slug_from_slugs_none_errors() {
-        let err = org_slug_from_slugs(&[]).unwrap_err();
-        assert_eq!(
-            err,
-            "could not derive an org from this credential: it has no org membership \
-             (org-scoped API keys are not supported here); set TRACEVAULT_ORG_SLUG"
-        );
-    }
-
-    #[test]
-    fn org_slug_from_slugs_multiple_lists_them() {
-        let err = org_slug_from_slugs(&["acme".to_string(), "globex".to_string()]).unwrap_err();
-        assert_eq!(
-            err,
-            "credential belongs to multiple orgs; set TRACEVAULT_ORG_SLUG to one of: acme, globex"
-        );
-    }
-
-    #[test]
-    fn org_slug_from_slugs_single_org_duplicated_is_not_multi() {
-        // One org with two membership rows must derive, not be rejected as multi-org.
-        assert_eq!(
-            org_slug_from_slugs(&["acme".to_string(), "acme".to_string()]),
-            Ok("acme".to_string())
-        );
-    }
-
-    #[test]
     fn binding_from_config_carries_remote_id_and_codebase_name() {
         let uuid = uuid::Uuid::new_v4();
         let config = crate::config::TracevaultConfig {
-            org_slug: Some("acme".into()),
             repo_id: Some("repo-1".into()),
             remote_id: Some(uuid.to_string()),
             codebase_name: Some("acme/foo".into()),
             ..Default::default()
         };
-        let binding = binding_from_config(&config).expect("org_slug + repo_id present");
+        let binding = binding_from_config(&config).expect("repo_id present");
         assert_eq!(binding.codebase_name, Some("acme/foo".to_string()));
         assert_eq!(binding.remote_id, Some(uuid));
     }
@@ -779,20 +715,5 @@ mod tests {
     #[test]
     fn pick_status_line_none_when_nothing_available() {
         assert_eq!(pick_status_line(None, None, None), None);
-    }
-
-    #[test]
-    fn org_slug_from_slugs_multiple_sorted_and_deduped() {
-        // Message must not depend on server ordering, and repeats collapse.
-        let err = org_slug_from_slugs(&[
-            "globex".to_string(),
-            "acme".to_string(),
-            "globex".to_string(),
-        ])
-        .unwrap_err();
-        assert_eq!(
-            err,
-            "credential belongs to multiple orgs; set TRACEVAULT_ORG_SLUG to one of: acme, globex"
-        );
     }
 }

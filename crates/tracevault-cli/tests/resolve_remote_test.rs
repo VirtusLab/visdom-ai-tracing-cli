@@ -45,7 +45,7 @@ async fn resolve_remote_returns_remote_on_200() {
     let (base, rx) = spawn_once(Box::leak(resp.into_boxed_str()));
     let client = ApiClient::new(&base, Some("tok"));
     let got = client
-        .resolve_remote("org", "git@github.com:o/x.git")
+        .resolve_remote("git@github.com:o/x.git")
         .await
         .unwrap();
     let got = got.expect("expected Some");
@@ -57,7 +57,7 @@ async fn resolve_remote_returns_remote_on_200() {
     );
     assert_eq!(got.normalized_url, "github.com/o/x");
     let request = rx.recv_timeout(RECV_TIMEOUT).expect("no request");
-    assert!(request.contains("/api/v1/orgs/org/remotes/resolve?git_url="));
+    assert!(request.contains("/api/v1/remotes/resolve?git_url="));
     assert!(
         request.contains("%40"),
         "git_url must be percent-encoded: {request}"
@@ -70,14 +70,14 @@ async fn resolve_remote_returns_none_on_404() {
     let (base, rx) = spawn_once(resp);
     let client = ApiClient::new(&base, Some("tok"));
     assert!(client
-        .resolve_remote("org", "git@github.com:o/x.git")
+        .resolve_remote("git@github.com:o/x.git")
         .await
         .unwrap()
         .is_none());
     // Assert a request actually went out (else a buggy resolve_remote that
     // returned None without any I/O would still pass this test).
     let request = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
-    assert!(request.contains("/api/v1/orgs/org/remotes/resolve?git_url="));
+    assert!(request.contains("/api/v1/remotes/resolve?git_url="));
 }
 
 #[tokio::test]
@@ -91,14 +91,11 @@ async fn get_remote_repos_returns_repos_array() {
     let (base, rx) = spawn_once(Box::leak(resp.into_boxed_str()));
     let client = ApiClient::new(&base, Some("tok"));
     let repos = client
-        .get_remote_repos(
-            "org",
-            "44000761-8d22-4256-bd2c-27a0ba278c6f".parse().unwrap(),
-        )
+        .get_remote_repos("44000761-8d22-4256-bd2c-27a0ba278c6f".parse().unwrap())
         .await
         .unwrap();
     assert_eq!(repos.len(), 2);
     assert_eq!(repos[0].name, "a");
     let request = rx.recv_timeout(RECV_TIMEOUT).expect("no request");
-    assert!(request.contains("/api/v1/orgs/org/remotes/44000761-8d22-4256-bd2c-27a0ba278c6f"));
+    assert!(request.contains("/api/v1/remotes/44000761-8d22-4256-bd2c-27a0ba278c6f"));
 }

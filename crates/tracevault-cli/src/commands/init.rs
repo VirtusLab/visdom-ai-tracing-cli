@@ -61,21 +61,6 @@ fn resolve_claude_target(
     })
 }
 
-fn parse_github_org(remote_url: &str) -> Option<String> {
-    // SSH: git@github.com:VirtusLab/visdom-ai-tracing.git
-    if let Some(path) = remote_url.strip_prefix("git@github.com:") {
-        return path.split('/').next().map(String::from);
-    }
-    // HTTPS: https://github.com/VirtusLab/visdom-ai-tracing.git
-    if let Some(path) = remote_url
-        .strip_prefix("https://github.com/")
-        .or_else(|| remote_url.strip_prefix("http://github.com/"))
-    {
-        return path.split('/').next().map(String::from);
-    }
-    None
-}
-
 /// If `dir` is inside a LINKED git worktree (not the primary checkout), return
 /// the primary worktree root. Returns `None` for the primary checkout or a
 /// non-git directory.
@@ -203,15 +188,11 @@ pub async fn init_in_directory(
         eprintln!("Run 'git remote add origin <url>' then 'tracevault sync' to register.");
     }
 
-    // Extract org slug from GitHub remote URL
-    let org_slug = remote_url.as_deref().and_then(parse_github_org);
-
-    // Write config (include server_url and org_slug if available)
+    // Write config (include server_url if available)
     let mut config = TracevaultConfig::default();
     if let Some(url) = server_url {
         config.server_url = Some(url.to_string());
     }
-    config.org_slug = org_slug.clone();
     config.user_context = Some(user_context);
     fs::write(
         TracevaultConfig::config_path(project_root),
@@ -257,7 +238,7 @@ pub async fn init_in_directory(
 
     if resolved_token.is_none() {
         eprintln!("Not logged in. Run 'tracevault login' to register this repo with the server.");
-    } else if let (Some(url), Some(remote), Some(slug)) = (effective_url, remote_url, org_slug) {
+    } else if let (Some(url), Some(remote)) = (effective_url, remote_url) {
         let client = ApiClient::new(&url, resolved_token.as_deref());
         let repo_name = git_repo_name(project_root);
         // Captured before `remote` is moved into the request below, so the
@@ -265,13 +246,10 @@ pub async fn init_in_directory(
         let origin_url = remote.clone();
 
         match client
-            .register_repo(
-                &slug,
-                crate::api_client::RegisterRepoRequest {
-                    repo_name,
-                    github_url: Some(remote),
-                },
-            )
+            .register_repo(crate::api_client::RegisterRepoRequest {
+                repo_name,
+                github_url: Some(remote),
+            })
             .await
         {
             Ok(resp) => {
@@ -284,7 +262,7 @@ pub async fn init_in_directory(
                     // init — `repo_id` above stays authoritative for ingest;
                     // `remote_id`/`codebase_name` here are recorded for
                     // display only.
-                    if let Ok(Some(remote)) = client.resolve_remote(&slug, &origin_url).await {
+                    if let Ok(Some(remote)) = client.resolve_remote(&origin_url).await {
                         println!(
                             "{}",
                             crate::resolution::codebase_line(
@@ -300,22 +278,25 @@ pub async fn init_in_directory(
                 }
             }
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("404") {
-                    eprintln!("Warning: organization '{}' not found on the server.", slug);
-                    eprintln!(
-                        "Create it first at your TraceVault instance, then run 'tracevault sync'."
-                    );
-                } else if msg.contains("403") {
-                    eprintln!("Warning: you are not a member of organization '{}'.", slug);
-                } else {
-                    eprintln!("Warning: could not register repo on server: {e}");
-                }
+                eprintln!("{}", registration_failure_message(e.as_ref()));
             }
         }
     }
 
     Ok(hook_gitignore_entry)
+}
+
+/// The warning line for a failed repo registration during `init`. A 403 means
+/// the token is valid but not authorized to register this repo — distinct
+/// from a network/server fault, so it gets its own actionable wording;
+/// registration failure is non-fatal to `init` either way (a warning, not an
+/// aborted init — the repo can be registered later via `tracevault sync`).
+fn registration_failure_message(err: &dyn std::error::Error) -> String {
+    if err.to_string().contains("403") {
+        "Warning: you are not authorized to register this repo.".to_string()
+    } else {
+        format!("Warning: could not register repo on server: {err}")
+    }
 }
 
 fn update_root_gitignore(project_root: &Path, settings_entry: &str) -> Result<(), io::Error> {
@@ -1101,6 +1082,48 @@ pub fn write_global_user_config_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    /// Spawn a one-shot raw-HTTP server that returns `response` to the first
+    /// request it accepts (mirrors `commands::repo`'s test module).
+    fn spawn_once(response: String) -> String {
+        let response: &'static str = Box::leak(response.into_boxed_str());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream);
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Format a raw HTTP/1.1 response with the given `status` line and a
+    /// correct `Content-Length` for `body`.
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            body.len(),
+            body
+        )
+    }
+
+    fn add_origin_remote(dir: &Path, url: &str) {
+        let ok = std::process::Command::new("git")
+            .args(["-C", &dir.to_string_lossy(), "remote", "add", "origin", url])
+            .status()
+            .expect("git remote add failed")
+            .success();
+        assert!(ok, "git remote add must succeed");
+    }
 
     #[test]
     fn linked_worktree_primary_detects_linked_and_primary() {
@@ -1132,32 +1155,6 @@ mod tests {
             linked_worktree_primary(tmp.path()).is_none(),
             "a non-git directory is not a linked worktree"
         );
-    }
-
-    #[test]
-    fn parse_github_org_ssh() {
-        assert_eq!(
-            parse_github_org("git@github.com:myorg/myrepo.git"),
-            Some("myorg".into())
-        );
-    }
-
-    #[test]
-    fn parse_github_org_https() {
-        assert_eq!(
-            parse_github_org("https://github.com/myorg/myrepo"),
-            Some("myorg".into())
-        );
-    }
-
-    #[test]
-    fn parse_github_org_non_github_returns_none() {
-        assert_eq!(parse_github_org("https://gitlab.com/org/repo"), None);
-    }
-
-    #[test]
-    fn parse_github_org_invalid() {
-        assert_eq!(parse_github_org("not-a-url"), None);
     }
 
     #[test]
@@ -1723,5 +1720,134 @@ mod tests {
         let gi = fs::read_to_string(root.join(".gitignore")).unwrap();
         assert!(gi.contains(".codex/hooks.json"));
         assert!(gi.contains(".tracevault/"));
+    }
+
+    /// A successful `POST /api/v1/repos` during `init` must persist the
+    /// returned `repo_id` into `.tracevault/config.toml` — this is the
+    /// "everything worked" happy path of the registration step at the end of
+    /// `init_in_directory`, previously untested.
+    ///
+    /// `XDG_CONFIG_HOME` is redirected so this doesn't read/write the
+    /// developer's real `~/.config/tracevault/credentials.json`;
+    /// `TRACEVAULT_API_KEY` is pinned directly since `resolve_credentials`
+    /// checks it before the credentials file. `_env_lock` serializes this
+    /// against other tests in the crate that mutate the same env vars
+    /// (see `test_helpers::lock_env_mutation`).
+    #[tokio::test]
+    async fn init_in_directory_registers_repo_and_persists_repo_id() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        crate::test_helpers::init_git_repo(root);
+        add_origin_remote(root, "git@github.com:org/repo.git");
+
+        let repo_id = "11111111-1111-4111-8111-111111111111";
+        let body = format!(r#"{{"repo_id":"{repo_id}"}}"#);
+        let base = spawn_once(http_response("200 OK", &body));
+
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("TRACEVAULT_API_KEY", "tok");
+        _guard.remove("TRACEVAULT_SERVER_URL");
+
+        init_in_directory(
+            root,
+            Some(&base),
+            None,
+            true,
+            crate::config::UserContext::Toggle(false),
+            crate::agent::Agent::Codex,
+        )
+        .await
+        .unwrap();
+
+        let cfg = crate::config::TracevaultConfig::load(root).expect("config.toml written by init");
+        assert_eq!(
+            cfg.repo_id,
+            Some(repo_id.to_string()),
+            "successful registration must persist repo_id to config.toml"
+        );
+    }
+
+    /// A 403 on `POST /api/v1/repos` must be a non-fatal warning (`init`
+    /// still succeeds and installs hooks) and must NOT persist a `repo_id` —
+    /// there's nothing valid to persist. The exact wording of the warning is
+    /// covered by `registration_failure_message_flags_403_as_not_authorized`
+    /// below.
+    #[tokio::test]
+    async fn init_in_directory_registration_403_does_not_persist_repo_id() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        crate::test_helpers::init_git_repo(root);
+        add_origin_remote(root, "git@github.com:org/repo.git");
+
+        let base = spawn_once(http_response("403 Forbidden", ""));
+
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("TRACEVAULT_API_KEY", "tok");
+        _guard.remove("TRACEVAULT_SERVER_URL");
+
+        let entry = init_in_directory(
+            root,
+            Some(&base),
+            None,
+            true,
+            crate::config::UserContext::Toggle(false),
+            crate::agent::Agent::Codex,
+        )
+        .await
+        .expect("a registration failure (403) must not abort init itself");
+        assert_eq!(entry, ".codex/hooks.json");
+
+        let cfg = crate::config::TracevaultConfig::load(root).expect("config.toml written by init");
+        assert!(
+            cfg.repo_id.is_none(),
+            "a 403 registration failure must not persist a repo_id"
+        );
+    }
+
+    /// The actual error shape `ApiClient::register_repo` produces for a 403
+    /// response (via the same mock-server harness) must be recognized by
+    /// `registration_failure_message` as a not-authorized case, not a
+    /// generic server fault.
+    #[tokio::test]
+    async fn registration_failure_message_flags_403_as_not_authorized() {
+        let base = spawn_once(http_response("403 Forbidden", ""));
+        let client = ApiClient::new(&base, Some("tok"));
+        let err = client
+            .register_repo(crate::api_client::RegisterRepoRequest {
+                repo_name: "repo".into(),
+                github_url: Some("git@github.com:org/repo.git".into()),
+            })
+            .await
+            .unwrap_err();
+        let msg = registration_failure_message(err.as_ref());
+        assert!(
+            msg.contains("not authorized"),
+            "403 registration failure must surface a not-authorized message; got: {msg}"
+        );
+    }
+
+    /// A non-403 registration failure (e.g. a 500) keeps the generic
+    /// "could not register" wording, distinguishing it from the 403 case.
+    #[tokio::test]
+    async fn registration_failure_message_generic_for_non_403() {
+        let base = spawn_once(http_response("500 Internal Server Error", ""));
+        let client = ApiClient::new(&base, Some("tok"));
+        let err = client
+            .register_repo(crate::api_client::RegisterRepoRequest {
+                repo_name: "repo".into(),
+                github_url: Some("git@github.com:org/repo.git".into()),
+            })
+            .await
+            .unwrap_err();
+        let msg = registration_failure_message(err.as_ref());
+        assert!(
+            msg.contains("could not register repo on server"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("not authorized"), "got: {msg}");
     }
 }
