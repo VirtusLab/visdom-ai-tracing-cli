@@ -288,12 +288,27 @@ pub async fn init_in_directory(
 
 /// The warning line for a failed repo registration during `init`. A 403 means
 /// the token is valid but not authorized to register this repo — distinct
-/// from a network/server fault, so it gets its own actionable wording;
-/// registration failure is non-fatal to `init` either way (a warning, not an
-/// aborted init — the repo can be registered later via `tracevault sync`).
+/// from a network/server fault, so it gets its own actionable wording; a 404
+/// means this server build doesn't recognize the registration route at all,
+/// which most plausibly means the CLI is newer than the server (a CLI/server
+/// version mismatch). Registration failure is non-fatal to `init` either
+/// way (a warning, not an aborted init — the repo can be registered later
+/// via `tracevault sync`).
+///
+/// Matches on the exact status-prefix shape `ApiClient::register_repo`
+/// produces (`"Server returned {status} ..."`, from its `authed_send_json`
+/// call) rather than a bare `.contains("403")`/`.contains("404")` — a
+/// response body that happens to contain that digit string (e.g. a proxy
+/// error page) must not be misclassified.
 fn registration_failure_message(err: &dyn std::error::Error) -> String {
-    if err.to_string().contains("403") {
+    let msg = err.to_string();
+    if msg.starts_with("Server returned 403 ") {
         "Warning: you are not authorized to register this repo.".to_string()
+    } else if msg.starts_with("Server returned 404 ") {
+        "Warning: could not register repo on server (404) — this endpoint may not exist on \
+         this server yet, possibly a CLI/server version mismatch. Run `tracevault sync` again \
+         once the server is upgraded."
+            .to_string()
     } else {
         format!("Warning: could not register repo on server: {err}")
     }
@@ -1835,5 +1850,55 @@ mod tests {
             "got: {msg}"
         );
         assert!(!msg.contains("not authorized"), "got: {msg}");
+    }
+
+    /// A 500 whose BODY happens to contain the digits "403" (e.g. a proxy
+    /// error page quoting an unrelated status) must not be misclassified as
+    /// a 403-not-authorized failure — the match must key on the actual
+    /// status prefix, not a bare substring search over the whole message.
+    #[tokio::test]
+    async fn registration_failure_message_does_not_misclassify_403_in_body() {
+        let base = spawn_once(http_response(
+            "500 Internal Server Error",
+            "upstream error 403 from proxy",
+        ));
+        let client = ApiClient::new(&base, Some("tok"));
+        let err = client
+            .register_repo(crate::api_client::RegisterRepoRequest {
+                repo_name: "repo".into(),
+                github_url: Some("git@github.com:org/repo.git".into()),
+            })
+            .await
+            .unwrap_err();
+        let msg = registration_failure_message(err.as_ref());
+        assert!(
+            !msg.contains("not authorized"),
+            "a 403 substring in the body must not trigger the not-authorized message; got: {msg}"
+        );
+        assert!(
+            msg.contains("could not register repo on server"),
+            "got: {msg}"
+        );
+    }
+
+    /// A 404 (the registration route doesn't exist on this server) surfaces a
+    /// CLI/server version-mismatch hint rather than the generic wording, so
+    /// the user has an actionable next step instead of an opaque status code.
+    #[tokio::test]
+    async fn registration_failure_message_flags_404_as_version_mismatch() {
+        let base = spawn_once(http_response("404 Not Found", ""));
+        let client = ApiClient::new(&base, Some("tok"));
+        let err = client
+            .register_repo(crate::api_client::RegisterRepoRequest {
+                repo_name: "repo".into(),
+                github_url: Some("git@github.com:org/repo.git".into()),
+            })
+            .await
+            .unwrap_err();
+        let msg = registration_failure_message(err.as_ref());
+        assert!(
+            msg.to_lowercase().contains("version mismatch"),
+            "a 404 registration failure should hint at a version mismatch; got: {msg}"
+        );
     }
 }
