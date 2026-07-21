@@ -1,7 +1,7 @@
 use crate::api_client::ApiClient;
 use crate::config::{user_config_path_in, TracevaultConfig, UserContext};
 use crate::context::Context;
-use crate::resolution::git_remote_url;
+use crate::resolution::{git_remote_url, git_repo_name};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -333,20 +333,6 @@ fn update_root_gitignore(project_root: &Path, settings_entry: &str) -> Result<()
     }
 
     fs::write(path, content)
-}
-
-fn git_repo_name(project_root: &Path) -> String {
-    std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(project_root)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .as_deref()
-        .and_then(|p| p.rsplit('/').next())
-        .map(String::from)
-        .unwrap_or_else(|| "unknown".into())
 }
 
 const HOOK_MARKER: &str = "# tracevault:enforce";

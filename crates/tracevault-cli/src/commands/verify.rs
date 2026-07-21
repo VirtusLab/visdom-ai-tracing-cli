@@ -70,7 +70,7 @@ pub async fn verify(
     let repo = resolve_repo_by_name(&client, project_root)
         .await
         .map_err(|e| match e {
-            ResolveRepoByNameError::Network(err) => err,
+            ResolveRepoByNameError::ListFailed(err) => err,
             ResolveRepoByNameError::NotFound { repo_name } => format!(
                 "Repo '{}' not found on server. Run 'tracevault sync' first.",
                 repo_name

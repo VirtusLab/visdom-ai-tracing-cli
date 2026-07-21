@@ -34,8 +34,8 @@ pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
 
 /// Basename of the git repository's toplevel directory — the convention used
 /// as the server-registered repo name by `verify`/`check`/`agent-policies`/
-/// `status`. Falls back to `"unknown"` if git fails (no repo, not a git
-/// checkout, etc.), mirroring what each of those commands' own
+/// `status`/`init`/`sync`. Falls back to `"unknown"` if git fails (no repo,
+/// not a git checkout, etc.), mirroring what each of those commands' own
 /// now-removed copy of this function did.
 pub(crate) fn git_repo_name(project_root: &Path) -> String {
     Command::new("git")
@@ -44,33 +44,38 @@ pub(crate) fn git_repo_name(project_root: &Path) -> String {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .and_then(|o| {
-            // `git --show-toplevel` emits forward slashes on all platforms, but
-            // Path::file_name is the OS-appropriate way to take the basename
-            // (also tolerant of a trailing separator / native-Windows backslash).
-            let toplevel = String::from_utf8_lossy(&o.stdout);
-            Path::new(toplevel.trim())
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-        })
+        .and_then(|o| repo_basename(String::from_utf8_lossy(&o.stdout).trim()))
         .unwrap_or_else(|| "unknown".into())
 }
 
+/// The basename of a `git rev-parse --show-toplevel` path. `git` always
+/// emits forward slashes (even on Windows), but `Path::file_name` is the
+/// OS-appropriate way to take the basename — it's also tolerant of a
+/// trailing separator. `None` if the path has no basename component (e.g.
+/// root `/`). Split out from [`git_repo_name`] so the basename logic is
+/// unit-testable without shelling out to git.
+fn repo_basename(toplevel: &str) -> Option<String> {
+    Path::new(toplevel)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+}
+
 /// Either half of [`resolve_repo_by_name`]'s failure: the `list_repos` call
-/// itself failed (network/API error, returned raw so a caller can add its own
-/// actionable wrapping — e.g. `check`'s `connectivity_message`), or the call
-/// succeeded but no repo's name matched (so callers can phrase their own
-/// "not found" message/next-step).
+/// itself failed for any reason — network/transport, or any non-2xx status
+/// (401/403/404/500/...), not only a network problem — returned raw so a
+/// caller can add its own actionable wrapping (e.g. `check`'s
+/// `connectivity_message`); or the call succeeded but no repo's name matched
+/// (so callers can phrase their own "not found" message/next-step).
+#[derive(Debug)]
 pub(crate) enum ResolveRepoByNameError {
-    Network(Box<dyn std::error::Error>),
+    ListFailed(Box<dyn std::error::Error>),
     NotFound { repo_name: String },
 }
 
 /// Resolve the server-registered repo matching `project_root`'s git-toplevel
 /// basename: derive the name via [`git_repo_name`], call `GET /repos`, and
-/// find the matching entry. Shared by `verify`/`agent-policies` (and, via the
-/// `Network`/`NotFound` split, `check`), which previously each duplicated
-/// this name-derive → list → find sequence with their own `fn git_repo_name`.
+/// find the matching entry. Shared via the `ListFailed`/`NotFound` split so
+/// each caller can phrase its own message for either failure.
 pub(crate) async fn resolve_repo_by_name(
     client: &ApiClient,
     project_root: &Path,
@@ -79,7 +84,7 @@ pub(crate) async fn resolve_repo_by_name(
     let repos = client
         .list_repos()
         .await
-        .map_err(ResolveRepoByNameError::Network)?;
+        .map_err(ResolveRepoByNameError::ListFailed)?;
     repos
         .into_iter()
         .find(|r| r.name == repo_name)
@@ -359,6 +364,45 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::thread;
+
+    #[test]
+    fn repo_basename_bare_name() {
+        assert_eq!(repo_basename("myrepo"), Some("myrepo".to_string()));
+    }
+
+    #[test]
+    fn repo_basename_nested_path() {
+        assert_eq!(
+            repo_basename("/home/user/code/myrepo"),
+            Some("myrepo".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_basename_trailing_slash() {
+        // `Path::file_name` skips a trailing separator rather than treating
+        // it as an empty final component.
+        assert_eq!(
+            repo_basename("/home/user/code/myrepo/"),
+            Some("myrepo".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_basename_dot_git_suffix_directory() {
+        // A checkout directory literally named `myrepo.git` (e.g. a bare
+        // clone) keeps the suffix — `git_repo_name` takes the raw basename,
+        // it does not strip `.git`.
+        assert_eq!(
+            repo_basename("/srv/repos/myrepo.git"),
+            Some("myrepo.git".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_basename_root_has_no_basename() {
+        assert_eq!(repo_basename("/"), None);
+    }
 
     /// Spawn a one-shot raw-HTTP server that returns a response built from
     /// `status` (e.g. `"200 OK"`) and `body` to the first request it accepts.
@@ -715,5 +759,63 @@ mod tests {
     #[test]
     fn pick_status_line_none_when_nothing_available() {
         assert_eq!(pick_status_line(None, None, None), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_by_name_ok_when_name_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        let repo_name = git_repo_name(tmp.path());
+        let body =
+            format!(r#"[{{"id":"11111111-1111-1111-1111-111111111111","name":"{repo_name}"}}]"#);
+        let (addr, _h) = spawn_once("200 OK", Box::leak(body.into_boxed_str()));
+        let client = ApiClient::new(&format!("http://{addr}"), Some("tok"));
+
+        let repo = resolve_repo_by_name(&client, tmp.path())
+            .await
+            .expect("expected a match");
+        assert_eq!(repo.name, repo_name);
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_by_name_not_found_when_list_has_no_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        let (addr, _h) = spawn_once(
+            "200 OK",
+            r#"[{"id":"11111111-1111-1111-1111-111111111111","name":"some-other-repo"}]"#,
+        );
+        let client = ApiClient::new(&format!("http://{addr}"), Some("tok"));
+
+        match resolve_repo_by_name(&client, tmp.path()).await {
+            Err(ResolveRepoByNameError::NotFound { .. }) => {}
+            other => panic!(
+                "expected NotFound, got a different outcome: {}",
+                other.is_ok()
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_by_name_list_failed_on_non_2xx() {
+        // A `list_repos` failure (401/403/500/... — not necessarily a
+        // network error, hence `ListFailed` rather than the old `Network`
+        // name) must be distinguished from `NotFound` so callers like
+        // `check`'s `connectivity_message` can add their own actionable
+        // wrapping instead of a bare "not found" message.
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        let (addr, _h) = spawn_once("500 Internal Server Error", "");
+        let client = ApiClient::new(&format!("http://{addr}"), Some("tok"));
+
+        match resolve_repo_by_name(&client, tmp.path()).await {
+            Err(ResolveRepoByNameError::ListFailed(e)) => {
+                assert!(e.to_string().contains("500"), "got: {e}");
+            }
+            other => panic!(
+                "expected ListFailed, got a different outcome: {}",
+                other.is_ok()
+            ),
+        }
     }
 }
