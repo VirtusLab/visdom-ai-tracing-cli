@@ -205,6 +205,14 @@ fn capture_project(
 ///
 /// Takes `&dyn Error` rather than `&Box<dyn Error>` to avoid the clippy
 /// `borrowed_box` lint at call sites that already hold a `Box<dyn Error>`.
+///
+/// COUPLING: the `"(NNN "` markers below must byte-for-byte match what
+/// `ApiClient::authed_send_json`'s `err_prefix` closures render (e.g.
+/// `stream_event`'s `"Stream failed ({status})"`, where `{status}` Displays
+/// as `"404 Not Found"`, yielding `"Stream failed (404 Not Found): ..."` —
+/// hence the `"(404 "` marker below matching on the open-paren + code + the
+/// space before the reason phrase). If that error-formatting ever changes,
+/// update this list (and its tests) to match.
 fn is_deterministic_client_error(e: &dyn std::error::Error) -> bool {
     let s = e.to_string();
     // 401 is deliberately excluded: it's an authentication failure (bad/expired

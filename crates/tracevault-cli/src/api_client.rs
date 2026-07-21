@@ -339,6 +339,14 @@ impl ApiClient {
     /// Attach the bearer token, send `builder`, and deserialize a successful
     /// JSON response — the shared shape of every simple authenticated
     /// request/response method (`send_authed` + `success_json`).
+    ///
+    /// NOTE: callers whose `err_prefix` renders the status as `"({status})"`
+    /// (e.g. `stream_event`'s `"Stream failed ({status})"`) produce error
+    /// strings containing `"(404 "`/`"(403 "`/etc. —
+    /// `commands::stream::is_deterministic_client_error` matches on exactly
+    /// that substring shape to classify a stream-send failure. If you change
+    /// how a status is rendered here, check that predicate (and its tests)
+    /// still pass.
     async fn authed_send_json<T, F>(
         &self,
         builder: reqwest::RequestBuilder,
