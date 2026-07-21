@@ -312,12 +312,12 @@ fn connectivity_message(raw: &str) -> String {
             "Session token may be expired. Run `tracevault login --server-url=<server_url>` to refresh.",
         );
     }
-    // 403 — authenticated but not allowed. Re-login won't help; this is an
-    // org-membership problem.
+    // 403 — authenticated but not allowed. Re-login won't help; the token
+    // itself is not authorized for this repo's policies.
     if lower.contains("403") || lower.contains("forbidden") {
         return with_action(
             raw,
-            "Your token lacks access to this repo's policies. Check your org membership and rerun `tracevault login`.",
+            "Your token is not authorized for this repo's policies. Confirm the token/service account has access and rerun `tracevault login`.",
         );
     }
     // 5xx — server-side fault. Checked before the transport keywords below
@@ -482,10 +482,10 @@ mod tests {
     #[test]
     fn connectivity_message_does_not_collide_on_403() {
         let m = connectivity_message("403 Forbidden");
-        // 403 should suggest org membership, NOT a re-login.
+        // 403 should point at token authorization, NOT a re-login.
         assert!(
-            m.to_lowercase().contains("membership"),
-            "403 should mention membership; got: {m}"
+            m.to_lowercase().contains("authorized"),
+            "403 should mention authorization; got: {m}"
         );
     }
 
