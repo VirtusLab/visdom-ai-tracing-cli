@@ -44,10 +44,15 @@ pub(crate) fn git_repo_name(project_root: &Path) -> String {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .as_deref()
-        .and_then(|p| p.rsplit('/').next())
-        .map(String::from)
+        .and_then(|o| {
+            // `git --show-toplevel` emits forward slashes on all platforms, but
+            // Path::file_name is the OS-appropriate way to take the basename
+            // (also tolerant of a trailing separator / native-Windows backslash).
+            let toplevel = String::from_utf8_lossy(&o.stdout);
+            Path::new(toplevel.trim())
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
         .unwrap_or_else(|| "unknown".into())
 }
 
