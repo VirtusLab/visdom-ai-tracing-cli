@@ -228,21 +228,12 @@ impl ApiClient {
         &self,
         req: RegisterRepoRequest,
     ) -> Result<RegisterRepoResponse, Box<dyn Error>> {
-        let mut builder = self.client.post(format!("{}/api/v1/repos", self.base_url));
-
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-
-        let resp = builder.json(&req).send().await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Server returned {status}: {body}").into());
-        }
-
-        Ok(resp.json().await?)
+        let builder = self
+            .client
+            .post(format!("{}/api/v1/repos", self.base_url))
+            .json(&req);
+        self.authed_send_json(builder, |status| format!("Server returned {status}"))
+            .await
     }
 
     pub async fn device_start(&self) -> Result<DeviceAuthResponse, Box<dyn Error>> {
@@ -305,6 +296,62 @@ impl ApiClient {
         Ok(())
     }
 
+    /// Attach the bearer token (if configured) to a request. Shared by every
+    /// authenticated request builder so header attachment has exactly one
+    /// implementation.
+    fn attach_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.api_key {
+            Some(key) => builder.header("Authorization", format!("Bearer {key}")),
+            None => builder,
+        }
+    }
+
+    /// Attach the bearer token and send `builder`. The shared first step of
+    /// every authenticated request; callers that need bespoke status-code
+    /// handling (e.g. treating 404/409 as non-error outcomes) use this
+    /// directly instead of `authed_send_json`.
+    async fn send_authed(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, Box<dyn Error>> {
+        Ok(self.attach_auth(builder).send().await?)
+    }
+
+    /// Check that `resp`'s status is a success and deserialize its JSON
+    /// body; otherwise build an error as `"{err_prefix(status)}: {body}"`.
+    /// `err_prefix` receives the status so each caller can format its own
+    /// distinct message (parenthesized status, bare status, ...) — this
+    /// helper only supplies the shared "check status, else deserialize"
+    /// shape, not the message wording.
+    async fn success_json<T, F>(resp: reqwest::Response, err_prefix: F) -> Result<T, Box<dyn Error>>
+    where
+        T: serde::de::DeserializeOwned,
+        F: FnOnce(reqwest::StatusCode) -> String,
+    {
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("{}: {}", err_prefix(status), body).into());
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Attach the bearer token, send `builder`, and deserialize a successful
+    /// JSON response — the shared shape of every simple authenticated
+    /// request/response method (`send_authed` + `success_json`).
+    async fn authed_send_json<T, F>(
+        &self,
+        builder: reqwest::RequestBuilder,
+        err_prefix: F,
+    ) -> Result<T, Box<dyn Error>>
+    where
+        T: serde::de::DeserializeOwned,
+        F: FnOnce(reqwest::StatusCode) -> String,
+    {
+        let resp = self.send_authed(builder).await?;
+        Self::success_json(resp, err_prefix).await
+    }
+
     /// GET `{base}{path}` with the bearer token, mapping failures into
     /// `GetMeError` (401 → `Unauthorized`, transport → `Network`, other
     /// non-2xx or bad JSON → `Server`). Shared by the credential-scoped GETs
@@ -313,10 +360,7 @@ impl ApiClient {
         &self,
         path: &str,
     ) -> Result<T, GetMeError> {
-        let mut builder = self.client.get(format!("{}{}", self.base_url, path));
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
+        let builder = self.attach_auth(self.client.get(format!("{}{}", self.base_url, path)));
 
         let resp = builder
             .send()
@@ -345,42 +389,23 @@ impl ApiClient {
     }
 
     pub async fn list_repos(&self) -> Result<Vec<RepoListItem>, Box<dyn Error>> {
-        let mut builder = self.client.get(format!("{}/api/v1/repos", self.base_url));
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-
-        let resp = builder.send().await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Failed to list repos ({status}): {body}").into());
-        }
-
-        let repos: Vec<RepoListItem> = resp.json().await?;
-        Ok(repos)
+        let builder = self.client.get(format!("{}/api/v1/repos", self.base_url));
+        self.authed_send_json(builder, |status| format!("Failed to list repos ({status})"))
+            .await
     }
 
     pub async fn get_agent_instructions(
         &self,
         repo_id: &uuid::Uuid,
     ) -> Result<AgentInstructionsResponse, Box<dyn Error>> {
-        let mut builder = self.client.get(format!(
+        let builder = self.client.get(format!(
             "{}/api/v1/repos/{}/policies/agent-instructions",
             self.base_url, repo_id
         ));
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-
-        let resp = builder.send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Failed to fetch agent instructions ({status}): {body}").into());
-        }
-        Ok(resp.json().await?)
+        self.authed_send_json(builder, |status| {
+            format!("Failed to fetch agent instructions ({status})")
+        })
+        .await
     }
 
     pub async fn verify_commits(
@@ -388,23 +413,15 @@ impl ApiClient {
         repo_id: &uuid::Uuid,
         req: CiVerifyRequest,
     ) -> Result<CiVerifyResponse, Box<dyn Error>> {
-        let mut builder = self.client.post(format!(
-            "{}/api/v1/repos/{}/ci/verify",
-            self.base_url, repo_id
-        ));
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-
-        let resp = builder.json(&req).send().await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("CI verify failed ({status}): {body}").into());
-        }
-
-        Ok(resp.json().await?)
+        let builder = self
+            .client
+            .post(format!(
+                "{}/api/v1/repos/{}/ci/verify",
+                self.base_url, repo_id
+            ))
+            .json(&req);
+        self.authed_send_json(builder, |status| format!("CI verify failed ({status})"))
+            .await
     }
 
     pub async fn push_commit(
@@ -412,20 +429,15 @@ impl ApiClient {
         repo_id: &str,
         req: &tracevault_protocol::streaming::CommitPushRequest,
     ) -> Result<tracevault_protocol::streaming::CommitPushResponse, Box<dyn Error>> {
-        let mut builder = self.client.post(format!(
-            "{}/api/v1/repos/{}/commits",
-            self.base_url, repo_id
-        ));
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-        let resp = builder.json(req).send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Commit push failed ({status}): {body}").into());
-        }
-        Ok(resp.json().await?)
+        let builder = self
+            .client
+            .post(format!(
+                "{}/api/v1/repos/{}/commits",
+                self.base_url, repo_id
+            ))
+            .json(req);
+        self.authed_send_json(builder, |status| format!("Commit push failed ({status})"))
+            .await
     }
 
     pub async fn stream_event(
@@ -433,19 +445,12 @@ impl ApiClient {
         repo_id: &str,
         req: &tracevault_protocol::streaming::StreamEventRequest,
     ) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn Error>> {
-        let mut builder = self
+        let builder = self
             .client
-            .post(format!("{}/api/v1/repos/{}/stream", self.base_url, repo_id));
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-        let resp = builder.json(req).send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Stream failed ({status}): {body}").into());
-        }
-        Ok(resp.json().await?)
+            .post(format!("{}/api/v1/repos/{}/stream", self.base_url, repo_id))
+            .json(req);
+        self.authed_send_json(builder, |status| format!("Stream failed ({status})"))
+            .await
     }
 
     /// Project-scoped variant of `stream_event`: posts to the project's
@@ -467,17 +472,11 @@ impl ApiClient {
             self.base_url, project_id
         ))?;
         url.query_pairs_mut().append_pair("repo_id", repo_id);
-        let mut builder = self.client.post(url);
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-        let resp = builder.json(req).send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Project stream failed ({status}): {body}").into());
-        }
-        Ok(resp.json().await?)
+        let builder = self.client.post(url).json(req);
+        self.authed_send_json(builder, |status| {
+            format!("Project stream failed ({status})")
+        })
+        .await
     }
 
     pub async fn check_policies(
@@ -485,24 +484,15 @@ impl ApiClient {
         repo_id: &uuid::Uuid,
         req: CheckPoliciesRequest,
     ) -> Result<CheckPoliciesResponse, Box<dyn Error>> {
-        let mut builder = self.client.post(format!(
-            "{}/api/v1/repos/{}/policies/check",
-            self.base_url, repo_id
-        ));
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-
-        let resp = builder.json(&req).send().await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Policy check failed ({status}): {body}").into());
-        }
-
-        let result: CheckPoliciesResponse = resp.json().await?;
-        Ok(result)
+        let builder = self
+            .client
+            .post(format!(
+                "{}/api/v1/repos/{}/policies/check",
+                self.base_url, repo_id
+            ))
+            .json(&req);
+        self.authed_send_json(builder, |status| format!("Policy check failed ({status})"))
+            .await
     }
 
     /// Resolve a git URL to its codebase (git remote) by NORMALIZED URL —
@@ -514,20 +504,12 @@ impl ApiClient {
     ) -> Result<Option<ResolveRemoteResponse>, Box<dyn std::error::Error>> {
         let mut url = Url::parse(&format!("{}/api/v1/remotes/resolve", self.base_url))?;
         url.query_pairs_mut().append_pair("git_url", git_url);
-        let mut builder = self.client.get(url);
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-        let resp = builder.send().await?;
+        let resp = self.send_authed(self.client.get(url)).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("resolve_remote failed ({status}): {body}").into());
-        }
-        let parsed: ResolveRemoteResponse = resp.json().await?;
+        let parsed: ResolveRemoteResponse =
+            Self::success_json(resp, |status| format!("resolve_remote failed ({status})")).await?;
         Ok(Some(parsed))
     }
 
@@ -537,20 +519,13 @@ impl ApiClient {
         &self,
         remote_id: uuid::Uuid,
     ) -> Result<RemoteDetail, Box<dyn std::error::Error>> {
-        let mut builder = self
+        let builder = self
             .client
             .get(format!("{}/api/v1/remotes/{}", self.base_url, remote_id));
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-        let resp = builder.send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("get_remote_detail failed ({status}): {body}").into());
-        }
-        let detail: RemoteDetail = resp.json().await?;
-        Ok(detail)
+        self.authed_send_json(builder, |status| {
+            format!("get_remote_detail failed ({status})")
+        })
+        .await
     }
 
     /// The repos linked to a remote (the codebase's members).
@@ -563,44 +538,24 @@ impl ApiClient {
 
     /// List all projects. `GET /api/v1/projects`.
     pub async fn list_projects(&self) -> Result<Vec<ProjectListItem>, Box<dyn Error>> {
-        let mut builder = self
+        let builder = self
             .client
             .get(format!("{}/api/v1/projects", self.base_url));
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-
-        let resp = builder.send().await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Failed to list projects ({status}): {body}").into());
-        }
-
-        let projects: Vec<ProjectListItem> = resp.json().await?;
-        Ok(projects)
+        self.authed_send_json(builder, |status| {
+            format!("Failed to list projects ({status})")
+        })
+        .await
     }
 
     /// Full detail for a project. `GET /api/v1/projects/{id}`.
     pub async fn get_project(&self, id: uuid::Uuid) -> Result<ProjectDetail, Box<dyn Error>> {
-        let mut builder = self
+        let builder = self
             .client
             .get(format!("{}/api/v1/projects/{}", self.base_url, id));
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-
-        let resp = builder.send().await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Failed to get project ({status}): {body}").into());
-        }
-
-        let detail: ProjectDetail = resp.json().await?;
-        Ok(detail)
+        self.authed_send_json(builder, |status| {
+            format!("Failed to get project ({status})")
+        })
+        .await
     }
 
     /// Resolve a git URL to its project, distinguishing "no project" (404)
@@ -612,11 +567,7 @@ impl ApiClient {
     ) -> Result<ResolveProjectOutcome, Box<dyn std::error::Error>> {
         let mut url = Url::parse(&format!("{}/api/v1/projects/resolve", self.base_url))?;
         url.query_pairs_mut().append_pair("git_url", git_url);
-        let mut builder = self.client.get(url);
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-        let resp = builder.send().await?;
+        let resp = self.send_authed(self.client.get(url)).await?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(ResolveProjectOutcome::None);
@@ -624,11 +575,8 @@ impl ApiClient {
         if status == reqwest::StatusCode::CONFLICT {
             return Ok(ResolveProjectOutcome::Ambiguous);
         }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("resolve_project failed ({status}): {body}").into());
-        }
-        let parsed: ResolveProjectResponse = resp.json().await?;
+        let parsed: ResolveProjectResponse =
+            Self::success_json(resp, |status| format!("resolve_project failed ({status})")).await?;
         Ok(ResolveProjectOutcome::Resolved(parsed.project_id))
     }
 }
