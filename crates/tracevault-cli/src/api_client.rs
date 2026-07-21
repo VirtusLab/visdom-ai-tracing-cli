@@ -15,7 +15,7 @@ pub struct RegisterRepoRequest {
     pub github_url: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct RegisterRepoResponse {
     pub repo_id: uuid::Uuid,
 }
