@@ -485,7 +485,10 @@ mod tests {
 
     #[tokio::test]
     async fn user_default_used_when_deduction_404() {
-        let (addr, _h) = spawn_once("404 Not Found", "{}");
+        // A domain 404 (server's `{"error": ...}` envelope) — the shape a
+        // real (non-skewed) server sends for "no project" — must still fall
+        // through to the user default, unlike a bare route-404.
+        let (addr, _h) = spawn_once("404 Not Found", "{\"error\":\"no project\"}");
         let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
         let ud = ProjectBinding {
             project_id: "user".into(),
@@ -504,6 +507,30 @@ mod tests {
             .unwrap();
         assert_eq!(src, ProjectSource::UserDefault);
         assert_eq!(b.project_id, "user");
+    }
+
+    #[tokio::test]
+    async fn deduction_bare_404_is_version_skew_err_not_fallthrough() {
+        // A bare 404 (no JSON error body) is axum's "no route matched"
+        // fallback, not a domain "no project" — it must propagate as an
+        // error instead of silently falling through to the user default.
+        let (addr, _h) = spawn_once("404 Not Found", "");
+        let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
+        let ud = ProjectBinding {
+            project_id: "user".into(),
+            project_name: "u".into(),
+            updated_at: "".into(),
+        };
+        let inputs = ProjectResolveInputs {
+            project_flag: None,
+            session: &SessionState::default(),
+            worktree_path: None,
+            config_default: None,
+        };
+        let err = resolve_effective_project(&inputs, Some(ud), Some("git@x:y.git"), &client)
+            .await
+            .expect_err("a bare 404 must not silently fall through to the user default");
+        assert!(err.to_string().to_lowercase().contains("version mismatch"));
     }
 
     #[tokio::test]

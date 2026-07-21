@@ -20,7 +20,7 @@ pub struct RegisterRepoResponse {
     pub repo_id: uuid::Uuid,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct ResolveRemoteResponse {
     pub remote_id: uuid::Uuid,
     #[serde(default)]
@@ -505,7 +505,13 @@ impl ApiClient {
 
     /// Resolve a git URL to its codebase (git remote) by NORMALIZED URL —
     /// deduped, unlike an exact `github_url` match. `Ok(None)` if the
-    /// codebase isn't tracked (404).
+    /// codebase isn't tracked: a genuine domain 404, identified by the
+    /// server's JSON error envelope (see [`is_domain_error_body`]). A bare
+    /// 404 with no such body — axum's built-in "no route matched" fallback
+    /// — is surfaced as `Err` instead, since it means this server doesn't
+    /// have this route at all (most plausibly a CLI/server version skew,
+    /// e.g. this CLI shipped ahead of a server that still uses the old
+    /// org-scoped paths) rather than an absent codebase.
     pub async fn resolve_remote(
         &self,
         git_url: &str,
@@ -514,7 +520,12 @@ impl ApiClient {
         url.query_pairs_mut().append_pair("git_url", git_url);
         let resp = self.send_authed(self.client.get(url)).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
+            let body = resp.text().await.unwrap_or_default();
+            return if is_domain_error_body(&body) {
+                Ok(None)
+            } else {
+                Err(version_skew_404_error("resolve_remote"))
+            };
         }
         let parsed: ResolveRemoteResponse =
             Self::success_json(resp, |status| format!("resolve_remote failed ({status})")).await?;
@@ -566,9 +577,11 @@ impl ApiClient {
         .await
     }
 
-    /// Resolve a git URL to its project, distinguishing "no project" (404)
-    /// from "ambiguous, multiple candidate projects" (409).
-    /// `GET /api/v1/projects/resolve?git_url=`.
+    /// Resolve a git URL to its project, distinguishing "no project" (a
+    /// genuine domain 404 — see [`is_domain_error_body`]) from "ambiguous,
+    /// multiple candidate projects" (409). A bare 404 with no domain-error
+    /// body is surfaced as `Err` instead of `None` (see `resolve_remote`'s
+    /// doc comment for why). `GET /api/v1/projects/resolve?git_url=`.
     pub async fn resolve_project(
         &self,
         git_url: &str,
@@ -578,7 +591,12 @@ impl ApiClient {
         let resp = self.send_authed(self.client.get(url)).await?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(ResolveProjectOutcome::None);
+            let body = resp.text().await.unwrap_or_default();
+            return if is_domain_error_body(&body) {
+                Ok(ResolveProjectOutcome::None)
+            } else {
+                Err(version_skew_404_error("resolve_project"))
+            };
         }
         if status == reqwest::StatusCode::CONFLICT {
             return Ok(ResolveProjectOutcome::Ambiguous);
@@ -587,6 +605,35 @@ impl ApiClient {
             Self::success_json(resp, |status| format!("resolve_project failed ({status})")).await?;
         Ok(ResolveProjectOutcome::Resolved(parsed.project_id))
     }
+}
+
+/// Whether a 404 response body matches the server's JSON error envelope —
+/// `{"error": "...", ...}`, emitted by every domain-level `AppError` (see
+/// `tracevault-server`'s `error.rs`) — rather than the empty/plain body
+/// axum's built-in "no route matched" fallback sends when the server has no
+/// handler for the path at all. Used by `resolve_remote`/`resolve_project`
+/// to tell a genuine "not tracked"/"no project" 404 apart from a 404 that
+/// really means "this server doesn't have this route" (most plausibly a
+/// CLI/server version skew).
+fn is_domain_error_body(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").map(|_| ()))
+        .is_some()
+}
+
+/// The error for a 404 whose body doesn't match the server's JSON error
+/// envelope (see [`is_domain_error_body`]) — surfaced instead of silently
+/// treating the call as "not tracked"/"no project", since this shape is the
+/// CLI's best signal that the server doesn't recognize `what`'s route at
+/// all, rather than a genuine absence of the resource.
+fn version_skew_404_error(what: &str) -> Box<dyn std::error::Error> {
+    format!(
+        "{what} got a 404 with no recognizable error body — this endpoint may not exist on \
+         this server yet. This usually means the CLI is newer than the server (a CLI/server \
+         version mismatch); confirm the server has been upgraded and retry."
+    )
+    .into()
 }
 
 /// Resolve server URL and auth token from multiple sources.

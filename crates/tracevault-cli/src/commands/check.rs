@@ -195,7 +195,7 @@ pub async fn check_policies(
     // guessing — see `connectivity_message` below.
     let repo = match resolve_repo_by_name(&client, project_root).await {
         Ok(r) => r,
-        Err(ResolveRepoByNameError::Network(e)) => {
+        Err(ResolveRepoByNameError::ListFailed(e)) => {
             return Err(connectivity_message(&e.to_string()).into());
         }
         Err(ResolveRepoByNameError::NotFound { repo_name }) => {
@@ -291,7 +291,10 @@ pub async fn check_policies(
 /// Wrap an opaque API-client error string with the most useful next step.
 /// Today the api_client surfaces errors as `"Stream failed (401 ...)"` or
 /// `"Server returned 500 Internal Server Error: ..."` strings; we sniff for
-/// the common shapes and surface a one-line action.
+/// the common shapes and surface a one-line action. A 404 gets its own
+/// version-mismatch hint rather than the generic fallback, since the calls
+/// that route through here have no legitimate domain reason to 404 — see
+/// the 404 branch below.
 fn connectivity_message(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
 
@@ -309,6 +312,19 @@ fn connectivity_message(raw: &str) -> String {
         return with_action(
             raw,
             "Your token is not authorized for this repo's policies. Confirm the token/service account has access and rerun `tracevault login`.",
+        );
+    }
+    // 404 — the route itself wasn't found. Neither call that reaches this
+    // function (`list_repos`, `check_policies`) has a legitimate domain
+    // reason to 404 — a missing repo is already turned into its own message
+    // by `resolve_repo_by_name`'s `NotFound` variant before it gets here —
+    // so a 404 this far down most plausibly means this server build doesn't
+    // recognize the route at all: a CLI/server version mismatch (e.g. this
+    // CLI shipped ahead of a server still on the old routes).
+    if lower.contains("404") {
+        return with_action(
+            raw,
+            "This server may not recognize this endpoint yet — this can happen when the CLI is newer than the server. Confirm the server has been upgraded, or downgrade the CLI to match it.",
         );
     }
     // 5xx — server-side fault. Checked before the transport keywords below
@@ -477,6 +493,20 @@ mod tests {
         assert!(
             m.to_lowercase().contains("authorized"),
             "403 should mention authorization; got: {m}"
+        );
+    }
+
+    #[test]
+    fn connectivity_message_flags_404_as_version_mismatch() {
+        // Simulates an old-server-404 skew: a route the CLI expects to exist
+        // (e.g. `Failed to list repos (404 Not Found)`) doesn't exist yet on
+        // this server build. Must hint at a version mismatch, not just
+        // report a bare 404 with no next step.
+        let m = connectivity_message("Failed to list repos (404 Not Found): ");
+        assert!(
+            m.to_lowercase().contains("newer than the server")
+                || m.to_lowercase().contains("version mismatch"),
+            "404 should hint at a possible CLI/server version mismatch; got: {m}"
         );
     }
 

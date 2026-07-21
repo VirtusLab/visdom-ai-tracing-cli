@@ -673,8 +673,16 @@ mod tests {
         crate::test_helpers::init_git_repo(tmp.path());
         add_origin_remote(tmp.path(), "git@github.com:org/unregistered.git");
 
-        let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        let base = spawn_once(resp);
+        // A genuine domain 404 carries the server's JSON error envelope
+        // (`{"error": "..."}` — what every `AppError` renders), which is
+        // what distinguishes "not tracked" from a bare route-404 (see
+        // `ApiClient::resolve_remote`).
+        let body = r#"{"error":"No remote for that URL"}"#;
+        let resp = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body
+        );
+        let base = spawn_once(Box::leak(resp.into_boxed_str()));
         let client = ApiClient::new(&base, Some("tok"));
 
         let err = resolve_switch_binding(tmp.path(), &client)
@@ -683,6 +691,34 @@ mod tests {
         assert!(
             err.to_string().contains("not registered"),
             "unexpected error message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_switch_binding_flags_bare_404_as_version_skew() {
+        // A bare 404 (no JSON error body) is axum's "no route matched"
+        // fallback — the shape an old server sends for a route it doesn't
+        // have yet. `repo switch` must not misreport this as "not
+        // registered"; it should surface a diagnosable version-mismatch
+        // error instead.
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        add_origin_remote(tmp.path(), "git@github.com:org/unregistered.git");
+
+        let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let base = spawn_once(resp);
+        let client = ApiClient::new(&base, Some("tok"));
+
+        let err = resolve_switch_binding(tmp.path(), &client)
+            .await
+            .expect_err("expected Err for a bare route-404");
+        assert!(
+            !err.to_string().contains("not registered"),
+            "must not be misreported as 'not registered'; got: {err}"
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("version mismatch"),
+            "expected a version-mismatch hint; got: {err}"
         );
     }
 
