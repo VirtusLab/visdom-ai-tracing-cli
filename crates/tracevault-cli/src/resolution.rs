@@ -5,8 +5,9 @@
 //! `.tracevault/config.toml`). See design §2/§3/§4.
 
 use std::path::Path;
+use std::process::Command;
 
-use crate::api_client::{ApiClient, ResolveProjectOutcome};
+use crate::api_client::{ApiClient, RepoListItem, ResolveProjectOutcome};
 use crate::session_state::{ProjectBinding, RepoBinding, SessionState};
 
 /// `git -C <path> remote get-url origin`, trimmed. `None` if git fails or there
@@ -29,6 +30,55 @@ pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
     } else {
         Some(url)
     }
+}
+
+/// Basename of the git repository's toplevel directory — the convention used
+/// as the server-registered repo name by `verify`/`check`/`agent-policies`/
+/// `status`. Falls back to `"unknown"` if git fails (no repo, not a git
+/// checkout, etc.), mirroring what each of those commands' own
+/// now-removed copy of this function did.
+pub(crate) fn git_repo_name(project_root: &Path) -> String {
+    Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(project_root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .as_deref()
+        .and_then(|p| p.rsplit('/').next())
+        .map(String::from)
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Either half of [`resolve_repo_by_name`]'s failure: the `list_repos` call
+/// itself failed (network/API error, returned raw so a caller can add its own
+/// actionable wrapping — e.g. `check`'s `connectivity_message`), or the call
+/// succeeded but no repo's name matched (so callers can phrase their own
+/// "not found" message/next-step).
+pub(crate) enum ResolveRepoByNameError {
+    Network(Box<dyn std::error::Error>),
+    NotFound { repo_name: String },
+}
+
+/// Resolve the server-registered repo matching `project_root`'s git-toplevel
+/// basename: derive the name via [`git_repo_name`], call `GET /repos`, and
+/// find the matching entry. Shared by `verify`/`agent-policies` (and, via the
+/// `Network`/`NotFound` split, `check`), which previously each duplicated
+/// this name-derive → list → find sequence with their own `fn git_repo_name`.
+pub(crate) async fn resolve_repo_by_name(
+    client: &ApiClient,
+    project_root: &Path,
+) -> Result<RepoListItem, ResolveRepoByNameError> {
+    let repo_name = git_repo_name(project_root);
+    let repos = client
+        .list_repos()
+        .await
+        .map_err(ResolveRepoByNameError::Network)?;
+    repos
+        .into_iter()
+        .find(|r| r.name == repo_name)
+        .ok_or(ResolveRepoByNameError::NotFound { repo_name })
 }
 
 /// Render a human line for a codebase resolved via `resolve_remote` /
