@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::api_client::{resolve_credentials, ApiClient, ProjectListItem};
+use crate::api_client::{resolve_client, ApiClient, ProjectListItem};
 use crate::resolution::{
     effective_project, git_remote_url, resolve_effective_project, ProjectResolveInputs,
     ProjectSource,
@@ -74,14 +74,6 @@ fn resolve_project_name<'a>(
             names.join(", ")
         )
     })
-}
-
-/// Resolve credentials into an `ApiClient`.
-async fn resolve_client(project_root: &Path) -> Result<ApiClient, Box<dyn std::error::Error>> {
-    let (server_url, token) = resolve_credentials(project_root);
-    let server_url = server_url
-        .ok_or("no server URL configured: set TRACEVAULT_SERVER_URL or run `tracevault login`")?;
-    Ok(ApiClient::new(&server_url, token.as_deref()))
 }
 
 /// Resolve `name` to a registered project (via `list_projects`) and, unless
@@ -165,7 +157,7 @@ async fn switch(
     project_root: &Path,
     cwd: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = resolve_client(project_root).await?;
+    let client = resolve_client(project_root)?;
     let session = crate::commands::repo::resolve_session_id(session_id).ok();
     let dest = switch_destination(user, session);
     let check_codebase = matches!(dest, SwitchDest::Session(_));
@@ -262,7 +254,7 @@ async fn status(
     // rung 4/5 chain (deduction, user default) needs it too. Best-effort: no
     // client degrades to the pure local rungs (flag/config_default stay
     // unresolved) rather than failing the whole inspector.
-    let effective = match resolve_client(project_root).await {
+    let effective = match resolve_client(project_root) {
         Ok(client) => {
             let items = if project_flag_name.is_some() || config_default_name.is_some() {
                 client.list_projects().await.ok()

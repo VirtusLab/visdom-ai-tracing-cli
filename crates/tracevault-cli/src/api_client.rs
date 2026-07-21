@@ -622,3 +622,16 @@ pub fn resolve_credentials(project_root: &Path) -> (Option<String>, Option<Strin
 
     (server_url, token)
 }
+
+/// Resolve `project_root`'s credentials (via `resolve_credentials`) into a
+/// ready `ApiClient`, or the standard "no server URL configured" error when
+/// none of the credential sources yield a server URL. Shared by every
+/// command that needs a client from a project root
+/// (`commands::project::switch`/`status`, `commands::repo::switch`) so this
+/// resolve-then-construct shape has exactly one implementation.
+pub fn resolve_client(project_root: &Path) -> Result<ApiClient, Box<dyn Error>> {
+    let (server_url, token) = resolve_credentials(project_root);
+    let server_url = server_url
+        .ok_or("no server URL configured: set TRACEVAULT_SERVER_URL or run `tracevault login`")?;
+    Ok(ApiClient::new(&server_url, token.as_deref()))
+}

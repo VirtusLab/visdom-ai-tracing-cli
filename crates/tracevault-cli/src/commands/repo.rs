@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::api_client::{resolve_credentials, ApiClient};
+use crate::api_client::{resolve_client, resolve_credentials, ApiClient};
 use crate::resolution::{
     binding_from_config, effective_binding, resolve_path_to_binding, BindingSource, ResolveInputs,
 };
@@ -202,10 +202,7 @@ async fn switch(
     // network error from the resolution step below.
     let target = switch_target(path, name)?;
 
-    let (server_url, token) = resolve_credentials(project_root);
-    let server_url = server_url
-        .ok_or("no server URL configured: set TRACEVAULT_SERVER_URL or run `tracevault login`")?;
-    let client = ApiClient::new(&server_url, token.as_deref());
+    let client = resolve_client(project_root)?;
 
     let binding = match target {
         SwitchTarget::Path(p) => resolve_switch_binding(Path::new(p), &client).await?,
