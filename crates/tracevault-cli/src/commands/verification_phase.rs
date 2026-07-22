@@ -30,10 +30,6 @@ pub async fn open_verification_phase(
     let config = TracevaultConfig::load(project_root)
         .ok_or("TraceVault not initialized. Run `tracevault init` first.")?;
 
-    let org_slug = config
-        .org_slug
-        .as_deref()
-        .ok_or("No org_slug configured. Run `tracevault init`.")?;
     let repo_id = config
         .repo_id
         .as_deref()
@@ -154,7 +150,7 @@ pub async fn open_verification_phase(
     let client = ApiClient::new(server_url, Some(&creds.token));
 
     client
-        .stream_event(org_slug, repo_id, &event)
+        .stream_event(repo_id, &event)
         .await
         .map_err(|e| format!("Failed to send verification phase event: {e}"))?;
 
