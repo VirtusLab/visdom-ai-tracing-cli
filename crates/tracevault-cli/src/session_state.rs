@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 /// A resolved binding to a registered repo.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RepoBinding {
+    pub org_slug: String,
     pub repo_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_url: Option<String>,
@@ -24,6 +25,7 @@ pub struct RepoBinding {
 /// A resolved binding to a registered project.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectBinding {
+    pub org_slug: String,
     pub project_id: String,
     pub project_name: String,
     pub updated_at: String,
@@ -126,6 +128,7 @@ mod tests {
 
     fn binding(id: &str) -> RepoBinding {
         RepoBinding {
+            org_slug: "org".into(),
             repo_id: id.into(),
             git_url: None,
             remote_id: None,
@@ -216,6 +219,7 @@ mod tests {
     fn session_state_carries_project_bindings() {
         let tmp = tempfile::tempdir().unwrap();
         let pb = ProjectBinding {
+            org_slug: "acme".into(),
             project_id: "11111111-1111-1111-1111-111111111111".into(),
             project_name: "payments".into(),
             updated_at: "t".into(),

@@ -1,7 +1,21 @@
 use crate::api_client::{resolve_credentials, ApiClient, CiVerifyRequest};
-use crate::resolution::{resolve_repo_by_name, ResolveRepoByNameError};
+use crate::config::TracevaultConfig;
 use std::path::Path;
 use std::process::Command;
+
+fn git_repo_name(project_root: &Path) -> String {
+    Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(project_root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .as_deref()
+        .and_then(|p| p.rsplit('/').next())
+        .map(String::from)
+        .unwrap_or_else(|| "unknown".into())
+}
 
 fn expand_range(
     project_root: &Path,
@@ -64,28 +78,31 @@ pub async fn verify(
         return Err("No auth token. Set TRACEVAULT_API_KEY or run 'tracevault login'.".into());
     }
 
+    let org_slug = TracevaultConfig::load(project_root)
+        .and_then(|c| c.org_slug)
+        .ok_or("No org_slug in config. Run 'tracevault init' first.")?;
+
     let client = ApiClient::new(&server_url, token.as_deref());
 
     // Resolve repo_id by name
-    let repo = resolve_repo_by_name(&client, project_root)
-        .await
-        .map_err(|e| match e {
-            ResolveRepoByNameError::ListFailed(err) => err,
-            ResolveRepoByNameError::NotFound { repo_name } => format!(
-                "Repo '{}' not found on server. Run 'tracevault sync' first.",
-                repo_name
-            )
-            .into(),
-        })?;
+    let repo_name = git_repo_name(project_root);
+    let repos = client.list_repos(&org_slug).await?;
+    let repo = repos.iter().find(|r| r.name == repo_name).ok_or_else(|| {
+        format!(
+            "Repo '{}' not found on server. Run 'tracevault sync' first.",
+            repo_name
+        )
+    })?;
 
     println!(
         "Verifying {} commit(s) for repo '{}'...",
         commit_list.len(),
-        repo.name
+        repo_name
     );
 
     let result = client
         .verify_commits(
+            &org_slug,
             &repo.id,
             CiVerifyRequest {
                 commits: commit_list,

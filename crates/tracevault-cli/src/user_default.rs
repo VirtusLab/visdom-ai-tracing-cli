@@ -62,6 +62,7 @@ mod tests {
 
     fn binding(id: &str) -> RepoBinding {
         RepoBinding {
+            org_slug: "org".into(),
             repo_id: id.into(),
             git_url: None,
             remote_id: None,

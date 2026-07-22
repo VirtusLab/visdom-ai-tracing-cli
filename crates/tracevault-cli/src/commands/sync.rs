@@ -1,5 +1,6 @@
 use crate::api_client::{resolve_credentials, ApiClient};
-use crate::resolution::{git_remote_url, git_repo_name};
+use crate::config::TracevaultConfig;
+use crate::resolution::git_remote_url;
 use std::path::Path;
 
 pub async fn sync_repo(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -18,6 +19,10 @@ pub async fn sync_repo(project_root: &Path) -> Result<(), Box<dyn std::error::Er
         return Ok(());
     }
 
+    let org_slug = TracevaultConfig::load(project_root)
+        .and_then(|c| c.org_slug)
+        .ok_or("No org_slug in config. Run 'tracevault init' first.")?;
+
     let remote = match git_remote_url(project_root) {
         Some(url) => url,
         None => {
@@ -28,13 +33,26 @@ pub async fn sync_repo(project_root: &Path) -> Result<(), Box<dyn std::error::Er
 
     let client = ApiClient::new(&server_url, token.as_deref());
 
-    let repo_name = git_repo_name(project_root);
+    let repo_name = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(project_root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .as_deref()
+        .and_then(|p| p.rsplit('/').next())
+        .map(String::from)
+        .unwrap_or_else(|| "unknown".into());
 
     match client
-        .register_repo(crate::api_client::RegisterRepoRequest {
-            repo_name,
-            github_url: Some(remote.clone()),
-        })
+        .register_repo(
+            &org_slug,
+            crate::api_client::RegisterRepoRequest {
+                repo_name,
+                github_url: Some(remote.clone()),
+            },
+        )
         .await
     {
         Ok(resp) => {
