@@ -117,12 +117,7 @@ async fn stream_event_for_project_targets_project_endpoint() {
     let req = sample_stream_event_request();
 
     let got = client
-        .stream_event_for_project(
-            "org",
-            project_id,
-            "11111111-1111-1111-1111-111111111111",
-            &req,
-        )
+        .stream_event_for_project(project_id, "11111111-1111-1111-1111-111111111111", &req)
         .await
         .unwrap();
     assert_eq!(got.status, "accepted");
@@ -130,7 +125,7 @@ async fn stream_event_for_project_targets_project_endpoint() {
     let line = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
     assert!(
         line.starts_with(
-            "POST /api/v1/orgs/org/projects/00000000-0000-0000-0000-000000000000/stream?repo_id=11111111-1111-1111-1111-111111111111 "
+            "POST /api/v1/projects/00000000-0000-0000-0000-000000000000/stream?repo_id=11111111-1111-1111-1111-111111111111 "
         ),
         "got: {line}"
     );
