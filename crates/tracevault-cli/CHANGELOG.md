@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.24.0...v0.25.0) - 2026-07-22
+
+### Added
+
+- *(cli)* Phase 4B — hook/stream project attribution (part of #306) ([#32](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/32))
+- *(cli)* Phase 4A — project binding & resolution (part of #306) ([#31](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/31))
+- *(cli)* Phase 2e — remote-aware repo resolution ([#30](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/30))
+- *(cli)* OpenCode agent support — init --agent opencode + bundled plugin + fileless inline capture ([#29](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/29))
+- *(cli)* GSD (pi) agent support — init --agent gsd + extension + gsd-tagged streaming ([#27](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/27))
+
+### Other
+
+- *(cli)* drop dead multi-project-refusal warning (server no longer 409s on multi-project ingest) ([#34](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/34))
+- Revert "Single-tenant collapse — CLI (drop orgs) ([#35](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/35))" ([#36](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/36))
+- Single-tenant collapse — CLI (drop orgs) ([#35](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/35))
+
 ## [0.24.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.23.3...v0.24.0) - 2026-07-13
 
 ### Added
