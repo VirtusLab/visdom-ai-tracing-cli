@@ -58,6 +58,9 @@ fn short_session_id(id: &str) -> &str {
 }
 
 pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let org_slug = crate::resolution::org_slug_for(project_root)
+        .ok_or("no org configured (set TRACEVAULT_ORG_SLUG, log in, or run in a bound repo)")?;
+
     let (server_url, token) = resolve_credentials(project_root);
     let server_url = server_url.ok_or("server_url not configured")?;
     let client = ApiClient::new(&server_url, token.as_deref());
@@ -105,7 +108,7 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
                     event_total
                 );
                 event.truncate_large_fields();
-                match client.stream_event(&repo_id, &event).await {
+                match client.stream_event(&org_slug, &repo_id, &event).await {
                     Ok(_) => {
                         total_sent += 1;
                     }

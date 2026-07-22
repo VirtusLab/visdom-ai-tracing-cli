@@ -125,8 +125,16 @@ pub(crate) fn read_hook_event_or_allow() -> Option<HookEvent> {
 /// error (best-effort — a fetch failure degrades to allow, never blocks the
 /// hook). Factored out of `resolve_and_inject` so the network step can be
 /// exercised in a unit test without touching creds/env/git.
-async fn fetch_context(client: &ApiClient, event: &str, repo_id: uuid::Uuid) -> Option<HookOutput> {
-    let resp = client.get_agent_instructions(&repo_id).await.ok()?;
+async fn fetch_context(
+    client: &ApiClient,
+    event: &str,
+    org_slug: &str,
+    repo_id: uuid::Uuid,
+) -> Option<HookOutput> {
+    let resp = client
+        .get_agent_instructions(org_slug, &repo_id)
+        .await
+        .ok()?;
     Some(HookOutput::with_context(event, cap_context(resp.content)))
 }
 
@@ -181,7 +189,7 @@ pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn st
     };
     let client = ApiClient::new(&server_url, token.as_deref());
 
-    match fetch_context(&client, event, repo_uuid).await {
+    match fetch_context(&client, event, &binding.org_slug, repo_uuid).await {
         Some(output) => {
             println!("{}", serde_json::to_string(&output)?);
             // Best-effort: persist the last-injected repo so a later
@@ -352,7 +360,7 @@ mod tests {
     async fn fetch_context_returns_none_on_network_failure() {
         let client = ApiClient::new("http://127.0.0.1:1", None);
         let repo_id = uuid::Uuid::new_v4();
-        let result = fetch_context(&client, "SessionStart", repo_id).await;
+        let result = fetch_context(&client, "SessionStart", "org", repo_id).await;
         assert!(result.is_none());
     }
 }

@@ -12,6 +12,7 @@ pub async fn run_commit_push(
     // Config / credentials come from the PRIMARY root (the only place
     // .tracevault/ exists); git state comes from the invoking worktree (cwd).
     let config = TracevaultConfig::load(project_root).ok_or("config not found")?;
+    let org_slug = config.org_slug.ok_or("org_slug not configured")?;
     let repo_id = config.repo_id.ok_or("repo_id not configured")?;
 
     let (server_url, token) = resolve_credentials(project_root);
@@ -20,7 +21,7 @@ pub async fn run_commit_push(
 
     let req = collect_commit_request(cwd)?;
 
-    match client.push_commit(&repo_id, &req).await {
+    match client.push_commit(&org_slug, &repo_id, &req).await {
         Ok(resp) => {
             println!(
                 "Commit pushed: {} ({} attributions)",

@@ -7,9 +7,10 @@
 use crate::api_client::{ApiClient, GetMeError};
 use crate::config::TracevaultConfig;
 use crate::credentials::Credentials;
-use crate::resolution::{git_remote_url, git_repo_name};
+use crate::resolution::git_remote_url;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const ANSI_GREEN: &str = "\x1b[32m";
 const ANSI_RED: &str = "\x1b[31m";
@@ -239,8 +240,12 @@ fn project_checks(
     // both cases to `None`.
     let config = match TracevaultConfig::try_load(project_root) {
         Ok(Some(c)) => {
+            let slug = c.org_slug.as_deref().unwrap_or("<unset>");
             let url = c.server_url.as_deref().unwrap_or("<unset>");
-            out.push(Check::ok("Project config", format!("server={url}")));
+            out.push(Check::ok(
+                "Project config",
+                format!("org={slug}, server={url}"),
+            ));
             Some(c)
         }
         Ok(None) => {
@@ -459,7 +464,10 @@ fn workspace_binding_check_in(
                 Some(b) => (
                     Check::ok(
                         "Workspace binding",
-                        format!("repo {} via repo switch (session {id})", b.repo_id),
+                        format!(
+                            "repo {} (org {}) via repo switch (session {id})",
+                            b.repo_id, b.org_slug
+                        ),
                     ),
                     Some(b),
                 ),
@@ -479,8 +487,8 @@ fn workspace_binding_check_in(
                 Check::ok(
                     "Workspace binding",
                     format!(
-                        "repo {} via repo switch — most recent session with a binding: {id} (may be another repo; pass --session-id to target one)",
-                        b.repo_id
+                        "repo {} (org {}) via repo switch — most recent session with a binding: {id} (may be another repo; pass --session-id to target one)",
+                        b.repo_id, b.org_slug
                     ),
                 ),
                 Some(b),
@@ -496,57 +504,26 @@ fn workspace_binding_check_in(
 // --- Server repo ---
 
 /// How `status` should locate the repo on the server.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 enum RepoMatch {
     ByName(String),
     ById(String),
 }
 
-/// Bound mode (a loaded project config, match by git repo NAME) takes
-/// precedence; otherwise workspace mode (the authoritative binding, match by
+/// Bound mode (config `org_slug`, match by git repo NAME) takes precedence;
+/// otherwise workspace mode (the authoritative binding's `org_slug`, match by
 /// `repo_id`). `None` when neither is available. Pure — `repo_name` is passed
 /// in so this is unit-testable without invoking git.
 fn server_repo_lookup(
-    config_present: bool,
+    config_org_slug: Option<&str>,
     repo_name: &str,
     binding: Option<&crate::session_state::RepoBinding>,
-) -> Option<RepoMatch> {
-    if config_present {
-        return Some(RepoMatch::ByName(repo_name.to_string()));
+) -> Option<(String, RepoMatch)> {
+    if let Some(slug) = config_org_slug {
+        return Some((slug.to_string(), RepoMatch::ByName(repo_name.to_string())));
     }
     if let Some(b) = binding {
-        return Some(RepoMatch::ById(b.repo_id.clone()));
-    }
-    None
-}
-
-/// Find the repo matching `want`, retrying by workspace-binding id if a
-/// `ByName` lookup misses. A directory rename after `tracevault init`
-/// registered the repo would otherwise make the (name-based) bound-mode
-/// lookup miss even though the binding's `repo_id` still resolves — since this
-/// is a read-only inspector, a stale name should not produce a false "not
-/// found on server" negative when a binding is available to double-check
-/// against. Returns the matched repo plus the [`RepoMatch`] that actually
-/// found it, so the caller can tell a direct hit from a fallback hit (the
-/// fallback must not be treated as if the name-based lookup had succeeded —
-/// see the `RepoMatch::ById` arm of the "Remote URL matches" check below).
-/// `ById` lookups have already tried the only id available, so they are never
-/// retried.
-fn find_repo_with_fallback<'a>(
-    repos: &'a [crate::api_client::RepoListItem],
-    want: &RepoMatch,
-    binding: Option<&crate::session_state::RepoBinding>,
-) -> Option<(&'a crate::api_client::RepoListItem, RepoMatch)> {
-    if let Some(r) = repos.iter().find(|r| match want {
-        RepoMatch::ByName(name) => &r.name == name,
-        RepoMatch::ById(id) => &r.id.to_string() == id,
-    }) {
-        return Some((r, want.clone()));
-    }
-    if let RepoMatch::ByName(_) = want {
-        let b = binding?;
-        let r = repos.iter().find(|r| r.id.to_string() == b.repo_id)?;
-        return Some((r, RepoMatch::ById(b.repo_id.clone())));
+        return Some((b.org_slug.clone(), RepoMatch::ById(b.repo_id.clone())));
     }
     None
 }
@@ -568,16 +545,20 @@ async fn server_repo_checks(
     };
 
     let repo_name = git_repo_name(project_root);
-    let Some(want) = server_repo_lookup(config.is_some(), &repo_name, binding) else {
+    let Some((slug, want)) = server_repo_lookup(
+        config.and_then(|c| c.org_slug.as_deref()),
+        &repo_name,
+        binding,
+    ) else {
         out.push(Check::skip(
             "Repo registered on server",
-            "not bound (need a project config.toml or a --session-id workspace binding)",
+            "no org (need a bound config.toml or a --session-id workspace binding)",
         ));
         return out;
     };
 
     let client = ApiClient::new(server_url, Some(token));
-    let repos = match client.list_repos().await {
+    let repos = match client.list_repos(&slug).await {
         Ok(r) => r,
         Err(e) => {
             out.push(Check::warn(
@@ -588,7 +569,10 @@ async fn server_repo_checks(
         }
     };
 
-    let found = find_repo_with_fallback(&repos, &want, binding);
+    let found = repos.iter().find(|r| match &want {
+        RepoMatch::ByName(name) => &r.name == name,
+        RepoMatch::ById(id) => &r.id.to_string() == id,
+    });
 
     match found {
         None => {
@@ -598,11 +582,11 @@ async fn server_repo_checks(
             };
             out.push(Check::err(
                 "Repo registered on server",
-                format!("{what} not found on the server. Run `tracevault init` while logged in, or `tracevault sync`."),
+                format!("{what} not found in org '{slug}'. Run `tracevault init` while logged in, or `tracevault sync`."),
             ));
             return out;
         }
-        Some((r, matched_via)) => {
+        Some(r) => {
             out.push(Check::ok(
                 "Repo registered on server",
                 format!("id={}", r.id),
@@ -627,7 +611,7 @@ async fn server_repo_checks(
                 )),
             }
 
-            match &matched_via {
+            match &want {
                 RepoMatch::ByName(_) => {
                     let local_remote = git_remote_url(project_root);
                     match (local_remote.as_deref(), r.github_url.as_deref()) {
@@ -759,6 +743,20 @@ fn session_checks(project_root: &Path) -> Vec<Check> {
 }
 
 // --- Git helpers ---
+
+fn git_repo_name(project_root: &Path) -> String {
+    Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(project_root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .as_deref()
+        .and_then(|p| p.rsplit('/').next())
+        .map(String::from)
+        .unwrap_or_else(|| "unknown".into())
+}
 
 /// Make two remote URLs comparable by dropping `.git`, trailing slash, and
 /// collapsing SSH ↔ HTTPS differences for github.com specifically.
@@ -1267,6 +1265,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let st = crate::session_state::SessionState {
             active: Some(crate::session_state::RepoBinding {
+                org_slug: "acme".into(),
                 repo_id: "11111111-1111-4111-8111-111111111111".into(),
                 git_url: None,
                 remote_id: None,
@@ -1282,13 +1281,7 @@ mod tests {
         .unwrap();
         let (check, binding) = workspace_binding_check_in(dir.path(), Some("sess-9"));
         assert_eq!(check.level, Level::Ok);
-        assert!(
-            check
-                .detail
-                .contains("11111111-1111-4111-8111-111111111111"),
-            "detail: {}",
-            check.detail
-        );
+        assert!(check.detail.contains("acme"), "detail: {}", check.detail);
         assert_eq!(
             binding.unwrap().repo_id,
             "11111111-1111-4111-8111-111111111111"
@@ -1322,6 +1315,7 @@ mod tests {
         // Two sessions; the one written LAST should be picked by the mtime scan.
         let older = crate::session_state::SessionState {
             active: Some(crate::session_state::RepoBinding {
+                org_slug: "o1".into(),
                 repo_id: "aaaaaaaa-1111-4111-8111-111111111111".into(),
                 git_url: None,
                 remote_id: None,
@@ -1339,6 +1333,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let newer = crate::session_state::SessionState {
             active: Some(crate::session_state::RepoBinding {
+                org_slug: "o2".into(),
                 repo_id: "bbbbbbbb-2222-4222-8222-222222222222".into(),
                 git_url: None,
                 remote_id: None,
@@ -1355,8 +1350,8 @@ mod tests {
         let (check, binding) = workspace_binding_check_in(dir.path(), None);
         assert_eq!(check.level, Level::Ok);
         assert_eq!(
-            binding.unwrap().repo_id,
-            "bbbbbbbb-2222-4222-8222-222222222222",
+            binding.unwrap().org_slug,
+            "o2",
             "must pick the most-recently-modified session"
         );
     }
@@ -1368,6 +1363,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let with_binding = crate::session_state::SessionState {
             active: Some(crate::session_state::RepoBinding {
+                org_slug: "has-it".into(),
                 repo_id: "aaaaaaaa-1111-4111-8111-111111111111".into(),
                 git_url: None,
                 remote_id: None,
@@ -1390,10 +1386,7 @@ mod tests {
         .unwrap();
         let (check, binding) = workspace_binding_check_in(dir.path(), None);
         assert_eq!(check.level, Level::Ok);
-        assert_eq!(
-            binding.unwrap().repo_id,
-            "aaaaaaaa-1111-4111-8111-111111111111"
-        );
+        assert_eq!(binding.unwrap().org_slug, "has-it");
     }
 
     #[test]
@@ -1411,106 +1404,35 @@ mod tests {
         assert!(binding.is_none());
     }
 
-    fn repo_item(id: &str, name: &str) -> crate::api_client::RepoListItem {
-        crate::api_client::RepoListItem {
-            id: id.parse().unwrap(),
-            name: name.to_string(),
-            github_url: None,
-            clone_status: None,
-        }
-    }
-
-    #[test]
-    fn find_repo_with_fallback_direct_name_hit_no_fallback_needed() {
-        let repos = vec![repo_item("11111111-1111-4111-8111-111111111111", "myrepo")];
-        let want = RepoMatch::ByName("myrepo".to_string());
-        let (r, matched_via) = find_repo_with_fallback(&repos, &want, None).unwrap();
-        assert_eq!(r.name, "myrepo");
-        assert_eq!(matched_via, want);
-    }
-
-    #[test]
-    fn find_repo_with_fallback_falls_back_to_binding_id_on_name_miss() {
-        // Local checkout directory was renamed after registration: the
-        // git-derived name ("renamed") no longer matches the server's
-        // registered name ("myrepo"), but the workspace binding still carries
-        // the correct repo_id.
-        let id = "11111111-1111-4111-8111-111111111111";
-        let repos = vec![repo_item(id, "myrepo")];
-        let binding = crate::session_state::RepoBinding {
-            repo_id: id.to_string(),
-            git_url: None,
-            remote_id: None,
-            codebase_name: None,
-            updated_at: "t".into(),
-        };
-        let want = RepoMatch::ByName("renamed".to_string());
-        let (r, matched_via) = find_repo_with_fallback(&repos, &want, Some(&binding))
-            .expect("fallback by binding id must find the repo");
-        assert_eq!(r.name, "myrepo");
-        assert_eq!(matched_via, RepoMatch::ById(id.to_string()));
-    }
-
-    #[test]
-    fn find_repo_with_fallback_none_when_name_misses_and_no_binding() {
-        let repos = vec![repo_item("11111111-1111-4111-8111-111111111111", "myrepo")];
-        let want = RepoMatch::ByName("renamed".to_string());
-        assert!(find_repo_with_fallback(&repos, &want, None).is_none());
-    }
-
-    #[test]
-    fn find_repo_with_fallback_none_when_name_and_binding_both_miss() {
-        let repos = vec![repo_item("11111111-1111-4111-8111-111111111111", "myrepo")];
-        let binding = crate::session_state::RepoBinding {
-            repo_id: "22222222-2222-4222-8222-222222222222".to_string(),
-            git_url: None,
-            remote_id: None,
-            codebase_name: None,
-            updated_at: "t".into(),
-        };
-        let want = RepoMatch::ByName("renamed".to_string());
-        assert!(find_repo_with_fallback(&repos, &want, Some(&binding)).is_none());
-    }
-
-    #[test]
-    fn find_repo_with_fallback_by_id_miss_is_never_retried() {
-        // An ById lookup has already tried the only id available — a miss
-        // stays a miss even with a (necessarily-matching-or-irrelevant)
-        // binding present.
-        let repos = vec![repo_item("11111111-1111-4111-8111-111111111111", "myrepo")];
-        let binding = crate::session_state::RepoBinding {
-            repo_id: "99999999-9999-4999-8999-999999999999".to_string(),
-            git_url: None,
-            remote_id: None,
-            codebase_name: None,
-            updated_at: "t".into(),
-        };
-        let want = RepoMatch::ById("99999999-9999-4999-8999-999999999999".to_string());
-        assert!(find_repo_with_fallback(&repos, &want, Some(&binding)).is_none());
-    }
-
     #[test]
     fn server_repo_lookup_prefers_config_by_name() {
-        let m = server_repo_lookup(true, "myrepo", None).unwrap();
-        assert_eq!(m, RepoMatch::ByName("myrepo".to_string()));
+        let m = server_repo_lookup(Some("acme"), "myrepo", None).unwrap();
+        assert_eq!(
+            m,
+            ("acme".to_string(), RepoMatch::ByName("myrepo".to_string()))
+        );
     }
 
     #[test]
     fn server_repo_lookup_falls_back_to_binding_by_id() {
         let b = crate::session_state::RepoBinding {
+            org_slug: "visdom".into(),
             repo_id: "rid-1".into(),
             git_url: None,
             remote_id: None,
             codebase_name: None,
             updated_at: "t".into(),
         };
-        let m = server_repo_lookup(false, "ignored", Some(&b)).unwrap();
-        assert_eq!(m, RepoMatch::ById("rid-1".to_string()));
+        let m = server_repo_lookup(None, "ignored", Some(&b)).unwrap();
+        assert_eq!(
+            m,
+            ("visdom".to_string(), RepoMatch::ById("rid-1".to_string()))
+        );
     }
 
     #[test]
     fn server_repo_lookup_none_when_neither() {
-        assert!(server_repo_lookup(false, "x", None).is_none());
+        assert!(server_repo_lookup(None, "x", None).is_none());
     }
 
     #[test]

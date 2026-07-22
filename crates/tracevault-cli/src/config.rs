@@ -15,6 +15,8 @@ pub struct TracevaultConfig {
     #[allow(dead_code)]
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_context: Option<UserContext>,
@@ -44,6 +46,7 @@ impl Default for TracevaultConfig {
             agent: "claude-code".to_string(),
             server_url: None,
             api_key: None,
+            org_slug: None,
             repo_id: None,
             user_context: None,
             remote_id: None,
@@ -290,6 +293,7 @@ mod tests {
             agent: "claude-code".into(),
             server_url: Some("https://example.com".into()),
             api_key: None, // api_key not included in to_toml
+            org_slug: Some("my-org".into()),
             repo_id: Some("repo-1".into()),
             user_context: None,
             remote_id: None,
@@ -299,6 +303,7 @@ mod tests {
         let toml = cfg.to_toml();
         assert!(toml.contains("agent = \"claude-code\""));
         assert!(toml.contains("server_url = \"https://example.com\""));
+        assert!(toml.contains("org_slug = \"my-org\""));
         assert!(toml.contains("repo_id = \"repo-1\""));
         assert!(
             !toml.contains("user_context"),
@@ -321,30 +326,13 @@ mod tests {
         fs::create_dir_all(&tv_dir).unwrap();
         fs::write(
             tv_dir.join("config.toml"),
-            "agent = \"claude-code\"\nserver_url = \"https://example.com\"\n",
+            "agent = \"claude-code\"\nserver_url = \"https://example.com\"\norg_slug = \"myorg\"\n",
         )
         .unwrap();
         let cfg = TracevaultConfig::load(dir.path()).unwrap();
         assert_eq!(cfg.agent, "claude-code");
         assert_eq!(cfg.server_url.unwrap(), "https://example.com");
-    }
-
-    #[test]
-    fn load_old_config_with_org_slug_still_parses() {
-        // Old on-disk files may still contain `org_slug` from before the
-        // single-tenant org removal. serde must silently ignore the unknown
-        // field rather than fail to parse (no `deny_unknown_fields`).
-        let dir = tempfile::tempdir().unwrap();
-        let tv_dir = dir.path().join(".tracevault");
-        fs::create_dir_all(&tv_dir).unwrap();
-        fs::write(
-            tv_dir.join("config.toml"),
-            "agent = \"claude-code\"\nserver_url = \"https://example.com\"\norg_slug = \"x\"\n",
-        )
-        .unwrap();
-        let cfg = TracevaultConfig::load(dir.path()).unwrap();
-        assert_eq!(cfg.agent, "claude-code");
-        assert_eq!(cfg.server_url.unwrap(), "https://example.com");
+        assert_eq!(cfg.org_slug.unwrap(), "myorg");
     }
 
     #[test]
@@ -408,6 +396,7 @@ mod tests {
             agent: "claude-code".into(),
             server_url: Some("https://example.com".into()),
             api_key: Some("secret".into()),
+            org_slug: Some("my-org".into()),
             repo_id: None,
             user_context: None,
             remote_id: None,
@@ -417,6 +406,7 @@ mod tests {
         let toml = cfg.to_toml();
         assert!(toml.contains("agent = \"claude-code\""));
         assert!(toml.contains("server_url = \"https://example.com\""));
+        assert!(toml.contains("org_slug = \"my-org\""));
         assert!(!toml.contains("api_key"), "api_key must never be written");
         assert!(!toml.contains("repo_id"), "None fields must be omitted");
 
@@ -424,6 +414,7 @@ mod tests {
         let parsed: TracevaultConfig = toml::from_str(&toml).unwrap();
         assert_eq!(parsed.agent, "claude-code");
         assert_eq!(parsed.server_url.as_deref(), Some("https://example.com"));
+        assert_eq!(parsed.org_slug.as_deref(), Some("my-org"));
         assert_eq!(parsed.api_key, None);
     }
 
