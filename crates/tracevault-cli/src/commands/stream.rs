@@ -226,16 +226,6 @@ fn is_deterministic_client_error(e: &dyn std::error::Error) -> bool {
         .any(|marker| s.contains(marker))
 }
 
-/// True when an error's rendered message carries the server's stable
-/// "repo/remote belongs to multiple projects" refusal token. Both the
-/// `repo_in_multiple_projects` and `remote_in_multiple_projects` error codes
-/// contain the substring `multiple_projects` (underscore) — the server never
-/// emits the space-separated phrase "multiple projects", so matching on that
-/// phrase (the pre-fix behavior) never fires.
-fn is_multi_project_refusal(e: &dyn std::error::Error) -> bool {
-    e.to_string().contains("multiple_projects")
-}
-
 /// Send a single stream event, routing to the project-scoped endpoint when a
 /// local project binding resolved (`capture_pid = Some(_)`), else the
 /// repo-scoped endpoint (server-side deduction/refusal). Factored out so both
@@ -276,27 +266,10 @@ async fn send_stream_event(
                     *fallback_warned = true;
                 }
                 // Repo-scoped fallback: the server deduces the project itself.
-                // This can itself return the multi-project 409, which
-                // `warn_if_multi_project_refusal` surfaces at the call site.
                 client.stream_event(repo_id, req).await
             }
             Err(e) => Err(e), // transient — propagate for buffer/retry
         },
-    }
-}
-
-/// Surface the server's ambiguous-repo refusal (repo belongs to more than one
-/// project, so a repo-scoped send can't attribute unambiguously) as an
-/// actionable warning instead of a bare error. Fires on the FINAL error
-/// regardless of whether `capture_pid` was `Some` or `None`: with no local
-/// project binding this is a direct repo-scoped 409; with a binding it can
-/// still occur after `send_stream_event`'s deterministic-client-error
-/// fallback re-sends to the repo-scoped endpoint.
-fn warn_if_multi_project_refusal(e: &dyn std::error::Error) {
-    if is_multi_project_refusal(e) {
-        eprintln!(
-            "tracevault: warning: this repo belongs to multiple projects; capture is unattributed. Run `tracevault project switch <name>` to pick one."
-        );
     }
 }
 
@@ -621,7 +594,7 @@ pub async fn run_stream(
     // Send pending events first
     for pending_json in &pending_events {
         if let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(pending_json) {
-            if let Err(e) = send_stream_event(
+            if send_stream_event(
                 &client,
                 repo_id,
                 capture_pid,
@@ -629,8 +602,8 @@ pub async fn run_stream(
                 &mut fallback_warned,
             )
             .await
+            .is_err()
             {
-                warn_if_multi_project_refusal(e.as_ref());
                 // Re-queue all remaining pending events
                 for evt in &pending_events {
                     append_pending(&pending_path, evt)?;
@@ -662,10 +635,9 @@ pub async fn run_stream(
                 // 10. On success update .stream_offset
                 fs::write(&offset_path, new_offset.to_string())?;
             }
-            Err(e) => {
+            Err(_) => {
                 // 11. On failure append to pending.jsonl (advance the inline
                 // record counter regardless — see the note above).
-                warn_if_multi_project_refusal(e.as_ref());
                 append_pending(&pending_path, &req_json)?;
                 if is_inline {
                     fs::write(&offset_path, new_offset.to_string())?;
@@ -1401,91 +1373,6 @@ mod tests {
         assert!(
             line.starts_with("POST /api/v1/repos/11111111-1111-1111-1111-111111111111/stream "),
             "no binding must fall back to the repo-scoped endpoint, got: {line}"
-        );
-    }
-
-    // ── is_multi_project_refusal / is_deterministic_client_error predicates ───
-
-    /// A minimal `std::error::Error` wrapping a fixed message, for exercising
-    /// the string-matching predicates against exact server-shaped text
-    /// without going over the network.
-    #[derive(Debug)]
-    struct FixedError(String);
-    impl std::fmt::Display for FixedError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{}", self.0)
-        }
-    }
-    impl std::error::Error for FixedError {}
-
-    /// C1: the server's real 409 body uses `repo_in_multiple_projects` /
-    /// `remote_in_multiple_projects` (underscore) — never the space-separated
-    /// "multiple projects" phrase the pre-fix predicate matched on. Both
-    /// stable codes must be recognized; the dead space-phrase must not be
-    /// required to match.
-    #[test]
-    fn is_multi_project_refusal_matches_real_server_codes() {
-        let repo_code = FixedError(
-            "stream_event failed (409 Conflict): {\"error\":\"Repo 11111111-1111-1111-1111-111111111111 belongs to 2 projects; pass a project explicitly (--project) or set default_project.\",\"code\":\"repo_in_multiple_projects\"}"
-                .to_string(),
-        );
-        assert!(
-            is_multi_project_refusal(&repo_code),
-            "must recognize the repo_in_multiple_projects code"
-        );
-
-        let remote_code = FixedError(
-            "stream_event failed (409 Conflict): {\"error\":\"...\",\"code\":\"remote_in_multiple_projects\"}"
-                .to_string(),
-        );
-        assert!(
-            is_multi_project_refusal(&remote_code),
-            "must recognize the remote_in_multiple_projects code"
-        );
-
-        // Sanity: the OLD buggy predicate matched on the space-separated
-        // phrase, which the server never actually sends — confirm that a
-        // message containing ONLY that phrase (no underscore token) does NOT
-        // satisfy the FIXED predicate, i.e. this isn't accidentally matching
-        // on substring "multiple projects" too.
-        let space_phrase_only = FixedError("this repo belongs to multiple projects".to_string());
-        assert!(
-            !is_multi_project_refusal(&space_phrase_only),
-            "fixed predicate must key on the underscore token, not the dead space phrase"
-        );
-    }
-
-    /// C1 end-to-end: drive a REAL 409 response (repo-scoped send, no local
-    /// project binding) through `send_stream_event` and confirm the resulting
-    /// error's rendered message satisfies `is_multi_project_refusal` — i.e.
-    /// the warning `send_stream_event`'s callers rely on would actually fire
-    /// against genuine server output, not just a hand-written string.
-    #[tokio::test]
-    async fn c1_real_409_multi_project_body_triggers_refusal_predicate() {
-        let body = r#"{"error":"Repo 11111111-1111-1111-1111-111111111111 belongs to 2 projects; pass a project explicitly (--project) or set default_project.","code":"repo_in_multiple_projects"}"#;
-        let resp = format!(
-            "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let (base, _rx) = spawn_once_capturing_request(Box::leak(resp.into_boxed_str()));
-        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
-        let req = sample_stream_event_request();
-
-        let mut fallback_warned = false;
-        let err = send_stream_event(
-            &client,
-            "11111111-1111-1111-1111-111111111111",
-            None,
-            &req,
-            &mut fallback_warned,
-        )
-        .await
-        .expect_err("409 multi-project refusal must surface as Err");
-
-        assert!(
-            is_multi_project_refusal(err.as_ref()),
-            "real server 409 body must satisfy the multi-project refusal predicate, got: {err}"
         );
     }
 
