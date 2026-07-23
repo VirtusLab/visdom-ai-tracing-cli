@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.25.0...v0.26.0) - 2026-07-23
+
+### Other
+
+- Revert "Revert "Single-tenant collapse — CLI (drop orgs) ([#35](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/35))" ([#36](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/36))" ([#37](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/37))
+
 ## [0.25.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.24.0...v0.25.0) - 2026-07-22
 
 ### Added
