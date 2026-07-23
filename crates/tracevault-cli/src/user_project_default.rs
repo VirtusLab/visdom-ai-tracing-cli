@@ -70,7 +70,6 @@ mod tests {
     fn user_project_default_roundtrips() {
         let tmp = tempfile::tempdir().unwrap();
         let pb = ProjectBinding {
-            org_slug: "acme".into(),
             project_id: "id".into(),
             project_name: "p".into(),
             updated_at: "t".into(),
@@ -105,7 +104,6 @@ mod tests {
         _guard.set("XDG_CONFIG_HOME", tmp.path());
 
         let pb = ProjectBinding {
-            org_slug: "acme".into(),
             project_id: "id".into(),
             project_name: "p".into(),
             updated_at: "t".into(),

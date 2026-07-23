@@ -8,8 +8,8 @@ use tokio::sync::{Mutex, MutexGuard};
 
 /// Serializes tests that mutate process-wide env vars consulted by
 /// config/credential resolution (`XDG_CONFIG_HOME`, `TRACEVAULT_SERVER_URL`/
-/// `_ORG_SLUG`/`_API_KEY`, and anything else `dirs::config_dir()` or
-/// `resolve_credentials`/`org_slug_for` depend on). `cargo test` runs
+/// `_API_KEY`, and anything else `dirs::config_dir()` or
+/// `resolve_credentials` depend on). `cargo test` runs
 /// `#[test]`/`#[tokio::test]` functions across multiple threads by default,
 /// and env vars are process-global, so two such tests running concurrently
 /// could otherwise clobber each other's value mid-test. Every test that sets

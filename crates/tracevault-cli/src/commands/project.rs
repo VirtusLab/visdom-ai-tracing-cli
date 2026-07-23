@@ -5,10 +5,10 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::api_client::{resolve_credentials, ApiClient, ProjectListItem};
+use crate::api_client::{resolve_client, ApiClient, ProjectListItem};
 use crate::resolution::{
-    self, effective_project, git_remote_url, org_slug_for, resolve_effective_project,
-    ProjectResolveInputs, ProjectSource,
+    effective_project, git_remote_url, resolve_effective_project, ProjectResolveInputs,
+    ProjectSource,
 };
 use crate::session_state::{self, ProjectBinding, SessionState};
 
@@ -76,33 +76,6 @@ fn resolve_project_name<'a>(
     })
 }
 
-/// Resolve credentials + the org slug the same way `repo::switch` does: the
-/// locally-configured org wins; only when none is set do we ask the server
-/// which org this credential belongs to.
-async fn resolve_org_and_client(
-    project_root: &Path,
-) -> Result<(String, ApiClient), Box<dyn std::error::Error>> {
-    let (server_url, token) = resolve_credentials(project_root);
-    let server_url = server_url
-        .ok_or("no server URL configured: set TRACEVAULT_SERVER_URL or run `tracevault login`")?;
-    let client = ApiClient::new(&server_url, token.as_deref());
-
-    let org_slug = match org_slug_for(project_root) {
-        Some(s) => s,
-        None => {
-            let orgs = client.list_my_orgs().await.map_err(|e| {
-                format!(
-                    "no org configured and could not derive it from your credential ({e}); \
-                     set TRACEVAULT_ORG_SLUG, log in, or run inside a bound repo checkout"
-                )
-            })?;
-            let slugs: Vec<String> = orgs.into_iter().map(|o| o.org_name).collect();
-            resolution::org_slug_from_slugs(&slugs)?
-        }
-    };
-    Ok((org_slug, client))
-}
-
 /// Resolve `name` to a registered project (via `list_projects`) and, unless
 /// `check_codebase` is `false`, verify that project contains the current
 /// codebase (resolved from `cwd`'s git origin remote, mirroring
@@ -111,12 +84,11 @@ async fn resolve_org_and_client(
 /// `commands::repo::resolve_switch_binding`.
 async fn resolve_switch_project(
     name: &str,
-    org_slug: &str,
     client: &ApiClient,
     check_codebase: bool,
     cwd: &Path,
 ) -> Result<ProjectBinding, Box<dyn std::error::Error>> {
-    let items = client.list_projects(org_slug).await?;
+    let items = client.list_projects().await?;
     let matched = resolve_project_name(&items, name)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let project_id = matched.id;
@@ -124,15 +96,15 @@ async fn resolve_switch_project(
 
     if check_codebase {
         if let Some(git_url) = git_remote_url(cwd) {
-            if let Some(remote) = client.resolve_remote(org_slug, &git_url).await? {
+            if let Some(remote) = client.resolve_remote(&git_url).await? {
                 let codebase_repo_ids: HashSet<uuid::Uuid> = client
-                    .get_remote_repos(org_slug, remote.remote_id)
+                    .get_remote_repos(remote.remote_id)
                     .await?
                     .into_iter()
                     .map(|r| r.id)
                     .collect();
                 let project_repo_ids: HashSet<uuid::Uuid> = client
-                    .get_project(org_slug, project_id)
+                    .get_project(project_id)
                     .await?
                     .repos
                     .into_iter()
@@ -153,7 +125,6 @@ async fn resolve_switch_project(
     }
 
     Ok(ProjectBinding {
-        org_slug: org_slug.to_string(),
         project_id: project_id.to_string(),
         project_name,
         updated_at: chrono::Utc::now().to_rfc3339(),
@@ -186,27 +157,24 @@ async fn switch(
     project_root: &Path,
     cwd: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (org_slug, client) = resolve_org_and_client(project_root).await?;
+    let client = resolve_client(project_root)?;
     let session = crate::commands::repo::resolve_session_id(session_id).ok();
     let dest = switch_destination(user, session);
     let check_codebase = matches!(dest, SwitchDest::Session(_));
-    let binding = resolve_switch_project(name, &org_slug, &client, check_codebase, cwd).await?;
+    let binding = resolve_switch_project(name, &client, check_codebase, cwd).await?;
 
     match dest {
         SwitchDest::Session(id) => {
             let mut state = session_state::load(&id);
             state.active_project = Some(binding.clone());
             session_state::save(&id, &state)?;
-            println!(
-                "bound session {id} to project {} (org {})",
-                binding.project_name, binding.org_slug
-            );
+            println!("bound session {id} to project {}", binding.project_name);
         }
         SwitchDest::UserDefault => {
             crate::user_project_default::save(&binding)?;
             println!(
-                "set user-level default project {} (org {}); applies to new sessions without their own binding (the current session, if any, is unchanged — omit --user to bind this session)",
-                binding.project_name, binding.org_slug
+                "set user-level default project {}; applies to new sessions without their own binding (the current session, if any, is unchanged — omit --user to bind this session)",
+                binding.project_name
             );
         }
     }
@@ -251,7 +219,7 @@ fn format_status(effective: Option<(&ProjectBinding, ProjectSource)>) -> String 
             } else {
                 &b.project_name
             };
-            format!("project: {label} (org {}) via {source}", b.org_slug)
+            format!("project: {label} via {source}")
         }
         None => "no project bound".to_string(),
     }
@@ -286,10 +254,10 @@ async fn status(
     // rung 4/5 chain (deduction, user default) needs it too. Best-effort: no
     // client degrades to the pure local rungs (flag/config_default stay
     // unresolved) rather than failing the whole inspector.
-    let effective = match resolve_org_and_client(project_root).await {
-        Ok((org_slug, client)) => {
+    let effective = match resolve_client(project_root) {
+        Ok(client) => {
             let items = if project_flag_name.is_some() || config_default_name.is_some() {
-                client.list_projects(&org_slug).await.ok()
+                client.list_projects().await.ok()
             } else {
                 None
             };
@@ -298,7 +266,6 @@ async fn status(
                     .as_ref()
                     .and_then(|items| resolve_project_name(items, name).ok())?;
                 Some(ProjectBinding {
-                    org_slug: org_slug.clone(),
                     project_id: matched.id.to_string(),
                     project_name: matched.name.clone(),
                     updated_at: chrono::Utc::now().to_rfc3339(),
@@ -335,27 +302,20 @@ async fn status(
             // propagating the error up through `run`/`main` as a hard
             // failure. `resolve_effective_project` itself keeps returning
             // `Err` unchanged; only this call site swallows it.
-            let resolved = match resolve_effective_project(
-                &inputs,
-                user_default,
-                &org_slug,
-                git_url.as_deref(),
-                &client,
-            )
-            .await
-            {
-                Ok(effective) => effective,
-                Err(e) => {
-                    println!("project: unresolved — {e}");
-                    return Ok(());
-                }
-            };
+            let resolved =
+                match resolve_effective_project(&inputs, user_default, git_url.as_deref(), &client)
+                    .await
+                {
+                    Ok(effective) => effective,
+                    Err(e) => {
+                        println!("project: unresolved — {e}");
+                        return Ok(());
+                    }
+                };
             enrich_deduced_name(resolved, items.as_deref())
         }
         Err(e) => {
-            eprintln!(
-                "warning: could not resolve org/credentials ({e}); showing local status only"
-            );
+            eprintln!("warning: could not resolve credentials ({e}); showing local status only");
             let inputs = ProjectResolveInputs {
                 project_flag: None,
                 session: &session,
@@ -428,7 +388,6 @@ mod tests {
 
     fn pb(name: &str) -> ProjectBinding {
         ProjectBinding {
-            org_slug: "org".into(),
             project_id: format!("id-{name}"),
             project_name: name.into(),
             updated_at: "t".into(),
@@ -445,7 +404,7 @@ mod tests {
         let b = pb("web");
         assert_eq!(
             format_status(Some((&b, ProjectSource::ProjectFlag))),
-            "project: web (org org) via --project override"
+            "project: web via --project override"
         );
     }
 
@@ -454,21 +413,20 @@ mod tests {
         let b = pb("payments");
         assert_eq!(
             format_status(Some((&b, ProjectSource::SessionActive))),
-            "project: payments (org org) via session (project switch)"
+            "project: payments via session (project switch)"
         );
     }
 
     #[test]
     fn format_status_deduced_falls_back_to_id_when_name_empty() {
         let b = ProjectBinding {
-            org_slug: "org".into(),
             project_id: "deduced-id".into(),
             project_name: String::new(),
             updated_at: "".into(),
         };
         assert_eq!(
             format_status(Some((&b, ProjectSource::Deduced))),
-            "project: deduced-id (org org) via repo deduction"
+            "project: deduced-id via repo deduction"
         );
     }
 
@@ -477,7 +435,7 @@ mod tests {
         let b = pb("payments");
         assert_eq!(
             format_status(Some((&b, ProjectSource::UserDefault))),
-            "project: payments (org org) via user default (project switch --user)"
+            "project: payments via user default (project switch --user)"
         );
     }
 
@@ -559,12 +517,11 @@ mod tests {
         let base = spawn_once(http_200(list));
         let client = ApiClient::new(&base, Some("tok"));
 
-        let binding = resolve_switch_project("web", "org", &client, true, tmp.path())
+        let binding = resolve_switch_project("web", &client, true, tmp.path())
             .await
             .expect("expected Ok binding");
         assert_eq!(binding.project_id, "22222222-2222-4222-8222-222222222222");
         assert_eq!(binding.project_name, "web");
-        assert_eq!(binding.org_slug, "org");
 
         let session_id = format!("project-switch-test-{}", uuid::Uuid::new_v4());
         let mut state = session_state::load(&session_id);
@@ -583,7 +540,7 @@ mod tests {
         let base = spawn_once(http_200(list));
         let client = ApiClient::new(&base, Some("tok"));
 
-        let err = resolve_switch_project("web", "org", &client, false, Path::new("/nonexistent"))
+        let err = resolve_switch_project("web", &client, false, Path::new("/nonexistent"))
             .await
             .expect_err("expected Err for an unknown project name");
         let msg = err.to_string();
@@ -628,7 +585,7 @@ mod tests {
         ]);
         let client = ApiClient::new(&base, Some("tok"));
 
-        let err = resolve_switch_project("payments", "org", &client, true, tmp.path())
+        let err = resolve_switch_project("payments", &client, true, tmp.path())
             .await
             .expect_err("expected Err: project doesn't contain the current codebase");
         assert!(
@@ -651,27 +608,26 @@ mod tests {
     /// which closes after the first `accept()`) would fail fast, and the
     /// switch would error instead of succeeding.
     ///
-    /// Credentials/org are supplied two ways at once: a
-    /// `.tracevault/config.toml` in `cwd`, and `TRACEVAULT_SERVER_URL`/
-    /// `_ORG_SLUG`/`_API_KEY` env vars pinned (via the guard below) at the
-    /// same mock server/values. The env vars sit above the config file in
-    /// `resolve_credentials`'s precedence, so without pinning them
-    /// explicitly, an ambient shell that already exports
-    /// `TRACEVAULT_SERVER_URL` (etc.) would leak in and point this test's
-    /// client at the wrong server — deterministic in CI (which doesn't set
-    /// them) but flaky on a developer machine that has them exported. The
-    /// guard's `set` calls make the test's behavior independent of the
-    /// ambient environment. `_env_lock` (taken below) also serializes this
-    /// against `status_reports_ambiguous_deduction_as_informational_not_
-    /// fatal`, which touches the same three vars. `XDG_CONFIG_HOME` is
-    /// redirected so this doesn't read the developer's real
-    /// `credentials.json` (which could otherwise short-circuit
-    /// `org_slug_for`/`resolve_credentials` before the config file/env vars
-    /// are consulted, and race for real on a machine with actual
-    /// TraceVault credentials) and so the resulting user-default write
-    /// lands in a tempdir, not `~/.config`. `user_project_default`'s own
-    /// real-path round-trip test mutates the same var, so both hold
-    /// `test_helpers::lock_env_mutation()` for their duration.
+    /// Credentials are supplied two ways at once: a `.tracevault/config.toml`
+    /// in `cwd`, and `TRACEVAULT_SERVER_URL`/`_API_KEY` env vars pinned (via
+    /// the guard below) at the same mock server/values. The env vars sit
+    /// above the config file in `resolve_credentials`'s precedence, so
+    /// without pinning them explicitly, an ambient shell that already
+    /// exports `TRACEVAULT_SERVER_URL` (etc.) would leak in and point this
+    /// test's client at the wrong server — deterministic in CI (which
+    /// doesn't set them) but flaky on a developer machine that has them
+    /// exported. The guard's `set` calls make the test's behavior
+    /// independent of the ambient environment. `_env_lock` (taken below)
+    /// also serializes this against `status_reports_ambiguous_deduction_as_
+    /// informational_not_fatal`, which touches the same vars.
+    /// `XDG_CONFIG_HOME` is redirected so this doesn't read the developer's
+    /// real `credentials.json` (which could otherwise short-circuit
+    /// `resolve_credentials` before the config file/env vars are consulted,
+    /// and race for real on a machine with actual TraceVault credentials)
+    /// and so the resulting user-default write lands in a tempdir, not
+    /// `~/.config`. `user_project_default`'s own real-path round-trip test
+    /// mutates the same var, so both hold `test_helpers::lock_env_mutation()`
+    /// for their duration.
     #[tokio::test]
     async fn switch_without_session_or_user_flag_skips_codebase_check() {
         let _env_lock = crate::test_helpers::lock_env_mutation().await;
@@ -699,30 +655,28 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
             config_dir.join("config.toml"),
-            format!("agent = \"claude-code\"\nserver_url = \"{base}\"\napi_key = \"tok\"\norg_slug = \"org\"\n"),
+            format!("agent = \"claude-code\"\nserver_url = \"{base}\"\napi_key = \"tok\"\n"),
         )
         .unwrap();
 
         // SAFETY: test-scoped env mutation, restored in a guard so a panic
         // in `switch` still cleans up the process env. `_env_lock` (taken
-        // above) also covers `resolve_credentials`/`org_slug_for`'s *reads*
-        // of TRACEVAULT_SERVER_URL/_ORG_SLUG/_API_KEY: those env vars sit
-        // above `.tracevault/config.toml` in precedence, so if the
-        // developer's ambient shell happens to already export them (e.g.
-        // pointing at a real server), `resolve_credentials` would pick
-        // those up instead of this test's config file and the request
-        // would go to the wrong place — deterministic in CI (which doesn't
-        // set them) but flaky locally. Pin them explicitly at this test's
-        // own mock server so behavior doesn't depend on the ambient
-        // environment, mirroring the precedent in `status_reports_
-        // ambiguous_deduction_as_informational_not_fatal`. `_env_lock`
-        // (taken above) also serializes this against that test and any
-        // other test in the crate touching the same three vars.
+        // above) also covers `resolve_credentials`'s *reads* of
+        // TRACEVAULT_SERVER_URL/_API_KEY: those env vars sit above
+        // `.tracevault/config.toml` in precedence, so if the developer's
+        // ambient shell happens to already export them (e.g. pointing at a
+        // real server), `resolve_credentials` would pick those up instead of
+        // this test's config file and the request would go to the wrong
+        // place — deterministic in CI (which doesn't set them) but flaky
+        // locally. Pin them explicitly at this test's own mock server so
+        // behavior doesn't depend on the ambient environment, mirroring the
+        // precedent in `status_reports_ambiguous_deduction_as_informational_
+        // not_fatal`. `_env_lock` (taken above) also serializes this against
+        // that test and any other test in the crate touching the same vars.
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.remove("TRACEVAULT_SESSION_ID");
         _guard.set("XDG_CONFIG_HOME", tmp.path());
         _guard.set("TRACEVAULT_SERVER_URL", &base);
-        _guard.set("TRACEVAULT_ORG_SLUG", "org");
         _guard.set("TRACEVAULT_API_KEY", "tok");
 
         let result = switch("payments", false, None, tmp.path(), tmp.path()).await;
@@ -755,7 +709,6 @@ mod tests {
     fn deduced(id: uuid::Uuid) -> (ProjectBinding, ProjectSource) {
         (
             ProjectBinding {
-                org_slug: "org".into(),
                 project_id: id.to_string(),
                 project_name: String::new(),
                 updated_at: "".into(),
@@ -837,14 +790,13 @@ mod tests {
         // `commands::login`'s tests, restored in a guard so a panic in
         // `status` still cleans up the process env. `_env_lock` (taken
         // above) serializes this against any other test in the crate that
-        // reads or sets TRACEVAULT_SERVER_URL/TRACEVAULT_ORG_SLUG/
-        // TRACEVAULT_API_KEY (e.g. `switch_without_session_or_user_flag_
-        // skips_codebase_check`, whose credential resolution would
-        // otherwise observe these values while they're set here and get
-        // routed at this test's mock server instead of its own).
+        // reads or sets TRACEVAULT_SERVER_URL/TRACEVAULT_API_KEY (e.g.
+        // `switch_without_session_or_user_flag_skips_codebase_check`, whose
+        // credential resolution would otherwise observe these values while
+        // they're set here and get routed at this test's mock server instead
+        // of its own).
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("TRACEVAULT_SERVER_URL", &base);
-        _guard.set("TRACEVAULT_ORG_SLUG", "org");
         _guard.set("TRACEVAULT_API_KEY", "tok");
 
         let result = status(None, None, tmp.path(), tmp.path()).await;

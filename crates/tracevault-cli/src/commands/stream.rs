@@ -205,6 +205,14 @@ fn capture_project(
 ///
 /// Takes `&dyn Error` rather than `&Box<dyn Error>` to avoid the clippy
 /// `borrowed_box` lint at call sites that already hold a `Box<dyn Error>`.
+///
+/// COUPLING: the `"(NNN "` markers below must byte-for-byte match what
+/// `ApiClient::authed_send_json`'s `err_prefix` closures render (e.g.
+/// `stream_event`'s `"Stream failed ({status})"`, where `{status}` Displays
+/// as `"404 Not Found"`, yielding `"Stream failed (404 Not Found): ..."` —
+/// hence the `"(404 "` marker below matching on the open-paren + code + the
+/// space before the reason phrase). If that error-formatting ever changes,
+/// update this list (and its tests) to match.
 fn is_deterministic_client_error(e: &dyn std::error::Error) -> bool {
     let s = e.to_string();
     // 401 is deliberately excluded: it's an authentication failure (bad/expired
@@ -241,18 +249,14 @@ fn is_deterministic_client_error(e: &dyn std::error::Error) -> bool {
 /// leaving the fallback behavior itself unchanged.
 async fn send_stream_event(
     client: &crate::api_client::ApiClient,
-    org_slug: &str,
     repo_id: &str,
     capture_pid: Option<uuid::Uuid>,
     req: &StreamEventRequest,
     fallback_warned: &mut bool,
 ) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn std::error::Error>> {
     match capture_pid {
-        None => client.stream_event(org_slug, repo_id, req).await,
-        Some(pid) => match client
-            .stream_event_for_project(org_slug, pid, repo_id, req)
-            .await
-        {
+        None => client.stream_event(repo_id, req).await,
+        Some(pid) => match client.stream_event_for_project(pid, repo_id, req).await {
             Ok(r) => Ok(r),
             Err(e) if is_deterministic_client_error(e.as_ref()) => {
                 if !*fallback_warned {
@@ -262,7 +266,7 @@ async fn send_stream_event(
                     *fallback_warned = true;
                 }
                 // Repo-scoped fallback: the server deduces the project itself.
-                client.stream_event(org_slug, repo_id, req).await
+                client.stream_event(repo_id, req).await
             }
             Err(e) => Err(e), // transient — propagate for buffer/retry
         },
@@ -461,8 +465,8 @@ pub async fn run_stream(
         .or_else(|| inline_tool_is_error(&transcript_lines));
 
     // Load config once, up front, so it can back both the user-level context
-    // layer resolution below and the org_slug/repo_id lookup further down —
-    // avoids a redundant second read of the same file. `try_load` keeps the
+    // layer resolution below and the repo_id lookup further down — avoids a
+    // redundant second read of the same file. `try_load` keeps the
     // missing/malformed distinction so the required-config error further down
     // can report which one it is.
     // Best-effort here: a missing/unconfigured repo config does NOT mean "no
@@ -524,13 +528,13 @@ pub async fn run_stream(
     let (server_url, token) = crate::api_client::resolve_credentials(&project_root);
 
     // 7. Config (loaded above, alongside the user-level context layer
-    // resolution) no longer directly gates org_slug/repo_id — a missing
-    // config is not fatal on its own, since the repo may instead resolve via
-    // the workspace-mode precedence chain (session binding / subagent
-    // worktree override) below. A malformed config is still surfaced here —
-    // that's easy to miss in hook output otherwise. Only a bound
-    // `config.toml`'s org_slug/repo_id feed the lowest-precedence tier
-    // (via `binding_from_config` below).
+    // resolution) no longer directly gates repo_id — a missing config is not
+    // fatal on its own, since the repo may instead resolve via the
+    // workspace-mode precedence chain (session binding / subagent worktree
+    // override) below. A malformed config is still surfaced here — that's
+    // easy to miss in hook output otherwise. Only a bound `config.toml`'s
+    // repo_id feeds the lowest-precedence tier (via `binding_from_config`
+    // below).
     if let Err(e) = &config {
         return Err(format!("malformed .tracevault/config.toml: {e}").into());
     }
@@ -566,7 +570,6 @@ pub async fn run_stream(
         no_op_allow()?;
         return Ok(());
     }
-    let org_slug = binding.org_slug.as_str();
     let repo_id = binding.repo_id.as_str();
 
     // Explicit local project binding (if any) overrides server-side repo
@@ -593,7 +596,6 @@ pub async fn run_stream(
         if let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(pending_json) {
             if send_stream_event(
                 &client,
-                org_slug,
                 repo_id,
                 capture_pid,
                 &pending_req,
@@ -628,16 +630,7 @@ pub async fn run_stream(
             fs::write(&offset_path, new_offset.to_string())?;
         }
     } else {
-        match send_stream_event(
-            &client,
-            org_slug,
-            repo_id,
-            capture_pid,
-            &req,
-            &mut fallback_warned,
-        )
-        .await
-        {
+        match send_stream_event(&client, repo_id, capture_pid, &req, &mut fallback_warned).await {
             Ok(_) => {
                 // 10. On success update .stream_offset
                 fs::write(&offset_path, new_offset.to_string())?;
@@ -928,7 +921,6 @@ mod tests {
 
     fn binding(id: &str) -> RepoBinding {
         RepoBinding {
-            org_slug: "org".into(),
             repo_id: id.into(),
             git_url: None,
             remote_id: None,
@@ -1146,7 +1138,6 @@ mod tests {
     fn capture_project_precedence_local_only() {
         use crate::session_state::{ProjectBinding, SessionState};
         let pb = |id: &str| ProjectBinding {
-            org_slug: "o".into(),
             project_id: id.into(),
             project_name: "n".into(),
             updated_at: "".into(),
@@ -1304,7 +1295,6 @@ mod tests {
         let pid = uuid::Uuid::from_u128(99);
         let session = SessionState {
             active_project: Some(ProjectBinding {
-                org_slug: "org".into(),
                 project_id: pid.to_string(),
                 project_name: "proj".into(),
                 updated_at: "".into(),
@@ -1322,7 +1312,6 @@ mod tests {
         let mut fallback_warned = false;
         let got = send_stream_event(
             &client,
-            "org",
             "11111111-1111-1111-1111-111111111111",
             capture_pid,
             &req,
@@ -1337,7 +1326,7 @@ mod tests {
             .expect("no request captured");
         assert!(
             line.starts_with(&format!(
-                "POST /api/v1/orgs/org/projects/{pid}/stream?repo_id=11111111-1111-1111-1111-111111111111 "
+                "POST /api/v1/projects/{pid}/stream?repo_id=11111111-1111-1111-1111-111111111111 "
             )),
             "an active project binding must route to the project-scoped endpoint, got: {line}"
         );
@@ -1369,7 +1358,6 @@ mod tests {
         let mut fallback_warned = false;
         let got = send_stream_event(
             &client,
-            "org",
             "11111111-1111-1111-1111-111111111111",
             capture_pid,
             &req,
@@ -1383,9 +1371,7 @@ mod tests {
             .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
             .expect("no request captured");
         assert!(
-            line.starts_with(
-                "POST /api/v1/orgs/org/repos/11111111-1111-1111-1111-111111111111/stream "
-            ),
+            line.starts_with("POST /api/v1/repos/11111111-1111-1111-1111-111111111111/stream "),
             "no binding must fall back to the repo-scoped endpoint, got: {line}"
         );
     }
@@ -1456,7 +1442,6 @@ mod tests {
         let mut fallback_warned = false;
         let got = send_stream_event(
             &client,
-            "org",
             "11111111-1111-1111-1111-111111111111",
             Some(pid),
             &req,
@@ -1478,9 +1463,7 @@ mod tests {
             .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
             .expect("no second (fallback) request captured");
         assert!(
-            second.starts_with(
-                "POST /api/v1/orgs/org/repos/11111111-1111-1111-1111-111111111111/stream "
-            ),
+            second.starts_with("POST /api/v1/repos/11111111-1111-1111-1111-111111111111/stream "),
             "second request must fall back to the repo-scoped endpoint, got: {second}"
         );
     }
@@ -1505,7 +1488,6 @@ mod tests {
         let mut fallback_warned = false;
         let err = send_stream_event(
             &client,
-            "org",
             "11111111-1111-1111-1111-111111111111",
             Some(pid),
             &req,

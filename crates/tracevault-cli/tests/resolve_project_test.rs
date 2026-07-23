@@ -44,7 +44,7 @@ async fn resolve_project_returns_resolved_on_200() {
     let (base, rx) = spawn_once(Box::leak(resp.into_boxed_str()));
     let client = ApiClient::new(&base, Some("tok"));
     let outcome = client
-        .resolve_project("org", "git@github.com:acme/app.git")
+        .resolve_project("git@github.com:acme/app.git")
         .await
         .unwrap();
     match outcome {
@@ -54,8 +54,7 @@ async fn resolve_project_returns_resolved_on_200() {
         other => panic!("expected Resolved, got {other:?}"),
     }
     let request = rx.recv_timeout(RECV_TIMEOUT).expect("no request");
-    assert!(request
-        .contains("/api/v1/orgs/org/projects/resolve?git_url=git%40github.com%3Aacme%2Fapp.git"));
+    assert!(request.contains("/api/v1/projects/resolve?git_url=git%40github.com%3Aacme%2Fapp.git"));
     assert!(
         request.contains("%40"),
         "git_url must be percent-encoded: {request}"
@@ -63,12 +62,19 @@ async fn resolve_project_returns_resolved_on_200() {
 }
 
 #[tokio::test]
-async fn resolve_project_returns_none_on_404() {
-    let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    let (base, rx) = spawn_once(resp);
+async fn resolve_project_returns_none_on_domain_404() {
+    // A genuine domain 404 carries the server's JSON error envelope
+    // (`{"error": "..."}`, as every `AppError` renders) — the shape a real
+    // (non-skewed) server sends for "no project".
+    let body = r#"{"error":"No project for that URL"}"#;
+    let resp = format!(
+        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(), body
+    );
+    let (base, rx) = spawn_once(Box::leak(resp.into_boxed_str()));
     let client = ApiClient::new(&base, Some("tok"));
     let outcome = client
-        .resolve_project("org", "git@github.com:acme/app.git")
+        .resolve_project("git@github.com:acme/app.git")
         .await
         .unwrap();
     match outcome {
@@ -78,7 +84,26 @@ async fn resolve_project_returns_none_on_404() {
     // Assert a request actually went out (else a buggy resolve_project that
     // returned None without any I/O would still pass this test).
     let request = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
-    assert!(request.contains("/api/v1/orgs/org/projects/resolve?git_url="));
+    assert!(request.contains("/api/v1/projects/resolve?git_url="));
+}
+
+#[tokio::test]
+async fn resolve_project_errs_on_bare_404_version_skew() {
+    // A bare 404 with no JSON error body is axum's built-in "no route
+    // matched" fallback — the shape an OLD server sends for a de-slugged
+    // path it doesn't have yet. This must NOT be read as "no project"; it
+    // must surface as an error the user can diagnose as a version skew.
+    let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let (base, _rx) = spawn_once(resp);
+    let client = ApiClient::new(&base, Some("tok"));
+    let err = client
+        .resolve_project("git@github.com:acme/app.git")
+        .await
+        .expect_err("a bare 404 body must not be treated as 'no project'");
+    assert!(
+        err.to_string().to_lowercase().contains("version mismatch"),
+        "expected a version-mismatch hint; got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -87,7 +112,7 @@ async fn resolve_project_returns_ambiguous_on_409() {
     let (base, rx) = spawn_once(resp);
     let client = ApiClient::new(&base, Some("tok"));
     let outcome = client
-        .resolve_project("org", "git@github.com:acme/app.git")
+        .resolve_project("git@github.com:acme/app.git")
         .await
         .unwrap();
     match outcome {
@@ -95,5 +120,5 @@ async fn resolve_project_returns_ambiguous_on_409() {
         other => panic!("expected Ambiguous, got {other:?}"),
     }
     let request = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
-    assert!(request.contains("/api/v1/orgs/org/projects/resolve?git_url="));
+    assert!(request.contains("/api/v1/projects/resolve?git_url="));
 }
