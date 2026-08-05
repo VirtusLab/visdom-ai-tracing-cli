@@ -34,8 +34,9 @@ pub fn http_json(status: &str, body: &str) -> String {
 /// the next entry of `responses`, then stops accepting.
 ///
 /// Returns the server's base URL and a channel of captured requests, one per
-/// served request, each rendered as `"<request line> | <body>"` — enough to
-/// assert on the method, path, and form fields of an OAuth token request.
+/// served request, each rendered as
+/// `"<request line> | <headers> | <body>"` — enough to assert on the method,
+/// path, `Authorization` header, and form fields of an OAuth token request.
 /// The whole request (headers AND body) is consumed before the response is
 /// written, so a client POSTing a form never sees its write end reset.
 ///
@@ -76,13 +77,18 @@ where
 }
 
 /// Read one complete HTTP request off `stream` and render it as
-/// `"<request line> | <body>"`.
+/// `"<request line> | <headers, newline-separated> | <body>"`.
+///
+/// The headers are RETAINED rather than discarded so a test can assert which
+/// bearer token a request actually carried — without them, an assertion on
+/// `Authorization` silently matches nothing.
 fn read_request(stream: &std::net::TcpStream) -> String {
     let mut reader = BufReader::new(stream.try_clone().expect("clone test socket"));
     let mut request_line = String::new();
     let _ = reader.read_line(&mut request_line);
 
     let mut content_length = 0usize;
+    let mut headers: Vec<String> = Vec::new();
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).unwrap_or(0) == 0 {
@@ -92,12 +98,15 @@ fn read_request(stream: &std::net::TcpStream) -> String {
         if header.is_empty() {
             break;
         }
+        // Header names arrive lowercased from hyper, but accept either case so
+        // this helper isn't tied to one client's formatting.
         if let Some(v) = header
             .strip_prefix("Content-Length:")
             .or_else(|| header.strip_prefix("content-length:"))
         {
             content_length = v.trim().parse().unwrap_or(0);
         }
+        headers.push(header.to_string());
     }
 
     let mut body = vec![0u8; content_length];
@@ -105,8 +114,9 @@ fn read_request(stream: &std::net::TcpStream) -> String {
         let _ = reader.read_exact(&mut body);
     }
     format!(
-        "{} | {}",
+        "{} | {} | {}",
         request_line.trim_end(),
+        headers.join("\n"),
         String::from_utf8_lossy(&body)
     )
 }

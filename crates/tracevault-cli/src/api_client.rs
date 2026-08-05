@@ -330,20 +330,45 @@ impl ApiClient {
 
     /// Refresh the held session in place and persist it. Caller holds the
     /// session lock, which is what makes "one refresh at a time" true.
+    ///
+    /// # Residual cross-process race, and why it is currently benign
+    ///
+    /// The on-disk adopt below closes the SEQUENTIAL case (something already
+    /// finished refreshing before we started) but only NARROWS the concurrent
+    /// one: two hooks spawned at the same instant can both read the same
+    /// session before either writes, and the window is this function's
+    /// discovery GET plus its token POST. Both would then present the same
+    /// refresh token.
+    ///
+    /// That is harmless ONLY because the realm keeps Keycloak's
+    /// `revokeRefreshToken` at its default (off): a re-presented refresh token
+    /// stays valid, so the worst outcome is one wasted round trip and a
+    /// last-writer-wins access token, both invisible to the user. If that
+    /// realm setting is ever enabled, the second presenter gets
+    /// `invalid_grant` — surfacing as a spurious "your session has expired" —
+    /// and this code then needs a real inter-process file lock around
+    /// read-refresh-write, not just the adopt.
     async fn refresh_locked(&self, session: &mut KeycloakSession) -> Result<(), AuthError> {
         let now = (self.now)();
 
         // Someone else may have refreshed already: another process (two git
         // hooks firing at once), or another `ApiClient` in this process that
         // was built from the same on-disk credential before either refreshed.
-        // Adopting a newer on-disk session skips a pointless round trip AND
-        // avoids presenting a refresh token that was already consumed — which,
-        // in a realm configured to rotate refresh tokens, would come back as
-        // `invalid_grant` and log the user out for no reason.
+        //
+        // A DIFFERENT refresh token on disk is proof that ours has been
+        // superseded, so adopt unconditionally — including when the adopted
+        // session is itself inside the refresh window, in which case we fall
+        // through and refresh with the ADOPTED token. Gating the adopt on the
+        // disk session being fresh would leave exactly the case this exists to
+        // prevent: refreshing with an in-memory token another client already
+        // consumed.
         if let Some(disk) = Credentials::load().and_then(|c| c.auth) {
-            if disk.refresh_token != session.refresh_token && !disk.needs_refresh(now) {
+            if disk.refresh_token != session.refresh_token {
+                let disk_needs_refresh = disk.needs_refresh(now);
                 *session = disk;
-                return Ok(());
+                if !disk_needs_refresh {
+                    return Ok(());
+                }
             }
         }
 
@@ -1004,6 +1029,58 @@ mod tests {
         assert_eq!(token.as_deref(), Some("other-process-at"));
     }
 
+    /// The interleaving that makes the adopt unconditional: the on-disk
+    /// session has a NEWER refresh token AND its access token is itself inside
+    /// the refresh window. A refresh is genuinely needed, so it must be
+    /// performed with the ADOPTED refresh token — refreshing with the
+    /// in-memory one, which another client already consumed, is the
+    /// guaranteed-`invalid_grant` case the adopt exists to prevent.
+    #[tokio::test]
+    async fn a_refresh_after_adopting_uses_the_disk_refresh_token() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        let (issuer, rx) = spawn_idp(
+            r#"{"access_token":"newest-at","refresh_token":"newest-rt","expires_in":300}"#,
+        );
+
+        // On disk: another client already rotated the refresh token, but its
+        // access token is ALSO within 60s of expiry.
+        let creds_dir = dir.path().join("tracevault");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(
+            creds_dir.join("credentials.json"),
+            format!(
+                r#"{{"server_url":"https://example.com","email":"a@b.com","auth":{{"issuer":"{issuer}","client_id":"tracevault-cli","refresh_token":"rotated-rt","access_token":"rotated-at","access_expires_at":{}}}}}"#,
+                NOW + 5
+            ),
+        )
+        .unwrap();
+
+        // In memory: the superseded session, also inside the window.
+        let client = ApiClient::with_credential(
+            "https://example.com",
+            Some(Credential::Keycloak(session(&issuer, NOW + 10))),
+        )
+        .with_now(fixed_now);
+
+        let token = client.bearer().await.expect("the refresh must succeed");
+        assert_eq!(token.as_deref(), Some("newest-at"));
+
+        let _discovery = rx.recv_timeout(RECV_TIMEOUT).expect("no discovery request");
+        let refresh = rx.recv_timeout(RECV_TIMEOUT).expect("no token request");
+        assert!(
+            refresh.contains("refresh_token=rotated-rt"),
+            "the refresh must use the adopted on-disk token: {refresh}"
+        );
+        assert!(
+            !refresh.contains("refresh_token=old-rt"),
+            "the superseded in-memory token must NOT be presented: {refresh}"
+        );
+    }
+
     /// Outside the window the stored token is used as-is. The issuer points
     /// at a port nothing listens on, so ANY refresh attempt would fail the
     /// call — proving no network round trip happened.
@@ -1090,13 +1167,21 @@ mod tests {
             .expect("the retry after a forced refresh must succeed");
         assert!(repos.is_empty());
 
+        // The point of the retry is that it presents the REFRESHED token; a
+        // retry that re-sent the rejected one would be pointless and would
+        // still 401 in production.
         let first = rx.recv_timeout(RECV_TIMEOUT).expect("no first request");
+        assert!(first.contains("GET /api/v1/repos"), "{first}");
         assert!(
-            first.contains("Bearer") || first.contains("GET /api/v1/repos"),
-            "{first}"
+            first.contains("Bearer old-at"),
+            "the first attempt must carry the stored token: {first}"
         );
         let second = rx.recv_timeout(RECV_TIMEOUT).expect("no retry request");
         assert!(second.contains("GET /api/v1/repos"), "{second}");
+        assert!(
+            second.contains("Bearer fresh-at"),
+            "the retry must carry the REFRESHED token, not the rejected one: {second}"
+        );
         assert!(
             rx.recv_timeout(Duration::from_millis(300)).is_err(),
             "the retry must happen at most once, or a 401-always server would loop"
@@ -1178,6 +1263,16 @@ mod tests {
     /// so status says "cannot confirm" rather than "you were logged out".
     #[tokio::test]
     async fn get_me_maps_an_unreachable_idp_to_network() {
+        // The session is inside the refresh window, so `refresh_locked` calls
+        // `Credentials::load()`. Without this redirect that reads the
+        // DEVELOPER's real `~/.config/tracevault/credentials.json` — which on a
+        // machine logged in with Keycloak means reading a live token, and makes
+        // the test's outcome depend on the developer's own login state.
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
         let client = ApiClient::with_credential(
             "http://127.0.0.1:1",
             Some(Credential::Keycloak(session(
