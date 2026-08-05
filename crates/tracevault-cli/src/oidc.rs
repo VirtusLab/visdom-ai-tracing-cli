@@ -44,12 +44,35 @@ const SLOW_DOWN_INCREMENT_SECS: u64 = 5;
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 
 /// What the TraceVault server publishes about its identity provider.
-/// Deliberately minimal: the CLI needs the realm issuer and the public
-/// client id registered for it, nothing else.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// This type exists only for the CONFIGURED case: "no Keycloak here" is an
+/// error ([`OidcError::NoKeycloak`]), not a `PublicConfig` with empty fields,
+/// so no caller can accidentally proceed with an empty issuer.
+#[derive(Debug, Clone)]
 pub struct PublicConfig {
     pub issuer: String,
     pub cli_client_id: String,
+    /// The audience the server expects in an access token's `aud`. Optional so
+    /// the CLI keeps working against a server that does not publish it; used
+    /// only to sharpen the diagnosis when `/auth/me` rejects a fresh token.
+    pub audience: Option<String>,
+}
+
+/// Wire shape of `GET /api/v1/auth/public-config`.
+///
+/// Every field except `oidc_enabled` is optional on the wire because the
+/// not-configured response omits them; requiring them here would turn a
+/// well-formed "no Keycloak" answer into a parse error.
+#[derive(Deserialize)]
+struct PublicConfigWire {
+    #[serde(default)]
+    oidc_enabled: bool,
+    #[serde(default)]
+    issuer: Option<String>,
+    #[serde(default)]
+    cli_client_id: Option<String>,
+    #[serde(default)]
+    audience: Option<String>,
 }
 
 /// The subset of the realm's OpenID discovery document the CLI uses.
@@ -168,20 +191,6 @@ struct OauthErrorBody {
     error_description: Option<String>,
 }
 
-/// Wire shape of a TraceVault error envelope, as far as this module cares:
-/// the machine-readable `code` that tells one 503 from another.
-#[derive(Deserialize)]
-struct ServerErrorBody {
-    #[serde(default)]
-    code: Option<String>,
-}
-
-/// The `code` the TraceVault server sends with its `public-config` 503 when
-/// it has no Keycloak configured at all. Any OTHER 503 from that endpoint is
-/// a transient IdP/JWKS outage and is retryable — see
-/// [`fetch_public_config`].
-const CODE_OIDC_NOT_CONFIGURED: &str = "oidc_not_configured";
-
 /// Failures of the login/refresh machinery. Every variant that a caller has
 /// to *behave* differently about is its own variant; anything else collapses
 /// into [`OidcError::Oauth`] (the IdP said no, with a code) or
@@ -278,20 +287,27 @@ pub fn canonical_issuer(issuer: &str) -> String {
 
 /// Ask the TraceVault server which realm to authenticate against.
 ///
-/// The endpoint uses 503 for TWO different situations, and they must not be
-/// conflated:
+/// "Is this instance configured for SSO, and against which realm?"
 ///
-/// * `code: "oidc_not_configured"` → the instance has no Keycloak at all.
-///   Permanent; the user needs a `tvk_` API key ([`OidcError::NoKeycloak`]).
-/// * any other/absent `code` → the server has Keycloak but can't reach it
-///   right now (JWKS fetch failing, IdP restarting). Retryable
-///   ([`OidcError::IdpUnavailable`]).
+/// Two outcomes must stay distinguishable, because the advice differs and one
+/// is permanent while the other is not:
 ///
-/// Keying on the status alone would tell a user in the middle of a 30-second
-/// Keycloak restart to go get an API key — misleading and unactionable. Body
-/// parsing is deliberately tolerant: an empty or unparseable 503 body falls
-/// into the retryable branch, because "no Keycloak configured" is the
-/// stronger claim and must be positively evidenced by the `code`.
+/// * `200 {"oidc_enabled": false}` → the instance has no Keycloak at all.
+///   PERMANENT; the user needs a `tvk_` API key ([`OidcError::NoKeycloak`]).
+/// * any `5xx` → the server (or an intermediary/web proxy in front of it) is
+///   unhealthy right now. RETRYABLE ([`OidcError::IdpUnavailable`]), and
+///   deliberately never phrased as "go get an API key": telling a user in the
+///   middle of a 30-second restart to change credentials is unactionable.
+///
+/// The not-configured answer is a 200 rather than a 503 because a 503 from a
+/// healthy server makes load balancers fail the pod out and 5xx SLO alerts
+/// fire. The 5xx branch remains regardless, since an intermediary can still
+/// produce one when the backend is down.
+///
+/// `oidc_enabled: true` with `issuer` or `cli_client_id` missing is a hard
+/// error rather than an empty-string default: the alternative is a device
+/// authorization POSTed to `"/.well-known/..."`, failing with something
+/// unrelated to the actual misconfiguration.
 pub async fn fetch_public_config(
     client: &reqwest::Client,
     server_url: &str,
@@ -303,28 +319,40 @@ pub async fn fetch_public_config(
     let resp = client.get(&url).send().await.map_err(transport)?;
     let status = resp.status();
 
-    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-        let body = resp.text().await.unwrap_or_default();
-        let code = serde_json::from_str::<ServerErrorBody>(&body)
-            .ok()
-            .and_then(|b| b.code);
-        return Err(match code.as_deref() {
-            Some(CODE_OIDC_NOT_CONFIGURED) => OidcError::NoKeycloak,
-            Some(other) => OidcError::IdpUnavailable {
-                detail: format!("server returned 503 {other}"),
-            },
-            None => OidcError::IdpUnavailable {
-                detail: "server returned 503 with no error code".to_string(),
-            },
+    if status.is_server_error() {
+        return Err(OidcError::IdpUnavailable {
+            detail: format!("server returned {status}"),
         });
     }
-
     if !status.is_success() {
         return Err(OidcError::Transport(format!("GET {url} returned {status}")));
     }
-    resp.json::<PublicConfig>()
+
+    let wire: PublicConfigWire = resp
+        .json()
         .await
-        .map_err(|e| OidcError::Transport(format!("malformed auth public-config response: {e}")))
+        .map_err(|e| OidcError::Transport(format!("malformed auth public-config response: {e}")))?;
+
+    if !wire.oidc_enabled {
+        return Err(OidcError::NoKeycloak);
+    }
+    let missing = |field: &'static str| {
+        OidcError::Transport(format!(
+            "the server reports SSO is enabled but its auth public-config omits `{field}` — the \
+         server is misconfigured; report this to whoever operates it"
+        ))
+    };
+    Ok(PublicConfig {
+        issuer: wire
+            .issuer
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| missing("issuer"))?,
+        cli_client_id: wire
+            .cli_client_id
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| missing("cli_client_id"))?,
+        audience: wire.audience.filter(|s| !s.trim().is_empty()),
+    })
 }
 
 /// Fetch and validate the realm's OpenID discovery document.
@@ -582,6 +610,59 @@ fn oauth_error_from_body(body: &str) -> Option<OidcError> {
 
 fn transport(e: reqwest::Error) -> OidcError {
     OidcError::Transport(format!("network error: {e}"))
+}
+
+/// The `aud` claim of a JWT, read WITHOUT verifying the signature.
+///
+/// NOT authentication or validation of any kind, and must never be used as
+/// such: this is for one diagnostic sentence, deciding whether a rejected
+/// token was minted for this server at all. The CLI is the token's holder, not
+/// its verifier — the server does that — so reading the payload it just
+/// received from the IdP over TLS is only ever used to explain a failure.
+///
+/// Returns `None` on anything unexpected (not a JWT, un-decodable payload, no
+/// `aud`). Callers must treat `None` as "cannot tell" and fall back to the
+/// generic message rather than guessing.
+pub fn unverified_audiences(access_token: &str) -> Option<Vec<String>> {
+    let payload = access_token.split('.').nth(1)?;
+    let json = base64url_decode(payload)?;
+    let claims: serde_json::Value = serde_json::from_slice(&json).ok()?;
+    match claims.get("aud")? {
+        serde_json::Value::String(one) => Some(vec![one.clone()]),
+        serde_json::Value::Array(many) => Some(
+            many.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Minimal unpadded base64url decoder, so reading a JWT payload needs no new
+/// dependency. `None` on any character outside the alphabet.
+fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            // Padding is optional in base64url and always trailing.
+            b'=' => break,
+            _ => return None,
+        } as u32;
+        acc = (acc << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 /// Build an `application/x-www-form-urlencoded` POST.
@@ -846,55 +927,56 @@ mod tests {
         assert_eq!(disc.revocation_endpoint, Some(format!("{base}/revoke")));
     }
 
-    /// The ONLY 503 that means "this instance has no Keycloak" is the one
-    /// carrying `code: "oidc_not_configured"`.
+    /// "No Keycloak here" is a 200 with `oidc_enabled: false`, and it is
+    /// PERMANENT: the user must switch to an API key. (The server answers 200
+    /// rather than 503 because a 503 from a healthy server fails the pod out of
+    /// its load balancer and trips 5xx SLO alerts.)
     #[tokio::test]
-    async fn public_config_503_with_oidc_not_configured_code_maps_to_no_keycloak() {
-        let (base, _rx) = spawn_seq(vec![http_json(
-            "503 Service Unavailable",
-            r#"{"error":"Keycloak is not configured on this TraceVault instance","code":"oidc_not_configured"}"#,
-        )]);
+    async fn public_config_oidc_disabled_is_permanent_no_keycloak() {
+        let (base, _rx) = spawn_seq(vec![http_json("200 OK", r#"{"oidc_enabled":false}"#)]);
         let client = reqwest::Client::new();
         let err = fetch_public_config(&client, &base)
             .await
-            .expect_err("503 must not be reported as a generic failure");
+            .expect_err("oidc_enabled:false must not parse as a usable config");
         assert!(matches!(err, OidcError::NoKeycloak), "got {err:?}");
     }
 
-    /// The same endpoint answers 503 for a transient JWKS/IdP outage. That
-    /// is retryable and must NOT be reported as "no Keycloak configured" —
-    /// telling a user to go get an API key during a 30-second Keycloak
-    /// restart is misleading and unactionable.
+    /// A 5xx is the server (or an intermediary in front of it) being unhealthy:
+    /// retryable, and never phrased as "go get an API key". This branch stays
+    /// even though the not-configured case moved to 200, because a web proxy
+    /// still answers 503 when the backend is down.
     #[tokio::test]
-    async fn public_config_503_with_another_code_is_transient_not_no_keycloak() {
-        let (base, _rx) = spawn_seq(vec![http_json(
+    async fn public_config_5xx_is_transient_not_no_keycloak() {
+        for status in [
             "503 Service Unavailable",
-            r#"{"error":"could not fetch JWKS","code":"idp_unreachable"}"#,
-        )]);
-        let client = reqwest::Client::new();
-        let err = fetch_public_config(&client, &base).await.unwrap_err();
-        assert!(
-            matches!(err, OidcError::IdpUnavailable { .. }),
-            "a non-oidc_not_configured 503 must be the retryable variant; got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("temporarily unavailable") && msg.contains("retry"),
-            "message must read as retryable: {msg}"
-        );
-        assert!(
-            !msg.to_lowercase().contains("api key"),
-            "must not send the user off to get an API key: {msg}"
-        );
+            "502 Bad Gateway",
+            "500 Internal Server Error",
+        ] {
+            let (base, _rx) = spawn_seq(vec![http_json(status, r#"{"error":"backend down"}"#)]);
+            let client = reqwest::Client::new();
+            let err = fetch_public_config(&client, &base).await.unwrap_err();
+            assert!(
+                matches!(err, OidcError::IdpUnavailable { .. }),
+                "{status} must be the retryable variant; got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("temporarily unavailable") && msg.contains("retry"),
+                "message must read as retryable: {msg}"
+            );
+            assert!(
+                !msg.to_lowercase().contains("api key"),
+                "must not send the user off to get an API key: {msg}"
+            );
+        }
     }
 
-    /// A 503 whose body isn't the expected envelope (empty, HTML from a
-    /// proxy, truncated JSON) must fall into the retryable branch: "no
-    /// Keycloak configured" is the stronger claim and needs positive
-    /// evidence from the `code` field.
+    /// A 5xx body is not parsed at all now, so a proxy's HTML error page or an
+    /// empty body must still land in the retryable branch — never the permanent
+    /// one, which is the stronger claim.
     #[tokio::test]
-    async fn public_config_503_with_unparseable_body_is_transient() {
-        for body in ["", "not json at all", r#"{"error":"boom"}"#] {
+    async fn public_config_5xx_with_unparseable_body_is_transient() {
+        for body in ["", "not json at all", "<html>502 Bad Gateway</html>"] {
             let (base, _rx) = spawn_seq(vec![http_json("503 Service Unavailable", body)]);
             let client = reqwest::Client::new();
             let err = fetch_public_config(&client, &base).await.unwrap_err();
@@ -906,10 +988,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_config_200_parses_issuer_and_client_id() {
+    async fn public_config_200_parses_issuer_client_id_and_audience() {
         let (base, rx) = spawn_seq(vec![http_json(
             "200 OK",
-            r#"{"issuer":"https://idp.test/realms/visdom","cli_client_id":"tracevault-cli"}"#,
+            r#"{"oidc_enabled":true,"issuer":"https://idp.test/realms/visdom","audience":"tracevault","cli_client_id":"tracevault-cli"}"#,
         )]);
         let client = reqwest::Client::new();
         let cfg = fetch_public_config(&client, &format!("{base}/"))
@@ -917,11 +999,59 @@ mod tests {
             .unwrap();
         assert_eq!(cfg.issuer, "https://idp.test/realms/visdom");
         assert_eq!(cfg.cli_client_id, "tracevault-cli");
+        assert_eq!(cfg.audience.as_deref(), Some("tracevault"));
         let req = rx.recv_timeout(RECV_TIMEOUT).unwrap();
         assert!(
             req.contains("GET /api/v1/auth/public-config"),
             "unexpected request: {req}"
         );
+    }
+
+    /// A server that omits `audience` is still usable — it only costs the
+    /// sharper wrong-audience diagnosis.
+    #[tokio::test]
+    async fn public_config_without_audience_still_resolves() {
+        let (base, _rx) = spawn_seq(vec![http_json(
+            "200 OK",
+            r#"{"oidc_enabled":true,"issuer":"https://idp.test/realms/v","cli_client_id":"tracevault-cli"}"#,
+        )]);
+        let client = reqwest::Client::new();
+        let cfg = fetch_public_config(&client, &base).await.unwrap();
+        assert_eq!(cfg.audience, None);
+    }
+
+    /// `oidc_enabled: true` with a field missing is a misconfigured server.
+    /// Defaulting to an empty string would send the device authorization to a
+    /// nonsense URL and fail with something unrelated to the real cause.
+    #[tokio::test]
+    async fn public_config_enabled_but_incomplete_is_a_named_error() {
+        for (body, field) in [
+            (
+                r#"{"oidc_enabled":true,"cli_client_id":"tracevault-cli"}"#,
+                "issuer",
+            ),
+            (
+                r#"{"oidc_enabled":true,"issuer":"https://idp.test/realms/v"}"#,
+                "cli_client_id",
+            ),
+            (
+                r#"{"oidc_enabled":true,"issuer":"  ","cli_client_id":"tracevault-cli"}"#,
+                "issuer",
+            ),
+        ] {
+            let (base, _rx) = spawn_seq(vec![http_json("200 OK", body)]);
+            let client = reqwest::Client::new();
+            let err = fetch_public_config(&client, &base).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(field) && msg.contains("misconfigured"),
+                "must name the missing field `{field}`: {msg}"
+            );
+            assert!(
+                !matches!(err, OidcError::NoKeycloak),
+                "an incomplete config is not the same as no Keycloak: {msg}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1005,6 +1135,53 @@ mod tests {
             !dbg.contains("super-secret-refresh"),
             "refresh leaked: {dbg}"
         );
+    }
+
+    /// Reading `aud` out of a JWT payload: diagnosis only, never validation.
+    #[test]
+    fn unverified_audiences_reads_string_and_array_forms() {
+        assert_eq!(
+            unverified_audiences("eyJhbGciOiAiUlMyNTYifQ.eyJhdWQiOiAidHJhY2V2YXVsdCIsICJzdWIiOiAidSJ9.signature-not-checked"),
+            Some(vec!["tracevault".to_string()])
+        );
+        assert_eq!(
+            unverified_audiences("eyJhbGciOiAiUlMyNTYifQ.eyJhdWQiOiBbImFjY291bnQiLCAidHJhY2V2YXVsdCJdLCAic3ViIjogInUifQ.signature-not-checked"),
+            Some(vec!["account".to_string(), "tracevault".to_string()])
+        );
+        assert_eq!(
+            unverified_audiences(
+                "eyJhbGciOiAiUlMyNTYifQ.eyJhdWQiOiAic29tZS1vdGhlci1hcHAifQ.signature-not-checked"
+            ),
+            Some(vec!["some-other-app".to_string()])
+        );
+    }
+
+    /// Anything unexpected must be `None` — "cannot tell" — so the caller falls
+    /// back to the generic message instead of guessing at a cause.
+    #[test]
+    fn unverified_audiences_is_none_when_it_cannot_tell() {
+        // No `aud` claim.
+        assert_eq!(
+            unverified_audiences("eyJhbGciOiAiUlMyNTYifQ.eyJzdWIiOiAidSJ9.signature-not-checked"),
+            None
+        );
+        // Not a JWT at all (an opaque token, as some IdPs issue).
+        assert_eq!(unverified_audiences("opaque-token"), None);
+        assert_eq!(unverified_audiences(""), None);
+        // Payload is not base64url.
+        assert_eq!(unverified_audiences("a.!!!not-base64!!!.c"), None);
+        // Payload decodes but is not JSON.
+        assert_eq!(unverified_audiences("a.bm90LWpzb24.c"), None);
+    }
+
+    #[test]
+    fn base64url_decode_handles_padding_and_rejects_junk() {
+        assert_eq!(base64url_decode("aGVsbG8"), Some(b"hello".to_vec()));
+        assert_eq!(base64url_decode("aGVsbG8="), Some(b"hello".to_vec()));
+        // `-` and `_` are the url-safe substitutions for `+` and `/`:
+        // 111110 111110 111111 111111 -> 0xFB 0xEF 0xFF.
+        assert_eq!(base64url_decode("--__"), Some(vec![0xfb, 0xef, 0xff]));
+        assert!(base64url_decode("not valid!").is_none());
     }
 
     #[test]

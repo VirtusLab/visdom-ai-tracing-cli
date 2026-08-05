@@ -142,6 +142,9 @@ pub async fn login(server_url: &str, no_browser: bool) -> Result<(), Box<dyn std
     })?;
 
     let now = chrono::Utc::now().timestamp();
+    // Kept for the wrong-audience diagnosis below, after the session takes
+    // ownership of the token.
+    let access_token = tokens.access_token.clone();
     let session = KeycloakSession {
         issuer: oidc::canonical_issuer(&config.issuer),
         client_id: config.cli_client_id.clone(),
@@ -189,6 +192,25 @@ pub async fn login(server_url: &str, no_browser: bool) -> Result<(), Box<dyn std
                  account the `tracing` realm role (or `tracing-admin` for admin access) in \
                  Keycloak; after that, re-run any TraceVault command — no new login is needed."
             );
+            // A second, less common cause of the same 403: the realm's client
+            // has no audience mapper, so the token is not FOR this server at
+            // all. Only mentioned when the token provably lacks the audience
+            // the server advertises — a wrong guess here would send an admin
+            // looking at the wrong setting, so "cannot tell" stays silent.
+            if let Some(expected) = &config.audience {
+                if let Some(found) = oidc::unverified_audiences(&access_token) {
+                    if !found.iter().any(|a| a == expected) {
+                        eprintln!();
+                        eprintln!(
+                            "Note: the issued token's audience is [{}], but this server expects \
+                             '{expected}'. If granting the role does not help, the realm's \
+                             `{}` client is missing its audience mapper for '{expected}'.",
+                            found.join(", "),
+                            config.cli_client_id
+                        );
+                    }
+                }
+            }
             Err("account lacks the `tracing` Keycloak realm role".into())
         }
         Err(GetMeError::Unauthorized) => {

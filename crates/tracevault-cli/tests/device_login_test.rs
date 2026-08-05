@@ -95,7 +95,9 @@ async fn device_login_sequence_completes_through_the_public_api() {
             //    fake TraceVault server are the same socket.)
             http_json(
                 "200 OK",
-                &format!(r#"{{"issuer":"{base}","cli_client_id":"tracevault-cli"}}"#),
+                &format!(
+                    r#"{{"oidc_enabled":true,"issuer":"{base}","audience":"tracevault","cli_client_id":"tracevault-cli"}}"#
+                ),
             ),
             // 2. Discovery.
             http_json(
