@@ -74,7 +74,7 @@ mod tests {
             .await
             .expect("a failed revocation must not fail logout");
         assert!(
-            !Credentials::path().exists(),
+            !Credentials::path().unwrap().exists(),
             "the credentials file must be removed even when revocation fails"
         );
     }
@@ -96,7 +96,7 @@ mod tests {
         .unwrap();
 
         logout().await.expect("api-key logout must succeed");
-        assert!(!Credentials::path().exists());
+        assert!(!Credentials::path().unwrap().exists());
     }
 
     #[tokio::test]

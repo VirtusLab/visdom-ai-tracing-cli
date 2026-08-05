@@ -198,15 +198,50 @@ impl Credentials {
         self.token.clone().map(Credential::ApiKey)
     }
 
-    pub fn path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("~/.config"))
-            .join("tracevault")
-            .join("credentials.json")
+    /// Where the credential file lives, or an error naming what is missing.
+    ///
+    /// Returns `Err` rather than inventing a path. The previous fallback,
+    /// `PathBuf::from("~/.config")`, is a RELATIVE path — a shell expands `~`,
+    /// `Path` does not — so with no resolvable config directory `login` created
+    /// `./~/.config/tracevault/` in the current working directory and wrote an
+    /// offline refresh token into it, plausibly inside the user's repo. There is
+    /// no defensible guess for "where is this user's config", so failing loudly
+    /// is the only correct answer.
+    pub fn path() -> Result<PathBuf, std::io::Error> {
+        Self::path_in(dirs::config_dir())
+    }
+
+    /// [`Self::path`] with the config directory injected, so the
+    /// no-config-directory branch is testable.
+    ///
+    /// It cannot be reached through the environment on glibc Linux — with `HOME`
+    /// unset `dirs::config_dir()` falls back to the passwd database — so in the
+    /// wild it needs something more unusual (a container with no passwd entry
+    /// for the uid, some static builds). That makes it rarer than "HOME unset",
+    /// but no less wrong to guess at.
+    fn path_in(config_dir: Option<PathBuf>) -> Result<PathBuf, std::io::Error> {
+        let dir = config_dir.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cannot determine the user config directory: set XDG_CONFIG_HOME (or HOME) so \
+                 credentials can be stored under $XDG_CONFIG_HOME/tracevault/",
+            )
+        })?;
+        Ok(dir.join("tracevault").join("credentials.json"))
+    }
+
+    /// The credential file's path for DISPLAY, when there is nothing useful to
+    /// do about a missing config directory (a message is being printed either
+    /// way). Never used to read or write.
+    pub fn path_for_display() -> String {
+        match Self::path() {
+            Ok(p) => p.display().to_string(),
+            Err(_) => "<no user config directory: set XDG_CONFIG_HOME or HOME>".to_string(),
+        }
     }
 
     pub fn load() -> Option<Self> {
-        let path = Self::path();
+        let path = Self::path().ok()?;
         let content = fs::read_to_string(&path).ok()?;
         serde_json::from_str(&content).ok()
     }
@@ -230,7 +265,7 @@ impl Credentials {
     /// `AlreadyExists`, which we resolve by picking a fresh name rather than
     /// failing the save.
     pub fn save(&self) -> Result<(), std::io::Error> {
-        let path = Self::path();
+        let path = Self::path()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -314,7 +349,10 @@ impl Credentials {
     /// `min_age`, only files at least that old; without it, all of them (used
     /// by `delete`, where the user is logging out and nothing should survive).
     fn remove_temp_files(min_age: Option<std::time::Duration>) {
-        let Some(dir) = Self::path().parent().map(PathBuf::from) else {
+        let Some(dir) = Self::path()
+            .ok()
+            .and_then(|p| p.parent().map(PathBuf::from))
+        else {
             return;
         };
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -423,7 +461,7 @@ impl Credentials {
     /// The sweep is best-effort: a stray file that cannot be removed must not
     /// fail the logout.
     pub fn delete() -> Result<(), std::io::Error> {
-        let path = Self::path();
+        let path = Self::path()?;
         if path.exists() {
             fs::remove_file(&path)?;
         }
@@ -613,7 +651,7 @@ mod tests {
             .save()
             .unwrap();
 
-        let raw = fs::read_to_string(Credentials::path()).unwrap();
+        let raw = fs::read_to_string(Credentials::path().unwrap()).unwrap();
         assert!(
             !raw.contains("\"token\""),
             "a Keycloak file must not carry an api-key `token` field: {raw}"
@@ -627,7 +665,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(Credentials::path())
+            let mode = fs::metadata(Credentials::path().unwrap())
                 .unwrap()
                 .permissions()
                 .mode();
@@ -684,7 +722,7 @@ mod tests {
         .save()
         .expect("a stale temp file must not fail the save");
 
-        let mode = fs::metadata(Credentials::path())
+        let mode = fs::metadata(Credentials::path().unwrap())
             .unwrap()
             .permissions()
             .mode();
@@ -763,7 +801,7 @@ mod tests {
 
         Credentials::delete().unwrap();
 
-        assert!(!Credentials::path().exists());
+        assert!(!Credentials::path().unwrap().exists());
         let remaining: Vec<_> = fs::read_dir(&creds_dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -807,6 +845,38 @@ mod tests {
             fresh.exists(),
             "a just-created temp file may still be in flight elsewhere; sweeping it would break \
              that process's rename"
+        );
+    }
+
+    /// With no way to locate the user's config directory, `path()` must FAIL
+    /// rather than invent one. The old fallback was `PathBuf::from("~/.config")`
+    /// — a relative path, since only a shell expands `~` — so `login` created
+    /// `./~/.config/tracevault/` in the current working directory and wrote an
+    /// offline refresh token into it, plausibly inside the user's repo.
+    #[test]
+    fn path_fails_instead_of_inventing_a_relative_home() {
+        let err = Credentials::path_in(None)
+            .expect_err("no config directory must not yield a guessed path");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("XDG_CONFIG_HOME") && msg.contains("HOME"),
+            "the error must name the variables to set: {msg}"
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+        // The display helper degrades to an explanation, never to a path that
+        // would be wrong to write to.
+        let shown = Credentials::path_for_display();
+        assert!(
+            !shown.starts_with('~'),
+            "a `~`-prefixed path must never be presented as a location: {shown}"
+        );
+
+        // And with a real directory it still composes the same layout.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            Credentials::path_in(Some(dir.path().to_path_buf())).unwrap(),
+            dir.path().join("tracevault").join("credentials.json")
         );
     }
 
@@ -932,7 +1002,7 @@ mod tests {
         Credentials::persist_session("https://instance-a.example.com", &a_session)
             .expect("a foreign file is a skip, not an error");
 
-        let after = fs::read_to_string(Credentials::path()).unwrap();
+        let after = fs::read_to_string(Credentials::path().unwrap()).unwrap();
         assert_eq!(after, original, "another server's file was overwritten");
     }
 
@@ -999,7 +1069,7 @@ mod tests {
         Credentials::persist_session("https://example.com", &session)
             .expect("a logged-out user must not turn a refresh into a hard error");
         assert!(
-            !Credentials::path().exists(),
+            !Credentials::path().unwrap().exists(),
             "persist_session must not resurrect a deleted credentials file"
         );
     }

@@ -23,13 +23,13 @@ pub fn run_proxy_info() -> i32 {
             );
             eprintln!(
                 "Credentials file expected at: {}",
-                Credentials::path().display()
+                Credentials::path_for_display()
             );
             return 1;
         }
     };
 
-    let creds_path = Credentials::path();
+    let creds_path = Credentials::path_for_display();
 
     // Resolved BEFORE any instructions are printed: the setup script below
     // cannot be followed without a credential, so bailing here avoids
@@ -40,7 +40,7 @@ pub fn run_proxy_info() -> i32 {
             eprintln!(
                 "The credentials file at {} holds no usable credential (no API key and no \
                  Keycloak session).",
-                creds_path.display()
+                creds_path
             );
             eprintln!(
                 "Run `tracevault login --server-url <url>`, or set TRACEVAULT_API_KEY to a \
@@ -57,7 +57,7 @@ pub fn run_proxy_info() -> i32 {
     println!();
     println!("  Server:           {server_url}");
     println!("  Proxy base URL:   {ANSI_BOLD}{proxy_url}{ANSI_RESET}");
-    println!("  Credentials file: {}", creds_path.display());
+    println!("  Credentials file: {}", creds_path);
     println!();
     println!("{ANSI_BOLD}Setup{ANSI_RESET}");
     println!();
@@ -78,7 +78,7 @@ pub fn run_proxy_info() -> i32 {
         Credential::ApiKey(_) => {
             println!(
                 "     {ANSI_DIM}Your TraceVault token lives in {} as the \"token\" field.{ANSI_RESET}",
-                creds_path.display()
+                creds_path
             );
         }
         // A Keycloak access token is refreshed every few minutes and would

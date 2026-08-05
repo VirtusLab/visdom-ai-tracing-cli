@@ -172,7 +172,7 @@ pub async fn login(server_url: &str, no_browser: bool) -> Result<(), Box<dyn std
                 Some(role) => println!("Logged in as {} (role: {role})", me.email),
                 None => println!("Logged in as {}", me.email),
             }
-            println!("Credentials saved to {}", Credentials::path().display());
+            println!("Credentials saved to {}", Credentials::path_for_display());
             Ok(())
         }
         Err(GetMeError::Forbidden(_)) => {
@@ -182,7 +182,7 @@ pub async fn login(server_url: &str, no_browser: bool) -> Result<(), Box<dyn std
             // says who has to act. The response body is deliberately not
             // echoed — it adds nothing over this explanation.
             println!();
-            println!("Credentials saved to {}", Credentials::path().display());
+            println!("Credentials saved to {}", Credentials::path_for_display());
             eprintln!();
             eprintln!(
                 "Signed in successfully, but this account is NOT authorized to use Visdom Trace."
@@ -215,7 +215,7 @@ pub async fn login(server_url: &str, no_browser: bool) -> Result<(), Box<dyn std
         }
         Err(GetMeError::Unauthorized) => {
             println!();
-            println!("Credentials saved to {}", Credentials::path().display());
+            println!("Credentials saved to {}", Credentials::path_for_display());
             Err(
                 "the server rejected the freshly issued token — check that the server and the \
                  CLI point at the same Keycloak realm and audience"
@@ -226,7 +226,7 @@ pub async fn login(server_url: &str, no_browser: bool) -> Result<(), Box<dyn std
             // Network/server hiccup only: the credential itself is good, so
             // this is a warning and the command still succeeds.
             println!();
-            println!("Credentials saved to {}", Credentials::path().display());
+            println!("Credentials saved to {}", Credentials::path_for_display());
             eprintln!("Warning: could not confirm your identity with the server: {e}");
             Ok(())
         }
