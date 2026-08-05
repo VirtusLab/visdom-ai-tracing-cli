@@ -525,7 +525,7 @@ pub async fn run_stream(
     req.truncate_large_fields();
 
     // 6. Resolve credentials
-    let (server_url, token) = crate::api_client::resolve_credentials(&project_root);
+    let (server_url, credential) = crate::api_client::resolve_credentials(&project_root);
 
     // 7. Config (loaded above, alongside the user-level context layer
     // resolution) no longer directly gates repo_id — a missing config is not
@@ -579,7 +579,7 @@ pub async fn run_stream(
 
     // 8. Create ApiClient
     let server_url = server_url.ok_or("server_url not configured")?;
-    let client = crate::api_client::ApiClient::new(&server_url, token.as_deref());
+    let client = crate::api_client::ApiClient::with_credential(&server_url, credential);
 
     // 9. Try drain pending queue and send
     let pending_path = pending_path_for(&session_dir, repo_id);

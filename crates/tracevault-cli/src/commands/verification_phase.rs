@@ -143,11 +143,14 @@ pub async fn open_verification_phase(
     };
 
     let creds = Credentials::load().ok_or("Not logged in. Run `tracevault login` first.")?;
+    let credential = creds
+        .credential()
+        .ok_or("Credentials file has no usable token. Run `tracevault login` again.")?;
     let server_url = config
         .server_url
         .as_deref()
         .unwrap_or("https://tracevault.softwaremill.com");
-    let client = ApiClient::new(server_url, Some(&creds.token));
+    let client = ApiClient::with_credential(server_url, Some(credential));
 
     client
         .stream_event(repo_id, &event)

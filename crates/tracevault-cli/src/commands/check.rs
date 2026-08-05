@@ -170,19 +170,19 @@ pub async fn check_policies(
     project_root: &Path,
     cwd: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (server_url, token) = resolve_credentials(project_root);
+    let (server_url, credential) = resolve_credentials(project_root);
 
     let server_url = server_url
         .ok_or("No server URL configured. Run `tracevault login --server-url=<url>` to set one.")?;
 
-    if token.is_none() {
+    if credential.is_none() {
         return Err(
             "Not logged in. Run `tracevault login --server-url=<server_url>` to authenticate."
                 .into(),
         );
     }
 
-    let client = ApiClient::new(&server_url, token.as_deref());
+    let client = ApiClient::with_credential(&server_url, credential);
 
     // Resolve repo_id by name.
     //

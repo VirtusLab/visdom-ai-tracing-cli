@@ -6,12 +6,12 @@ use crate::resolution::{resolve_repo_by_name, ResolveRepoByNameError};
 use std::path::Path;
 
 pub async fn run(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let (server_url, token) = resolve_credentials(project_root);
+    let (server_url, credential) = resolve_credentials(project_root);
 
     let server_url = server_url.ok_or("No server URL configured. Run 'tracevault login' first.")?;
-    let token = token.ok_or("Not logged in. Run 'tracevault login' first.")?;
+    let credential = credential.ok_or("Not logged in. Run 'tracevault login' first.")?;
 
-    let client = ApiClient::new(&server_url, Some(&token));
+    let client = ApiClient::with_credential(&server_url, Some(credential));
 
     let repo = resolve_repo_by_name(&client, project_root)
         .await

@@ -233,13 +233,13 @@ pub async fn init_in_directory(
         println!("  Detected: {}", tool.name());
     }
 
-    let (resolved_url, resolved_token) = crate::api_client::resolve_credentials(project_root);
+    let (resolved_url, resolved_credential) = crate::api_client::resolve_credentials(project_root);
     let effective_url = server_url.map(String::from).or(resolved_url);
 
-    if resolved_token.is_none() {
+    if resolved_credential.is_none() {
         eprintln!("Not logged in. Run 'tracevault login' to register this repo with the server.");
     } else if let (Some(url), Some(remote)) = (effective_url, remote_url) {
-        let client = ApiClient::new(&url, resolved_token.as_deref());
+        let client = ApiClient::with_credential(&url, resolved_credential);
         let repo_name = git_repo_name(project_root);
         // Captured before `remote` is moved into the request below, so the
         // codebase-resolve step doesn't need to shell out to git again.

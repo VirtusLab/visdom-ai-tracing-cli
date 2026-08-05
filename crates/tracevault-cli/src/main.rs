@@ -8,6 +8,7 @@ mod config;
 mod context;
 mod credentials;
 mod hooks;
+mod oidc;
 mod paths;
 mod resolution;
 mod session_state;
@@ -541,11 +542,17 @@ async fn main() {
         } => {
             if let Err(e) = commands::login::login(&server_url, no_browser).await {
                 eprintln!("Login error: {e}");
+                // Non-zero exit matters here: a scripted `tracevault login &&
+                // ...`, and above all the "account lacks the `tracing` realm
+                // role" case (which saves credentials but is NOT a usable
+                // login), must not look like success.
+                std::process::exit(1);
             }
         }
         Cli::Logout => {
             if let Err(e) = commands::logout::logout().await {
                 eprintln!("Logout error: {e}");
+                std::process::exit(1);
             }
         }
         Cli::CommitPush => {

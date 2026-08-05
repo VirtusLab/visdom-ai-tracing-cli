@@ -6,7 +6,7 @@
 
 use crate::api_client::{ApiClient, GetMeError};
 use crate::config::TracevaultConfig;
-use crate::credentials::Credentials;
+use crate::credentials::{Credential, Credentials};
 use crate::resolution::{git_remote_url, git_repo_name};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -97,7 +97,9 @@ fn print_section(title: &str, checks: &[Check]) {
 
 struct AuthContext {
     server_url: Option<String>,
-    token: Option<String>,
+    /// The resolved credential, if any. Cloned per client construction
+    /// because a Keycloak session may be refreshed by the checks below.
+    credential: Option<Credential>,
     source: &'static str, // "env", "credentials", or "none"
     email_from_creds: Option<String>,
 }
@@ -112,7 +114,7 @@ fn resolve_auth() -> AuthContext {
     if let Some(token) = env_key {
         return AuthContext {
             server_url: env_url,
-            token: Some(token),
+            credential: Some(Credential::ApiKey(token)),
             source: "env (TRACEVAULT_API_KEY)",
             email_from_creds: None,
         };
@@ -120,17 +122,24 @@ fn resolve_auth() -> AuthContext {
 
     let creds = Credentials::load();
     if let Some(c) = creds {
+        let source = match &c.auth {
+            Some(_) => "credentials file (Keycloak session)",
+            None => "credentials file (API key)",
+        };
         return AuthContext {
-            server_url: Some(c.server_url),
-            token: Some(c.token),
-            source: "credentials file",
-            email_from_creds: Some(c.email),
+            server_url: Some(c.server_url.clone()),
+            credential: c.credential(),
+            source,
+            // An empty email means a login saved credentials before
+            // `/auth/me` could resolve the identity (e.g. the account lacks
+            // the `tracing` role); there is nothing to compare against.
+            email_from_creds: Some(c.email).filter(|e| !e.is_empty()),
         };
     }
 
     AuthContext {
         server_url: env_url,
-        token: None,
+        credential: None,
         source: "none",
         email_from_creds: None,
     }
@@ -139,7 +148,7 @@ fn resolve_auth() -> AuthContext {
 async fn auth_checks(auth: &AuthContext) -> Vec<Check> {
     let mut out = Vec::new();
 
-    match (auth.token.as_ref(), auth.server_url.as_ref()) {
+    match (auth.credential.as_ref(), auth.server_url.as_ref()) {
         (None, _) => {
             out.push(Check::err(
                 "Logged in",
@@ -162,12 +171,15 @@ async fn auth_checks(auth: &AuthContext) -> Vec<Check> {
     }
 
     let server_url = auth.server_url.as_ref().unwrap();
-    let token = auth.token.as_ref().unwrap();
-    let client = ApiClient::new(server_url, Some(token));
+    let client = ApiClient::with_credential(server_url, auth.credential.clone());
     match client.get_me().await {
         Ok(me) => {
             let who = me.name.unwrap_or_else(|| me.email.clone());
-            out.push(Check::ok("Token valid", format!("{who} <{}>", me.email)));
+            let detail = match &me.role {
+                Some(role) => format!("{who} <{}> (role: {role})", me.email),
+                None => format!("{who} <{}>", me.email),
+            };
+            out.push(Check::ok("Token valid", detail));
 
             if let Some(cached) = &auth.email_from_creds {
                 if cached != &me.email {
@@ -185,6 +197,15 @@ async fn auth_checks(auth: &AuthContext) -> Vec<Check> {
             out.push(Check::err(
                 "Token valid",
                 "rejected by server (expired or revoked). Run `tracevault login` again.",
+            ));
+        }
+        // A valid token whose account isn't authorized. Re-running login
+        // would NOT help, so this must not say "log in again".
+        Err(GetMeError::Forbidden(_)) => {
+            out.push(Check::err(
+                "Account authorized",
+                "the token is valid but this account lacks the `tracing` Keycloak realm role — \
+                 ask an administrator to grant `tracing` (or `tracing-admin`).",
             ));
         }
         Err(GetMeError::Network(msg)) => {
@@ -559,7 +580,8 @@ async fn server_repo_checks(
 ) -> Vec<Check> {
     let mut out = Vec::new();
 
-    let (Some(token), Some(server_url)) = (auth.token.as_ref(), auth.server_url.as_ref()) else {
+    let (Some(credential), Some(server_url)) = (auth.credential.clone(), auth.server_url.as_ref())
+    else {
         out.push(Check::skip(
             "Repo registered on server",
             "not authenticated",
@@ -576,7 +598,7 @@ async fn server_repo_checks(
         return out;
     };
 
-    let client = ApiClient::new(server_url, Some(token));
+    let client = ApiClient::with_credential(server_url, Some(credential));
     let repos = match client.list_repos().await {
         Ok(r) => r,
         Err(e) => {

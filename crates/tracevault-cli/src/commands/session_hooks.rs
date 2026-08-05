@@ -175,11 +175,11 @@ pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn st
         return print_allow();
     };
 
-    let (server_url, token) = resolve_credentials(&project_root);
+    let (server_url, credential) = resolve_credentials(&project_root);
     let Some(server_url) = server_url else {
         return print_allow();
     };
-    let client = ApiClient::new(&server_url, token.as_deref());
+    let client = ApiClient::with_credential(&server_url, credential);
 
     match fetch_context(&client, event, repo_uuid).await {
         Some(output) => {

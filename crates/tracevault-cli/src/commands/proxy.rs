@@ -5,7 +5,7 @@
 //! Read-only and purely local: never calls the network. Output is intended
 //! to be copy-pasted directly into a shell or tool config.
 
-use crate::credentials::Credentials;
+use crate::credentials::{Credential, Credentials};
 
 const ANSI_BOLD: &str = "\x1b[1m";
 const ANSI_DIM: &str = "\x1b[2m";
@@ -51,10 +51,25 @@ pub fn run_proxy_info() -> i32 {
         "       {ANSI_BOLD}export ANTHROPIC_API_KEY=\"<your TraceVault session token>\"{ANSI_RESET}"
     );
     println!();
-    println!(
-        "     {ANSI_DIM}Your TraceVault session token lives in {} as the \"token\" field.{ANSI_RESET}",
-        creds_path.display()
-    );
+    // `ANTHROPIC_API_KEY` is static tool configuration, so it needs a static
+    // credential. A Keycloak access token is refreshed every few minutes and
+    // would silently stop working — say so instead of pointing at a "token"
+    // field that no longer exists in that file.
+    match creds.credential() {
+        Some(Credential::Keycloak(_)) => {
+            println!(
+                "     {ANSI_DIM}This machine is signed in with a Keycloak session, whose access \
+                 token expires every few minutes — it cannot be pasted here as a static value. \
+                 Use a TraceVault API key (tvk_...) for the proxy instead.{ANSI_RESET}"
+            );
+        }
+        _ => {
+            println!(
+                "     {ANSI_DIM}Your TraceVault token lives in {} as the \"token\" field.{ANSI_RESET}",
+                creds_path.display()
+            );
+        }
+    }
     println!();
     println!("  3. Run your AI tool as usual. Requests go through TraceVault and are");
     println!("     forwarded to api.anthropic.com using the Anthropic key you stored");

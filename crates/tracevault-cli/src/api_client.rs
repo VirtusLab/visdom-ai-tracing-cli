@@ -1,12 +1,64 @@
+use crate::credentials::{Credential, Credentials, KeycloakSession};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use url::Url;
 
 pub struct ApiClient {
     base_url: String,
-    api_key: Option<String>,
+    credential: Option<ClientCredential>,
     client: reqwest::Client,
+    /// Injectable "now" (unix seconds). Only the token-refresh window reads
+    /// it; tests override it so the boundary is deterministic instead of
+    /// depending on wall-clock time.
+    now: fn() -> i64,
+}
+
+/// A [`Credential`] prepared for use by a client.
+///
+/// A Keycloak session sits behind an `Arc<Mutex<..>>` so several concurrent
+/// in-process requests (the stream hook drains a queue with a shared client)
+/// serialise on ONE refresh instead of each racing to mint its own and
+/// invalidating the others' refresh token.
+enum ClientCredential {
+    ApiKey(String),
+    Keycloak(Arc<Mutex<KeycloakSession>>),
+}
+
+/// Why a request could not be given a bearer token.
+///
+/// Separate from [`GetMeError`] because it is produced before any request
+/// goes out, and separate from a plain string because callers must be able
+/// to distinguish "this session is dead, log in again" from "we couldn't
+/// reach the IdP right now".
+#[derive(Debug)]
+pub enum AuthError {
+    /// The refresh token was rejected: the user must log in again.
+    SessionExpired,
+    /// The refresh attempt itself failed (IdP unreachable, 5xx, ...).
+    Refresh(String),
+}
+
+impl fmt::Display for AuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SessionExpired => write!(
+                f,
+                "your session has expired — run `tracevault login` to sign in again"
+            ),
+            Self::Refresh(m) => write!(f, "could not refresh the access token: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for AuthError {}
+
+/// Wall-clock unix seconds; the production value of [`ApiClient::now`].
+fn now_unix() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 #[derive(Serialize)]
@@ -47,18 +99,6 @@ pub struct RemoteDetail {
     pub normalized_url: String,
     pub clone_status: String,
     pub repos: Vec<RemoteRepoRef>,
-}
-
-#[derive(Deserialize)]
-pub struct DeviceAuthResponse {
-    pub token: String,
-}
-
-#[derive(Deserialize)]
-pub struct DeviceStatusResponse {
-    pub status: String,
-    pub token: Option<String>,
-    pub email: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,15 +156,25 @@ pub struct MeResponse {
     pub user_id: uuid::Uuid,
     pub email: String,
     pub name: Option<String>,
+    /// The role the server derived for this caller (from the `tracing` /
+    /// `tracing-admin` realm roles for a Keycloak bearer). Optional so this
+    /// CLI keeps parsing a server that predates the field.
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 #[derive(Debug)]
 pub enum GetMeError {
     /// 401 — token is missing or invalid.
     Unauthorized,
+    /// 403 — the token is valid but the account is not authorized (for a
+    /// Keycloak bearer: it lacks the `tracing` realm role). Distinct from
+    /// `Unauthorized` because the fix is "an admin grants a role", not
+    /// "log in again".
+    Forbidden(String),
     /// Transport-level failure (DNS, TCP, TLS, timeout).
     Network(String),
-    /// HTTP ≥ 400 other than 401, or malformed JSON.
+    /// HTTP ≥ 400 other than 401/403, or malformed JSON.
     Server(String),
 }
 
@@ -132,6 +182,7 @@ impl std::fmt::Display for GetMeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unauthorized => write!(f, "unauthorized (token invalid or expired)"),
+            Self::Forbidden(m) => write!(f, "forbidden (account not authorized): {m}"),
             Self::Network(m) => write!(f, "network error: {m}"),
             Self::Server(m) => write!(f, "server error: {m}"),
         }
@@ -213,15 +264,131 @@ struct ResolveProjectResponse {
 }
 
 impl ApiClient {
+    /// Construct a client authenticated with a raw API key (or nothing).
+    ///
+    /// Part of the crate's public API and the shape every test constructs, so
+    /// it stays exactly as it was. Command code goes through
+    /// [`ApiClient::with_credential`] instead, which is why the `tracevault`
+    /// BINARY target — where nothing but the lib's tests calls this — would
+    /// otherwise report it as dead.
+    #[allow(dead_code)]
     pub fn new(base_url: &str, api_key: Option<&str>) -> Self {
+        Self::with_credential(base_url, api_key.map(|k| Credential::ApiKey(k.to_string())))
+    }
+
+    /// Construct a client from a resolved [`Credential`].
+    ///
+    /// Takes an `Option` because every caller resolves credentials that may
+    /// be absent (`resolve_credentials` returns an `Option`), and an
+    /// unauthenticated client is a legitimate state — several commands
+    /// degrade gracefully rather than failing when nothing is configured.
+    pub fn with_credential(base_url: &str, credential: Option<Credential>) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.map(String::from),
+            credential: credential.map(|c| match c {
+                Credential::ApiKey(k) => ClientCredential::ApiKey(k),
+                Credential::Keycloak(s) => ClientCredential::Keycloak(Arc::new(Mutex::new(s))),
+            }),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
                 .unwrap_or_default(),
+            now: now_unix,
         }
+    }
+
+    /// Test-only clock override, so the refresh window can be exercised
+    /// without waiting for a token to actually age.
+    #[cfg(test)]
+    fn with_now(mut self, now: fn() -> i64) -> Self {
+        self.now = now;
+        self
+    }
+
+    /// The bearer token to present, refreshing first if needed.
+    ///
+    /// * `ApiKey` → the key verbatim. Never refreshed, never rotated: this is
+    ///   the automation path and it must stay a pure passthrough.
+    /// * `Keycloak` → refresh when the access token is inside
+    ///   [`crate::credentials::REFRESH_WINDOW_SECS`] of expiry, persist the
+    ///   new tokens, and return the fresh one. The session mutex is held
+    ///   across the refresh so concurrent callers wait for it instead of
+    ///   each starting their own.
+    async fn bearer(&self) -> Result<Option<String>, AuthError> {
+        match &self.credential {
+            None => Ok(None),
+            Some(ClientCredential::ApiKey(key)) => Ok(Some(key.clone())),
+            Some(ClientCredential::Keycloak(session)) => {
+                let mut guard = session.lock().await;
+                if guard.needs_refresh((self.now)()) {
+                    self.refresh_locked(&mut guard).await?;
+                }
+                Ok(Some(guard.access_token.clone()))
+            }
+        }
+    }
+
+    /// Refresh the held session in place and persist it. Caller holds the
+    /// session lock, which is what makes "one refresh at a time" true.
+    async fn refresh_locked(&self, session: &mut KeycloakSession) -> Result<(), AuthError> {
+        let now = (self.now)();
+
+        // Someone else may have refreshed already: another process (two git
+        // hooks firing at once), or another `ApiClient` in this process that
+        // was built from the same on-disk credential before either refreshed.
+        // Adopting a newer on-disk session skips a pointless round trip AND
+        // avoids presenting a refresh token that was already consumed — which,
+        // in a realm configured to rotate refresh tokens, would come back as
+        // `invalid_grant` and log the user out for no reason.
+        if let Some(disk) = Credentials::load().and_then(|c| c.auth) {
+            if disk.refresh_token != session.refresh_token && !disk.needs_refresh(now) {
+                *session = disk;
+                return Ok(());
+            }
+        }
+
+        // Discovery is re-fetched per refresh rather than cached: a refresh
+        // happens at most once per access-token lifetime (minutes), and
+        // caching it would mean a rotated realm endpoint needs a re-login.
+        let discovery = crate::oidc::discover(&self.client, &session.issuer)
+            .await
+            .map_err(auth_error)?;
+        let tokens = crate::oidc::refresh(
+            &self.client,
+            &discovery,
+            &session.client_id,
+            &session.refresh_token,
+        )
+        .await
+        .map_err(auth_error)?;
+        session.apply(&tokens, now);
+
+        // Best-effort: a token that can't be written to disk still works for
+        // THIS process, so failing the request would be worse than a warning.
+        // The message deliberately contains no token material.
+        if let Err(e) = Credentials::persist_session(session) {
+            eprintln!("Warning: could not save refreshed credentials: {e}");
+        }
+        Ok(())
+    }
+
+    /// Force one refresh after an unexpected 401 and return the new token.
+    ///
+    /// `Ok(None)` means "not refreshable" (API key or no credential), which
+    /// is the signal not to retry. `stale` is the token that just got
+    /// rejected: if another task already refreshed while we waited for the
+    /// lock, the current token is already different and is reused instead of
+    /// refreshing a second time.
+    async fn force_refresh(&self, stale: Option<&str>) -> Result<Option<String>, AuthError> {
+        let Some(ClientCredential::Keycloak(session)) = &self.credential else {
+            return Ok(None);
+        };
+        let mut guard = session.lock().await;
+        if Some(guard.access_token.as_str()) != stale {
+            return Ok(Some(guard.access_token.clone()));
+        }
+        self.refresh_locked(&mut guard).await?;
+        Ok(Some(guard.access_token.clone()))
     }
 
     pub async fn register_repo(
@@ -236,72 +403,15 @@ impl ApiClient {
             .await
     }
 
-    pub async fn device_start(&self) -> Result<DeviceAuthResponse, Box<dyn Error>> {
-        let resp = self
-            .client
-            // Send an explicit `Content-Length: 0`. reqwest/hyper omit the header
-            // entirely for a bodyless POST, and strict frontends (e.g. Google
-            // Front End) reject such requests with `411 Length Required`.
-            .post(format!("{}/api/v1/auth/device", self.base_url))
-            .header(reqwest::header::CONTENT_LENGTH, "0")
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Server returned {status}: {body}").into());
-        }
-
-        Ok(resp.json().await?)
-    }
-
-    pub async fn device_status(&self, token: &str) -> Result<DeviceStatusResponse, Box<dyn Error>> {
-        let resp = self
-            .client
-            .get(format!(
-                "{}/api/v1/auth/device/{token}/status",
-                self.base_url
-            ))
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Server returned {status}: {body}").into());
-        }
-
-        Ok(resp.json().await?)
-    }
-
-    pub async fn logout(&self) -> Result<(), Box<dyn Error>> {
-        let mut builder = self
-            .client
-            .post(format!("{}/api/v1/auth/logout", self.base_url));
-        if let Some(key) = &self.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-        // Explicit `Content-Length: 0` (see `device_start`): reqwest/hyper omit it
-        // for a bodyless POST, which strict frontends reject with 411.
-        let resp = builder
-            .header(reqwest::header::CONTENT_LENGTH, "0")
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Server returned {status}: {body}").into());
-        }
-        Ok(())
-    }
-
-    /// Attach the bearer token (if configured) to a request. Shared by every
+    /// Attach a bearer token (if there is one) to a request. Shared by every
     /// authenticated request builder so header attachment has exactly one
     /// implementation.
-    fn attach_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.api_key {
-            Some(key) => builder.header("Authorization", format!("Bearer {key}")),
+    fn attach_auth(
+        builder: reqwest::RequestBuilder,
+        token: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        match token {
+            Some(t) => builder.header("Authorization", format!("Bearer {t}")),
             None => builder,
         }
     }
@@ -310,11 +420,36 @@ impl ApiClient {
     /// every authenticated request; callers that need bespoke status-code
     /// handling (e.g. treating 404/409 as non-error outcomes) use this
     /// directly instead of `authed_send_json`.
+    ///
+    /// On an unexpected 401 with a refreshable (Keycloak) credential the
+    /// request is retried EXACTLY once against a force-refreshed token —
+    /// covering a server-side session invalidation or a clock skew that the
+    /// proactive expiry window missed. The retry is a bare `send`, not a
+    /// recursive call, so a server that answers 401 unconditionally cannot
+    /// make this loop. An API key never retries: a 401 on a `tvk_` key is a
+    /// real rejection and re-sending it would just double every failure.
     async fn send_authed(
         &self,
         builder: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, Box<dyn Error>> {
-        Ok(self.attach_auth(builder).send().await?)
+        // Cloned BEFORE sending: a builder is consumed by `send`. `None`
+        // means the body isn't replayable, in which case we simply don't
+        // retry.
+        let retry = builder.try_clone();
+        let token = self.bearer().await?;
+        let resp = Self::attach_auth(builder, token.as_deref()).send().await?;
+
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
+        let Some(retry) = retry else {
+            return Ok(resp);
+        };
+        match self.force_refresh(token.as_deref()).await? {
+            Some(fresh) => Ok(Self::attach_auth(retry, Some(&fresh)).send().await?),
+            // Not refreshable — surface the original 401 unchanged.
+            None => Ok(resp),
+        }
     }
 
     /// Check that `resp`'s status is a success and deserialize its JSON
@@ -361,23 +496,31 @@ impl ApiClient {
     }
 
     /// GET `{base}{path}` with the bearer token, mapping failures into
-    /// `GetMeError` (401 → `Unauthorized`, transport → `Network`, other
-    /// non-2xx or bad JSON → `Server`). Shared by the credential-scoped GETs
-    /// so auth/error handling lives in one place.
+    /// `GetMeError` (401 → `Unauthorized`, 403 → `Forbidden`, transport →
+    /// `Network`, other non-2xx or bad JSON → `Server`). Shared by the
+    /// credential-scoped GETs so auth/error handling lives in one place.
+    ///
+    /// Goes through `send_authed`, so a Keycloak access token is refreshed
+    /// before the call (and once after a 401) exactly like every other
+    /// request. A refresh failure is mapped by cause: a dead session is
+    /// `Unauthorized` ("log in again"), an unreachable IdP is `Network`
+    /// ("cannot confirm") — `tracevault status` renders those very
+    /// differently, so collapsing them would misreport a network blip as a
+    /// revoked login.
     async fn authed_get_json<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
     ) -> Result<T, GetMeError> {
-        let builder = self.attach_auth(self.client.get(format!("{}{}", self.base_url, path)));
-
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| GetMeError::Network(e.to_string()))?;
+        let builder = self.client.get(format!("{}{}", self.base_url, path));
+        let resp = self.send_authed(builder).await.map_err(get_me_send_error)?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(GetMeError::Unauthorized);
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(GetMeError::Forbidden(body));
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -607,6 +750,28 @@ impl ApiClient {
     }
 }
 
+/// Map an OIDC failure onto [`AuthError`], keeping "the session is dead"
+/// distinct from "the refresh attempt itself failed".
+fn auth_error(e: crate::oidc::OidcError) -> AuthError {
+    match e {
+        crate::oidc::OidcError::SessionExpired => AuthError::SessionExpired,
+        other => AuthError::Refresh(other.to_string()),
+    }
+}
+
+/// Classify a `send_authed` failure for the `GetMeError`-returning callers.
+/// A dead session becomes `Unauthorized`; everything else (transport, IdP
+/// unreachable) becomes `Network`, which callers render as "cannot confirm".
+fn get_me_send_error(e: Box<dyn Error>) -> GetMeError {
+    match e.downcast::<AuthError>() {
+        Ok(auth) => match *auth {
+            AuthError::SessionExpired => GetMeError::Unauthorized,
+            AuthError::Refresh(m) => GetMeError::Network(m),
+        },
+        Err(other) => GetMeError::Network(other.to_string()),
+    }
+}
+
 /// Whether a 404 response body matches the server's JSON error envelope —
 /// `{"error": "...", ...}`, emitted by every domain-level `AppError` (see
 /// `tracevault-server`'s `error.rs`) — rather than the empty/plain body
@@ -636,12 +801,15 @@ fn version_skew_404_error(what: &str) -> Box<dyn std::error::Error> {
     .into()
 }
 
-/// Resolve server URL and auth token from multiple sources.
+/// Resolve server URL and credential from multiple sources.
 /// Priority: env var > credentials file > project config.toml
-/// Returns (server_url, auth_token).
-pub fn resolve_credentials(project_root: &Path) -> (Option<String>, Option<String>) {
-    use crate::credentials::Credentials;
-
+/// Returns (server_url, credential).
+///
+/// Only the credentials file can yield a [`Credential::Keycloak`]: an env var
+/// or a `config.toml` `api_key` is always a `tvk_` API key, and an API key is
+/// never treated as refreshable. That asymmetry is the whole contract — CI
+/// and automation stay on the unchanging key path.
+pub fn resolve_credentials(project_root: &Path) -> (Option<String>, Option<Credential>) {
     // 1. Env var API key
     let env_key = std::env::var("TRACEVAULT_API_KEY").ok();
 
@@ -670,12 +838,13 @@ pub fn resolve_credentials(project_root: &Path) -> (Option<String>, Option<Strin
         .or_else(|| creds.as_ref().map(|c| c.server_url.clone()))
         .or(config_server_url);
 
-    // Resolve token: env api key > creds token > config api key
-    let token = env_key
-        .or_else(|| creds.map(|c| c.token))
-        .or(config_api_key);
+    // Resolve the credential: env api key > credentials file > config api key
+    let credential = env_key
+        .map(Credential::ApiKey)
+        .or_else(|| creds.as_ref().and_then(Credentials::credential))
+        .or_else(|| config_api_key.map(Credential::ApiKey));
 
-    (server_url, token)
+    (server_url, credential)
 }
 
 /// Resolve `project_root`'s credentials (via `resolve_credentials`) into a
@@ -684,8 +853,358 @@ pub fn resolve_credentials(project_root: &Path) -> (Option<String>, Option<Strin
 /// command that needs a client from a project root, so this
 /// resolve-then-construct shape has exactly one implementation.
 pub fn resolve_client(project_root: &Path) -> Result<ApiClient, Box<dyn Error>> {
-    let (server_url, token) = resolve_credentials(project_root);
+    let (server_url, credential) = resolve_credentials(project_root);
     let server_url = server_url
         .ok_or("no server URL configured: set TRACEVAULT_SERVER_URL or run `tracevault login`")?;
-    Ok(ApiClient::new(&server_url, token.as_deref()))
+    Ok(ApiClient::with_credential(&server_url, credential))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credentials::KeycloakSession;
+    use crate::test_helpers::{http_json, spawn_seq, spawn_seq_with, RECV_TIMEOUT};
+    use std::time::Duration;
+
+    /// Fixed "now" for the refresh-window tests. Using a constant instead of
+    /// the wall clock is what makes the boundary assertions deterministic.
+    const NOW: i64 = 1_800_000_000;
+
+    fn fixed_now() -> i64 {
+        NOW
+    }
+
+    /// A fake IdP that answers discovery (self-reporting its own URL as the
+    /// issuer, as a real one must) and then one token request. Returns the
+    /// issuer URL to put in the session.
+    fn spawn_idp(token_response: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        spawn_seq_with(move |base| {
+            vec![
+                http_json(
+                    "200 OK",
+                    &format!(
+                        r#"{{"issuer":"{base}","token_endpoint":"{base}/token","device_authorization_endpoint":"{base}/device","revocation_endpoint":"{base}/revoke"}}"#
+                    ),
+                ),
+                http_json("200 OK", token_response),
+            ]
+        })
+    }
+
+    /// Point `XDG_CONFIG_HOME` at a tempdir holding a Keycloak credentials
+    /// file for `issuer`, so a refresh has something to persist into.
+    fn write_keycloak_file(dir: &std::path::Path, issuer: &str, expires_at: i64) {
+        let creds_dir = dir.join("tracevault");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(
+            creds_dir.join("credentials.json"),
+            format!(
+                r#"{{"server_url":"https://example.com","email":"a@b.com","auth":{{"issuer":"{issuer}","client_id":"tracevault-cli","refresh_token":"old-rt","access_token":"old-at","access_expires_at":{expires_at}}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn session(issuer: &str, expires_at: i64) -> KeycloakSession {
+        KeycloakSession {
+            issuer: issuer.to_string(),
+            client_id: "tracevault-cli".into(),
+            refresh_token: "old-rt".into(),
+            access_token: "old-at".into(),
+            access_expires_at: expires_at,
+        }
+    }
+
+    /// An access token inside the 60s window is refreshed BEFORE the request
+    /// goes out, and the new tokens are written back to disk so the next
+    /// process doesn't repeat the refresh.
+    #[tokio::test]
+    async fn bearer_refreshes_inside_the_sixty_second_window() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        let (issuer, rx) =
+            spawn_idp(r#"{"access_token":"fresh-at","refresh_token":"fresh-rt","expires_in":300}"#);
+        // 30s of life left — inside the window.
+        write_keycloak_file(dir.path(), &issuer, NOW + 30);
+
+        let client = ApiClient::with_credential(
+            "https://example.com",
+            Some(Credential::Keycloak(session(&issuer, NOW + 30))),
+        )
+        .with_now(fixed_now);
+
+        let token = client.bearer().await.unwrap();
+        assert_eq!(token.as_deref(), Some("fresh-at"));
+
+        // Discovery, then the refresh_token grant.
+        let disc = rx.recv_timeout(RECV_TIMEOUT).expect("no discovery request");
+        assert!(disc.contains("/.well-known/openid-configuration"), "{disc}");
+        let refresh = rx.recv_timeout(RECV_TIMEOUT).expect("no token request");
+        assert!(refresh.contains("grant_type=refresh_token"), "{refresh}");
+        assert!(refresh.contains("refresh_token=old-rt"), "{refresh}");
+        assert!(
+            !refresh.contains("client_secret"),
+            "the CLI client is public; no secret may be sent: {refresh}"
+        );
+
+        // Persisted, so a git hook running a second later doesn't refresh again.
+        let saved = Credentials::load().expect("credentials must still exist");
+        let auth = saved.auth.expect("auth block must survive a refresh");
+        assert_eq!(auth.access_token, "fresh-at");
+        assert_eq!(auth.refresh_token, "fresh-rt");
+        assert_eq!(auth.access_expires_at, NOW + 300);
+        assert_eq!(saved.email, "a@b.com", "unrelated fields must be preserved");
+    }
+
+    /// Two git hooks can run at once, and `tracevault status` builds two
+    /// clients from one credential. If another process already refreshed, this
+    /// one must ADOPT that session rather than present the refresh token that
+    /// was just consumed — with refresh-token rotation enabled that would come
+    /// back `invalid_grant` and log the user out for no reason.
+    ///
+    /// The issuer points at a dead port, so any actual refresh attempt would
+    /// fail the call: reaching the assertion proves no round trip happened.
+    #[tokio::test]
+    async fn bearer_adopts_a_newer_session_written_by_another_process() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        // On disk: a session refreshed by "another process" — different
+        // refresh token, plenty of life left.
+        let creds_dir = dir.path().join("tracevault");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(
+            creds_dir.join("credentials.json"),
+            format!(
+                r#"{{"server_url":"https://example.com","email":"a@b.com","auth":{{"issuer":"http://127.0.0.1:1","client_id":"tracevault-cli","refresh_token":"rotated-rt","access_token":"other-process-at","access_expires_at":{}}}}}"#,
+                NOW + 3600
+            ),
+        )
+        .unwrap();
+
+        // In memory: the stale session this client was built from.
+        let client = ApiClient::with_credential(
+            "https://example.com",
+            Some(Credential::Keycloak(session(
+                "http://127.0.0.1:1",
+                NOW + 10,
+            ))),
+        )
+        .with_now(fixed_now);
+
+        let token = client
+            .bearer()
+            .await
+            .expect("adopting the on-disk session must not require the IdP");
+        assert_eq!(token.as_deref(), Some("other-process-at"));
+    }
+
+    /// Outside the window the stored token is used as-is. The issuer points
+    /// at a port nothing listens on, so ANY refresh attempt would fail the
+    /// call — proving no network round trip happened.
+    #[tokio::test]
+    async fn bearer_does_not_refresh_outside_the_window() {
+        let client = ApiClient::with_credential(
+            "https://example.com",
+            Some(Credential::Keycloak(session(
+                "http://127.0.0.1:1",
+                NOW + 3600,
+            ))),
+        )
+        .with_now(fixed_now);
+
+        let token = client
+            .bearer()
+            .await
+            .expect("a still-valid token must not trigger any IdP call");
+        assert_eq!(token.as_deref(), Some("old-at"));
+    }
+
+    /// The API-key path is a pure passthrough: no clock, no IdP, no refresh.
+    #[tokio::test]
+    async fn bearer_returns_an_api_key_verbatim() {
+        let client = ApiClient::new("https://example.com", Some("tvk_abc"));
+        assert_eq!(client.bearer().await.unwrap().as_deref(), Some("tvk_abc"));
+
+        let anonymous = ApiClient::new("https://example.com", None);
+        assert_eq!(anonymous.bearer().await.unwrap(), None);
+    }
+
+    /// A 401 on an API key is a real rejection: retrying would double every
+    /// failure and could re-run a non-idempotent write. Exactly ONE request
+    /// must reach the server.
+    #[tokio::test]
+    async fn a_401_with_an_api_key_does_not_refresh_or_retry() {
+        let (base, rx) = spawn_seq(vec![
+            http_json("401 Unauthorized", r#"{"error":"invalid token"}"#),
+            // A second response is queued precisely to prove it is unused.
+            http_json("200 OK", "[]"),
+        ]);
+        let client = ApiClient::new(&base, Some("tvk_abc"));
+        client
+            .list_repos()
+            .await
+            .expect_err("a 401 must surface as an error");
+
+        let first = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
+        assert!(first.contains("GET /api/v1/repos"), "{first}");
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "an API key must never be retried after a 401"
+        );
+    }
+
+    /// A Keycloak credential that gets an unexpected 401 (server-side session
+    /// invalidation, clock skew) force-refreshes and retries ONCE.
+    #[tokio::test]
+    async fn a_401_with_a_keycloak_credential_refreshes_and_retries_once() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        let (issuer, _idp_rx) =
+            spawn_idp(r#"{"access_token":"fresh-at","refresh_token":"fresh-rt","expires_in":300}"#);
+        write_keycloak_file(dir.path(), &issuer, NOW + 3600);
+
+        let (base, rx) = spawn_seq(vec![
+            http_json("401 Unauthorized", r#"{"error":"expired"}"#),
+            http_json("200 OK", "[]"),
+        ]);
+        // Far from expiry: the proactive window must NOT be what triggers the
+        // refresh here — the 401 must.
+        let client = ApiClient::with_credential(
+            &base,
+            Some(Credential::Keycloak(session(&issuer, NOW + 3600))),
+        )
+        .with_now(fixed_now);
+
+        let repos = client
+            .list_repos()
+            .await
+            .expect("the retry after a forced refresh must succeed");
+        assert!(repos.is_empty());
+
+        let first = rx.recv_timeout(RECV_TIMEOUT).expect("no first request");
+        assert!(
+            first.contains("Bearer") || first.contains("GET /api/v1/repos"),
+            "{first}"
+        );
+        let second = rx.recv_timeout(RECV_TIMEOUT).expect("no retry request");
+        assert!(second.contains("GET /api/v1/repos"), "{second}");
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the retry must happen at most once, or a 401-always server would loop"
+        );
+    }
+
+    /// A 401 that survives the retry must not send the request a third time:
+    /// a server answering 401 unconditionally has to terminate.
+    #[tokio::test]
+    async fn a_persistent_401_stops_after_one_retry() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        let (issuer, _idp_rx) =
+            spawn_idp(r#"{"access_token":"fresh-at","refresh_token":"fresh-rt","expires_in":300}"#);
+        write_keycloak_file(dir.path(), &issuer, NOW + 3600);
+
+        let (base, rx) = spawn_seq(vec![
+            http_json("401 Unauthorized", r#"{"error":"nope"}"#),
+            http_json("401 Unauthorized", r#"{"error":"nope"}"#),
+            http_json("200 OK", "[]"),
+        ]);
+        let client = ApiClient::with_credential(
+            &base,
+            Some(Credential::Keycloak(session(&issuer, NOW + 3600))),
+        )
+        .with_now(fixed_now);
+
+        client
+            .list_repos()
+            .await
+            .expect_err("a persistent 401 must surface as an error");
+
+        assert!(rx.recv_timeout(RECV_TIMEOUT).is_ok());
+        assert!(rx.recv_timeout(RECV_TIMEOUT).is_ok());
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a third attempt means the retry can loop"
+        );
+    }
+
+    /// A dead refresh token must surface as "log in again", not as a bland
+    /// 401 or a network error — `tracevault status` renders those differently.
+    #[tokio::test]
+    async fn get_me_maps_a_dead_refresh_token_to_unauthorized() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        let (issuer, _rx) = spawn_seq_with(|base| {
+            vec![
+                http_json(
+                    "200 OK",
+                    &format!(r#"{{"issuer":"{base}","token_endpoint":"{base}/token"}}"#),
+                ),
+                http_json("400 Bad Request", r#"{"error":"invalid_grant"}"#),
+            ]
+        });
+        write_keycloak_file(dir.path(), &issuer, NOW + 10);
+
+        let client = ApiClient::with_credential(
+            "http://127.0.0.1:1",
+            // Inside the window, so the (failing) refresh happens before any
+            // request to the server is attempted.
+            Some(Credential::Keycloak(session(&issuer, NOW + 10))),
+        )
+        .with_now(fixed_now);
+
+        match client.get_me().await {
+            Err(GetMeError::Unauthorized) => {}
+            other => panic!("expected Unauthorized for a dead session, got {other:?}"),
+        }
+    }
+
+    /// An unreachable IdP is NOT a dead session: it must stay distinguishable
+    /// so status says "cannot confirm" rather than "you were logged out".
+    #[tokio::test]
+    async fn get_me_maps_an_unreachable_idp_to_network() {
+        let client = ApiClient::with_credential(
+            "http://127.0.0.1:1",
+            Some(Credential::Keycloak(session(
+                "http://127.0.0.1:1",
+                NOW + 10,
+            ))),
+        )
+        .with_now(fixed_now);
+
+        match client.get_me().await {
+            Err(GetMeError::Network(_)) => {}
+            other => panic!("expected Network for an unreachable IdP, got {other:?}"),
+        }
+    }
+
+    /// A 403 is its own outcome: the token is fine, the account isn't
+    /// authorized, and "log in again" would be the wrong advice.
+    #[tokio::test]
+    async fn get_me_maps_403_to_forbidden() {
+        let (base, _rx) = spawn_seq(vec![http_json(
+            "403 Forbidden",
+            r#"{"error":"missing role"}"#,
+        )]);
+        let client = ApiClient::new(&base, Some("tvk_abc"));
+        match client.get_me().await {
+            Err(GetMeError::Forbidden(_)) => {}
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+    }
 }

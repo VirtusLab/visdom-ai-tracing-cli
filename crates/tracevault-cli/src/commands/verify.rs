@@ -49,7 +49,7 @@ pub async fn verify(
         return Ok(());
     }
 
-    let (server_url, token) = resolve_credentials(project_root);
+    let (server_url, credential) = resolve_credentials(project_root);
 
     let server_url =
         match server_url {
@@ -60,11 +60,11 @@ pub async fn verify(
             ),
         };
 
-    if token.is_none() {
+    if credential.is_none() {
         return Err("No auth token. Set TRACEVAULT_API_KEY or run 'tracevault login'.".into());
     }
 
-    let client = ApiClient::new(&server_url, token.as_deref());
+    let client = ApiClient::with_credential(&server_url, credential);
 
     // Resolve repo_id by name
     let repo = resolve_repo_by_name(&client, project_root)
