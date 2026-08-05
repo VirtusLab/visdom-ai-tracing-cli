@@ -156,14 +156,33 @@ impl fmt::Debug for Credentials {
 impl Credentials {
     /// A Keycloak session credential file (what `tracevault login` writes).
     ///
-    /// There is deliberately no `api_key` counterpart: nothing in the CLI
-    /// writes an API-key credentials file (a key is supplied via
-    /// `TRACEVAULT_API_KEY` or `config.toml`), it is only ever READ from a
-    /// file a user or an older CLI version created.
+    /// # The single policy both writers follow
+    ///
+    /// **A write never destroys a credential it did not come to replace.** This
+    /// constructor and [`Self::persist_session`] are the only two writers, and
+    /// they now agree: `persist_session` replaces `auth` and keeps everything
+    /// else, and this preserves any pre-existing `token` (an API key) instead of
+    /// dropping it. Logging in supersedes a key without deleting it, which is
+    /// safe because [`Self::credential`] already prefers a Keycloak session over
+    /// a leftover `token` — so the key is inert while the session lives, and
+    /// still there if the session is later removed.
+    ///
+    /// The token is only carried over when the existing file is for the SAME
+    /// server ([`same_server`]): moving another instance's key into this
+    /// instance's file would be the same cross-instance mixing the resolution
+    /// guards exist to prevent.
+    ///
+    /// There is deliberately no `api_key` counterpart constructor: nothing in
+    /// the CLI creates an API-key credentials file (a key comes from
+    /// `TRACEVAULT_API_KEY` or `config.toml`); such a file is only ever READ,
+    /// from one a user or an older CLI version wrote.
     pub fn keycloak(server_url: &str, email: String, session: KeycloakSession) -> Self {
+        let preserved_token = Self::load()
+            .filter(|existing| same_server(&existing.server_url, server_url))
+            .and_then(|existing| existing.token);
         Self {
             server_url: server_url.to_string(),
-            token: None,
+            token: preserved_token,
             email,
             auth: Some(session),
         }
@@ -349,7 +368,8 @@ impl Credentials {
     }
 
     /// Persist refreshed Keycloak tokens for `server_url`, keeping every other
-    /// field of the file as it is on disk.
+    /// field of the file as it is on disk — including a `token` (API key),
+    /// per the single write policy documented on [`Self::keycloak`].
     ///
     /// Re-reads the file rather than rewriting a cached copy so a
     /// concurrently changed `server_url`/`email` isn't reverted. A missing
@@ -788,6 +808,76 @@ mod tests {
             "a just-created temp file may still be in flight elsewhere; sweeping it would break \
              that process's rename"
         );
+    }
+
+    /// Logging in must not destroy a `tvk_` API key already in the file: the two
+    /// writers had opposite policies, with `persist_session` carefully
+    /// preserving the token that `keycloak` silently dropped. The key stays
+    /// inert while the session lives (`credential()` prefers the session) and is
+    /// still there if the session is later removed.
+    #[test]
+    fn keycloak_preserves_an_existing_api_key_for_the_same_server() {
+        let (_dir, _lock, _guard) = with_credentials_file(
+            r#"{"server_url":"https://example.com","token":"tvk_precious","email":"old@b.com"}"#,
+        );
+
+        Credentials::keycloak(
+            "https://example.com",
+            "new@b.com".into(),
+            KeycloakSession {
+                issuer: "i".into(),
+                client_id: "c".into(),
+                refresh_token: "rt".into(),
+                access_token: "at".into(),
+                access_expires_at: 1,
+            },
+        )
+        .save()
+        .unwrap();
+
+        let reloaded = Credentials::load().unwrap();
+        assert_eq!(
+            reloaded.token.as_deref(),
+            Some("tvk_precious"),
+            "login destroyed an API key it did not come to replace"
+        );
+        assert_eq!(reloaded.email, "new@b.com");
+        // The session still wins for actual use.
+        assert!(matches!(
+            reloaded.credential(),
+            Some(Credential::Keycloak(_))
+        ));
+    }
+
+    /// ...but a key belonging to a DIFFERENT instance is not carried into this
+    /// instance's file: that is the same cross-instance mixing the resolution
+    /// guards exist to prevent.
+    #[test]
+    fn keycloak_does_not_carry_over_another_servers_api_key() {
+        let (_dir, _lock, _guard) = with_credentials_file(
+            r#"{"server_url":"https://instance-b.example.com","token":"tvk_for_b","email":"b@b.com"}"#,
+        );
+
+        Credentials::keycloak(
+            "https://instance-a.example.com",
+            "a@b.com".into(),
+            KeycloakSession {
+                issuer: "i".into(),
+                client_id: "c".into(),
+                refresh_token: "rt".into(),
+                access_token: "at".into(),
+                access_expires_at: 1,
+            },
+        )
+        .save()
+        .unwrap();
+
+        let reloaded = Credentials::load().unwrap();
+        assert_eq!(
+            reloaded.token, None,
+            "another instance's key must not be moved into this instance's file"
+        );
+        assert_eq!(reloaded.server_url, "https://instance-a.example.com");
     }
 
     /// A refresh must update only the `auth` block — the file's `email`
