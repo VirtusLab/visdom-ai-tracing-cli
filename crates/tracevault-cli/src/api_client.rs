@@ -855,12 +855,15 @@ fn version_skew_404_error(what: &str) -> Box<dyn std::error::Error> {
 ///
 /// # Errors
 ///
-/// Fails when the resolved server URL and a Keycloak session read from the
+/// Fails when the resolved server URL and a credential read from the
 /// credentials file are for different TraceVault instances (see
-/// [`server_mismatch_error`]). Failing is deliberate rather than silently
-/// dropping the credential: every "Not logged in, run `tracevault login`"
-/// message downstream would be actively WRONG advice — the user IS logged in,
-/// and logging in again to the same instance would not change anything.
+/// [`server_mismatch_error`]). This covers EITHER kind of file-sourced
+/// credential — the distinction that matters is not Keycloak-vs-key but
+/// named-on-this-invocation vs. read-from-the-file. Failing is deliberate
+/// rather than silently dropping the credential: every "Not logged in, run
+/// `tracevault login`" message downstream would be actively WRONG advice — the
+/// user IS logged in, and logging in again to the same instance would not
+/// change anything.
 #[allow(clippy::type_complexity)]
 pub fn resolve_credentials(
     project_root: &Path,
@@ -900,14 +903,16 @@ pub fn resolve_credentials(
         Some(key) => Some(Credential::ApiKey(key)),
         None => {
             let from_file = creds.as_ref().and_then(Credentials::credential);
-            if let Some(Credential::Keycloak(_)) = &from_file {
+            if from_file.is_some() {
                 // The two precedence chains above disagree: the URL can come
-                // from the env while the credential comes from the file. A
-                // Keycloak access token is minted for ONE TraceVault instance,
-                // so handing it to a client pointed elsewhere would send it to
-                // a host it was never issued for — on the very first request,
-                // before any refresh, so neither guard in `refresh_locked`
-                // would see it.
+                // from the env while the credential comes from the file. Every
+                // credential in that file — a Keycloak access token or a `tvk_`
+                // API key alike — was issued by ONE TraceVault instance, so
+                // handing it to a client pointed elsewhere transmits a secret to
+                // a host it was never issued for, which then has it in its logs.
+                //
+                // This is the FIRST request, before any refresh, so neither
+                // server-scoping guard in `refresh_locked` would see it.
                 //
                 // Only reachable when TRACEVAULT_SERVER_URL is set: with it
                 // unset the URL comes from this same file, so the two match by
@@ -919,6 +924,10 @@ pub fn resolve_credentials(
                     }
                 }
             }
+            // A `config.toml` `api_key` is NOT guarded: committing a key to a
+            // project config, next to that config's own `server_url`, is as
+            // deliberate as naming it in the environment. It is also only
+            // reachable when the file yielded nothing.
             from_file.or_else(|| config_api_key.map(Credential::ApiKey))
         }
     };
@@ -926,7 +935,12 @@ pub fn resolve_credentials(
     Ok((server_url, credential))
 }
 
-/// The error for "the saved login is for a different TraceVault instance".
+/// The error for "the saved credential is for a different TraceVault instance".
+///
+/// Applies to any FILE-SOURCED credential, Keycloak session or `tvk_` key
+/// alike: both are secrets issued by one instance, and a key would not even
+/// work against another instance — so without this the user gets a confusing
+/// 401 from the wrong host instead of an explanation.
 ///
 /// Names BOTH URLs, because the whole failure is that two of them disagree and
 /// the user can see neither: `tracevault status` reports the file's URL, and
@@ -936,12 +950,12 @@ pub fn resolve_credentials(
 /// The third suggestion matters: pointing at the SAME instance through another
 /// address (a `kubectl port-forward`, an internal vs. external hostname) is a
 /// legitimate workflow that this guard cannot distinguish from a genuine
-/// mismatch, so the message names the two ways to proceed deliberately.
+/// mismatch, so the message names the ways to proceed deliberately.
 fn server_mismatch_error(file_url: &str, target: &str) -> Box<dyn Error> {
     format!(
-        "refusing to use the saved login: the credentials file holds a Keycloak session for \
-         '{file_url}', but this command is targeting '{target}'. An access token minted for one \
-         TraceVault instance must not be sent to another.\n\
+        "refusing to use the saved credentials: the credentials file is for '{file_url}', but \
+         this command is targeting '{target}'. A credential issued by one TraceVault instance \
+         must not be sent to another.\n\
          Either unset TRACEVAULT_SERVER_URL to use '{file_url}', or run `tracevault login \
          --server-url {target}`. If '{target}' is the same instance reached through a different \
          address (e.g. a port-forward), set TRACEVAULT_API_KEY to a `tvk_` key for it instead."
@@ -1483,21 +1497,22 @@ mod tests {
         }
     }
 
-    // ---- resolve_credentials: the file's session must not follow a
-    // ---- TRACEVAULT_SERVER_URL override to another instance.
+    // ---- resolve_credentials: a credential read from the FILE must not follow
+    // ---- a TRACEVAULT_SERVER_URL override to another instance. Applies to a
+    // ---- Keycloak session and a `tvk_` key alike; an env- or config-supplied
+    // ---- key is a deliberate operator act and is left alone.
 
-    /// Set up an empty project root plus a credentials file holding a Keycloak
-    /// session for `file_server_url`, with `TRACEVAULT_SERVER_URL` set to
-    /// `env_url` (unset when `None`). Returns the guards the caller must keep
-    /// alive, and the project root.
-    fn resolve_fixture(
-        file_server_url: &str,
-        env_url: Option<&str>,
-    ) -> (
+    type ResolveFixture = (
         tempfile::TempDir,
         tokio::sync::MutexGuard<'static, ()>,
         crate::test_helpers::EnvVarGuard,
-    ) {
+    );
+
+    /// Set up an empty project root with `TRACEVAULT_SERVER_URL` set to
+    /// `env_url` (unset when `None`) and `credentials.json` containing
+    /// `file_body` (no file when `None`). Returns the tempdir (which doubles as
+    /// the project root) plus the guards the caller must keep alive.
+    fn resolve_fixture_with(file_body: Option<&str>, env_url: Option<&str>) -> ResolveFixture {
         let env_lock = crate::test_helpers::lock_env_mutation_sync();
         let dir = tempfile::tempdir().unwrap();
         let mut guard = crate::test_helpers::EnvVarGuard::new();
@@ -1509,13 +1524,34 @@ mod tests {
             Some(u) => guard.set("TRACEVAULT_SERVER_URL", u),
             None => guard.remove("TRACEVAULT_SERVER_URL"),
         }
+        if let Some(body) = file_body {
+            let creds_dir = dir.path().join("tracevault");
+            std::fs::create_dir_all(&creds_dir).unwrap();
+            std::fs::write(creds_dir.join("credentials.json"), body).unwrap();
+        }
+        (dir, env_lock, guard)
+    }
+
+    /// [`resolve_fixture_with`] for a file holding a Keycloak session.
+    fn resolve_fixture(file_server_url: &str, env_url: Option<&str>) -> ResolveFixture {
+        let fixture = resolve_fixture_with(None, env_url);
         write_keycloak_file(
-            dir.path(),
+            fixture.0.path(),
             file_server_url,
             "https://idp.test/realms/v",
             NOW + 3600,
         );
-        (dir, env_lock, guard)
+        fixture
+    }
+
+    /// [`resolve_fixture_with`] for a file holding a `tvk_` API key.
+    fn resolve_fixture_api_key(file_server_url: &str, env_url: Option<&str>) -> ResolveFixture {
+        resolve_fixture_with(
+            Some(&format!(
+                r#"{{"server_url":"{file_server_url}","token":"tvk_from_file","email":"a@b.com"}}"#
+            )),
+            env_url,
+        )
     }
 
     /// The precedence chains disagree: the URL comes from the env, the
@@ -1571,6 +1607,78 @@ mod tests {
         let (url, credential) = resolve_credentials(dir.path()).expect("the normal case must work");
         assert_eq!(url.as_deref(), Some("https://example.com"));
         assert!(matches!(credential, Some(Credential::Keycloak(_))));
+    }
+
+    /// A `tvk_` key in the credentials file is instance-bound too: keys are
+    /// per-instance, so sending it to another host both leaks it into that
+    /// host's logs AND cannot succeed — today's outcome without the guard is a
+    /// confusing 401 from the wrong server.
+    #[test]
+    fn a_mismatched_server_url_refuses_the_files_api_key() {
+        let (dir, _lock, _guard) = resolve_fixture_api_key(
+            "https://instance-b.example.com",
+            Some("https://instance-a.example.com"),
+        );
+
+        let err = resolve_credentials(dir.path())
+            .expect_err("a key for another instance must not be handed out");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("https://instance-b.example.com"),
+            "must name the file's server: {msg}"
+        );
+        assert!(
+            msg.contains("https://instance-a.example.com"),
+            "must name the targeted server: {msg}"
+        );
+        assert!(msg.contains("TRACEVAULT_SERVER_URL"), "{msg}");
+        assert!(msg.contains("tracevault login"), "{msg}");
+        assert!(msg.contains("TRACEVAULT_API_KEY"), "{msg}");
+        assert!(
+            !msg.contains("tvk_from_file"),
+            "the error must not echo the key itself: {msg}"
+        );
+    }
+
+    /// Same normalisation for a file-sourced key as for a session: the file
+    /// keeps what login was given, `ApiClient` trims trailing slashes.
+    #[test]
+    fn a_file_api_key_with_a_matching_url_modulo_trailing_slash_still_resolves() {
+        let (dir, _lock, _guard) =
+            resolve_fixture_api_key("https://example.com/", Some("https://example.com"));
+
+        let (url, credential) =
+            resolve_credentials(dir.path()).expect("a trailing slash is not a different instance");
+        assert_eq!(url.as_deref(), Some("https://example.com"));
+        match credential {
+            Some(Credential::ApiKey(k)) => assert_eq!(k, "tvk_from_file"),
+            other => panic!("expected the file's API key, got {other:?}"),
+        }
+    }
+
+    /// A `config.toml` `api_key` is committed next to that config's own
+    /// `server_url`: as deliberate as naming it in the environment, so a URL
+    /// override must not break it. (It is also only consulted when the
+    /// credentials file yielded nothing, as here.)
+    #[test]
+    fn a_config_api_key_is_unaffected_by_a_mismatched_server_url() {
+        let (dir, _lock, _guard) =
+            resolve_fixture_with(None, Some("https://instance-a.example.com"));
+        let config_dir = dir.path().join(".tracevault");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "server_url = \"https://instance-b.example.com\"\napi_key = \"tvk_from_config\"\n",
+        )
+        .unwrap();
+
+        let (url, credential) = resolve_credentials(dir.path())
+            .expect("a config-supplied key must never be second-guessed");
+        assert_eq!(url.as_deref(), Some("https://instance-a.example.com"));
+        match credential {
+            Some(Credential::ApiKey(k)) => assert_eq!(k, "tvk_from_config"),
+            other => panic!("expected the config API key, got {other:?}"),
+        }
     }
 
     /// `TRACEVAULT_API_KEY` plus a URL pointing anywhere is a deliberate,

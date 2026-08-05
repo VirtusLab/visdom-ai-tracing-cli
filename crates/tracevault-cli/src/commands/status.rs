@@ -102,12 +102,12 @@ struct AuthContext {
     credential: Option<Credential>,
     source: &'static str, // "env", "credentials", or "none"
     email_from_creds: Option<String>,
-    /// `(file's server_url, TRACEVAULT_SERVER_URL)` when a saved Keycloak
-    /// session is for a different instance than the env var targets.
+    /// `(file's server_url, TRACEVAULT_SERVER_URL)` when the saved credential
+    /// is for a different instance than the env var targets.
     ///
-    /// This inspector deliberately reports the FILE's URL (that is the session
-    /// it validates), so without this field `status` would print a green
-    /// "Logged in" while every other command refuses to run — the exact
+    /// This inspector deliberately reports the FILE's URL (that is the
+    /// credential it validates), so without this field `status` would print a
+    /// green "Logged in" while every other command refuses to run — the exact
     /// situation someone runs `status` to diagnose.
     url_override_mismatch: Option<(String, String)>,
 }
@@ -136,10 +136,12 @@ fn resolve_auth() -> AuthContext {
             Some(_) => "credentials file (Keycloak session)",
             None => "credentials file (API key)",
         };
-        // Only a Keycloak session is instance-bound (see
-        // `api_client::resolve_credentials`, which refuses this pairing).
-        let url_override_mismatch = env_url
-            .filter(|env| c.auth.is_some() && !crate::credentials::same_server(&c.server_url, env));
+        // Any credential read from the FILE is instance-bound — a `tvk_` key as
+        // much as a Keycloak session (see `api_client::resolve_credentials`,
+        // which refuses this pairing for both).
+        let url_override_mismatch = env_url.filter(|env| {
+            c.credential().is_some() && !crate::credentials::same_server(&c.server_url, env)
+        });
         return AuthContext {
             server_url: Some(c.server_url.clone()),
             credential: c.credential(),
