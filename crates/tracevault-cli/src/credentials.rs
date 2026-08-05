@@ -260,6 +260,9 @@ impl Credentials {
                 let _ = fs::remove_file(&tmp);
                 return Err(e);
             }
+            // Bound the accumulation of abandoned temp files, each of which
+            // holds a full credential including the refresh token.
+            Self::sweep_stale_temp_files();
             return Ok(());
         }
         Err(last_err.unwrap_or_else(|| {
@@ -268,6 +271,57 @@ impl Credentials {
                 "could not create a unique temporary credentials file",
             )
         }))
+    }
+
+    /// Filename prefix of the atomic-write temp files. Anything matching this
+    /// contains a full credential JSON — including the offline refresh token —
+    /// so leftovers are credential material, not scratch data.
+    const TEMP_PREFIX: &'static str = ".credentials.json.tmp";
+
+    /// A temp file this old cannot still be in flight: a save is a couple of
+    /// syscalls. Only files older than this are swept, so a concurrent save in
+    /// another process never has its temp file deleted out from under it (which
+    /// would make its `rename` fail and turn a benign race into an error).
+    const TEMP_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    /// Best-effort removal of abandoned temp files, oldest-first semantics by
+    /// age threshold. Never reports failure: this is hygiene, and a stray file
+    /// we cannot delete must not fail the save or the logout that triggered it.
+    fn sweep_stale_temp_files() {
+        Self::remove_temp_files(Some(Self::TEMP_STALE_AFTER));
+    }
+
+    /// Remove atomic-write temp files in the credential directory. With
+    /// `min_age`, only files at least that old; without it, all of them (used
+    /// by `delete`, where the user is logging out and nothing should survive).
+    fn remove_temp_files(min_age: Option<std::time::Duration>) {
+        let Some(dir) = Self::path().parent().map(PathBuf::from) else {
+            return;
+        };
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with(Self::TEMP_PREFIX) {
+                continue;
+            }
+            if let Some(min_age) = min_age {
+                let recent = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+                    .map(|age| age < min_age)
+                    // A clock skew or unreadable mtime means "can't prove it's
+                    // stale" — leave it rather than risk deleting a live temp.
+                    .unwrap_or(true);
+                if recent {
+                    continue;
+                }
+            }
+            let _ = fs::remove_file(entry.path());
+        }
     }
 
     /// A temp file name unique per process AND per call within a process.
@@ -286,7 +340,8 @@ impl Credentials {
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
         format!(
-            ".credentials.json.tmp{}.{}.{}",
+            "{}{}.{}.{}",
+            Self::TEMP_PREFIX,
             std::process::id(),
             n,
             nanos
@@ -321,11 +376,27 @@ impl Credentials {
         creds.save()
     }
 
+    /// Remove the credential file — and any atomic-write temp files left
+    /// behind.
+    ///
+    /// The sweep is the difference between "logout" and "logout, except for the
+    /// refresh tokens still on disk": every `.credentials.json.tmp*` holds a
+    /// full credential JSON, so a temp file abandoned by an earlier crash
+    /// between `open` and `rename` would keep a working offline refresh token
+    /// in the config directory after the user asked to be logged out. No age
+    /// threshold here (unlike [`Self::sweep_stale_temp_files`]): the user is
+    /// logging out, so a save racing this is already a lost race — and its
+    /// failed `rename` cannot resurrect the credential file, since the very
+    /// next thing that happens is this delete.
+    ///
+    /// The sweep is best-effort: a stray file that cannot be removed must not
+    /// fail the logout.
     pub fn delete() -> Result<(), std::io::Error> {
         let path = Self::path();
         if path.exists() {
             fs::remove_file(&path)?;
         }
+        Self::remove_temp_files(None);
         Ok(())
     }
 }
@@ -636,6 +707,75 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    /// Logout must leave no credential material behind. Every
+    /// `.credentials.json.tmp*` holds a full credential JSON including the
+    /// offline refresh token, so a leftover from a crashed save would otherwise
+    /// keep a working token on disk after the user logged out.
+    #[test]
+    fn delete_also_removes_leftover_temp_files() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        let creds_dir = dir.path().join("tracevault");
+        fs::create_dir_all(&creds_dir).unwrap();
+        fs::write(creds_dir.join("credentials.json"), "{}").unwrap();
+        // Two leftovers, in both the old pid-only and the current shapes.
+        let old_shape = creds_dir.join(".credentials.json.tmp4242");
+        let new_shape = creds_dir.join(".credentials.json.tmp4242.0.123");
+        fs::write(&old_shape, r#"{"auth":{"refresh_token":"still-live-rt"}}"#).unwrap();
+        fs::write(&new_shape, r#"{"auth":{"refresh_token":"still-live-rt"}}"#).unwrap();
+
+        Credentials::delete().unwrap();
+
+        assert!(!Credentials::path().exists());
+        let remaining: Vec<_> = fs::read_dir(&creds_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "logout left credential material on disk: {remaining:?}"
+        );
+    }
+
+    /// The `save()` sweep must not delete a temp file that another process
+    /// could still be writing — that would break its `rename`. Only files past
+    /// the staleness threshold go.
+    #[test]
+    fn save_sweeps_only_old_temp_files() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        let creds_dir = dir.path().join("tracevault");
+        fs::create_dir_all(&creds_dir).unwrap();
+        let fresh = creds_dir.join(".credentials.json.tmp999.0.1");
+        fs::write(&fresh, "in flight in another process").unwrap();
+
+        Credentials::keycloak(
+            "https://example.com",
+            "a@b.com".into(),
+            KeycloakSession {
+                issuer: "i".into(),
+                client_id: "c".into(),
+                refresh_token: "rt".into(),
+                access_token: "at".into(),
+                access_expires_at: 1,
+            },
+        )
+        .save()
+        .unwrap();
+
+        assert!(
+            fresh.exists(),
+            "a just-created temp file may still be in flight elsewhere; sweeping it would break \
+             that process's rename"
         );
     }
 
