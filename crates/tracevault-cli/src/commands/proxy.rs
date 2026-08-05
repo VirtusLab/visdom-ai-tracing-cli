@@ -52,28 +52,105 @@ pub fn run_proxy_info() -> i32 {
     );
     println!();
     // `ANTHROPIC_API_KEY` is static tool configuration, so it needs a static
-    // credential. A Keycloak access token is refreshed every few minutes and
-    // would silently stop working — say so instead of pointing at a "token"
-    // field that no longer exists in that file.
-    match creds.credential() {
+    // credential. Every arm is spelled out rather than using a catch-all, so a
+    // future `Credential` variant cannot silently inherit the API-key wording.
+    let exit_code = match creds.credential() {
+        Some(Credential::ApiKey(_)) => {
+            println!(
+                "     {ANSI_DIM}Your TraceVault token lives in {} as the \"token\" field.{ANSI_RESET}",
+                creds_path.display()
+            );
+            0
+        }
+        // A Keycloak access token is refreshed every few minutes and would
+        // silently stop working if pasted into a static env var.
         Some(Credential::Keycloak(_)) => {
             println!(
                 "     {ANSI_DIM}This machine is signed in with a Keycloak session, whose access \
                  token expires every few minutes — it cannot be pasted here as a static value. \
                  Use a TraceVault API key (tvk_...) for the proxy instead.{ANSI_RESET}"
             );
+            0
         }
-        _ => {
-            println!(
-                "     {ANSI_DIM}Your TraceVault token lives in {} as the \"token\" field.{ANSI_RESET}",
+        // A credentials file with neither an `auth` object nor a `token`. There
+        // is nothing to paste, so pointing at a "token" field that isn't there
+        // would send the user looking for it.
+        None => {
+            eprintln!(
+                "The credentials file at {} holds no usable credential (no API key and no \
+                 Keycloak session).",
                 creds_path.display()
             );
+            eprintln!(
+                "Run `tracevault login --server-url <url>`, or set TRACEVAULT_API_KEY to a \
+                 TraceVault API key (tvk_...)."
+            );
+            1
         }
-    }
+    };
     println!();
     println!("  3. Run your AI tool as usual. Requests go through TraceVault and are");
     println!("     forwarded to api.anthropic.com using the Anthropic key you stored");
     println!("     in step 1.");
 
-    0
+    exit_code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_proxy_info;
+    use std::fs;
+
+    /// Redirect `XDG_CONFIG_HOME` at a tempdir containing `body` as the
+    /// credentials file (or no file at all when `body` is `None`), run
+    /// `run_proxy_info`, and return its exit code.
+    fn exit_code_for(body: Option<&str>) -> i32 {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        if let Some(body) = body {
+            let creds_dir = dir.path().join("tracevault");
+            fs::create_dir_all(&creds_dir).unwrap();
+            fs::write(creds_dir.join("credentials.json"), body).unwrap();
+        }
+        run_proxy_info()
+    }
+
+    /// A credentials file with neither a `token` nor an `auth` object holds
+    /// nothing the user can paste. Reporting success and pointing at a "token"
+    /// field that isn't in the file sends them looking for it.
+    #[test]
+    fn a_file_with_no_usable_credential_exits_non_zero() {
+        let code = exit_code_for(Some(
+            r#"{"server_url":"https://example.com","email":"a@b.com"}"#,
+        ));
+        assert_eq!(
+            code, 1,
+            "a file with no usable credential must not report success"
+        );
+    }
+
+    #[test]
+    fn an_api_key_file_still_succeeds() {
+        let code = exit_code_for(Some(
+            r#"{"server_url":"https://example.com","token":"tvk_abc","email":"a@b.com"}"#,
+        ));
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn a_keycloak_file_still_succeeds() {
+        let code = exit_code_for(Some(
+            r#"{"server_url":"https://example.com","email":"a@b.com","auth":{"issuer":"i","client_id":"c","refresh_token":"rt","access_token":"at","access_expires_at":1}}"#,
+        ));
+        assert_eq!(code, 0);
+    }
+
+    /// The pre-existing contract: no credentials file at all is exit 1.
+    #[test]
+    fn a_missing_credentials_file_exits_non_zero() {
+        assert_eq!(exit_code_for(None), 1);
+    }
 }
