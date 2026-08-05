@@ -7,12 +7,12 @@ pub struct TracevaultConfig {
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_url: Option<String>,
-    // Never persisted; may still be parsed if present in a hand-authored file.
-    // No production code reads this field today (credentials are resolved
-    // independently in api_client.rs::resolve_credentials); kept on the
-    // struct for forward-compat / round-trip parsing of existing files.
+    /// Never persisted by this CLI (`skip_serializing`), but read back when a
+    /// hand-authored file supplies one: `resolve_credentials` uses it as the
+    /// lowest-precedence credential source. Not guarded by the server-URL
+    /// scoping there, since committing a key next to this config's own
+    /// `server_url` is a deliberate act.
     #[serde(default, skip_serializing)]
-    #[allow(dead_code)]
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_id: Option<String>,

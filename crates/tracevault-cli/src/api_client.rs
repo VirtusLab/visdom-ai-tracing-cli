@@ -874,21 +874,20 @@ pub fn resolve_credentials(
     // 2. Credentials file
     let creds = Credentials::load();
 
-    // 3. Project config
-    let config_path = crate::config::TracevaultConfig::config_path(project_root);
-    let config_content = std::fs::read_to_string(&config_path).unwrap_or_default();
-
-    let config_server_url = config_content
-        .lines()
-        .find(|l| l.starts_with("server_url"))
-        .and_then(|l| l.split('=').nth(1))
-        .map(|s| s.trim().trim_matches('"').to_string());
-
-    let config_api_key = config_content
-        .lines()
-        .find(|l| l.starts_with("api_key"))
-        .and_then(|l| l.split('=').nth(1))
-        .map(|s| s.trim().trim_matches('"').to_string());
+    // 3. Project config — parsed as TOML by its own loader, not by hand.
+    //
+    // The previous line-scanning version split on `=` and took field 1, so a
+    // perfectly legal `api_key = "tvk_abc=="` resolved to `tvk_abc`: a silently
+    // truncated key, surfacing later as an unexplained 401 that (by design) is
+    // never retried. It also matched any line merely STARTING with the field
+    // name (`server_url_backup`) and read keys nested under a `[table]` as
+    // though they were top-level. `TracevaultConfig` already declares both
+    // fields, so the hand-parse only existed to duplicate it — badly. Using
+    // `load` also means a malformed config now warns instead of silently
+    // yielding nothing.
+    let config = crate::config::TracevaultConfig::load(project_root);
+    let config_server_url = config.as_ref().and_then(|c| c.server_url.clone());
+    let config_api_key = config.as_ref().and_then(|c| c.api_key.clone());
 
     // Resolve server URL: env > creds > config
     let server_url = std::env::var("TRACEVAULT_SERVER_URL")
@@ -1654,6 +1653,56 @@ mod tests {
             Some(Credential::ApiKey(k)) => assert_eq!(k, "tvk_from_file"),
             other => panic!("expected the file's API key, got {other:?}"),
         }
+    }
+
+    /// The config is parsed as TOML, not scanned line by line. A base64-ish key
+    /// containing `=` used to be truncated at the first `=` (`tvk_abc==` ->
+    /// `tvk_abc`), producing an unexplained 401 that the `ApiKey` path
+    /// deliberately never retries.
+    #[test]
+    fn a_config_api_key_containing_equals_signs_is_not_truncated() {
+        let (dir, _lock, _guard) = resolve_fixture_with(None, None);
+        let config_dir = dir.path().join(".tracevault");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "server_url = \"https://example.com\"\napi_key = \"tvk_YWJjZA==\"\n",
+        )
+        .unwrap();
+
+        let (url, credential) = resolve_credentials(dir.path()).unwrap();
+        assert_eq!(url.as_deref(), Some("https://example.com"));
+        match credential {
+            Some(Credential::ApiKey(k)) => assert_eq!(
+                k, "tvk_YWJjZA==",
+                "the key must survive verbatim, `=` padding and all"
+            ),
+            other => panic!("expected the config API key, got {other:?}"),
+        }
+    }
+
+    /// Line-scanning also matched any field whose name merely STARTED with the
+    /// one being looked for, and read a key nested in a `[table]` as top-level.
+    /// TOML parsing gets both right.
+    #[test]
+    fn a_config_lookalike_field_is_not_mistaken_for_the_real_one() {
+        let (dir, _lock, _guard) = resolve_fixture_with(None, None);
+        let config_dir = dir.path().join(".tracevault");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "server_url = \"https://real.example.com\"\n\
+             [user_context]\n\
+             enable = false\n",
+        )
+        .unwrap();
+
+        let (url, credential) = resolve_credentials(dir.path()).unwrap();
+        assert_eq!(url.as_deref(), Some("https://real.example.com"));
+        assert!(
+            credential.is_none(),
+            "no api_key is configured anywhere, so there is no credential"
+        );
     }
 
     /// A `config.toml` `api_key` is committed next to that config's own
