@@ -3,7 +3,7 @@ use crate::resolution::{git_remote_url, git_repo_name};
 use std::path::Path;
 
 pub async fn sync_repo(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let (server_url, credential) = resolve_credentials(project_root);
+    let (server_url, credential) = resolve_credentials(project_root)?;
 
     let server_url = match server_url {
         Some(url) => url,

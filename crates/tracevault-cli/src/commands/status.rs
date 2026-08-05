@@ -102,6 +102,14 @@ struct AuthContext {
     credential: Option<Credential>,
     source: &'static str, // "env", "credentials", or "none"
     email_from_creds: Option<String>,
+    /// `(file's server_url, TRACEVAULT_SERVER_URL)` when a saved Keycloak
+    /// session is for a different instance than the env var targets.
+    ///
+    /// This inspector deliberately reports the FILE's URL (that is the session
+    /// it validates), so without this field `status` would print a green
+    /// "Logged in" while every other command refuses to run — the exact
+    /// situation someone runs `status` to diagnose.
+    url_override_mismatch: Option<(String, String)>,
 }
 
 fn resolve_auth() -> AuthContext {
@@ -117,6 +125,8 @@ fn resolve_auth() -> AuthContext {
             credential: Some(Credential::ApiKey(token)),
             source: "env (TRACEVAULT_API_KEY)",
             email_from_creds: None,
+            // An explicitly supplied API key may target any URL by design.
+            url_override_mismatch: None,
         };
     }
 
@@ -126,6 +136,10 @@ fn resolve_auth() -> AuthContext {
             Some(_) => "credentials file (Keycloak session)",
             None => "credentials file (API key)",
         };
+        // Only a Keycloak session is instance-bound (see
+        // `api_client::resolve_credentials`, which refuses this pairing).
+        let url_override_mismatch = env_url
+            .filter(|env| c.auth.is_some() && !crate::credentials::same_server(&c.server_url, env));
         return AuthContext {
             server_url: Some(c.server_url.clone()),
             credential: c.credential(),
@@ -134,6 +148,7 @@ fn resolve_auth() -> AuthContext {
             // `/auth/me` could resolve the identity (e.g. the account lacks
             // the `tracing` role); there is nothing to compare against.
             email_from_creds: Some(c.email).filter(|e| !e.is_empty()),
+            url_override_mismatch: url_override_mismatch.map(|env| (c.server_url, env)),
         };
     }
 
@@ -142,6 +157,7 @@ fn resolve_auth() -> AuthContext {
         credential: None,
         source: "none",
         email_from_creds: None,
+        url_override_mismatch: None,
     }
 }
 
@@ -168,6 +184,21 @@ async fn auth_checks(auth: &AuthContext) -> Vec<Check> {
         (Some(_), Some(url)) => {
             out.push(Check::ok("Logged in", format!("{url} via {}", auth.source)));
         }
+    }
+
+    // Reported as an ERROR, not a warning: in this state every command that
+    // needs auth refuses to run (see `api_client::resolve_credentials`), so
+    // "everything is fine except this note" would be misleading.
+    if let Some((file_url, env_url)) = &auth.url_override_mismatch {
+        out.push(Check::err(
+            "Server URL",
+            format!(
+                "TRACEVAULT_SERVER_URL is '{env_url}' but the saved login is for '{file_url}'. \
+                 Commands will refuse to run rather than send that session's token to another \
+                 instance. Unset TRACEVAULT_SERVER_URL, or run `tracevault login --server-url \
+                 {env_url}`."
+            ),
+        ));
     }
 
     let server_url = auth.server_url.as_ref().unwrap();

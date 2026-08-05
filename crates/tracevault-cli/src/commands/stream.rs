@@ -525,7 +525,7 @@ pub async fn run_stream(
     req.truncate_large_fields();
 
     // 6. Resolve credentials
-    let (server_url, credential) = crate::api_client::resolve_credentials(&project_root);
+    let (server_url, credential) = crate::api_client::resolve_credentials(&project_root)?;
 
     // 7. Config (loaded above, alongside the user-level context layer
     // resolution) no longer directly gates repo_id — a missing config is not

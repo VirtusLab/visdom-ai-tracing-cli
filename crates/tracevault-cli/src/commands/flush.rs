@@ -58,7 +58,7 @@ fn short_session_id(id: &str) -> &str {
 }
 
 pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let (server_url, credential) = resolve_credentials(project_root);
+    let (server_url, credential) = resolve_credentials(project_root)?;
     let server_url = server_url.ok_or("server_url not configured")?;
     let client = ApiClient::with_credential(&server_url, credential);
 

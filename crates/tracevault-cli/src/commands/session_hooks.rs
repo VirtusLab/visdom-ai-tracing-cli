@@ -175,7 +175,17 @@ pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn st
         return print_allow();
     };
 
-    let (server_url, credential) = resolve_credentials(&project_root);
+    // A credential/URL mismatch is a misconfiguration the user has to fix, but
+    // this hook must ALWAYS emit an allow response — failing it would block the
+    // prompt. Report it on stderr (where hook output is surfaced) and skip
+    // injection, exactly as a missing server URL already does.
+    let (server_url, credential) = match resolve_credentials(&project_root) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            eprintln!("Skipping context injection: {e}");
+            return print_allow();
+        }
+    };
     let Some(server_url) = server_url else {
         return print_allow();
     };

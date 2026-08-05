@@ -6,7 +6,7 @@ use crate::resolution::{resolve_repo_by_name, ResolveRepoByNameError};
 use std::path::Path;
 
 pub async fn run(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let (server_url, credential) = resolve_credentials(project_root);
+    let (server_url, credential) = resolve_credentials(project_root)?;
 
     let server_url = server_url.ok_or("No server URL configured. Run 'tracevault login' first.")?;
     let credential = credential.ok_or("Not logged in. Run 'tracevault login' first.")?;

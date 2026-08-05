@@ -49,7 +49,7 @@ pub async fn verify(
         return Ok(());
     }
 
-    let (server_url, credential) = resolve_credentials(project_root);
+    let (server_url, credential) = resolve_credentials(project_root)?;
 
     let server_url =
         match server_url {
