@@ -29,9 +29,29 @@ pub fn run_proxy_info() -> i32 {
         }
     };
 
+    let creds_path = Credentials::path();
+
+    // Resolved BEFORE any instructions are printed: the setup script below
+    // cannot be followed without a credential, so bailing here avoids
+    // sandwiching the error between steps the user is being told to perform.
+    let credential = match creds.credential() {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "The credentials file at {} holds no usable credential (no API key and no \
+                 Keycloak session).",
+                creds_path.display()
+            );
+            eprintln!(
+                "Run `tracevault login --server-url <url>`, or set TRACEVAULT_API_KEY to a \
+                 TraceVault API key (tvk_...)."
+            );
+            return 1;
+        }
+    };
+
     let server_url = creds.server_url.trim_end_matches('/');
     let proxy_url = format!("{server_url}/proxy/anthropic");
-    let creds_path = Credentials::path();
 
     println!("{ANSI_BOLD}TraceVault LLM Proxy{ANSI_RESET}");
     println!();
@@ -52,48 +72,31 @@ pub fn run_proxy_info() -> i32 {
     );
     println!();
     // `ANTHROPIC_API_KEY` is static tool configuration, so it needs a static
-    // credential. Every arm is spelled out rather than using a catch-all, so a
+    // credential. Both arms are spelled out rather than using a catch-all, so a
     // future `Credential` variant cannot silently inherit the API-key wording.
-    let exit_code = match creds.credential() {
-        Some(Credential::ApiKey(_)) => {
+    match credential {
+        Credential::ApiKey(_) => {
             println!(
                 "     {ANSI_DIM}Your TraceVault token lives in {} as the \"token\" field.{ANSI_RESET}",
                 creds_path.display()
             );
-            0
         }
         // A Keycloak access token is refreshed every few minutes and would
         // silently stop working if pasted into a static env var.
-        Some(Credential::Keycloak(_)) => {
+        Credential::Keycloak(_) => {
             println!(
                 "     {ANSI_DIM}This machine is signed in with a Keycloak session, whose access \
                  token expires every few minutes — it cannot be pasted here as a static value. \
                  Use a TraceVault API key (tvk_...) for the proxy instead.{ANSI_RESET}"
             );
-            0
         }
-        // A credentials file with neither an `auth` object nor a `token`. There
-        // is nothing to paste, so pointing at a "token" field that isn't there
-        // would send the user looking for it.
-        None => {
-            eprintln!(
-                "The credentials file at {} holds no usable credential (no API key and no \
-                 Keycloak session).",
-                creds_path.display()
-            );
-            eprintln!(
-                "Run `tracevault login --server-url <url>`, or set TRACEVAULT_API_KEY to a \
-                 TraceVault API key (tvk_...)."
-            );
-            1
-        }
-    };
+    }
     println!();
     println!("  3. Run your AI tool as usual. Requests go through TraceVault and are");
     println!("     forwarded to api.anthropic.com using the Anthropic key you stored");
     println!("     in step 1.");
 
-    exit_code
+    0
 }
 
 #[cfg(test)]

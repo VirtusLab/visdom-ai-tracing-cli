@@ -362,6 +362,11 @@ impl Credentials {
     /// credentials of instance B that the user logged into meanwhile —
     /// silently signing them out of B. Skipping is not an error: A's refreshed
     /// token still works for the rest of A's process lifetime.
+    ///
+    /// The skip warns, because it is otherwise undiagnosable from the outside:
+    /// if the two URLs differ only by formatting the mismatch is PERMANENT, so
+    /// persistence is disabled for every future invocation and the CLI silently
+    /// re-refreshes forever.
     pub fn persist_session(
         server_url: &str,
         session: &KeycloakSession,
@@ -370,6 +375,12 @@ impl Credentials {
             return Ok(());
         };
         if !same_server(&creds.server_url, server_url) {
+            eprintln!(
+                "Warning: not saving the refreshed token — the credentials file is for \
+                 '{}', but this session is for '{}'. The refreshed token applies to this \
+                 process only; every later command will refresh again.",
+                creds.server_url, server_url
+            );
             return Ok(());
         }
         creds.auth = Some(session.clone());
