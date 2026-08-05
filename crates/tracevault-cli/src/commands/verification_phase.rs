@@ -3,9 +3,7 @@ use std::path::{Path, PathBuf};
 
 use tracevault_protocol::streaming::{StreamEventRequest, StreamEventType};
 
-use crate::api_client::ApiClient;
 use crate::config::TracevaultConfig;
-use crate::credentials::Credentials;
 
 /// Send a VerificationPhaseStart event to the server, recording the current
 /// timestamp as the start of the verification phase for this session.
@@ -142,15 +140,25 @@ pub async fn open_verification_phase(
         params: None,
     };
 
-    let creds = Credentials::load().ok_or("Not logged in. Run `tracevault login` first.")?;
-    let credential = creds
-        .credential()
-        .ok_or("Credentials file has no usable token. Run `tracevault login` again.")?;
-    let server_url = config
-        .server_url
-        .as_deref()
-        .unwrap_or("https://tracevault.softwaremill.com");
-    let client = ApiClient::with_credential(server_url, Some(credential));
+    // Through `resolve_client`, like every other command — NOT by pairing
+    // `Credentials::load()` with `config.server_url` directly.
+    //
+    // This is a security fix, not tidiness. `.tracevault/config.toml` is
+    // TRACKED in user repos (the `.gitignore` this CLI writes covers only
+    // `sessions/`, `cache/` and `*.local.toml`), so a pull request that edited
+    // `server_url` made any reviewer who ran `tracevault verify-start` in that
+    // checkout POST their Keycloak access token to an arbitrary host. The
+    // refresh token is protected by the credential/URL scoping in
+    // `resolve_credentials`, but the access token went out on the very first
+    // request, ahead of every guard. Going through `resolve_client` applies
+    // that scoping here too, and picks up TRACEVAULT_API_KEY /
+    // TRACEVAULT_SERVER_URL, which this path ignored entirely.
+    //
+    // Two deliberate precedence changes come with it: the credentials file's
+    // URL now beats `config.server_url`, and having no URL configured is an
+    // error instead of a stale hardcoded default (which pointed at a
+    // softwaremill host this project has since migrated away from).
+    let client = crate::api_client::resolve_client(project_root).map_err(|e| e.to_string())?;
 
     client
         .stream_event(repo_id, &event)
@@ -426,5 +434,118 @@ mod tests {
         std::fs::create_dir_all(dir.join("origin")).unwrap();
 
         assert_eq!(origin_match(&dir, "/wt/a"), OriginMatch::Mismatch);
+    }
+
+    /// `verify-start` used to pair `Credentials::load()` with
+    /// `config.server_url` directly, bypassing everything `resolve_credentials`
+    /// enforces. Since `.tracevault/config.toml` is TRACKED in user repos, a PR
+    /// that edited `server_url` made any reviewer running this command POST
+    /// their Keycloak access token to an arbitrary host.
+    ///
+    /// Going through `resolve_client` closes it by PRECEDENCE, which is stronger
+    /// than refusing: the credentials file's own URL outranks
+    /// `config.server_url`, so a committed config can no longer redirect the
+    /// token anywhere. Proven by pointing the saved login at a local one-shot
+    /// server and the config at a host that must never be contacted — if the
+    /// old code path were still in place, no request would arrive here at all.
+    #[tokio::test]
+    async fn a_committed_config_url_cannot_redirect_the_token() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let home = tempfile::tempdir().unwrap();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("XDG_CONFIG_HOME", home.path());
+        guard.remove("TRACEVAULT_API_KEY");
+        guard.remove("TRACEVAULT_SERVER_URL");
+
+        let (login_server, rx) = crate::test_helpers::spawn_seq(vec![
+            crate::test_helpers::http_json(
+                "200 OK",
+                r#"{"session_db_id":"22222222-2222-4222-8222-222222222222","event_db_id":null,"status":"ok"}"#,
+            ),
+        ]);
+
+        // The saved login is for `login_server`.
+        let creds_dir = home.path().join("tracevault");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(
+            creds_dir.join("credentials.json"),
+            format!(
+                r#"{{"server_url":"{login_server}","email":"a@b.com","auth":{{
+                "issuer":"https://idp.example.com/realms/v","client_id":"tracevault-cli",
+                "refresh_token":"rt","access_token":"at","access_expires_at":9999999999}}}}"#
+            ),
+        )
+        .unwrap();
+
+        // The repo's committed config points somewhere else — the malicious PR.
+        let repo = tempfile::tempdir().unwrap();
+        let tv = repo.path().join(".tracevault");
+        std::fs::create_dir_all(tv.join("sessions").join("sess-1")).unwrap();
+        std::fs::write(
+            tv.join("config.toml"),
+            "repo_id = \"11111111-1111-4111-8111-111111111111\"\n\
+             server_url = \"https://attacker.invalid\"\n",
+        )
+        .unwrap();
+
+        open_verification_phase(repo.path(), repo.path(), Some("sess-1"))
+            .await
+            .expect("the event must go to the login's server");
+
+        let request = rx
+            .recv_timeout(crate::test_helpers::RECV_TIMEOUT)
+            .expect("no request reached the login's server — the config URL was used instead");
+        assert!(
+            request.contains("/api/v1/repos/11111111-1111-4111-8111-111111111111/stream"),
+            "unexpected request: {request}"
+        );
+        assert!(
+            request.contains("Bearer at"),
+            "must present the saved credential: {request}"
+        );
+    }
+
+    /// And it consults the credential/URL guard: a `TRACEVAULT_SERVER_URL`
+    /// pointing at another instance is refused before any request goes out,
+    /// rather than sending the saved token there.
+    #[tokio::test]
+    async fn a_mismatched_env_server_url_refuses_before_sending() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let home = tempfile::tempdir().unwrap();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("XDG_CONFIG_HOME", home.path());
+        guard.remove("TRACEVAULT_API_KEY");
+        guard.set("TRACEVAULT_SERVER_URL", "https://instance-a.example.com");
+
+        let creds_dir = home.path().join("tracevault");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(
+            creds_dir.join("credentials.json"),
+            r#"{"server_url":"https://instance-b.example.com","email":"a@b.com","auth":{
+                "issuer":"https://idp.example.com/realms/v","client_id":"tracevault-cli",
+                "refresh_token":"rt","access_token":"at","access_expires_at":9999999999}}"#,
+        )
+        .unwrap();
+
+        let repo = tempfile::tempdir().unwrap();
+        let tv = repo.path().join(".tracevault");
+        std::fs::create_dir_all(tv.join("sessions").join("sess-1")).unwrap();
+        std::fs::write(
+            tv.join("config.toml"),
+            "repo_id = \"11111111-1111-4111-8111-111111111111\"\n",
+        )
+        .unwrap();
+
+        let err = open_verification_phase(repo.path(), repo.path(), Some("sess-1"))
+            .await
+            .expect_err("a mismatched server URL must be refused");
+        assert!(
+            err.contains("instance-a.example.com") && err.contains("instance-b.example.com"),
+            "the refusal must name both URLs: {err}"
+        );
+        assert!(
+            err.contains("refusing to use the saved credentials"),
+            "must be the credential-scoping refusal, not a connection error: {err}"
+        );
     }
 }
