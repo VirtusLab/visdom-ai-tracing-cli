@@ -181,6 +181,16 @@ impl Credentials {
     /// parses a half-written file and concludes the user is logged out. The
     /// temp file is created in the SAME directory so the `rename` stays
     /// within one filesystem and is therefore atomic.
+    ///
+    /// The temp file is created with `create_new(true)`, which is what makes
+    /// the 0600 promise real: `OpenOptions::mode()` applies ONLY when the file
+    /// is created, so opening a path that already exists inherits whatever mode
+    /// (or symlink target) is already there, and the following `rename` would
+    /// then publish that mode as the credential file's. A stale
+    /// `.credentials.json.tmp*` left by an earlier crash under a looser umask
+    /// is enough to defeat it. `create_new` turns that case into
+    /// `AlreadyExists`, which we resolve by picking a fresh name rather than
+    /// failing the save.
     pub fn save(&self) -> Result<(), std::io::Error> {
         let path = Self::path();
         if let Some(parent) = path.parent() {
@@ -188,12 +198,10 @@ impl Credentials {
         }
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
 
-        // Include the pid so two concurrent writers can't clobber each
-        // other's temp file mid-write.
-        let tmp = path.with_file_name(format!(".credentials.json.tmp{}", std::process::id()));
-
         let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        // `create_new` also refuses to follow a symlink planted at the temp
+        // path, so tokens cannot be written outside this directory.
+        opts.write(true).create_new(true);
         // Mode is set at creation, not after: a chmod afterwards would leave
         // the tokens world-readable for the interval in between.
         #[cfg(unix)]
@@ -202,20 +210,68 @@ impl Credentials {
             opts.mode(0o600);
         }
 
-        let write_result = opts.open(&tmp).and_then(|mut f| {
-            use std::io::Write;
-            f.write_all(json.as_bytes())?;
-            f.sync_all()
-        });
-        if let Err(e) = write_result {
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
+        // A few attempts, since each `AlreadyExists` means a genuinely
+        // different name is tried next (the counter is process-local and
+        // monotonic, and the nanos component differs per attempt). Bounded so a
+        // pathological directory can't spin here forever.
+        const ATTEMPTS: usize = 8;
+        let mut last_err = None;
+        for _ in 0..ATTEMPTS {
+            let tmp = path.with_file_name(Self::temp_file_name());
+            let file = match opts.open(&tmp) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            let write_result = (|| {
+                use std::io::Write;
+                let mut file = file;
+                file.write_all(json.as_bytes())?;
+                file.sync_all()
+            })();
+            if let Err(e) = write_result {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
+            if let Err(e) = fs::rename(&tmp, &path) {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
+            return Ok(());
         }
-        if let Err(e) = fs::rename(&tmp, &path) {
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
-        }
-        Ok(())
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not create a unique temporary credentials file",
+            )
+        }))
+    }
+
+    /// A temp file name unique per process AND per call within a process.
+    ///
+    /// The pid alone is not enough: two saves in one process (a refresh racing
+    /// the second `save()` of a login) would collide on the same path, and with
+    /// `create_new` that turns into a spurious failure. The counter makes it
+    /// unique within the process; the nanos make a name unlikely to collide
+    /// with a stale file left by a previous process that had the same pid.
+    fn temp_file_name() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        format!(
+            ".credentials.json.tmp{}.{}.{}",
+            std::process::id(),
+            n,
+            nanos
+        )
     }
 
     /// Persist refreshed Keycloak tokens, keeping every other field of the
@@ -445,6 +501,101 @@ mod tests {
         }
 
         // The atomic-write temp file must not be left behind.
+        let leftovers: Vec<_> = fs::read_dir(dir.path().join("tracevault"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "credentials.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    /// A stale temp file must not donate its mode to the credential file.
+    ///
+    /// `OpenOptions::mode()` only applies at CREATION, so opening an existing
+    /// path keeps that path's mode — and the `rename` would then publish it as
+    /// `credentials.json`'s. A crash under a looser umask is enough to leave
+    /// such a file behind. This test pre-creates the exact temp path the old
+    /// pid-only scheme used, with mode 0644; it fails (0644) without
+    /// `create_new` + a unique suffix, and passes (0600) with them.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_world_readable_temp_file_cannot_relax_the_credential_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        let creds_dir = dir.path().join("tracevault");
+        fs::create_dir_all(&creds_dir).unwrap();
+        let stale = creds_dir.join(format!(".credentials.json.tmp{}", std::process::id()));
+        fs::write(&stale, "leftover from a crashed run").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).unwrap();
+
+        Credentials::keycloak(
+            "https://example.com",
+            "a@b.com".into(),
+            KeycloakSession {
+                issuer: "i".into(),
+                client_id: "c".into(),
+                refresh_token: "rt".into(),
+                access_token: "at".into(),
+                access_expires_at: 1,
+            },
+        )
+        .save()
+        .expect("a stale temp file must not fail the save");
+
+        let mode = fs::metadata(Credentials::path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "credentials.json inherited the stale temp file's mode"
+        );
+        // The tokens must not have been written into the stale file either.
+        let stale_contents = fs::read_to_string(&stale).unwrap();
+        assert!(
+            !stale_contents.contains("rt"),
+            "secrets were written into the pre-existing temp file: {stale_contents}"
+        );
+    }
+
+    /// Two saves in one process must both succeed: with `create_new` and a
+    /// pid-only temp name they would collide on the same path, so the name also
+    /// carries a process-local counter.
+    #[test]
+    fn repeated_saves_in_one_process_do_not_collide() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        let session = KeycloakSession {
+            issuer: "i".into(),
+            client_id: "c".into(),
+            refresh_token: "rt".into(),
+            access_token: "at".into(),
+            access_expires_at: 1,
+        };
+        for i in 0..5 {
+            Credentials::keycloak(
+                "https://example.com",
+                format!("a{i}@b.com"),
+                session.clone(),
+            )
+            .save()
+            .unwrap_or_else(|e| panic!("save #{i} failed: {e}"));
+        }
+        assert_eq!(Credentials::load().unwrap().email, "a4@b.com");
+
+        // No temp files left behind by any of the attempts.
         let leftovers: Vec<_> = fs::read_dir(dir.path().join("tracevault"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
