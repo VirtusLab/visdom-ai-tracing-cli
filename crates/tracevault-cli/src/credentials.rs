@@ -81,6 +81,25 @@ impl fmt::Debug for KeycloakSession {
     }
 }
 
+/// Whether two TraceVault base URLs identify the same instance.
+///
+/// Needed because the two sides reach us differently formatted from the same
+/// user-supplied string: `ApiClient` trims trailing slashes from its
+/// `base_url`, while `credentials.json` stores `server_url` exactly as it was
+/// passed to `tracevault login`. So `https://tv.example.com/` and
+/// `https://tv.example.com` must compare equal, or a legitimate session would
+/// never be adopted.
+///
+/// Comparison is otherwise byte-exact (no host lowercasing, no default-port
+/// folding). That is deliberate: both values originate from the same string in
+/// every real flow, and the two failure directions are not symmetric. A false
+/// negative costs one extra token refresh; a false positive would send an
+/// access token to a host it was not minted for. When in doubt, don't match.
+pub fn same_server(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_end_matches('/').to_string();
+    norm(a) == norm(b)
+}
+
 /// How a request authenticates itself.
 #[derive(Clone)]
 pub enum Credential {
@@ -274,17 +293,30 @@ impl Credentials {
         )
     }
 
-    /// Persist refreshed Keycloak tokens, keeping every other field of the
-    /// file as it is on disk.
+    /// Persist refreshed Keycloak tokens for `server_url`, keeping every other
+    /// field of the file as it is on disk.
     ///
     /// Re-reads the file rather than rewriting a cached copy so a
     /// concurrently changed `server_url`/`email` isn't reverted. A missing
     /// file is not an error: there is nothing to keep in sync (the session
     /// may be held by a process whose file was removed by `tv logout`).
-    pub fn persist_session(session: &KeycloakSession) -> Result<(), std::io::Error> {
+    ///
+    /// Writes NOTHING when the file on disk belongs to a different server (see
+    /// [`same_server`]). There is one credentials file, so a long-running
+    /// process holding instance A's session would otherwise overwrite the
+    /// credentials of instance B that the user logged into meanwhile —
+    /// silently signing them out of B. Skipping is not an error: A's refreshed
+    /// token still works for the rest of A's process lifetime.
+    pub fn persist_session(
+        server_url: &str,
+        session: &KeycloakSession,
+    ) -> Result<(), std::io::Error> {
         let Some(mut creds) = Self::load() else {
             return Ok(());
         };
+        if !same_server(&creds.server_url, server_url) {
+            return Ok(());
+        }
         creds.auth = Some(session.clone());
         creds.save()
     }
@@ -630,7 +662,7 @@ mod tests {
             },
             1_000,
         );
-        Credentials::persist_session(&session).unwrap();
+        Credentials::persist_session("https://example.com", &session).unwrap();
 
         let reloaded = Credentials::load().unwrap();
         assert_eq!(reloaded.email, "a@b.com");
@@ -639,6 +671,74 @@ mod tests {
         assert_eq!(auth.access_token, "at2");
         assert_eq!(auth.refresh_token, "rt2");
         assert_eq!(auth.access_expires_at, 1_300);
+    }
+
+    /// One credentials file, several possible TraceVault instances: persisting
+    /// a refresh for instance A must not clobber a file that now belongs to
+    /// instance B, which would silently sign the user out of B.
+    #[test]
+    fn persist_session_leaves_another_servers_file_alone() {
+        let original = r#"{"server_url":"https://instance-b.example.com","email":"b@b.com","auth":{"issuer":"i","client_id":"c","refresh_token":"b-rt","access_token":"b-at","access_expires_at":99}}"#;
+        let (_dir, _lock, _guard) = with_credentials_file(original);
+
+        let a_session = KeycloakSession {
+            issuer: "i".into(),
+            client_id: "c".into(),
+            refresh_token: "a-rt".into(),
+            access_token: "a-at".into(),
+            access_expires_at: 1_234,
+        };
+        Credentials::persist_session("https://instance-a.example.com", &a_session)
+            .expect("a foreign file is a skip, not an error");
+
+        let after = fs::read_to_string(Credentials::path()).unwrap();
+        assert_eq!(after, original, "another server's file was overwritten");
+    }
+
+    /// The two sides of the comparison are formatted differently by
+    /// construction (`ApiClient` trims trailing slashes, the file keeps what
+    /// login was given), so a trailing slash must still count as a match.
+    #[test]
+    fn persist_session_matches_a_server_url_differing_by_a_trailing_slash() {
+        let (_dir, _lock, _guard) = with_credentials_file(
+            r#"{"server_url":"https://example.com/","email":"a@b.com","auth":{"issuer":"i","client_id":"c","refresh_token":"rt","access_token":"at","access_expires_at":1}}"#,
+        );
+
+        let session = KeycloakSession {
+            issuer: "i".into(),
+            client_id: "c".into(),
+            refresh_token: "rt2".into(),
+            access_token: "at2".into(),
+            access_expires_at: 4_242,
+        };
+        Credentials::persist_session("https://example.com", &session).unwrap();
+
+        let auth = Credentials::load().unwrap().auth.unwrap();
+        assert_eq!(
+            auth.access_token, "at2",
+            "a trailing slash must not block a legitimate persist"
+        );
+    }
+
+    #[test]
+    fn same_server_normalises_trailing_slashes_and_whitespace() {
+        assert!(same_server(
+            "https://x.example.com",
+            "https://x.example.com/"
+        ));
+        assert!(same_server(
+            " https://x.example.com/ ",
+            "https://x.example.com"
+        ));
+        assert!(!same_server(
+            "https://x.example.com",
+            "https://y.example.com"
+        ));
+        // A different path is a different instance, not a formatting variant.
+        assert!(!same_server(
+            "https://x.example.com",
+            "https://x.example.com/tv"
+        ));
     }
 
     #[test]
@@ -655,7 +755,7 @@ mod tests {
             access_token: "at".into(),
             access_expires_at: 1,
         };
-        Credentials::persist_session(&session)
+        Credentials::persist_session("https://example.com", &session)
             .expect("a logged-out user must not turn a refresh into a hard error");
         assert!(
             !Credentials::path().exists(),

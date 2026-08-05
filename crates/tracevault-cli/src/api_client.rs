@@ -348,6 +348,18 @@ impl ApiClient {
     /// `invalid_grant` — surfacing as a spurious "your session has expired" —
     /// and this code then needs a real inter-process file lock around
     /// read-refresh-write, not just the adopt.
+    ///
+    /// # Both directions are scoped to this client's server
+    ///
+    /// There is exactly ONE credentials file, but a machine can be pointed at
+    /// more than one TraceVault instance. So the adopt only reads, and
+    /// `persist_session` only writes, when that file's `server_url` is this
+    /// client's `base_url` (see [`crate::credentials::same_server`]).
+    /// Unscoped, a long-running `tracevault stream` against instance A plus a
+    /// `tracevault login` to instance B in another terminal would make A adopt
+    /// B's session and send B's access token to A — disclosing a token to a
+    /// host it was never minted for — and A's next refresh would then overwrite
+    /// B's credentials, signing the user out of B.
     async fn refresh_locked(&self, session: &mut KeycloakSession) -> Result<(), AuthError> {
         let now = (self.now)();
 
@@ -362,7 +374,12 @@ impl ApiClient {
         // disk session being fresh would leave exactly the case this exists to
         // prevent: refreshing with an in-memory token another client already
         // consumed.
-        if let Some(disk) = Credentials::load().and_then(|c| c.auth) {
+        //
+        // ... but only if that file is still this server's (see above).
+        if let Some(disk) = Credentials::load()
+            .filter(|c| crate::credentials::same_server(&c.server_url, &self.base_url))
+            .and_then(|c| c.auth)
+        {
             if disk.refresh_token != session.refresh_token {
                 let disk_needs_refresh = disk.needs_refresh(now);
                 *session = disk;
@@ -388,10 +405,11 @@ impl ApiClient {
         .map_err(auth_error)?;
         session.apply(&tokens, now);
 
-        // Best-effort: a token that can't be written to disk still works for
-        // THIS process, so failing the request would be worse than a warning.
-        // The message deliberately contains no token material.
-        if let Err(e) = Credentials::persist_session(session) {
+        // Best-effort, and scoped to this server (see the doc comment): a token
+        // that can't be written to disk still works for THIS process, so
+        // failing the request would be worse than a warning. The message
+        // deliberately contains no token material.
+        if let Err(e) = Credentials::persist_session(&self.base_url, session) {
             eprintln!("Warning: could not save refreshed credentials: {e}");
         }
         Ok(())
@@ -916,15 +934,19 @@ mod tests {
         })
     }
 
-    /// Point `XDG_CONFIG_HOME` at a tempdir holding a Keycloak credentials
-    /// file for `issuer`, so a refresh has something to persist into.
-    fn write_keycloak_file(dir: &std::path::Path, issuer: &str, expires_at: i64) {
+    /// Write a Keycloak credentials file for `server_url`/`issuer` into
+    /// `dir`, so a refresh has something to adopt from and persist into.
+    ///
+    /// `server_url` is explicit because the adopt and the persist are both
+    /// scoped to the client's `base_url`: a helper that hardcoded it would
+    /// silently disable persistence in tests whose client points elsewhere.
+    fn write_keycloak_file(dir: &std::path::Path, server_url: &str, issuer: &str, expires_at: i64) {
         let creds_dir = dir.join("tracevault");
         std::fs::create_dir_all(&creds_dir).unwrap();
         std::fs::write(
             creds_dir.join("credentials.json"),
             format!(
-                r#"{{"server_url":"https://example.com","email":"a@b.com","auth":{{"issuer":"{issuer}","client_id":"tracevault-cli","refresh_token":"old-rt","access_token":"old-at","access_expires_at":{expires_at}}}}}"#
+                r#"{{"server_url":"{server_url}","email":"a@b.com","auth":{{"issuer":"{issuer}","client_id":"tracevault-cli","refresh_token":"old-rt","access_token":"old-at","access_expires_at":{expires_at}}}}}"#
             ),
         )
         .unwrap();
@@ -953,7 +975,7 @@ mod tests {
         let (issuer, rx) =
             spawn_idp(r#"{"access_token":"fresh-at","refresh_token":"fresh-rt","expires_in":300}"#);
         // 30s of life left — inside the window.
-        write_keycloak_file(dir.path(), &issuer, NOW + 30);
+        write_keycloak_file(dir.path(), "https://example.com", &issuer, NOW + 30);
 
         let client = ApiClient::with_credential(
             "https://example.com",
@@ -1027,6 +1049,104 @@ mod tests {
             .await
             .expect("adopting the on-disk session must not require the IdP");
         assert_eq!(token.as_deref(), Some("other-process-at"));
+    }
+
+    /// `ApiClient` trims trailing slashes off its `base_url`, but
+    /// `credentials.json` stores `server_url` exactly as it was passed to
+    /// `tracevault login`. Comparing raw strings would therefore skip the
+    /// adopt for a perfectly legitimate same-server file.
+    #[tokio::test]
+    async fn adopt_matches_a_stored_server_url_with_a_trailing_slash() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        // Stored WITH a trailing slash; the client's base_url has none.
+        write_keycloak_file(
+            dir.path(),
+            "https://example.com/",
+            "http://127.0.0.1:1",
+            NOW + 3600,
+        );
+        let mut on_disk = Credentials::load().unwrap();
+        on_disk.auth.as_mut().unwrap().refresh_token = "rotated-rt".into();
+        on_disk.auth.as_mut().unwrap().access_token = "other-process-at".into();
+        on_disk.save().unwrap();
+
+        let client = ApiClient::with_credential(
+            "https://example.com",
+            Some(Credential::Keycloak(session(
+                "http://127.0.0.1:1",
+                NOW + 10,
+            ))),
+        )
+        .with_now(fixed_now);
+
+        // The issuer is a dead port, so an un-adopted session could only fail.
+        let token = client
+            .bearer()
+            .await
+            .expect("a trailing slash must not prevent the adopt");
+        assert_eq!(token.as_deref(), Some("other-process-at"));
+    }
+
+    /// There is one credentials file but a machine can target several
+    /// TraceVault instances. A file belonging to instance B must NOT be adopted
+    /// by a client talking to instance A (that would send B's token to A), and
+    /// A's refreshed session must NOT overwrite B's file (that would sign the
+    /// user out of B).
+    #[tokio::test]
+    async fn a_credentials_file_for_another_server_is_neither_adopted_nor_overwritten() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        let (issuer, rx) = spawn_idp(
+            r#"{"access_token":"a-fresh-at","refresh_token":"a-fresh-rt","expires_in":300}"#,
+        );
+
+        // On disk: instance B's session, freshly written by `tv login` in
+        // another terminal. Different refresh token, plenty of life left — so
+        // an unscoped adopt WOULD take it.
+        let creds_dir = dir.path().join("tracevault");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        let b_file = format!(
+            r#"{{"server_url":"https://instance-b.example.com","email":"b@b.com","auth":{{"issuer":"{issuer}","client_id":"tracevault-cli","refresh_token":"b-rt","access_token":"b-at","access_expires_at":{}}}}}"#,
+            NOW + 3600
+        );
+        std::fs::write(creds_dir.join("credentials.json"), &b_file).unwrap();
+
+        // This client talks to instance A and holds A's own session.
+        let client = ApiClient::with_credential(
+            "https://instance-a.example.com",
+            Some(Credential::Keycloak(session(&issuer, NOW + 10))),
+        )
+        .with_now(fixed_now);
+
+        let token = client.bearer().await.expect("A's own refresh must succeed");
+        assert_eq!(token.as_deref(), "a-fresh-at".into());
+
+        // The refresh used A's OWN in-memory token — B's was never presented.
+        let _discovery = rx.recv_timeout(RECV_TIMEOUT).expect("no discovery request");
+        let refresh = rx.recv_timeout(RECV_TIMEOUT).expect("no token request");
+        assert!(
+            refresh.contains("refresh_token=old-rt"),
+            "A must refresh with its own token: {refresh}"
+        );
+        assert!(
+            !refresh.contains("b-rt"),
+            "another server's refresh token must never be presented: {refresh}"
+        );
+
+        // And B's credentials file is untouched: byte-identical to what
+        // `tv login` wrote for B.
+        let after = std::fs::read_to_string(creds_dir.join("credentials.json")).unwrap();
+        assert_eq!(
+            after, b_file,
+            "instance A's refresh overwrote instance B's credentials"
+        );
     }
 
     /// The interleaving that makes the adopt unconditional: the on-disk
@@ -1147,12 +1267,14 @@ mod tests {
 
         let (issuer, _idp_rx) =
             spawn_idp(r#"{"access_token":"fresh-at","refresh_token":"fresh-rt","expires_in":300}"#);
-        write_keycloak_file(dir.path(), &issuer, NOW + 3600);
-
         let (base, rx) = spawn_seq(vec![
             http_json("401 Unauthorized", r#"{"error":"expired"}"#),
             http_json("200 OK", "[]"),
         ]);
+        // The file is for THIS client's server, so the refreshed session is
+        // persisted rather than skipped by the same-server guard.
+        write_keycloak_file(dir.path(), &base, &issuer, NOW + 3600);
+
         // Far from expiry: the proactive window must NOT be what triggers the
         // refresh here — the 401 must.
         let client = ApiClient::with_credential(
@@ -1199,13 +1321,12 @@ mod tests {
 
         let (issuer, _idp_rx) =
             spawn_idp(r#"{"access_token":"fresh-at","refresh_token":"fresh-rt","expires_in":300}"#);
-        write_keycloak_file(dir.path(), &issuer, NOW + 3600);
-
         let (base, rx) = spawn_seq(vec![
             http_json("401 Unauthorized", r#"{"error":"nope"}"#),
             http_json("401 Unauthorized", r#"{"error":"nope"}"#),
             http_json("200 OK", "[]"),
         ]);
+        write_keycloak_file(dir.path(), &base, &issuer, NOW + 3600);
         let client = ApiClient::with_credential(
             &base,
             Some(Credential::Keycloak(session(&issuer, NOW + 3600))),
@@ -1243,7 +1364,7 @@ mod tests {
                 http_json("400 Bad Request", r#"{"error":"invalid_grant"}"#),
             ]
         });
-        write_keycloak_file(dir.path(), &issuer, NOW + 10);
+        write_keycloak_file(dir.path(), "http://127.0.0.1:1", &issuer, NOW + 10);
 
         let client = ApiClient::with_credential(
             "http://127.0.0.1:1",
