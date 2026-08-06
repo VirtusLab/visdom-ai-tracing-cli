@@ -385,7 +385,19 @@ impl ApiClient {
         //   `invalid_grant`.
         //
         // Deliberately NOT "the access tokens differ": that would also adopt a
-        // strictly older session, downgrading a fresher one we already hold.
+        // strictly older session.
+        //
+        // There is deliberately no test asserting "never adopt an older
+        // session", because that property is unreachable where it would be
+        // desirable and undesirable where it is reachable. Through `bearer` it
+        // cannot be observed: this function is only entered when OURS is inside
+        // the refresh window, so an older disk session is inside it too and
+        // control falls through to a real refresh either way. Through
+        // `force_refresh` it IS reachable — and there, adopting a different
+        // token is exactly what we want, since the one we hold was just
+        // rejected. A test naming the downgrade would therefore have to be
+        // vacuous to pass; the predicate's existence is instead covered by the
+        // 401 retry tests, which fail if it always adopts.
         //
         // ... and only from a file that is still this server's (see above).
         if let Some(disk) = Credentials::load()
@@ -1209,46 +1221,6 @@ mod tests {
             .await
             .expect("a fresher on-disk session must be adopted, not re-refreshed");
         assert_eq!(token.as_deref(), Some("refreshed-by-someone-else"));
-    }
-
-    /// The converse: an on-disk session that is OLDER, with the same refresh
-    /// token, must not be adopted — that would downgrade the token we hold.
-    #[tokio::test]
-    async fn bearer_does_not_adopt_an_older_session() {
-        let _env_lock = crate::test_helpers::lock_env_mutation().await;
-        let dir = tempfile::tempdir().unwrap();
-        let mut _guard = crate::test_helpers::EnvVarGuard::new();
-        _guard.set("XDG_CONFIG_HOME", dir.path());
-
-        let creds_dir = dir.path().join("tracevault");
-        std::fs::create_dir_all(&creds_dir).unwrap();
-        std::fs::write(
-            creds_dir.join("credentials.json"),
-            format!(
-                r#"{{"server_url":"https://example.com","email":"a@b.com","auth":{{"issuer":"http://127.0.0.1:1","client_id":"tracevault-cli","refresh_token":"old-rt","access_token":"stale-at","access_expires_at":{}}}}}"#,
-                NOW + 100
-            ),
-        )
-        .unwrap();
-
-        // Ours is valid for an hour; the file's expires in 100s. No refresh is
-        // needed at all, so a dead issuer is harmless — and the token we return
-        // must still be ours.
-        let client = ApiClient::with_credential(
-            "https://example.com",
-            Some(Credential::Keycloak(session(
-                "http://127.0.0.1:1",
-                NOW + 3600,
-            ))),
-        )
-        .with_now(fixed_now);
-
-        let token = client.bearer().await.unwrap();
-        assert_eq!(
-            token.as_deref(),
-            Some("old-at"),
-            "an older on-disk session must not replace a fresher in-memory one"
-        );
     }
 
     /// Outside the window the stored token is used as-is. The issuer points
