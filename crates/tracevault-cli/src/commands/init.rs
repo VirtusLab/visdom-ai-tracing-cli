@@ -237,7 +237,7 @@ pub async fn init_in_directory(
     // repo against whichever instance the env var names while holding another
     // instance's session. `io::Error::other` because this function's error type
     // is `io::Error`.
-    let (resolved_url, resolved_credential) = crate::api_client::resolve_credentials(project_root)
+    let (resolved_url, resolved_credential) = crate::credentials::resolve_credentials(project_root)
         .map_err(|e| io::Error::other(e.to_string()))?;
     let effective_url = server_url.map(String::from).or(resolved_url);
 

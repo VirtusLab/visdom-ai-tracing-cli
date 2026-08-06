@@ -1,5 +1,6 @@
-use crate::api_client::{resolve_credentials, ApiClient};
+use crate::api_client::ApiClient;
 use crate::config::TracevaultConfig;
+use crate::credentials::resolve_credentials;
 use serde_json::json;
 use std::path::Path;
 use std::process::Command;

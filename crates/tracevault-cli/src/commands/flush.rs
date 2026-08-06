@@ -1,4 +1,5 @@
-use crate::api_client::{resolve_credentials, ApiClient};
+use crate::api_client::ApiClient;
+use crate::credentials::resolve_credentials;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;

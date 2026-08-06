@@ -1,4 +1,5 @@
-use crate::api_client::{resolve_credentials, ApiClient, CheckPoliciesRequest, SessionCheckData};
+use crate::api_client::{ApiClient, CheckPoliciesRequest, SessionCheckData};
+use crate::credentials::resolve_credentials;
 use crate::resolution::{resolve_repo_by_name, ResolveRepoByNameError};
 use std::collections::HashSet;
 use std::fs;

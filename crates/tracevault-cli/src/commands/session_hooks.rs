@@ -10,7 +10,8 @@ use serde::Serialize;
 
 use tracevault_protocol::hooks::{parse_hook_event, HookEvent};
 
-use crate::api_client::{resolve_credentials, ApiClient};
+use crate::api_client::ApiClient;
+use crate::credentials::resolve_credentials;
 use crate::resolution::{binding_from_config, effective_binding, ResolveInputs};
 
 /// Claude Code hook output. Field names are camelCase to match CC's contract

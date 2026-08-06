@@ -1,7 +1,8 @@
 //! `tracevault agent-policies` — fetch agent-readable Markdown instructions
 //! rendered server-side from the active policies for the current repo.
 
-use crate::api_client::{resolve_credentials, ApiClient};
+use crate::api_client::ApiClient;
+use crate::credentials::resolve_credentials;
 use crate::resolution::{resolve_repo_by_name, ResolveRepoByNameError};
 use std::path::Path;
 

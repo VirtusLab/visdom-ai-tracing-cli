@@ -1,4 +1,5 @@
-use crate::api_client::{resolve_credentials, ApiClient};
+use crate::api_client::ApiClient;
+use crate::credentials::resolve_credentials;
 use crate::resolution::{git_remote_url, git_repo_name};
 use std::path::Path;
 

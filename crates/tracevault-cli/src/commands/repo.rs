@@ -2,7 +2,8 @@
 
 use std::path::Path;
 
-use crate::api_client::{resolve_client, resolve_credentials, ApiClient};
+use crate::api_client::{resolve_client, ApiClient};
+use crate::credentials::resolve_credentials;
 use crate::resolution::{
     binding_from_config, effective_binding, resolve_path_to_binding, BindingSource, ResolveInputs,
 };

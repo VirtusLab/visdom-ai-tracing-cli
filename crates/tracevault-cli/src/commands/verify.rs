@@ -1,4 +1,5 @@
-use crate::api_client::{resolve_credentials, ApiClient, CiVerifyRequest};
+use crate::api_client::{ApiClient, CiVerifyRequest};
+use crate::credentials::resolve_credentials;
 use crate::resolution::{resolve_repo_by_name, ResolveRepoByNameError};
 use std::path::Path;
 use std::process::Command;
