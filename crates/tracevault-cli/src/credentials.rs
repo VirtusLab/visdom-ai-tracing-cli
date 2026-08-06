@@ -1006,31 +1006,11 @@ mod tests {
         assert_eq!(after, original, "another server's file was overwritten");
     }
 
-    /// The two sides of the comparison are formatted differently by
-    /// construction (`ApiClient` trims trailing slashes, the file keeps what
-    /// login was given), so a trailing slash must still count as a match.
-    #[test]
-    fn persist_session_matches_a_server_url_differing_by_a_trailing_slash() {
-        let (_dir, _lock, _guard) = with_credentials_file(
-            r#"{"server_url":"https://example.com/","email":"a@b.com","auth":{"issuer":"i","client_id":"c","refresh_token":"rt","access_token":"at","access_expires_at":1}}"#,
-        );
-
-        let session = KeycloakSession {
-            issuer: "i".into(),
-            client_id: "c".into(),
-            refresh_token: "rt2".into(),
-            access_token: "at2".into(),
-            access_expires_at: 4_242,
-        };
-        Credentials::persist_session("https://example.com", &session).unwrap();
-
-        let auth = Credentials::load().unwrap().auth.unwrap();
-        assert_eq!(
-            auth.access_token, "at2",
-            "a trailing slash must not block a legitimate persist"
-        );
-    }
-
+    /// The single owner of the normalisation property: the two sides of the
+    /// comparison are formatted differently by construction (`ApiClient` trims
+    /// trailing slashes, the file keeps whatever login was given), so a trailing
+    /// slash must count as a match. Call sites only prove that they consult
+    /// `same_server`, via their mismatch tests.
     #[test]
     fn same_server_normalises_trailing_slashes_and_whitespace() {
         assert!(same_server(

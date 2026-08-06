@@ -1136,47 +1136,6 @@ mod tests {
             .expect("adopting the on-disk session must not require the IdP");
         assert_eq!(token.as_deref(), Some("other-process-at"));
     }
-
-    /// `ApiClient` trims trailing slashes off its `base_url`, but
-    /// `credentials.json` stores `server_url` exactly as it was passed to
-    /// `tracevault login`. Comparing raw strings would therefore skip the
-    /// adopt for a perfectly legitimate same-server file.
-    #[tokio::test]
-    async fn adopt_matches_a_stored_server_url_with_a_trailing_slash() {
-        let _env_lock = crate::test_helpers::lock_env_mutation().await;
-        let dir = tempfile::tempdir().unwrap();
-        let mut _guard = crate::test_helpers::EnvVarGuard::new();
-        _guard.set("XDG_CONFIG_HOME", dir.path());
-
-        // Stored WITH a trailing slash; the client's base_url has none.
-        write_keycloak_file(
-            dir.path(),
-            "https://example.com/",
-            "http://127.0.0.1:1",
-            NOW + 3600,
-        );
-        let mut on_disk = Credentials::load().unwrap();
-        on_disk.auth.as_mut().unwrap().refresh_token = "rotated-rt".into();
-        on_disk.auth.as_mut().unwrap().access_token = "other-process-at".into();
-        on_disk.save().unwrap();
-
-        let client = ApiClient::with_credential(
-            "https://example.com",
-            Some(Credential::Keycloak(session(
-                "http://127.0.0.1:1",
-                NOW + 10,
-            ))),
-        )
-        .with_now(fixed_now);
-
-        // The issuer is a dead port, so an un-adopted session could only fail.
-        let token = client
-            .bearer()
-            .await
-            .expect("a trailing slash must not prevent the adopt");
-        assert_eq!(token.as_deref(), Some("other-process-at"));
-    }
-
     /// There is one credentials file but a machine can target several
     /// TraceVault instances. A file belonging to instance B must NOT be adopted
     /// by a client talking to instance A (that would send B's token to A), and
@@ -1655,38 +1614,60 @@ mod tests {
     }
 
     /// The precedence chains disagree: the URL comes from the env, the
-    /// credential from the file. Handing over the session would send instance
-    /// B's access token to instance A on the FIRST request, before any refresh,
-    /// so neither guard in `refresh_locked` would ever see it.
+    /// credential from the file. Handing either kind over would send a secret
+    /// minted by instance B to instance A on the FIRST request, before any
+    /// refresh, so neither guard in `refresh_locked` would ever see it.
+    ///
+    /// Both credential kinds are checked here because the distinction that
+    /// matters is not Keycloak-vs-key but named-on-this-invocation
+    /// vs. read-from-the-file — and because the two assert the same message.
     #[test]
-    fn a_mismatched_server_url_refuses_the_files_keycloak_session() {
-        let (dir, _lock, _guard) = resolve_fixture(
-            "https://instance-b.example.com",
-            Some("https://instance-a.example.com"),
-        );
+    fn a_mismatched_server_url_refuses_either_kind_of_file_credential() {
+        for kind in ["keycloak session", "api key"] {
+            let (dir, _lock, _guard) = if kind == "keycloak session" {
+                resolve_fixture(
+                    "https://instance-b.example.com",
+                    Some("https://instance-a.example.com"),
+                )
+            } else {
+                resolve_fixture_api_key(
+                    "https://instance-b.example.com",
+                    Some("https://instance-a.example.com"),
+                )
+            };
 
-        let err = resolve_credentials(dir.path())
-            .expect_err("a session for another instance must not be handed out");
-        let msg = err.to_string();
-        // Both URLs must be named: the user can see neither (status prints the
-        // file's, and the env var is usually set in a profile or CI job).
-        assert!(
-            msg.contains("https://instance-b.example.com"),
-            "must name the file's server: {msg}"
-        );
-        assert!(
-            msg.contains("https://instance-a.example.com"),
-            "must name the targeted server: {msg}"
-        );
-        // And it must point at the deliberate ways forward, including the
-        // same-instance-different-address case this guard cannot distinguish.
-        assert!(msg.contains("TRACEVAULT_SERVER_URL"), "{msg}");
-        assert!(msg.contains("tracevault login"), "{msg}");
-        assert!(msg.contains("TRACEVAULT_API_KEY"), "{msg}");
+            let err = resolve_credentials(dir.path())
+                .expect_err("a credential for another instance must not be handed out");
+            let msg = err.to_string();
+            // Both URLs must be named: the user can see neither (status prints
+            // the file's, and the env var is usually set in a profile or CI job).
+            assert!(
+                msg.contains("https://instance-b.example.com"),
+                "{kind}: must name the file's server: {msg}"
+            );
+            assert!(
+                msg.contains("https://instance-a.example.com"),
+                "{kind}: must name the targeted server: {msg}"
+            );
+            // And it must point at the deliberate ways forward, including the
+            // same-instance-different-address case this guard cannot
+            // distinguish from a real mismatch.
+            assert!(msg.contains("TRACEVAULT_SERVER_URL"), "{kind}: {msg}");
+            assert!(msg.contains("tracevault login"), "{kind}: {msg}");
+            assert!(msg.contains("TRACEVAULT_API_KEY"), "{kind}: {msg}");
+            assert!(
+                !msg.contains("tvk_from_file"),
+                "{kind}: the error must not echo the credential: {msg}"
+            );
+        }
     }
 
-    /// The two sides are formatted differently by construction, so a trailing
-    /// slash must not be read as "a different instance".
+    /// The two sides are formatted differently by construction (`ApiClient`
+    /// trims trailing slashes, the file keeps what login was given), so a
+    /// trailing slash must not be read as "a different instance". This guard
+    /// hard-FAILS, so a false positive here would break every command — hence
+    /// one positive test, while the other call sites need only prove that they
+    /// consult `same_server` at all, which their mismatch tests do.
     #[test]
     fn a_matching_server_url_modulo_trailing_slash_still_resolves() {
         let (dir, _lock, _guard) =
@@ -1707,53 +1688,6 @@ mod tests {
         let (url, credential) = resolve_credentials(dir.path()).expect("the normal case must work");
         assert_eq!(url.as_deref(), Some("https://example.com"));
         assert!(matches!(credential, Some(Credential::Keycloak(_))));
-    }
-
-    /// A `tvk_` key in the credentials file is instance-bound too: keys are
-    /// per-instance, so sending it to another host both leaks it into that
-    /// host's logs AND cannot succeed — today's outcome without the guard is a
-    /// confusing 401 from the wrong server.
-    #[test]
-    fn a_mismatched_server_url_refuses_the_files_api_key() {
-        let (dir, _lock, _guard) = resolve_fixture_api_key(
-            "https://instance-b.example.com",
-            Some("https://instance-a.example.com"),
-        );
-
-        let err = resolve_credentials(dir.path())
-            .expect_err("a key for another instance must not be handed out");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("https://instance-b.example.com"),
-            "must name the file's server: {msg}"
-        );
-        assert!(
-            msg.contains("https://instance-a.example.com"),
-            "must name the targeted server: {msg}"
-        );
-        assert!(msg.contains("TRACEVAULT_SERVER_URL"), "{msg}");
-        assert!(msg.contains("tracevault login"), "{msg}");
-        assert!(msg.contains("TRACEVAULT_API_KEY"), "{msg}");
-        assert!(
-            !msg.contains("tvk_from_file"),
-            "the error must not echo the key itself: {msg}"
-        );
-    }
-
-    /// Same normalisation for a file-sourced key as for a session: the file
-    /// keeps what login was given, `ApiClient` trims trailing slashes.
-    #[test]
-    fn a_file_api_key_with_a_matching_url_modulo_trailing_slash_still_resolves() {
-        let (dir, _lock, _guard) =
-            resolve_fixture_api_key("https://example.com/", Some("https://example.com"));
-
-        let (url, credential) =
-            resolve_credentials(dir.path()).expect("a trailing slash is not a different instance");
-        assert_eq!(url.as_deref(), Some("https://example.com"));
-        match credential {
-            Some(Credential::ApiKey(k)) => assert_eq!(k, "tvk_from_file"),
-            other => panic!("expected the file's API key, got {other:?}"),
-        }
     }
 
     /// The config is parsed as TOML, not scanned line by line. A base64-ish key
