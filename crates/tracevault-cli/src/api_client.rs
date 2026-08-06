@@ -367,20 +367,34 @@ impl ApiClient {
         // hooks firing at once), or another `ApiClient` in this process that
         // was built from the same on-disk credential before either refreshed.
         //
-        // A DIFFERENT refresh token on disk is proof that ours has been
-        // superseded, so adopt unconditionally — including when the adopted
-        // session is itself inside the refresh window, in which case we fall
-        // through and refresh with the ADOPTED token. Gating the adopt on the
-        // disk session being fresh would leave exactly the case this exists to
-        // prevent: refreshing with an in-memory token another client already
-        // consumed.
+        // Adopt when EITHER holds, because they catch different IdPs:
         //
-        // ... but only if that file is still this server's (see above).
+        // * the on-disk access token outlives ours — the on-disk session is
+        //   genuinely newer. This is the only signal available on an IdP that
+        //   does NOT rotate refresh tokens (RFC 6749 permits omitting
+        //   `refresh_token` on a refresh, which `KeycloakSession::apply`
+        //   handles), where the refresh token is identical everywhere and a
+        //   token-comparison alone would never fire — leaving `tracevault
+        //   status`, which builds three clients from one credential, doing three
+        //   redundant refreshes.
+        // * the on-disk refresh token differs from ours — ours has been
+        //   superseded, and on a ROTATING IdP already consumed. This must adopt
+        //   even when the adopted session is itself older and still needs a
+        //   refresh (then falling through to refresh with the ADOPTED token),
+        //   because refreshing with a consumed token is a guaranteed
+        //   `invalid_grant`.
+        //
+        // Deliberately NOT "the access tokens differ": that would also adopt a
+        // strictly older session, downgrading a fresher one we already hold.
+        //
+        // ... and only from a file that is still this server's (see above).
         if let Some(disk) = Credentials::load()
             .filter(|c| crate::credentials::same_server(&c.server_url, &self.base_url))
             .and_then(|c| c.auth)
         {
-            if disk.refresh_token != session.refresh_token {
+            let disk_is_newer = disk.access_expires_at > session.access_expires_at;
+            let ours_superseded = disk.refresh_token != session.refresh_token;
+            if disk_is_newer || ours_superseded {
                 let disk_needs_refresh = disk.needs_refresh(now);
                 *session = disk;
                 if !disk_needs_refresh {
@@ -1270,6 +1284,93 @@ mod tests {
         assert!(
             !refresh.contains("refresh_token=old-rt"),
             "the superseded in-memory token must NOT be presented: {refresh}"
+        );
+    }
+
+    /// On an IdP that does NOT rotate refresh tokens — RFC 6749 permits omitting
+    /// `refresh_token` on a refresh, and `KeycloakSession::apply` keeps the
+    /// previous one — every session on disk and in memory carries the SAME
+    /// refresh token. A refresh-token comparison therefore never fires, so
+    /// `tracevault status` (three clients from one credential) performed three
+    /// redundant refreshes, silently. The on-disk access token outliving ours is
+    /// the signal that actually works there.
+    ///
+    /// The issuer points at a dead port, so any refresh attempt would fail the
+    /// call: reaching the assertion proves the adopt happened instead.
+    #[tokio::test]
+    async fn bearer_adopts_a_fresher_session_from_a_non_rotating_idp() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        // On disk: another client refreshed and got a new access token, but the
+        // SAME refresh token back (no rotation).
+        let creds_dir = dir.path().join("tracevault");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(
+            creds_dir.join("credentials.json"),
+            format!(
+                r#"{{"server_url":"https://example.com","email":"a@b.com","auth":{{"issuer":"http://127.0.0.1:1","client_id":"tracevault-cli","refresh_token":"old-rt","access_token":"refreshed-by-someone-else","access_expires_at":{}}}}}"#,
+                NOW + 3600
+            ),
+        )
+        .unwrap();
+
+        // In memory: the same refresh token, an access token about to expire.
+        let client = ApiClient::with_credential(
+            "https://example.com",
+            Some(Credential::Keycloak(session(
+                "http://127.0.0.1:1",
+                NOW + 10,
+            ))),
+        )
+        .with_now(fixed_now);
+
+        let token = client
+            .bearer()
+            .await
+            .expect("a fresher on-disk session must be adopted, not re-refreshed");
+        assert_eq!(token.as_deref(), Some("refreshed-by-someone-else"));
+    }
+
+    /// The converse: an on-disk session that is OLDER, with the same refresh
+    /// token, must not be adopted — that would downgrade the token we hold.
+    #[tokio::test]
+    async fn bearer_does_not_adopt_an_older_session() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        let creds_dir = dir.path().join("tracevault");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(
+            creds_dir.join("credentials.json"),
+            format!(
+                r#"{{"server_url":"https://example.com","email":"a@b.com","auth":{{"issuer":"http://127.0.0.1:1","client_id":"tracevault-cli","refresh_token":"old-rt","access_token":"stale-at","access_expires_at":{}}}}}"#,
+                NOW + 100
+            ),
+        )
+        .unwrap();
+
+        // Ours is valid for an hour; the file's expires in 100s. No refresh is
+        // needed at all, so a dead issuer is harmless — and the token we return
+        // must still be ours.
+        let client = ApiClient::with_credential(
+            "https://example.com",
+            Some(Credential::Keycloak(session(
+                "http://127.0.0.1:1",
+                NOW + 3600,
+            ))),
+        )
+        .with_now(fixed_now);
+
+        let token = client.bearer().await.unwrap();
+        assert_eq!(
+            token.as_deref(),
+            Some("old-at"),
+            "an older on-disk session must not replace a fresher in-memory one"
         );
     }
 
