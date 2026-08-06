@@ -1390,21 +1390,82 @@ mod tests {
         );
     }
 
+    /// Unpadded base64url, so a fixture JWT can be assembled from a readable
+    /// payload instead of a pasted blob. Test-only; production only ever decodes.
+    fn base64url_encode(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            // Unpadded: emit only the characters backed by real input bytes —
+            // 1 byte → 2 chars, 2 → 3, 3 → 4.
+            for shift in [18, 12, 6, 0].iter().take(chunk.len() + 1) {
+                out.push(ALPHABET[((n >> shift) & 63) as usize] as char);
+            }
+        }
+        out
+    }
+
+    /// Build an unsigned JWT for the fixtures below from a readable payload.
+    ///
+    /// Two reasons not to paste a pre-encoded literal. A base64 blob hides what
+    /// the fixture asserts — you cannot see which `aud` it claims without decoding
+    /// it by hand. And a JWT's encoded header is a short fixed prefix that every
+    /// secret scanner matches on: these fixtures carry nothing secret (the
+    /// signature is a placeholder `unverified_audiences` never checks), but a
+    /// scanner cannot know that, and three HIGH findings on one test file is how a
+    /// repo trains people to wave through "it's only a fixture" — after which a
+    /// real leak looks the same. Aikido flagged exactly this on `f9ee250`.
+    fn unsigned_jwt(payload_json: &str) -> String {
+        format!(
+            "{}.{}.signature-not-checked",
+            base64url_encode(br#"{"alg":"none"}"#),
+            base64url_encode(payload_json.as_bytes())
+        )
+    }
+
+    /// Anchors the test-only encoder against a value that did not come from it:
+    /// `bm90LWpzb24` is the payload the "decodes but is not JSON" case below has
+    /// always used. Without this, a mirrored bug in encode and decode could let
+    /// every fixture-driven assertion pass while agreeing on the wrong bytes.
+    #[test]
+    fn base64url_encode_matches_a_known_value() {
+        assert_eq!(base64url_encode(b"not-json"), "bm90LWpzb24");
+        assert_eq!(
+            base64url_decode(&base64url_encode(b"abc")),
+            Some(b"abc".to_vec())
+        );
+        // Byte counts that exercise every remainder: 1, 2 and 0 mod 3.
+        for raw in [&b"a"[..], &b"ab"[..], &b"abc"[..], &b"abcd"[..]] {
+            assert_eq!(
+                base64url_decode(&base64url_encode(raw)),
+                Some(raw.to_vec()),
+                "round trip failed for {raw:?}"
+            );
+        }
+    }
+
     /// Reading `aud` out of a JWT payload: diagnosis only, never validation.
     #[test]
     fn unverified_audiences_reads_string_and_array_forms() {
         assert_eq!(
-            unverified_audiences("eyJhbGciOiAiUlMyNTYifQ.eyJhdWQiOiAidHJhY2V2YXVsdCIsICJzdWIiOiAidSJ9.signature-not-checked"),
+            unverified_audiences(&unsigned_jwt(r#"{"aud":"tracevault","sub":"u"}"#)),
             Some(vec!["tracevault".to_string()])
         );
         assert_eq!(
-            unverified_audiences("eyJhbGciOiAiUlMyNTYifQ.eyJhdWQiOiBbImFjY291bnQiLCAidHJhY2V2YXVsdCJdLCAic3ViIjogInUifQ.signature-not-checked"),
+            unverified_audiences(&unsigned_jwt(
+                r#"{"aud":["account","tracevault"],"sub":"u"}"#
+            )),
             Some(vec!["account".to_string(), "tracevault".to_string()])
         );
         assert_eq!(
-            unverified_audiences(
-                "eyJhbGciOiAiUlMyNTYifQ.eyJhdWQiOiAic29tZS1vdGhlci1hcHAifQ.signature-not-checked"
-            ),
+            unverified_audiences(&unsigned_jwt(r#"{"aud":"some-other-app"}"#)),
             Some(vec!["some-other-app".to_string()])
         );
     }
@@ -1414,10 +1475,7 @@ mod tests {
     #[test]
     fn unverified_audiences_is_none_when_it_cannot_tell() {
         // No `aud` claim.
-        assert_eq!(
-            unverified_audiences("eyJhbGciOiAiUlMyNTYifQ.eyJzdWIiOiAidSJ9.signature-not-checked"),
-            None
-        );
+        assert_eq!(unverified_audiences(&unsigned_jwt(r#"{"sub":"u"}"#)), None);
         // Not a JWT at all (an opaque token, as some IdPs issue).
         assert_eq!(unverified_audiences("opaque-token"), None);
         assert_eq!(unverified_audiences(""), None);
