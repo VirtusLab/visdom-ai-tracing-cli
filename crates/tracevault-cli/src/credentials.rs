@@ -1259,8 +1259,10 @@ mod tests {
     /// still there if the session is later removed.
     #[test]
     fn keycloak_preserves_an_existing_api_key_for_the_same_server() {
+        // Stored WITH a trailing slash, while login is given it without: the
+        // carry-over filter must normalise, not compare bytes.
         let (_dir, _lock, _guard) = with_credentials_file(
-            r#"{"server_url":"https://example.com","token":"tvk_precious","email":"old@b.com"}"#,
+            r#"{"server_url":"https://example.com/","token":"tvk_precious","email":"old@b.com"}"#,
         );
 
         Credentials::keycloak(
@@ -1376,6 +1378,23 @@ mod tests {
 
         let after = fs::read_to_string(Credentials::path().unwrap()).unwrap();
         assert_eq!(after, original, "another server's file was overwritten");
+
+        // The other direction at this same call site: the file's URL differing
+        // only by a trailing slash IS this server, so the write must happen.
+        // Without this half, replacing `same_server` with `!=`/`==` here goes
+        // unnoticed and quietly disables persistence — the state the skip
+        // warning exists to explain.
+        fs::write(
+            Credentials::path().unwrap(),
+            r#"{"server_url":"https://instance-a.example.com/","email":"a@b.com","auth":{"issuer":"i","client_id":"c","refresh_token":"old","access_token":"old","access_expires_at":1}}"#,
+        )
+        .unwrap();
+        Credentials::persist_session("https://instance-a.example.com", &a_session).unwrap();
+        let auth = Credentials::load().unwrap().auth.unwrap();
+        assert_eq!(
+            auth.access_token, "a-at",
+            "a trailing slash must not block a legitimate persist"
+        );
     }
 
     /// The single owner of the normalisation property: the two sides of the

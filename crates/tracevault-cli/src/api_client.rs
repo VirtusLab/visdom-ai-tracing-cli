@@ -1023,6 +1023,12 @@ mod tests {
     /// by a client talking to instance A (that would send B's token to A), and
     /// A's refreshed session must NOT overwrite B's file (that would sign the
     /// user out of B).
+    ///
+    /// Covers BOTH directions of the `same_server` comparison at this call site:
+    /// the mismatch above, and — at the end — that a file differing only by a
+    /// trailing slash IS still adopted. Without that second half, replacing
+    /// `same_server` with `==` here goes unnoticed and quietly disables the
+    /// adopt for every user whose stored URL has a trailing slash.
     #[tokio::test]
     async fn a_credentials_file_for_another_server_is_neither_adopted_nor_overwritten() {
         let _env_lock = crate::test_helpers::lock_env_mutation().await;
@@ -1073,6 +1079,36 @@ mod tests {
         assert_eq!(
             after, b_file,
             "instance A's refresh overwrote instance B's credentials"
+        );
+
+        // The other direction at this same call site: a file for the SAME
+        // instance, written with a trailing slash (as `tv login` stores whatever
+        // it was given, while `ApiClient` trims). It must be adopted — so the
+        // comparison has to be `same_server`, not `==`.
+        std::fs::write(
+            creds_dir.join("credentials.json"),
+            format!(
+                r#"{{"server_url":"https://instance-a.example.com/","email":"a@b.com","auth":{{"issuer":"http://127.0.0.1:1","client_id":"tracing-cli","refresh_token":"adopted-rt","access_token":"adopted-at","access_expires_at":{}}}}}"#,
+                NOW + 3600
+            ),
+        )
+        .unwrap();
+        // A dead issuer, so an un-adopted session could only fail here.
+        let client = ApiClient::with_credential(
+            "https://instance-a.example.com",
+            Some(Credential::Keycloak(session(
+                "http://127.0.0.1:1",
+                NOW + 10,
+            ))),
+        )
+        .with_now(fixed_now);
+        assert_eq!(
+            client
+                .bearer()
+                .await
+                .expect("a trailing slash must not prevent the adopt")
+                .as_deref(),
+            Some("adopted-at")
         );
     }
 
