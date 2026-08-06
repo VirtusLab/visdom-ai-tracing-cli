@@ -525,24 +525,13 @@ pub async fn device_start(
         .map_err(|e| OidcError::Transport(format!("malformed device authorization response: {e}")))
 }
 
-/// Poll the token endpoint until the user approves (or the attempt dies),
-/// sleeping with `tokio::time::sleep` between attempts.
-pub async fn poll_token(
-    client: &reqwest::Client,
-    discovery: &Discovery,
-    client_id: &str,
-    device: &DeviceAuth,
-) -> Result<TokenSet, OidcError> {
-    poll_token_with(client, discovery, client_id, device, tokio::time::sleep).await
-}
-
-/// [`poll_token`] with the sleep injected.
+/// Poll the token endpoint until the user approves, or the attempt dies.
 ///
-/// Two reasons this exists: tests must not burn wall-clock seconds, and the
-/// elapsed budget is accumulated from the sleep durations rather than read
-/// off a clock — so "give up after `expires_in`" is exercised deterministically
-/// by a no-op sleep, and a `slow_down` genuinely shortens the number of
-/// remaining attempts.
+/// The sleep is a parameter (production passes `tokio::time::sleep`) for two
+/// reasons: tests must not burn wall-clock seconds, and the elapsed budget is
+/// accumulated from the sleep durations rather than read off a clock — so "give
+/// up after `expires_in`" is exercised deterministically by a no-op sleep, and a
+/// `slow_down` genuinely shortens the number of remaining attempts.
 pub async fn poll_token_with<S, F>(
     client: &reqwest::Client,
     discovery: &Discovery,

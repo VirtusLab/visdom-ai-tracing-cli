@@ -96,6 +96,24 @@ fn print_user_code(user_code: &str) {
 }
 
 pub async fn login(server_url: &str, no_browser: bool) -> Result<(), Box<dyn std::error::Error>> {
+    login_with(server_url, no_browser, tokio::time::sleep).await
+}
+
+/// [`login`] with the poll loop's sleep injected.
+///
+/// Exists so tests can drive the whole flow — the "save the credentials before
+/// identifying, and keep them whatever `/auth/me` says" invariant is the point
+/// of this command — without spending the device code's poll interval in real
+/// seconds on every case.
+async fn login_with<S, F>(
+    server_url: &str,
+    no_browser: bool,
+    sleep: S,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: FnMut(std::time::Duration) -> F,
+    F: std::future::Future<Output = ()>,
+{
     // A dedicated client for the IdP conversation: these requests carry no
     // TraceVault credential, and there isn't one yet anyway.
     let http = reqwest::Client::builder()
@@ -165,7 +183,8 @@ pub async fn login(server_url: &str, no_browser: bool) -> Result<(), Box<dyn std
 
     // 4. Wait for the user to finish in the browser.
     println!("Waiting for you to approve the sign-in...");
-    let tokens = oidc::poll_token(&http, &discovery, &config.cli_client_id, &device).await?;
+    let tokens =
+        oidc::poll_token_with(&http, &discovery, &config.cli_client_id, &device, sleep).await?;
 
     let refresh_token = tokens.refresh_token.clone().ok_or_else(|| {
         // Without a refresh token the credential would die in minutes, which
@@ -273,6 +292,206 @@ pub async fn login(server_url: &str, no_browser: bool) -> Result<(), Box<dyn std
 #[cfg(test)]
 mod tests {
     use super::{browser_action, is_headless, print_user_code, BrowserAction};
+
+    use crate::credentials::Credentials;
+    use crate::test_helpers::{http_json, spawn_seq_with};
+
+    /// The four responses a successful login consumes, in order: public-config,
+    /// discovery, device authorization, token. `me` is appended by the caller,
+    /// which is where the interesting variation lives.
+    ///
+    /// `interval: 1` keeps the device response realistic while the injected
+    /// no-op sleep means no test actually waits.
+    fn login_responses(base: &str, me: String) -> Vec<String> {
+        vec![
+            http_json(
+                "200 OK",
+                &format!(
+                    r#"{{"oidc_enabled":true,"issuer":"{base}","audience":"tracevault","cli_client_id":"tracevault-cli"}}"#
+                ),
+            ),
+            http_json(
+                "200 OK",
+                &format!(
+                    r#"{{"issuer":"{base}","device_authorization_endpoint":"{base}/device","token_endpoint":"{base}/token","revocation_endpoint":"{base}/revoke"}}"#
+                ),
+            ),
+            http_json(
+                "200 OK",
+                &format!(
+                    r#"{{"device_code":"dc","user_code":"WDJB-MJHT","verification_uri":"{base}/device/verify","expires_in":600,"interval":1}}"#
+                ),
+            ),
+            http_json(
+                "200 OK",
+                r#"{"access_token":"the-at","refresh_token":"the-rt","expires_in":300}"#,
+            ),
+            me,
+        ]
+    }
+
+    /// Drive a whole login against a sequenced fake server whose `/auth/me`
+    /// answers `me`. Returns login's result plus the credentials file afterwards.
+    async fn run_login(me: String) -> (Result<(), String>, Option<Credentials>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+        _guard.set("TRACEVAULT_NO_BROWSER", "1");
+
+        let (base, _rx) = spawn_seq_with(|base| login_responses(base, me));
+        // No-op sleep: the poll interval must not cost real seconds.
+        let result = super::login_with(&base, true, |_| std::future::ready(()))
+            .await
+            .map_err(|e| e.to_string());
+        let saved = Credentials::load();
+        (result, saved)
+    }
+
+    /// The happy path: credentials saved AND `email` backfilled from `/auth/me`.
+    #[tokio::test]
+    async fn a_successful_login_saves_the_credentials_and_backfills_the_email() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let (result, saved) = run_login(http_json(
+            "200 OK",
+            r#"{"user_id":"11111111-1111-4111-8111-111111111111","email":"alice@example.com","name":"Alice","role":"tracing-admin"}"#,
+        ))
+        .await;
+
+        result.expect("a complete flow must succeed");
+        let saved = saved.expect("credentials must be on disk");
+        assert_eq!(saved.email, "alice@example.com", "email must be backfilled");
+        let auth = saved.auth.expect("the session must be saved");
+        assert_eq!(auth.refresh_token, "the-rt");
+        assert_eq!(auth.access_token, "the-at");
+        assert_eq!(auth.client_id, "tracevault-cli");
+    }
+
+    /// The central invariant, and the state every new Keycloak account starts
+    /// in: the token is valid, the authorization is not. The credentials MUST
+    /// survive — re-running login would change nothing, an admin has to grant a
+    /// role — and the command must still exit non-zero.
+    #[tokio::test]
+    async fn a_403_keeps_the_credentials_and_still_fails() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let (result, saved) = run_login(http_json(
+            "403 Forbidden",
+            r#"{"error":"missing required role"}"#,
+        ))
+        .await;
+
+        let err = result.expect_err("a 403 must not report success");
+        assert!(
+            err.contains("tracing") && err.contains("role"),
+            "the error must name the missing realm role: {err}"
+        );
+        let saved = saved.expect("a 403 must NOT throw the credentials away");
+        assert!(saved.auth.is_some(), "the session must still be saved");
+        assert_eq!(
+            saved.email, "",
+            "email is only backfilled on success, and must not be invented"
+        );
+    }
+
+    /// A 401 on a token the IdP just issued means the server and the CLI
+    /// disagree about the realm/audience.
+    ///
+    /// Note what the client does first: a 401 with a Keycloak credential
+    /// force-refreshes and retries once (`send_authed`), so a DEFINITIVE 401
+    /// needs the refresh round trip and the retry served too — otherwise the
+    /// failed refresh is reported as a network error and login (correctly)
+    /// treats it as "cannot confirm" and succeeds with a warning. Either way the
+    /// credential is kept; this covers the definitive branch.
+    #[tokio::test]
+    async fn a_401_keeps_the_credentials_and_still_fails() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+        _guard.set("TRACEVAULT_NO_BROWSER", "1");
+
+        let unauthorized = || http_json("401 Unauthorized", r#"{"error":"invalid token"}"#);
+        let (base, _rx) = spawn_seq_with(|base| {
+            let mut responses = login_responses(base, unauthorized());
+            // The forced refresh: discovery, then a token grant.
+            responses.push(http_json(
+                "200 OK",
+                &format!(
+                    r#"{{"issuer":"{base}","token_endpoint":"{base}/token","revocation_endpoint":"{base}/revoke"}}"#
+                ),
+            ));
+            responses.push(http_json(
+                "200 OK",
+                r#"{"access_token":"at2","refresh_token":"rt2","expires_in":300}"#,
+            ));
+            // ...and the retried `/auth/me`, still rejected.
+            responses.push(unauthorized());
+            responses
+        });
+
+        let err = super::login_with(&base, true, |_| std::future::ready(()))
+            .await
+            .expect_err("a definitive 401 must not report success");
+        let err = err.to_string();
+        assert!(
+            err.contains("realm") || err.contains("audience"),
+            "the error should point at the realm/audience mismatch: {err}"
+        );
+        assert!(
+            Credentials::load().and_then(|c| c.auth).is_some(),
+            "a 401 must not throw away a credential the IdP just issued"
+        );
+    }
+
+    /// A network failure while confirming identity must not lose the login: the
+    /// token exchange already succeeded, so the credential is good and the
+    /// command reports success with a warning.
+    #[tokio::test]
+    async fn a_network_failure_confirming_identity_keeps_the_credentials() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+        _guard.set("TRACEVAULT_NO_BROWSER", "1");
+
+        // Only four responses are served, so the fifth request — `/auth/me` —
+        // hits a closed listener.
+        let (base, _rx) = spawn_seq_with(|base| {
+            let mut r = login_responses(base, String::new());
+            r.truncate(4);
+            r
+        });
+
+        super::login_with(&base, true, |_| std::future::ready(()))
+            .await
+            .expect("an unreachable server must not fail a completed login");
+
+        let saved = Credentials::load().expect("credentials must survive a network failure");
+        assert!(saved.auth.is_some());
+        assert_eq!(saved.email, "");
+    }
+
+    /// `oidc_enabled: false` must write NOTHING: there is no session to save,
+    /// and a stale credentials file would be worse than none.
+    #[tokio::test]
+    async fn a_server_without_keycloak_writes_no_credentials() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+        _guard.set("TRACEVAULT_NO_BROWSER", "1");
+
+        let (base, _rx) =
+            spawn_seq_with(|_| vec![http_json("200 OK", r#"{"oidc_enabled":false}"#)]);
+
+        let err = super::login_with(&base, true, |_| std::future::ready(()))
+            .await
+            .expect_err("login cannot succeed against a server with no Keycloak");
+        assert!(err.to_string().contains("no Keycloak"), "{err}");
+        assert!(
+            Credentials::load().is_none(),
+            "no credentials may be written when there was never a session"
+        );
+    }
 
     /// A `verification_uri_complete` the IdP hands us is attacker-influenced
     /// input if the realm is compromised or simply broken. It must never reach
