@@ -198,15 +198,14 @@ struct OauthErrorBody {
 /// [`OidcError::Transport`] (we never got a usable answer).
 #[derive(Debug)]
 pub enum OidcError {
-    /// `/auth/public-config` answered 503 with `code: "oidc_not_configured"`:
-    /// this TraceVault instance has no Keycloak at all, so interactive login
-    /// is impossible and an API key must be used instead. Permanent until an
-    /// operator changes the deployment.
+    /// `/auth/public-config` answered `{"oidc_enabled": false}`: this TraceVault
+    /// instance has no Keycloak at all, so interactive login is impossible and
+    /// an API key must be used instead. Permanent until an operator changes the
+    /// deployment. See [`fetch_public_config`].
     NoKeycloak,
-    /// `/auth/public-config` answered 503 for some OTHER reason — the server
-    /// has a Keycloak but currently can't talk to it (JWKS fetch failing, IdP
-    /// restarting). Retryable, and explicitly NOT a reason to go get an API
-    /// key.
+    /// `/auth/public-config` answered a 5xx — the server, or an intermediary in
+    /// front of it, is unhealthy right now. Retryable, and explicitly NOT a
+    /// reason to go get an API key.
     IdpUnavailable { detail: String },
     /// The discovery document's own `issuer` disagrees with the issuer the
     /// server told us to use — a misconfiguration or a redirect to a

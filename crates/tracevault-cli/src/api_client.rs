@@ -547,10 +547,10 @@ impl ApiClient {
     /// NOTE: callers whose `err_prefix` renders the status as `"({status})"`
     /// (e.g. `stream_event`'s `"Stream failed ({status})"`) produce error
     /// strings containing `"(404 "`/`"(403 "`/etc. —
-    /// `commands::stream::is_deterministic_client_error` matches on exactly
-    /// that substring shape to classify a stream-send failure. If you change
-    /// how a status is rendered here, check that predicate (and its tests)
-    /// still pass.
+    /// `commands::stream::deterministic_client_error_kind` matches on exactly
+    /// that substring shape to classify a stream-send failure, and to tell a 403
+    /// apart from the binding statuses. If you change how a status is rendered
+    /// here, check that function (and its tests) still pass.
     async fn authed_send_json<T, F>(
         &self,
         builder: reqwest::RequestBuilder,
