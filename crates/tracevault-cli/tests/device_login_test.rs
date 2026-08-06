@@ -96,7 +96,7 @@ async fn device_login_sequence_completes_through_the_public_api() {
             http_json(
                 "200 OK",
                 &format!(
-                    r#"{{"oidc_enabled":true,"issuer":"{base}","audience":"tracevault","cli_client_id":"tracevault-cli"}}"#
+                    r#"{{"oidc_enabled":true,"issuer":"{base}","audience":"tracevault","cli_client_id":"tracing-cli"}}"#
                 ),
             ),
             // 2. Discovery.
@@ -126,7 +126,7 @@ async fn device_login_sequence_completes_through_the_public_api() {
     let http = reqwest::Client::new();
 
     let config = oidc::fetch_public_config(&http, &base).await.unwrap();
-    assert_eq!(config.cli_client_id, "tracevault-cli");
+    assert_eq!(config.cli_client_id, "tracing-cli");
 
     let discovery = oidc::discover(&http, &config.issuer).await.unwrap();
     let device = oidc::device_start(&http, &discovery, &config.cli_client_id)

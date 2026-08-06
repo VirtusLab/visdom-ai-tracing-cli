@@ -926,7 +926,7 @@ mod tests {
         std::fs::write(
             creds_dir.join("credentials.json"),
             format!(
-                r#"{{"server_url":"{server_url}","email":"a@b.com","auth":{{"issuer":"{issuer}","client_id":"tracevault-cli","refresh_token":"old-rt","access_token":"old-at","access_expires_at":{expires_at}}}}}"#
+                r#"{{"server_url":"{server_url}","email":"a@b.com","auth":{{"issuer":"{issuer}","client_id":"tracing-cli","refresh_token":"old-rt","access_token":"old-at","access_expires_at":{expires_at}}}}}"#
             ),
         )
         .unwrap();
@@ -935,7 +935,7 @@ mod tests {
     fn session(issuer: &str, expires_at: i64) -> KeycloakSession {
         KeycloakSession {
             issuer: issuer.to_string(),
-            client_id: "tracevault-cli".into(),
+            client_id: "tracing-cli".into(),
             refresh_token: "old-rt".into(),
             access_token: "old-at".into(),
             access_expires_at: expires_at,
@@ -1008,7 +1008,7 @@ mod tests {
         std::fs::write(
             creds_dir.join("credentials.json"),
             format!(
-                r#"{{"server_url":"https://example.com","email":"a@b.com","auth":{{"issuer":"http://127.0.0.1:1","client_id":"tracevault-cli","refresh_token":"rotated-rt","access_token":"other-process-at","access_expires_at":{}}}}}"#,
+                r#"{{"server_url":"https://example.com","email":"a@b.com","auth":{{"issuer":"http://127.0.0.1:1","client_id":"tracing-cli","refresh_token":"rotated-rt","access_token":"other-process-at","access_expires_at":{}}}}}"#,
                 NOW + 3600
             ),
         )
@@ -1058,7 +1058,7 @@ mod tests {
         let creds_dir = dir.path().join("tracevault");
         std::fs::create_dir_all(&creds_dir).unwrap();
         let b_file = format!(
-            r#"{{"server_url":"https://instance-b.example.com","email":"b@b.com","auth":{{"issuer":"{issuer}","client_id":"tracevault-cli","refresh_token":"b-rt","access_token":"b-at","access_expires_at":{}}}}}"#,
+            r#"{{"server_url":"https://instance-b.example.com","email":"b@b.com","auth":{{"issuer":"{issuer}","client_id":"tracing-cli","refresh_token":"b-rt","access_token":"b-at","access_expires_at":{}}}}}"#,
             NOW + 3600
         );
         std::fs::write(creds_dir.join("credentials.json"), &b_file).unwrap();
@@ -1148,7 +1148,7 @@ mod tests {
         std::fs::write(
             creds_dir.join("credentials.json"),
             format!(
-                r#"{{"server_url":"https://example.com","email":"a@b.com","auth":{{"issuer":"{issuer}","client_id":"tracevault-cli","refresh_token":"rotated-rt","access_token":"rotated-at","access_expires_at":{}}}}}"#,
+                r#"{{"server_url":"https://example.com","email":"a@b.com","auth":{{"issuer":"{issuer}","client_id":"tracing-cli","refresh_token":"rotated-rt","access_token":"rotated-at","access_expires_at":{}}}}}"#,
                 NOW + 5
             ),
         )
@@ -1200,7 +1200,7 @@ mod tests {
         std::fs::write(
             creds_dir.join("credentials.json"),
             format!(
-                r#"{{"server_url":"https://example.com","email":"a@b.com","auth":{{"issuer":"http://127.0.0.1:1","client_id":"tracevault-cli","refresh_token":"old-rt","access_token":"refreshed-by-someone-else","access_expires_at":{}}}}}"#,
+                r#"{{"server_url":"https://example.com","email":"a@b.com","auth":{{"issuer":"http://127.0.0.1:1","client_id":"tracing-cli","refresh_token":"old-rt","access_token":"refreshed-by-someone-else","access_expires_at":{}}}}}"#,
                 NOW + 3600
             ),
         )

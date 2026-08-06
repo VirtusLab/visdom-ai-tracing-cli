@@ -471,7 +471,7 @@ mod tests {
             creds_dir.join("credentials.json"),
             format!(
                 r#"{{"server_url":"{login_server}","email":"a@b.com","auth":{{
-                "issuer":"https://idp.example.com/realms/v","client_id":"tracevault-cli",
+                "issuer":"https://idp.example.com/realms/v","client_id":"tracing-cli",
                 "refresh_token":"rt","access_token":"at","access_expires_at":9999999999}}}}"#
             ),
         )
@@ -522,7 +522,7 @@ mod tests {
         std::fs::write(
             creds_dir.join("credentials.json"),
             r#"{"server_url":"https://instance-b.example.com","email":"a@b.com","auth":{
-                "issuer":"https://idp.example.com/realms/v","client_id":"tracevault-cli",
+                "issuer":"https://idp.example.com/realms/v","client_id":"tracing-cli",
                 "refresh_token":"rt","access_token":"at","access_expires_at":9999999999}}"#,
         )
         .unwrap();

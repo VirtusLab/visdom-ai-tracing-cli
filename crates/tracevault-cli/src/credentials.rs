@@ -633,7 +633,7 @@ mod tests {
         fs::write(
             creds_dir.join("credentials.json"),
             format!(
-                r#"{{"server_url":"{server_url}","email":"a@b.com","auth":{{"issuer":"{issuer}","client_id":"tracevault-cli","refresh_token":"old-rt","access_token":"old-at","access_expires_at":{expires_at}}}}}"#
+                r#"{{"server_url":"{server_url}","email":"a@b.com","auth":{{"issuer":"{issuer}","client_id":"tracing-cli","refresh_token":"old-rt","access_token":"old-at","access_expires_at":{expires_at}}}}}"#
             ),
         )
         .unwrap();
@@ -924,7 +924,7 @@ mod tests {
                 "email":"a@b.com",
                 "auth":{
                     "issuer":"https://idp.test/realms/visdom",
-                    "client_id":"tracevault-cli",
+                    "client_id":"tracing-cli",
                     "refresh_token":"rt",
                     "access_token":"at",
                     "access_expires_at":1893456000
@@ -935,7 +935,7 @@ mod tests {
         match creds.credential() {
             Some(Credential::Keycloak(s)) => {
                 assert_eq!(s.issuer, "https://idp.test/realms/visdom");
-                assert_eq!(s.client_id, "tracevault-cli");
+                assert_eq!(s.client_id, "tracing-cli");
                 assert_eq!(s.refresh_token, "rt");
                 assert_eq!(s.access_token, "at");
                 assert_eq!(s.access_expires_at, 1_893_456_000);
@@ -958,7 +958,7 @@ mod tests {
     fn needs_refresh_only_inside_the_sixty_second_window() {
         let session = KeycloakSession {
             issuer: "https://idp.test/realms/visdom".into(),
-            client_id: "tracevault-cli".into(),
+            client_id: "tracing-cli".into(),
             refresh_token: "rt".into(),
             access_token: "at".into(),
             access_expires_at: 1_000_000,
@@ -1014,7 +1014,7 @@ mod tests {
 
         let session = KeycloakSession {
             issuer: "https://idp.test/realms/visdom".into(),
-            client_id: "tracevault-cli".into(),
+            client_id: "tracing-cli".into(),
             refresh_token: "rt".into(),
             access_token: "at".into(),
             access_expires_at: 42,

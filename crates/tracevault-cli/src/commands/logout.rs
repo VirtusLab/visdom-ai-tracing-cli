@@ -65,7 +65,7 @@ mod tests {
         fs::write(
             creds_dir.join("credentials.json"),
             r#"{"server_url":"https://example.com","email":"a@b.com","auth":{
-                "issuer":"http://127.0.0.1:1","client_id":"tracevault-cli",
+                "issuer":"http://127.0.0.1:1","client_id":"tracing-cli",
                 "refresh_token":"rt","access_token":"at","access_expires_at":9999999999}}"#,
         )
         .unwrap();

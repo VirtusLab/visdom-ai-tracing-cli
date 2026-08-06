@@ -85,7 +85,7 @@ async fn device_start_post_is_length_delimited() {
     let (addr, server) = spawn_capture(http_ok(body)).await;
 
     let client = reqwest::Client::new();
-    let result = oidc::device_start(&client, &discovery_at(addr), "tracevault-cli").await;
+    let result = oidc::device_start(&client, &discovery_at(addr), "tracing-cli").await;
     assert!(result.is_ok(), "device_start failed: {:?}", result.err());
 
     assert_length_delimited(&server.await.unwrap(), "the device authorization POST");
@@ -96,7 +96,7 @@ async fn revoke_post_is_length_delimited() {
     let (addr, server) = spawn_capture(http_ok("{}")).await;
 
     let client = reqwest::Client::new();
-    let result = oidc::revoke(&client, &discovery_at(addr), "tracevault-cli", "rt").await;
+    let result = oidc::revoke(&client, &discovery_at(addr), "tracing-cli", "rt").await;
     assert!(result.is_ok(), "revoke failed: {:?}", result.err());
 
     assert_length_delimited(&server.await.unwrap(), "the revocation POST");

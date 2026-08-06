@@ -488,7 +488,7 @@ pub fn is_browser_safe(url: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Start a device authorization (RFC 8628 §3.1). `tracevault-cli` is a
+/// Start a device authorization (RFC 8628 §3.1). `tracing-cli` is a
 /// PUBLIC client, so the form carries `client_id` and no client secret.
 pub async fn device_start(
     client: &reqwest::Client,
@@ -831,7 +831,7 @@ mod tests {
         let tokens = poll_token_with(
             &client,
             &discovery_at(&base),
-            "tracevault-cli",
+            "tracing-cli",
             &device_auth(5, 600),
             recording_sleep(log.clone()),
         )
@@ -850,13 +850,10 @@ mod tests {
                 "poll must use the device_code grant: {req}"
             );
             assert!(req.contains("device_code=dev-code"), "missing device_code");
-            assert!(
-                req.contains("client_id=tracevault-cli"),
-                "missing client_id"
-            );
+            assert!(req.contains("client_id=tracing-cli"), "missing client_id");
             assert!(
                 !req.contains("client_secret"),
-                "tracevault-cli is a PUBLIC client; no secret may be sent: {req}"
+                "tracing-cli is a PUBLIC client; no secret may be sent: {req}"
             );
         }
         assert_eq!(*log.lock().unwrap(), vec![5, 5]);
@@ -874,7 +871,7 @@ mod tests {
         poll_token_with(
             &client,
             &discovery_at(&base),
-            "tracevault-cli",
+            "tracing-cli",
             &device_auth(5, 600),
             recording_sleep(log.clone()),
         )
@@ -896,7 +893,7 @@ mod tests {
         let err = poll_token_with(
             &client,
             &discovery_at(&base),
-            "tracevault-cli",
+            "tracing-cli",
             &device_auth(5, 600),
             recording_sleep(Arc::new(Mutex::new(Vec::new()))),
         )
@@ -924,7 +921,7 @@ mod tests {
         let err = poll_token_with(
             &client,
             &discovery_at(&base),
-            "tracevault-cli",
+            "tracing-cli",
             &device_auth(5, 600),
             recording_sleep(Arc::new(Mutex::new(Vec::new()))),
         )
@@ -953,7 +950,7 @@ mod tests {
         let err = poll_token_with(
             &client,
             &discovery_at(&base),
-            "tracevault-cli",
+            "tracing-cli",
             &device_auth(5, 10),
             recording_sleep(log.clone()),
         )
@@ -1247,14 +1244,14 @@ mod tests {
     async fn public_config_200_parses_issuer_client_id_and_audience() {
         let (base, rx) = spawn_seq(vec![http_json(
             "200 OK",
-            r#"{"oidc_enabled":true,"issuer":"https://idp.test/realms/visdom","audience":"tracevault","cli_client_id":"tracevault-cli"}"#,
+            r#"{"oidc_enabled":true,"issuer":"https://idp.test/realms/visdom","audience":"tracevault","cli_client_id":"tracing-cli"}"#,
         )]);
         let client = reqwest::Client::new();
         let cfg = fetch_public_config(&client, &format!("{base}/"))
             .await
             .unwrap();
         assert_eq!(cfg.issuer, "https://idp.test/realms/visdom");
-        assert_eq!(cfg.cli_client_id, "tracevault-cli");
+        assert_eq!(cfg.cli_client_id, "tracing-cli");
         assert_eq!(cfg.audience.as_deref(), Some("tracevault"));
         let req = rx.recv_timeout(RECV_TIMEOUT).unwrap();
         assert!(
@@ -1269,7 +1266,7 @@ mod tests {
     async fn public_config_without_audience_still_resolves() {
         let (base, _rx) = spawn_seq(vec![http_json(
             "200 OK",
-            r#"{"oidc_enabled":true,"issuer":"https://idp.test/realms/v","cli_client_id":"tracevault-cli"}"#,
+            r#"{"oidc_enabled":true,"issuer":"https://idp.test/realms/v","cli_client_id":"tracing-cli"}"#,
         )]);
         let client = reqwest::Client::new();
         let cfg = fetch_public_config(&client, &base).await.unwrap();
@@ -1283,7 +1280,7 @@ mod tests {
     async fn public_config_enabled_but_incomplete_is_a_named_error() {
         for (body, field) in [
             (
-                r#"{"oidc_enabled":true,"cli_client_id":"tracevault-cli"}"#,
+                r#"{"oidc_enabled":true,"cli_client_id":"tracing-cli"}"#,
                 "issuer",
             ),
             (
@@ -1291,7 +1288,7 @@ mod tests {
                 "cli_client_id",
             ),
             (
-                r#"{"oidc_enabled":true,"issuer":"  ","cli_client_id":"tracevault-cli"}"#,
+                r#"{"oidc_enabled":true,"issuer":"  ","cli_client_id":"tracing-cli"}"#,
                 "issuer",
             ),
         ] {
@@ -1317,7 +1314,7 @@ mod tests {
             r#"{"device_code":"dc","user_code":"ABCD-EFGH","verification_uri":"https://idp.test/device","expires_in":600,"interval":5}"#,
         )]);
         let client = reqwest::Client::new();
-        let device = device_start(&client, &discovery_at(&base), "tracevault-cli")
+        let device = device_start(&client, &discovery_at(&base), "tracing-cli")
             .await
             .unwrap();
         assert_eq!(device.user_code, "ABCD-EFGH");
@@ -1326,7 +1323,7 @@ mod tests {
             req.contains("offline_access"),
             "offline_access is what yields a refresh token: {req}"
         );
-        assert!(req.contains("client_id=tracevault-cli"));
+        assert!(req.contains("client_id=tracing-cli"));
     }
 
     #[tokio::test]
@@ -1336,7 +1333,7 @@ mod tests {
             r#"{"error":"invalid_grant","error_description":"Token is not active"}"#,
         )]);
         let client = reqwest::Client::new();
-        let err = refresh(&client, &discovery_at(&base), "tracevault-cli", "rt")
+        let err = refresh(&client, &discovery_at(&base), "tracing-cli", "rt")
             .await
             .expect_err("invalid_grant must be a distinct 'session expired' error");
         assert!(matches!(err, OidcError::SessionExpired), "got {err:?}");
@@ -1350,7 +1347,7 @@ mod tests {
     async fn revoke_sends_refresh_token_hint() {
         let (base, rx) = spawn_seq(vec![http_json("200 OK", "{}")]);
         let client = reqwest::Client::new();
-        revoke(&client, &discovery_at(&base), "tracevault-cli", "rt")
+        revoke(&client, &discovery_at(&base), "tracing-cli", "rt")
             .await
             .unwrap();
         let req = rx.recv_timeout(RECV_TIMEOUT).unwrap();
@@ -1366,7 +1363,7 @@ mod tests {
             revocation_endpoint: None,
         };
         let client = reqwest::Client::new();
-        let err = revoke(&client, &disc, "tracevault-cli", "rt")
+        let err = revoke(&client, &disc, "tracing-cli", "rt")
             .await
             .expect_err("no revocation endpoint must be an explicit error");
         assert!(err.to_string().contains("revocation"), "{err}");

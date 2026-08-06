@@ -307,7 +307,7 @@ mod tests {
             http_json(
                 "200 OK",
                 &format!(
-                    r#"{{"oidc_enabled":true,"issuer":"{base}","audience":"tracevault","cli_client_id":"tracevault-cli"}}"#
+                    r#"{{"oidc_enabled":true,"issuer":"{base}","audience":"tracevault","cli_client_id":"tracing-cli"}}"#
                 ),
             ),
             http_json(
@@ -362,7 +362,7 @@ mod tests {
         let auth = saved.auth.expect("the session must be saved");
         assert_eq!(auth.refresh_token, "the-rt");
         assert_eq!(auth.access_token, "the-at");
-        assert_eq!(auth.client_id, "tracevault-cli");
+        assert_eq!(auth.client_id, "tracing-cli");
     }
 
     /// The central invariant, and the state every new Keycloak account starts
