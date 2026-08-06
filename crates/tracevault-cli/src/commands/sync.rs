@@ -1,9 +1,10 @@
-use crate::api_client::{resolve_credentials, ApiClient};
+use crate::api_client::ApiClient;
+use crate::credentials::resolve_credentials;
 use crate::resolution::{git_remote_url, git_repo_name};
 use std::path::Path;
 
 pub async fn sync_repo(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let (server_url, token) = resolve_credentials(project_root);
+    let (server_url, credential) = resolve_credentials(project_root)?;
 
     let server_url = match server_url {
         Some(url) => url,
@@ -13,7 +14,7 @@ pub async fn sync_repo(project_root: &Path) -> Result<(), Box<dyn std::error::Er
         }
     };
 
-    if token.is_none() {
+    if credential.is_none() {
         eprintln!("Not logged in. Run 'tracevault login' to sync.");
         return Ok(());
     }
@@ -26,7 +27,7 @@ pub async fn sync_repo(project_root: &Path) -> Result<(), Box<dyn std::error::Er
         }
     };
 
-    let client = ApiClient::new(&server_url, token.as_deref());
+    let client = ApiClient::with_credential(&server_url, credential);
 
     let repo_name = git_repo_name(project_root);
 

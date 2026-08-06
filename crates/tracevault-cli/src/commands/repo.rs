@@ -2,7 +2,8 @@
 
 use std::path::Path;
 
-use crate::api_client::{resolve_client, resolve_credentials, ApiClient};
+use crate::api_client::{resolve_client, ApiClient};
+use crate::credentials::resolve_credentials;
 use crate::resolution::{
     binding_from_config, effective_binding, resolve_path_to_binding, BindingSource, ResolveInputs,
 };
@@ -257,7 +258,16 @@ async fn resolve_repo_flag(
 ) -> Option<RepoBinding> {
     let path = repo_flag_path?;
 
-    let (server_url, token) = resolve_credentials(project_root);
+    // Best-effort, per this function's contract: a credential/URL mismatch
+    // prints the reason and drops the `--path` override rather than failing the
+    // whole `status` inspector.
+    let (server_url, credential) = match resolve_credentials(project_root) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            eprintln!("--path {path}: {e}");
+            return None;
+        }
+    };
     let Some(server_url) = server_url else {
         eprintln!(
             "--path {path}: no server URL configured (run `tracevault login`); showing binding \
@@ -266,7 +276,7 @@ async fn resolve_repo_flag(
         return None;
     };
 
-    let client = ApiClient::new(&server_url, token.as_deref());
+    let client = ApiClient::with_credential(&server_url, credential);
     match resolve_path_to_binding(Path::new(path), &client).await {
         Ok(Some(binding)) => Some(binding),
         Ok(None) => {
@@ -345,10 +355,19 @@ async fn status(
     //   2. else a `git_url` → live `resolve_remote` for name + clone status;
     //   3. else fall back to the cached `codebase_name` (name only, offline).
     if let Some((binding, _)) = &effective {
-        let (server_url, token) = resolve_credentials(project_root);
+        // Best-effort codebase line: a credential/URL mismatch degrades to the
+        // offline fallback (cached name only) with the reason printed, rather
+        // than failing `repo status` — whose job is to explain local state.
+        let (server_url, credential) = match resolve_credentials(project_root) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                eprintln!("Warning: {e}");
+                (None, None)
+            }
+        };
         let client = server_url
             .as_ref()
-            .map(|su| ApiClient::new(su, token.as_deref()));
+            .map(|su| ApiClient::with_credential(su, credential));
         let detail_line = if let (Some(client), Some(remote_id)) = (&client, binding.remote_id) {
             client.get_remote_detail(remote_id).await.ok().map(|d| {
                 crate::resolution::codebase_line(

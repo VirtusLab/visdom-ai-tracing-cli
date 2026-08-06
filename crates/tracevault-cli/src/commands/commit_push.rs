@@ -1,5 +1,6 @@
-use crate::api_client::{resolve_credentials, ApiClient};
+use crate::api_client::ApiClient;
 use crate::config::TracevaultConfig;
+use crate::credentials::resolve_credentials;
 use serde_json::json;
 use std::path::Path;
 use std::process::Command;
@@ -14,9 +15,9 @@ pub async fn run_commit_push(
     let config = TracevaultConfig::load(project_root).ok_or("config not found")?;
     let repo_id = config.repo_id.ok_or("repo_id not configured")?;
 
-    let (server_url, token) = resolve_credentials(project_root);
+    let (server_url, credential) = resolve_credentials(project_root)?;
     let server_url = server_url.ok_or("server_url not configured")?;
-    let client = ApiClient::new(&server_url, token.as_deref());
+    let client = ApiClient::with_credential(&server_url, credential);
 
     let req = collect_commit_request(cwd)?;
 

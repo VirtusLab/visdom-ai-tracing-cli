@@ -5,6 +5,7 @@ pub mod config;
 pub mod context;
 pub mod credentials;
 pub mod hooks;
+pub mod oidc;
 pub mod paths;
 pub mod resolution;
 pub mod session_state;

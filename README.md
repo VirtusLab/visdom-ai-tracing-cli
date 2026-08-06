@@ -23,6 +23,49 @@ cargo install tracevault-cli
 
 ## Usage
 
+### `tracevault login` — sign in (humans)
+
+`tracevault login --server-url <URL>` signs you in through your organisation's Keycloak using
+the OAuth 2.0 **device authorization grant** (RFC 8628) — the same flow as `gh auth login` or
+a smart TV. The CLI asks the server which realm it trusts
+(`GET /api/v1/auth/public-config`) and then talks to Keycloak directly; your password never
+touches TraceVault.
+
+```sh
+tracevault login --server-url https://your-tracevault-server.example.com
+```
+
+It prints a verification URL and a one-time code, tries to open your browser (skip that with
+`--no-browser`, which is also implied in CI/containers/headless sessions), and waits while you
+approve. On success it writes `~/.config/tracevault/credentials.json` (mode `0600`) holding a
+short-lived access token plus a long-lived `offline_access` **refresh token**, and prints the
+account and role the server resolved for you.
+
+That refresh token is what makes unattended use work: every command refreshes the access token
+by itself shortly before it expires, so git hooks and background captures never stop to
+prompt. Nothing has to be re-run periodically.
+
+`tracevault logout` revokes the refresh token at Keycloak (best-effort — the local file is
+removed either way) and deletes the credentials file.
+
+If sign-in succeeds but the server answers "not authorized", the Keycloak account is missing
+the `tracing` realm role. The credentials are still saved; an administrator has to grant
+`tracing` (or `tracing-admin`), after which any TraceVault command works — no new login
+needed.
+
+**CI and automation do not use `tracevault login`.** They keep using a long-lived API key,
+which never expires and needs no browser:
+
+```sh
+export TRACEVAULT_SERVER_URL=https://your-tracevault-server.example.com
+export TRACEVAULT_API_KEY=tvk_...
+```
+
+`TRACEVAULT_API_KEY` takes precedence over the credentials file, so a key set in the
+environment always wins on a machine that also has an interactive login. A server deployed
+without Keycloak supports only this API-key path, and `tracevault login` says exactly that
+instead of starting a flow that cannot complete.
+
 ### `tracevault init` — set up tracing in a repo
 
 `tracevault init` wires TraceVault into a repository: it installs the AI-agent hooks that
