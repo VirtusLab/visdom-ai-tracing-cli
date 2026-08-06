@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.26.0...v0.27.0) - 2026-08-06
+
+### Added
+
+- *(cli)* sign in with the Keycloak device flow and self-refresh the token (VIS-40) ([#39](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/39))
+
 ## [0.26.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.25.0...v0.26.0) - 2026-07-23
 
 ### Other
