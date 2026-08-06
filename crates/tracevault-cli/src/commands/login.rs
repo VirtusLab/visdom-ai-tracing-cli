@@ -44,6 +44,34 @@ fn is_headless() -> bool {
     false
 }
 
+/// What `login` should do with the verification URL.
+///
+/// A separate decision from the printing so it can be tested without driving a
+/// whole login: the `Refuse` case in particular is a security property, and the
+/// only way to observe it otherwise would be a launched application.
+#[derive(Debug, PartialEq, Eq)]
+enum BrowserAction {
+    /// Headless, or `--no-browser`.
+    Skip,
+    /// The IdP handed us something that must not reach a desktop handler.
+    Refuse,
+    Open,
+}
+
+/// `open::that` launches whatever handler is registered for the URL's scheme, so
+/// a broken or hostile realm response could otherwise get `file:///...` — or any
+/// registered application scheme — launched on the user's desktop. The URL and
+/// code are printed regardless, so refusing costs the user nothing.
+fn browser_action(url: &str, no_browser: bool, headless: bool) -> BrowserAction {
+    if no_browser || headless {
+        BrowserAction::Skip
+    } else if !oidc::is_browser_safe(url) {
+        BrowserAction::Refuse
+    } else {
+        BrowserAction::Open
+    }
+}
+
 fn print_url_banner(url: &str) {
     println!();
     println!("  Open this URL in a browser to finish logging in:");
@@ -114,15 +142,24 @@ pub async fn login(server_url: &str, no_browser: bool) -> Result<(), Box<dyn std
     print_url_banner(&device.verification_uri);
     print_user_code(&device.user_code);
 
-    if no_browser || is_headless() {
-        println!("Not attempting to auto-open a browser (headless environment detected or --no-browser set).");
-    } else {
-        println!("Attempting to open the URL in your default browser...");
-        if let Err(e) = open::that(browser_url) {
-            // Non-fatal: the URL and code are already visible above, the user
-            // can just copy them.
-            eprintln!("Could not open browser automatically: {e}");
-            eprintln!("Copy the URL above into a browser manually.");
+    match browser_action(browser_url, no_browser, is_headless()) {
+        BrowserAction::Skip => {
+            println!("Not attempting to auto-open a browser (headless environment detected or --no-browser set).");
+        }
+        BrowserAction::Refuse => {
+            eprintln!(
+                "Not opening the verification URL automatically: the identity provider returned a \
+                 non-web URL. Use the URL and code printed above."
+            );
+        }
+        BrowserAction::Open => {
+            println!("Attempting to open the URL in your default browser...");
+            if let Err(e) = open::that(browser_url) {
+                // Non-fatal: the URL and code are already visible above, the
+                // user can just copy them.
+                eprintln!("Could not open browser automatically: {e}");
+                eprintln!("Copy the URL above into a browser manually.");
+            }
         }
     }
 
@@ -235,7 +272,50 @@ pub async fn login(server_url: &str, no_browser: bool) -> Result<(), Box<dyn std
 
 #[cfg(test)]
 mod tests {
-    use super::{is_headless, print_user_code};
+    use super::{browser_action, is_headless, print_user_code, BrowserAction};
+
+    /// A `verification_uri_complete` the IdP hands us is attacker-influenced
+    /// input if the realm is compromised or simply broken. It must never reach
+    /// `open::that`, which would launch the handler registered for its scheme.
+    #[test]
+    fn a_non_web_verification_url_is_never_opened() {
+        for hostile in [
+            "file:///etc/passwd",
+            "file:///Users/me/.ssh/id_rsa",
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vscode://file/etc/passwd",
+            "not a url at all",
+            "",
+        ] {
+            assert_eq!(
+                browser_action(hostile, false, false),
+                BrowserAction::Refuse,
+                "{hostile} must not be handed to the desktop URL handler"
+            );
+        }
+    }
+
+    #[test]
+    fn a_web_verification_url_is_opened_unless_suppressed() {
+        let url = "https://idp.example.com/device?user_code=WDJB-MJHT";
+        assert_eq!(browser_action(url, false, false), BrowserAction::Open);
+        assert_eq!(
+            browser_action(url, true, false),
+            BrowserAction::Skip,
+            "--no-browser must suppress the open"
+        );
+        assert_eq!(
+            browser_action(url, false, true),
+            BrowserAction::Skip,
+            "a headless environment must suppress the open"
+        );
+        // Plain http is legitimate for a local Keycloak.
+        assert_eq!(
+            browser_action("http://localhost:8080/device", false, false),
+            BrowserAction::Open
+        );
+    }
 
     #[test]
     fn tracevault_no_browser_env_forces_headless() {

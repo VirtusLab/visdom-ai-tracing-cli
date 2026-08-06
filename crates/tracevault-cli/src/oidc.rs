@@ -26,6 +26,7 @@
 use serde::Deserialize;
 use std::fmt;
 use std::time::Duration;
+use url::Url;
 
 /// Scopes requested for the device flow. `offline_access` is what makes
 /// Keycloak issue a long-lived refresh token, which is the whole point of
@@ -221,6 +222,16 @@ pub enum OidcError {
     PollTimeout { waited_secs: u64 },
     /// The issuer does not advertise an endpoint this operation needs.
     EndpointUnavailable { what: &'static str },
+    /// The issuer is not `https` (and not loopback), so the refresh token would
+    /// travel in clear text.
+    InsecureIssuer { issuer: String },
+    /// A discovery document named an endpoint on a different origin than the
+    /// issuer's — a misconfiguration, or an attempt to collect tokens elsewhere.
+    EndpointOriginMismatch {
+        what: &'static str,
+        endpoint: String,
+        issuer: String,
+    },
     /// An OAuth error code we don't special-case.
     Oauth {
         error: String,
@@ -265,6 +276,22 @@ impl fmt::Display for OidcError {
             Self::EndpointUnavailable { what } => write!(
                 f,
                 "the identity provider does not advertise a {what} endpoint"
+            ),
+            Self::InsecureIssuer { issuer } => write!(
+                f,
+                "refusing to use the insecure issuer '{issuer}': signing in would send a \
+                 long-lived refresh token over an unencrypted connection. Use an https issuer \
+                 (http is allowed only for a loopback address during local development)."
+            ),
+            Self::EndpointOriginMismatch {
+                what,
+                endpoint,
+                issuer,
+            } => write!(
+                f,
+                "the identity provider's discovery document points its {what} endpoint at \
+                 '{endpoint}', which is not the issuer's origin ('{issuer}'). Refusing, rather \
+                 than sending credentials to an unrelated host."
             ),
             Self::Oauth { error, description } => match description {
                 Some(d) => write!(f, "identity provider rejected the request: {error} ({d})"),
@@ -357,12 +384,25 @@ pub async fn fetch_public_config(
 
 /// Fetch and validate the realm's OpenID discovery document.
 ///
-/// The document's self-reported `issuer` must match `issuer` (both
-/// canonicalised). Skipping that check would let a redirect or a
-/// copy-pasted wrong realm silently mint tokens the TraceVault server will
-/// reject, with no clue why.
+/// Three checks, because everything downstream trusts what this returns with a
+/// refresh token attached:
+///
+/// 1. The issuer must be `https`, unless it is loopback. A plaintext issuer
+///    would POST the long-lived `offline_access` refresh token in clear text.
+///    Loopback is exempt so local Keycloak development works.
+/// 2. The document's self-reported `issuer` must match the one we asked for
+///    (both canonicalised). Otherwise a redirect or a copy-pasted wrong realm
+///    silently mints tokens the TraceVault server will reject, with no clue why.
+/// 3. Every endpoint must share the issuer's ORIGIN. A misconfigured or tampered
+///    document could otherwise name an unrelated host as the token endpoint and
+///    collect the refresh token there.
 pub async fn discover(client: &reqwest::Client, issuer: &str) -> Result<Discovery, OidcError> {
     let expected = canonical_issuer(issuer);
+    let issuer_url = Url::parse(&expected).map_err(|e| {
+        OidcError::Transport(format!("'{expected}' is not a valid issuer URL: {e}"))
+    })?;
+    require_secure(&issuer_url)?;
+
     let url = format!("{expected}/.well-known/openid-configuration");
     let resp = client.get(&url).send().await.map_err(transport)?;
     let status = resp.status();
@@ -379,11 +419,74 @@ pub async fn discover(client: &reqwest::Client, issuer: &str) -> Result<Discover
         return Err(OidcError::IssuerMismatch { expected, found });
     }
 
+    let origin = issuer_url.origin();
+    let checked =
+        |endpoint: Option<String>, what: &'static str| -> Result<Option<String>, OidcError> {
+            let Some(endpoint) = endpoint else {
+                return Ok(None);
+            };
+            let parsed = Url::parse(&endpoint).map_err(|e| {
+                OidcError::Transport(format!(
+                    "the discovery document's {what} endpoint '{endpoint}' is not a valid URL: {e}"
+                ))
+            })?;
+            if parsed.origin() != origin {
+                return Err(OidcError::EndpointOriginMismatch {
+                    what,
+                    endpoint,
+                    issuer: expected.clone(),
+                });
+            }
+            Ok(Some(endpoint))
+        };
+
+    let token_endpoint = checked(Some(doc.token_endpoint), "token")?
+        .expect("checked() returns Some for a Some input");
     Ok(Discovery {
-        device_authorization_endpoint: doc.device_authorization_endpoint,
-        token_endpoint: doc.token_endpoint,
-        revocation_endpoint: doc.revocation_endpoint,
+        device_authorization_endpoint: checked(
+            doc.device_authorization_endpoint,
+            "device authorization",
+        )?,
+        token_endpoint,
+        revocation_endpoint: checked(doc.revocation_endpoint, "revocation")?,
     })
+}
+
+/// Reject a non-TLS issuer, except on loopback.
+///
+/// The refresh token is long-lived and `offline_access`-scoped; handing it to an
+/// `http://` endpoint puts it on the wire in clear text. Loopback is exempt
+/// because a local Keycloak (`http://localhost:8080/realms/...`) is a normal
+/// development setup and never leaves the machine.
+fn require_secure(issuer: &Url) -> Result<(), OidcError> {
+    if issuer.scheme() == "https" || is_loopback_host(issuer) {
+        return Ok(());
+    }
+    Err(OidcError::InsecureIssuer {
+        issuer: issuer.to_string(),
+    })
+}
+
+/// Whether a URL's host is a loopback address or a `localhost` name.
+fn is_loopback_host(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(d)) => d == "localhost" || d.ends_with(".localhost"),
+        None => false,
+    }
+}
+
+/// Whether `url` is safe to hand to the desktop's URL handler.
+///
+/// `open::that` launches whatever handler is registered for the scheme, so a
+/// broken or hostile realm response could otherwise get `file:///...` — or any
+/// registered application scheme — launched on the user's desktop. Only the two
+/// schemes a verification URI is ever legitimately expressed in are allowed.
+pub fn is_browser_safe(url: &str) -> bool {
+    Url::parse(url)
+        .map(|u| matches!(u.scheme(), "http" | "https"))
+        .unwrap_or(false)
 }
 
 /// Start a device authorization (RFC 8628 §3.1). `tracevault-cli` is a
@@ -931,6 +1034,171 @@ mod tests {
     /// PERMANENT: the user must switch to an API key. (The server answers 200
     /// rather than 503 because a 503 from a healthy server fails the pod out of
     /// its load balancer and trips 5xx SLO alerts.)
+    /// An `http://` issuer would put the long-lived `offline_access` refresh
+    /// token on the wire in clear text, so discovery refuses before it even
+    /// fetches the document. (Nothing is spawned here: reaching the assertion
+    /// proves no request was attempted.)
+    #[tokio::test]
+    async fn discovery_refuses_a_plaintext_issuer() {
+        let client = reqwest::Client::new();
+        let err = discover(&client, "http://idp.example.com/realms/v")
+            .await
+            .expect_err("a plaintext issuer must be refused");
+        assert!(
+            matches!(err, OidcError::InsecureIssuer { .. }),
+            "got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refresh token") && msg.contains("https"),
+            "{msg}"
+        );
+    }
+
+    /// ...but a loopback issuer over http is a normal local-development setup
+    /// and must keep working: the token never leaves the machine.
+    #[tokio::test]
+    async fn discovery_allows_a_loopback_issuer_over_http() {
+        let (base, _rx) = crate::test_helpers::spawn_seq_with(|base| {
+            vec![http_json(
+                "200 OK",
+                &format!(r#"{{"issuer":"{base}","token_endpoint":"{base}/token"}}"#),
+            )]
+        });
+        // `spawn_seq` binds 127.0.0.1, so this exercises the loopback exemption.
+        assert!(base.starts_with("http://127.0.0.1"));
+        let client = reqwest::Client::new();
+        discover(&client, &base)
+            .await
+            .expect("loopback http must stay usable for local development");
+    }
+
+    /// A document that names another host as its token endpoint would collect
+    /// the refresh token there. Refused, naming the endpoint and the issuer.
+    #[tokio::test]
+    async fn discovery_rejects_an_endpoint_on_another_origin() {
+        let (base, _rx) = crate::test_helpers::spawn_seq_with(|base| {
+            vec![http_json(
+                "200 OK",
+                &format!(
+                    r#"{{"issuer":"{base}","token_endpoint":"https://evil.example.com/token"}}"#
+                ),
+            )]
+        });
+        let client = reqwest::Client::new();
+        let err = discover(&client, &base)
+            .await
+            .expect_err("a token endpoint on another origin must be refused");
+        assert!(
+            matches!(err, OidcError::EndpointOriginMismatch { what: "token", .. }),
+            "got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("evil.example.com"),
+            "must name the endpoint: {msg}"
+        );
+        assert!(msg.contains(&base), "must name the issuer: {msg}");
+    }
+
+    /// The same check covers the endpoints that are optional — the revocation
+    /// endpoint also receives the refresh token.
+    #[tokio::test]
+    async fn discovery_rejects_an_offsite_revocation_endpoint() {
+        let (base, _rx) = crate::test_helpers::spawn_seq_with(|base| {
+            vec![http_json(
+                "200 OK",
+                &format!(
+                    r#"{{"issuer":"{base}","token_endpoint":"{base}/token","revocation_endpoint":"https://evil.example.com/revoke"}}"#
+                ),
+            )]
+        });
+        let client = reqwest::Client::new();
+        let err = discover(&client, &base).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OidcError::EndpointOriginMismatch {
+                    what: "revocation",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// A port or scheme difference is a different origin too — `https://host` and
+    /// `https://host:8443` are not interchangeable for credential delivery.
+    #[tokio::test]
+    async fn discovery_treats_a_different_port_as_a_different_origin() {
+        let (base, _rx) = crate::test_helpers::spawn_seq_with(|base| {
+            // Same scheme and host as the issuer, different port. A fixed port
+            // rather than one derived from `base`: prefixing a digit onto an
+            // ephemeral port can exceed 65535, which would fail URL parsing and
+            // pass this test for the wrong reason.
+            vec![http_json(
+                "200 OK",
+                &format!(r#"{{"issuer":"{base}","token_endpoint":"http://127.0.0.1:9/token"}}"#),
+            )]
+        });
+        let client = reqwest::Client::new();
+        let err = discover(&client, &base).await.unwrap_err();
+        assert!(
+            matches!(err, OidcError::EndpointOriginMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// The loopback exemption by name as well as by address: the
+    /// server-backed test above only exercises `127.0.0.1`.
+    #[test]
+    fn require_secure_exempts_loopback_by_name_and_address() {
+        for allowed in [
+            "https://idp.example.com/realms/v",
+            "http://localhost:8080/realms/v",
+            "http://keycloak.localhost/realms/v",
+            "http://127.0.0.1:8080/realms/v",
+            "http://[::1]:8080/realms/v",
+        ] {
+            require_secure(&Url::parse(allowed).unwrap())
+                .unwrap_or_else(|e| panic!("{allowed} must be allowed: {e}"));
+        }
+        for refused in [
+            "http://idp.example.com/realms/v",
+            // Not loopback despite the name resembling it.
+            "http://localhost.evil.example.com/realms/v",
+            "http://10.0.0.5:8080/realms/v",
+        ] {
+            let err = require_secure(&Url::parse(refused).unwrap())
+                .expect_err("{refused} must be refused");
+            assert!(matches!(err, OidcError::InsecureIssuer { .. }), "{refused}");
+        }
+    }
+
+    /// `open::that` hands the URL to the desktop's registered handler, so only
+    /// the two schemes a verification URI is legitimately expressed in may pass.
+    #[test]
+    fn is_browser_safe_allows_only_http_and_https() {
+        assert!(is_browser_safe("https://idp.example.com/device?code=X"));
+        assert!(is_browser_safe("http://localhost:8080/device"));
+
+        for hostile in [
+            "file:///etc/passwd",
+            "file:///Users/me/.ssh/id_rsa",
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vscode://file/etc/passwd",
+            "smb://attacker.example.com/share",
+            "not a url at all",
+            "",
+        ] {
+            assert!(
+                !is_browser_safe(hostile),
+                "{hostile} must not be handed to the desktop URL handler"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn public_config_oidc_disabled_is_permanent_no_keycloak() {
         let (base, _rx) = spawn_seq(vec![http_json("200 OK", r#"{"oidc_enabled":false}"#)]);
