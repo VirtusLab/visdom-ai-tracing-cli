@@ -336,7 +336,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", dir.path());
-        _guard.set("TRACEVAULT_NO_BROWSER", "1");
 
         let (base, _rx) = spawn_seq_with(|base| login_responses(base, me));
         // No-op sleep: the poll interval must not cost real seconds.
@@ -407,7 +406,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", dir.path());
-        _guard.set("TRACEVAULT_NO_BROWSER", "1");
 
         let unauthorized = || http_json("401 Unauthorized", r#"{"error":"invalid token"}"#);
         let (base, _rx) = spawn_seq_with(|base| {
@@ -451,7 +449,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", dir.path());
-        _guard.set("TRACEVAULT_NO_BROWSER", "1");
 
         // Only four responses are served, so the fifth request — `/auth/me` —
         // hits a closed listener.
@@ -478,7 +475,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", dir.path());
-        _guard.set("TRACEVAULT_NO_BROWSER", "1");
 
         let (base, _rx) =
             spawn_seq_with(|_| vec![http_json("200 OK", r#"{"oidc_enabled":false}"#)]);
@@ -536,17 +532,18 @@ mod tests {
         );
     }
 
+    /// Holds the shared env lock and restores through `EnvVarGuard` rather than
+    /// setting the variable raw. The previous version asserted in a SAFETY
+    /// comment that nothing else touched `TRACEVAULT_NO_BROWSER`; once the login
+    /// flow tests existed that was no longer true, leaving a window in which they
+    /// could clear it mid-assertion on a desktop with `DISPLAY` set (where
+    /// `is_headless()` has no other reason to be true).
     #[test]
     fn tracevault_no_browser_env_forces_headless() {
-        // SAFETY: test-scoped env mutation. serial_test is not available, but
-        // this test only reads a variable name nothing else touches.
-        unsafe {
-            std::env::set_var("TRACEVAULT_NO_BROWSER", "1");
-        }
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("TRACEVAULT_NO_BROWSER", "1");
         assert!(is_headless());
-        unsafe {
-            std::env::remove_var("TRACEVAULT_NO_BROWSER");
-        }
     }
 
     /// The box drawn around the user code must line up for any code length —
