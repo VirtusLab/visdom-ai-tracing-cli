@@ -213,17 +213,59 @@ fn capture_project(
 /// hence the `"(404 "` marker below matching on the open-paren + code + the
 /// space before the reason phrase). If that error-formatting ever changes,
 /// update this list (and its tests) to match.
-fn is_deterministic_client_error(e: &dyn std::error::Error) -> bool {
+/// Which deterministic client error this is, so the fallback warning can name a
+/// cause that is actually possible instead of assuming one.
+#[derive(Debug, PartialEq, Eq)]
+enum ClientErrorKind {
+    /// 403, which now has TWO plausible causes — see [`send_stream_event`].
+    Forbidden,
+    /// 400/404/409: a binding/scoping problem, and only that.
+    Scoping,
+}
+
+/// The one-line warning printed when a project-scoped send falls back to
+/// repo deduction. Pure, so the wording is asserted directly rather than by
+/// capturing stderr.
+fn fallback_warning(pid: uuid::Uuid, kind: &ClientErrorKind) -> String {
+    match kind {
+        // Since Keycloak, a 403 has a SECOND and now more common cause: the
+        // account has no `tracing` realm role at all, in which case nothing this
+        // hook does will work and `project switch` is confidently wrong advice —
+        // on the code path users hit most. The server's 403 envelope is not
+        // distinguishable from here (see `ClientErrorKind`), so name both.
+        ClientErrorKind::Forbidden => format!(
+            "tracevault: warning: the server refused to attribute this event to active project \
+             {pid} (403). Either that project does not apply to this repo (not a member, or \
+             missing TracePush) — run `tracevault project switch <name>` — or this account lacks \
+             the `tracing` Keycloak realm role entirely, which an administrator must grant. \
+             Attributing via repo deduction instead."
+        ),
+        ClientErrorKind::Scoping => format!(
+            "tracevault: warning: active project {pid} does not apply to this repo (not a member, \
+             or missing permission); attributing via repo deduction instead. Run `tracevault \
+             project switch <name>` to update."
+        ),
+    }
+}
+
+fn deterministic_client_error_kind(e: &dyn std::error::Error) -> Option<ClientErrorKind> {
     let s = e.to_string();
     // 401 is deliberately excluded: it's an authentication failure (bad/expired
     // token), not a project-scoping problem, and the repo-scoped fallback uses
     // the SAME token — it would also 401, so falling back just wastes a
-    // request before the error propagates to buffer/retry. 403 stays in: it
-    // means the token is valid but lacks TracePush on the bound project, and
-    // the repo-scoped fallback (a different authorization check) can help.
-    ["(400 ", "(403 ", "(404 ", "(409 "]
+    // request before the error propagates to buffer/retry. 403 stays in: it can
+    // mean the token is valid but lacks TracePush on the bound project, and the
+    // repo-scoped fallback (a different authorization check) can help.
+    if s.contains("(403 ") {
+        return Some(ClientErrorKind::Forbidden);
+    }
+    if ["(400 ", "(404 ", "(409 "]
         .iter()
         .any(|marker| s.contains(marker))
+    {
+        return Some(ClientErrorKind::Scoping);
+    }
+    None
 }
 
 /// Send a single stream event, routing to the project-scoped endpoint when a
@@ -256,20 +298,33 @@ async fn send_stream_event(
 ) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn std::error::Error>> {
     match capture_pid {
         None => client.stream_event(repo_id, req).await,
-        Some(pid) => match client.stream_event_for_project(pid, repo_id, req).await {
-            Ok(r) => Ok(r),
-            Err(e) if is_deterministic_client_error(e.as_ref()) => {
-                if !*fallback_warned {
-                    eprintln!(
-                        "tracevault: warning: active project {pid} does not apply to this repo (not a member, or missing permission); attributing via repo deduction instead. Run `tracevault project switch <name>` to update."
-                    );
-                    *fallback_warned = true;
+        Some(pid) => {
+            let attempt = client.stream_event_for_project(pid, repo_id, req).await;
+            let kind = match &attempt {
+                Ok(_) => None,
+                Err(e) => deterministic_client_error_kind(e.as_ref()),
+            };
+            match (attempt, kind) {
+                (Ok(r), _) => Ok(r),
+                (Err(_), Some(kind)) => {
+                    if !*fallback_warned {
+                        // Since Keycloak, a 403 has a SECOND and now more common
+                        // cause: the account has no `tracing` realm role at all,
+                        // in which case nothing this hook does will work and
+                        // `project switch` is confidently wrong advice — on the
+                        // code path users hit most. The server's 403 envelope
+                        // isn't distinguishable from here (see
+                        // `ClientErrorKind`), so the wording names both.
+                        eprintln!("{}", fallback_warning(pid, &kind));
+                        *fallback_warned = true;
+                    }
+                    // Repo-scoped fallback: the server deduces the project itself.
+                    client.stream_event(repo_id, req).await
                 }
-                // Repo-scoped fallback: the server deduces the project itself.
-                client.stream_event(repo_id, req).await
+                // transient — propagate for buffer/retry
+                (Err(e), None) => Err(e),
             }
-            Err(e) => Err(e), // transient — propagate for buffer/retry
-        },
+        }
     }
 }
 
@@ -1500,7 +1555,7 @@ mod tests {
             "propagated error must reflect the transient status, got: {err}"
         );
         assert!(
-            !is_deterministic_client_error(err.as_ref()),
+            deterministic_client_error_kind(err.as_ref()).is_none(),
             "a 503 must not be classified as a deterministic client error"
         );
 
@@ -1521,6 +1576,74 @@ mod tests {
         assert!(
             rx.recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT).is_err(),
             "no second (fallback) request should have been sent for a transient error"
+        );
+    }
+
+    /// A 403 must be classified apart from the binding/scoping statuses: since
+    /// Keycloak it has a second, now more common cause (no `tracing` realm role
+    /// at all) whose advice is completely different.
+    #[test]
+    fn a_403_is_classified_apart_from_the_scoping_statuses() {
+        let err = |s: &str| -> Box<dyn std::error::Error> { s.to_string().into() };
+        assert_eq!(
+            deterministic_client_error_kind(err("Stream failed (403 Forbidden): {}").as_ref()),
+            Some(ClientErrorKind::Forbidden)
+        );
+        for scoping in [
+            "Stream failed (400 Bad Request): {}",
+            "Stream failed (404 Not Found): {}",
+            "Stream failed (409 Conflict): {}",
+        ] {
+            assert_eq!(
+                deterministic_client_error_kind(err(scoping).as_ref()),
+                Some(ClientErrorKind::Scoping),
+                "{scoping}"
+            );
+        }
+        // Unchanged: 401 and transient failures are not deterministic client
+        // errors and must keep propagating to buffer/retry.
+        for transient in [
+            "Stream failed (401 Unauthorized): {}",
+            "Stream failed (503 Service Unavailable): {}",
+            "error sending request for url (http://x/stream)",
+        ] {
+            assert_eq!(
+                deterministic_client_error_kind(err(transient).as_ref()),
+                None,
+                "{transient}"
+            );
+        }
+    }
+
+    /// The 403 warning must not tell a user whose account has no `tracing` role
+    /// to switch projects, which cannot possibly help. It names both causes; the
+    /// scoping statuses keep the precise project wording.
+    #[test]
+    fn the_403_warning_names_the_realm_role_as_well_as_the_project() {
+        let pid = uuid::Uuid::from_u128(7);
+
+        let forbidden = fallback_warning(pid, &ClientErrorKind::Forbidden);
+        assert!(
+            forbidden.contains("`tracing` Keycloak realm role"),
+            "must offer the missing-role explanation: {forbidden}"
+        );
+        assert!(
+            forbidden.contains("project switch"),
+            "must still offer the project explanation: {forbidden}"
+        );
+        assert!(
+            forbidden.contains("Either"),
+            "must present them as alternatives, not assert one: {forbidden}"
+        );
+        assert!(forbidden.contains(&pid.to_string()));
+
+        // A 400/404/409 genuinely IS a binding problem, so that wording stays
+        // unhedged — hedging everything would dilute the useful case.
+        let scoping = fallback_warning(pid, &ClientErrorKind::Scoping);
+        assert!(scoping.contains("project switch"), "{scoping}");
+        assert!(
+            !scoping.contains("realm role"),
+            "the scoping case must not mention the realm role: {scoping}"
         );
     }
 }
