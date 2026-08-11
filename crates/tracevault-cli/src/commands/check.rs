@@ -750,6 +750,33 @@ mod push_ref_tests {
     }
 
     #[test]
+    fn parses_a_single_ref_line_without_trailing_newline() {
+        // This is the exact shape the generated pre-push hook produces: it
+        // captures git's stdin with `$(cat)` (which strips trailing
+        // newlines) and replays it with `printf '%s'` (which adds none
+        // back), so the real input to `check` has no trailing newline on
+        // its final line. Here that unterminated line is the *only* line.
+        // Do not delete this as a duplicate of `parses_a_single_ref_line`;
+        // it pins a different, easy-to-break input shape.
+        let refs = parse_push_refs("refs/heads/main abc123 refs/heads/main def456");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].local_sha, "abc123");
+        assert_eq!(refs[0].remote_sha, "def456");
+    }
+
+    #[test]
+    fn parses_multiple_refs_when_last_line_has_no_trailing_newline() {
+        // Same hook-stdin shape as above, but with two refs: only the final
+        // line is unterminated, matching a real multi-ref push through
+        // `$(cat)` + `printf '%s'`.
+        let refs =
+            parse_push_refs("refs/heads/a 111 refs/heads/a 222\nrefs/heads/b 333 refs/heads/b 444");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].local_sha, "111");
+        assert_eq!(refs[1].local_sha, "333");
+    }
+
+    #[test]
     fn skips_branch_deletions() {
         let zeros = "0".repeat(40);
         let line = format!("(delete) {zeros} refs/heads/gone abc123\n");
