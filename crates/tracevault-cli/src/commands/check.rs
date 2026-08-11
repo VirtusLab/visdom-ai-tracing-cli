@@ -113,6 +113,53 @@ fn git_empty_tree_sha(project_root: &Path) -> Option<String> {
     }
 }
 
+/// How long to wait for git's pre-push stdin to close before falling back to
+/// `@{upstream}..HEAD`. A pre-push hook writes its ref lines and closes the
+/// pipe immediately, so this bound is never hit in normal operation — it
+/// exists only to protect against a stalled non-TTY pipe (see
+/// `resolve_changed_paths` and `read_stdin_with_timeout`).
+const STDIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run `f` on a detached background thread and wait up to `timeout` for it
+/// to produce a value, returning `None` on timeout.
+///
+/// `f` is not cancelled on timeout: a blocked read has no way to be aborted
+/// from the outside, so the thread is deliberately leaked and we let the
+/// process exit around it rather than wait for it to unblock.
+///
+/// Generic over the read so the timeout mechanism can be exercised in tests
+/// without touching the process's real, global stdin — see
+/// `read_stdin_with_timeout`, which is the thin, untested wrapper that calls
+/// this with `std::io::stdin().read_to_string(..)`.
+fn read_with_timeout<F>(f: F, timeout: std::time::Duration) -> Option<String>
+where
+    F: FnOnce() -> Option<String> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(timeout).ok().flatten()
+}
+
+/// Read all of stdin, giving up after `timeout`.
+///
+/// `read_to_string` blocks until EOF, and a non-TTY pipe whose writer never
+/// closes never sends one. A git pre-push hook always closes the pipe, so
+/// this bound is not hit in normal operation — but `tracevault check` sits in
+/// the push path, and hanging there with no output is far worse than losing
+/// the push-diff optimisation.
+fn read_stdin_with_timeout(timeout: std::time::Duration) -> Option<String> {
+    use std::io::Read;
+    read_with_timeout(
+        || {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf).ok().map(|_| buf)
+        },
+        timeout,
+    )
+}
+
 /// Files in the push being attempted, or `None` if it cannot be determined.
 ///
 /// Order: git's pre-push stdin (authoritative — correct for new branches,
@@ -120,13 +167,15 @@ fn git_empty_tree_sha(project_root: &Path) -> Option<String> {
 /// up. `None` is safe: the server falls back to evaluating the raw AI-touched
 /// set, which over-blocks rather than under-blocks.
 fn resolve_changed_paths(project_root: &Path) -> Option<Vec<String>> {
-    use std::io::{IsTerminal, Read};
+    use std::io::IsTerminal;
 
     // `tracevault check` is also run by hand. Reading stdin unconditionally
-    // would block waiting for EOF, hanging the terminal.
+    // would block waiting for EOF, hanging the terminal. That guard alone is
+    // incomplete, though: a non-TTY pipe whose writer never closes (e.g. a
+    // stalled hook, a misbehaving wrapper script) also never sends EOF, so
+    // the read is additionally bounded in time.
     if !std::io::stdin().is_terminal() {
-        let mut buf = String::new();
-        if std::io::stdin().read_to_string(&mut buf).is_ok() {
+        if let Some(buf) = read_stdin_with_timeout(STDIN_READ_TIMEOUT) {
             let refs = parse_push_refs(&buf);
             if !refs.is_empty() {
                 let files = changed_files_for_refs(project_root, &refs);
@@ -734,19 +783,20 @@ mod push_ref_tests {
 /// new branches) and `git_empty_tree_sha`.
 ///
 /// `resolve_changed_paths` itself is deliberately NOT driven directly here.
-/// It reads `std::io::stdin()` unconditionally when stdin is not a terminal,
-/// and `cargo test` runs every test in one process sharing that real stdin —
+/// It reads `std::io::stdin()` when stdin is not a terminal, and `cargo
+/// test` runs every test in one process sharing that real, global stdin —
 /// there is no per-test way to inject or close it without invasive,
-/// process-wide fd surgery. Empirically, in at least one sandboxed shell
-/// environment stdin is neither a TTY nor at EOF (an open pipe nobody
-/// writes to or closes), so `read_to_string` blocks forever: exactly the
-/// hang this comment warns against. Testing the two git-backed branches it
+/// process-wide fd surgery, and a test that consumes it would make unrelated
+/// tests in the same binary flaky. Testing the two git-backed branches it
 /// falls back to (below) is the safe substitute; the stdin-parsing branch
 /// itself is already covered without touching stdin by `push_ref_tests`
 /// (`parse_push_refs`) plus `two_dot_range_returns_only_the_newer_commits_files`
 /// and `new_branch_zero_remote_sha_resolves_via_empty_tree` below, which
 /// together exercise every step `resolve_changed_paths` performs once it has
-/// a parsed `Vec<PushRef>` in hand.
+/// a parsed `Vec<PushRef>` in hand. The timeout mechanism that bounds the
+/// stdin read (`read_with_timeout`) is factored generically over the reading
+/// closure precisely so it can be tested without touching stdin at all —
+/// see `read_with_timeout_tests` below.
 #[cfg(test)]
 mod git_diff_tests {
     use super::{changed_files_for_refs, git_empty_tree_sha, PushRef};
@@ -931,6 +981,54 @@ mod git_diff_tests {
         assert!(
             String::from_utf8_lossy(&out.stdout).trim().is_empty(),
             "identical upstream/HEAD must diff to no files"
+        );
+    }
+}
+
+/// Coverage for the generic timeout mechanism behind `read_stdin_with_timeout`.
+///
+/// These drive `read_with_timeout` directly with an injected closure instead
+/// of the real `stdin()` — see the doc comment on `git_diff_tests` above for
+/// why touching the process's real, global stdin from a test is unsafe here.
+/// `read_stdin_with_timeout` itself is left thin and untested; once the
+/// generic helper is proven to time out and to pass through a prompt result,
+/// there is nothing stdin-specific left to verify.
+#[cfg(test)]
+mod read_with_timeout_tests {
+    use super::read_with_timeout;
+    use std::time::Duration;
+
+    #[test]
+    fn returns_the_value_when_it_arrives_before_the_deadline() {
+        let got = read_with_timeout(|| Some("hi".to_string()), Duration::from_secs(1));
+        assert_eq!(got, Some("hi".to_string()));
+    }
+
+    #[test]
+    fn returns_none_when_the_closure_itself_returns_none() {
+        let got = read_with_timeout(|| None, Duration::from_secs(1));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn times_out_instead_of_hanging_on_a_closure_that_never_returns() {
+        // The stalled-pipe case in miniature: the closure blocks well past
+        // the deadline (in the real bug, forever). Margins are kept wide so
+        // this cannot flake on a loaded CI machine — a 50ms timeout that
+        // must return within 1s, against a closure that sleeps for 10s.
+        let start = std::time::Instant::now();
+        let got = read_with_timeout(
+            || {
+                std::thread::sleep(Duration::from_secs(10));
+                Some("too late".to_string())
+            },
+            Duration::from_millis(50),
+        );
+        assert_eq!(got, None, "must give up rather than wait for the closure");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "must return promptly on timeout, not block on the stalled closure; took {:?}",
+            start.elapsed()
         );
     }
 }
