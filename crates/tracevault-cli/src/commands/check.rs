@@ -23,6 +23,140 @@ fn git_head_sha(project_root: &Path) -> Option<String> {
     }
 }
 
+/// One ref being pushed, as described by git's pre-push stdin protocol.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PushRef {
+    pub local_sha: String,
+    pub remote_sha: String,
+}
+
+fn is_zero_sha(sha: &str) -> bool {
+    !sha.is_empty() && sha.chars().all(|c| c == '0')
+}
+
+/// Parse git's pre-push stdin. Malformed lines are skipped rather than
+/// failing the push: this is an enrichment, and a parse error must never be
+/// the reason a developer cannot push. Branch deletions (all-zero LOCAL sha)
+/// are dropped — no content is being pushed for them.
+pub(crate) fn parse_push_refs(stdin: &str) -> Vec<PushRef> {
+    stdin
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let _local_ref = parts.next()?;
+            let local_sha = parts.next()?;
+            let _remote_ref = parts.next()?;
+            let remote_sha = parts.next()?;
+            if is_zero_sha(local_sha) {
+                return None;
+            }
+            Some(PushRef {
+                local_sha: local_sha.to_string(),
+                remote_sha: remote_sha.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Files changed by the refs being pushed, repo-relative as git emits them.
+/// Over-inclusion is the safe direction: a larger set only means less pruning
+/// of AI-touched paths, never a missed violation.
+fn changed_files_for_refs(project_root: &Path, refs: &[PushRef]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for r in refs {
+        // A new branch has no remote sha to diff from. `git diff --name-only
+        // <sha>` (one argument) diffs the working tree against that commit,
+        // which is wrong here, so name the empty tree explicitly.
+        let base = if is_zero_sha(&r.remote_sha) {
+            match git_empty_tree_sha(project_root) {
+                Some(t) => t,
+                None => continue,
+            }
+        } else {
+            r.remote_sha.clone()
+        };
+        let out_bytes = Command::new("git")
+            .args(["diff", "--name-only", &format!("{base}..{}", r.local_sha)])
+            .current_dir(project_root)
+            .output();
+        let Ok(o) = out_bytes else { continue };
+        if !o.status.success() {
+            continue;
+        }
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let p = line.trim();
+            if !p.is_empty() && seen.insert(p.to_string()) {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The well-known empty tree object, resolved via git so it is correct for
+/// both sha1 and sha256 repositories rather than hardcoded.
+fn git_empty_tree_sha(project_root: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["hash-object", "-t", "tree", "/dev/null"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Files in the push being attempted, or `None` if it cannot be determined.
+///
+/// Order: git's pre-push stdin (authoritative — correct for new branches,
+/// force pushes, and multi-ref pushes), then `@{upstream}..HEAD`, then give
+/// up. `None` is safe: the server falls back to evaluating the raw AI-touched
+/// set, which over-blocks rather than under-blocks.
+fn resolve_changed_paths(project_root: &Path) -> Option<Vec<String>> {
+    use std::io::{IsTerminal, Read};
+
+    // `tracevault check` is also run by hand. Reading stdin unconditionally
+    // would block waiting for EOF, hanging the terminal.
+    if !std::io::stdin().is_terminal() {
+        let mut buf = String::new();
+        if std::io::stdin().read_to_string(&mut buf).is_ok() {
+            let refs = parse_push_refs(&buf);
+            if !refs.is_empty() {
+                let files = changed_files_for_refs(project_root, &refs);
+                if !files.is_empty() {
+                    return Some(files);
+                }
+            }
+        }
+    }
+
+    let out = Command::new("git")
+        .args(["diff", "--name-only", "@{upstream}..HEAD"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if files.is_empty() {
+        None
+    } else {
+        Some(files)
+    }
+}
+
 fn collect_session_data(session_dir: &Path) -> Option<SessionCheckData> {
     let session_id = session_dir.file_name()?.to_string_lossy().to_string();
 
@@ -252,12 +386,14 @@ pub async fn check_policies(
     // HEAD comes from the invoking worktree (`cwd`), not the primary root —
     // the commit being pushed lives on the current worktree's branch.
     let commit_sha = git_head_sha(cwd);
+    let changed_paths = resolve_changed_paths(cwd);
     let result = client
         .check_policies(
             &repo.id,
             CheckPoliciesRequest {
                 sessions,
                 commit_sha,
+                changed_paths,
             },
         )
         .await
@@ -541,5 +677,54 @@ mod tests {
             m.to_lowercase().contains("server returned an error"),
             "504 should be treated as a server error; got: {m}"
         );
+    }
+}
+
+#[cfg(test)]
+mod push_ref_tests {
+    use super::{is_zero_sha, parse_push_refs};
+
+    #[test]
+    fn parses_a_single_ref_line() {
+        let refs = parse_push_refs("refs/heads/main abc123 refs/heads/main def456\n");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].local_sha, "abc123");
+        assert_eq!(refs[0].remote_sha, "def456");
+    }
+
+    #[test]
+    fn parses_multiple_refs() {
+        let refs = parse_push_refs(
+            "refs/heads/a 111 refs/heads/a 222\nrefs/heads/b 333 refs/heads/b 444\n",
+        );
+        assert_eq!(refs.len(), 2);
+    }
+
+    #[test]
+    fn skips_branch_deletions() {
+        let zeros = "0".repeat(40);
+        let line = format!("(delete) {zeros} refs/heads/gone abc123\n");
+        assert!(parse_push_refs(&line).is_empty());
+    }
+
+    #[test]
+    fn keeps_new_branches_whose_remote_sha_is_zero() {
+        let zeros = "0".repeat(40);
+        let line = format!("refs/heads/new abc123 refs/heads/new {zeros}\n");
+        let refs = parse_push_refs(&line);
+        assert_eq!(refs.len(), 1);
+        assert!(is_zero_sha(&refs[0].remote_sha));
+    }
+
+    #[test]
+    fn skips_malformed_lines_without_panicking() {
+        assert!(parse_push_refs("garbage\n\nalso garbage here\n").is_empty());
+    }
+
+    #[test]
+    fn zero_sha_detection_handles_sha256_length() {
+        assert!(is_zero_sha(&"0".repeat(64)));
+        assert!(!is_zero_sha("0000000000000000000000000000000000000001"));
+        assert!(!is_zero_sha(""));
     }
 }
