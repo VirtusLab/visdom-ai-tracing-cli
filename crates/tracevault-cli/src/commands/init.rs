@@ -363,8 +363,19 @@ fn install_git_hook(project_root: &Path) -> Result<(), io::Error> {
     fs::create_dir_all(&hooks_dir)?;
 
     let hook_path = hooks_dir.join("pre-push");
+    // Capture git's pre-push ref list once, then feed it to `check` explicitly
+    // rather than relying on it inheriting stdin from the hook process. `sync`
+    // never reads stdin, so today it reaches `check` anyway — this only drops
+    // the dependency on that inheritance for hooks installed from here on;
+    // already-installed hooks keep working without re-running `tracevault
+    // init`.
     let tracevault_block = format!(
-        "{HOOK_MARKER}\ntracevault sync 2>/dev/null || true\ntracevault check || {{ echo \"tracevault: policy check failed\"; exit 1; }}\n"
+        "{HOOK_MARKER}\n\
+         # Capture git's pre-push ref list once; `check` uses it to determine\n\
+         # which files are being pushed.\n\
+         tracevault_prepush_stdin=$(cat)\n\
+         tracevault sync 2>/dev/null || true\n\
+         printf '%s' \"$tracevault_prepush_stdin\" | tracevault check || {{ echo \"tracevault: policy check failed\"; exit 1; }}\n"
     );
 
     if hook_path.exists() {

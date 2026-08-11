@@ -728,3 +728,209 @@ mod push_ref_tests {
         assert!(!is_zero_sha(""));
     }
 }
+
+/// Real-git coverage for the functions `resolve_changed_paths` composes:
+/// `changed_files_for_refs` (the two-dot range and the empty-tree base for
+/// new branches) and `git_empty_tree_sha`.
+///
+/// `resolve_changed_paths` itself is deliberately NOT driven directly here.
+/// It reads `std::io::stdin()` unconditionally when stdin is not a terminal,
+/// and `cargo test` runs every test in one process sharing that real stdin —
+/// there is no per-test way to inject or close it without invasive,
+/// process-wide fd surgery. Empirically, in at least one sandboxed shell
+/// environment stdin is neither a TTY nor at EOF (an open pipe nobody
+/// writes to or closes), so `read_to_string` blocks forever: exactly the
+/// hang this comment warns against. Testing the two git-backed branches it
+/// falls back to (below) is the safe substitute; the stdin-parsing branch
+/// itself is already covered without touching stdin by `push_ref_tests`
+/// (`parse_push_refs`) plus `two_dot_range_returns_only_the_newer_commits_files`
+/// and `new_branch_zero_remote_sha_resolves_via_empty_tree` below, which
+/// together exercise every step `resolve_changed_paths` performs once it has
+/// a parsed `Vec<PushRef>` in hand.
+#[cfg(test)]
+mod git_diff_tests {
+    use super::{changed_files_for_refs, git_empty_tree_sha, PushRef};
+    use crate::test_helpers::init_git_repo;
+    use std::path::Path;
+    use std::process::Command;
+
+    /// Write `name` with `content` in `dir`, stage it, and commit it,
+    /// returning the new commit's sha. Assumes `init_git_repo` already
+    /// configured a local `user.name`/`user.email` in `dir`.
+    fn commit_file(dir: &Path, name: &str, content: &str) -> String {
+        std::fs::write(dir.join(name), content).unwrap();
+        let ok = Command::new("git")
+            .args(["-C", &dir.to_string_lossy(), "add", name])
+            .status()
+            .expect("git add failed")
+            .success();
+        assert!(ok, "git add must succeed");
+        let ok = Command::new("git")
+            .args([
+                "-C",
+                &dir.to_string_lossy(),
+                "commit",
+                "-m",
+                &format!("add {name}"),
+            ])
+            .status()
+            .expect("git commit failed")
+            .success();
+        assert!(ok, "git commit must succeed");
+        head_sha(dir)
+    }
+
+    fn head_sha(dir: &Path) -> String {
+        let out = Command::new("git")
+            .args(["-C", &dir.to_string_lossy(), "rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse failed");
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn two_dot_range_returns_only_the_newer_commits_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path()); // empty "init" commit
+
+        let sha1 = commit_file(tmp.path(), "a.txt", "a");
+        let sha2 = commit_file(tmp.path(), "b.txt", "b");
+
+        let refs = vec![PushRef {
+            local_sha: sha2,
+            remote_sha: sha1,
+        }];
+        let files = changed_files_for_refs(tmp.path(), &refs);
+
+        // Must be exactly the file the newer commit touched. A single-arg
+        // `git diff --name-only <sha>` would instead diff against the
+        // working tree and silently pull in every tracked file (here, also
+        // "a.txt") — this is the mistake this test exists to catch.
+        assert_eq!(files, vec!["b.txt".to_string()]);
+    }
+
+    #[test]
+    fn new_branch_zero_remote_sha_resolves_via_empty_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+
+        commit_file(tmp.path(), "a.txt", "a");
+        let sha2 = commit_file(tmp.path(), "b.txt", "b");
+
+        let refs = vec![PushRef {
+            local_sha: sha2,
+            remote_sha: "0".repeat(40),
+        }];
+        let mut files = changed_files_for_refs(tmp.path(), &refs);
+        files.sort();
+
+        // A brand-new branch has no remote sha to diff from; the base must
+        // resolve to the empty tree, so the full branch history shows up.
+        assert_eq!(files, vec!["a.txt".to_string(), "b.txt".to_string()]);
+    }
+
+    #[test]
+    fn identical_shas_yield_an_empty_file_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+        let sha = commit_file(tmp.path(), "a.txt", "a");
+
+        let refs = vec![PushRef {
+            local_sha: sha.clone(),
+            remote_sha: sha,
+        }];
+        let files = changed_files_for_refs(tmp.path(), &refs);
+
+        assert!(
+            files.is_empty(),
+            "a no-op push (same local and remote sha) must yield no files, got {files:?}"
+        );
+    }
+
+    #[test]
+    fn git_empty_tree_sha_is_the_well_known_constant() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+
+        let empty_tree =
+            git_empty_tree_sha(tmp.path()).expect("git hash-object must resolve the empty tree");
+        // The well-known empty-tree object id for sha1 repositories (git's
+        // default) — asserted against the literal, not just "non-empty", so
+        // a regression that resolves some other tree can't slip through.
+        assert_eq!(empty_tree, "4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+    }
+
+    /// Not a call into `resolve_changed_paths` (see the module doc comment
+    /// above for why) — this drives the exact git invocation its
+    /// `@{{upstream}}` fallback branch makes, in a repo with no upstream
+    /// configured, confirming that branch fails cleanly (non-zero exit) and
+    /// so `resolve_changed_paths` would correctly return `None` rather than
+    /// erroring or panicking.
+    #[test]
+    fn upstream_fallback_diff_fails_cleanly_with_no_upstream_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+        commit_file(tmp.path(), "a.txt", "a");
+
+        let out = Command::new("git")
+            .args(["diff", "--name-only", "@{upstream}..HEAD"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git diff must run");
+
+        assert!(
+            !out.status.success(),
+            "no upstream is configured, so this must fail rather than \
+             silently resolve to something else"
+        );
+    }
+
+    /// Companion to the test above: with an upstream configured but no diff
+    /// between it and `HEAD`, the same invocation must succeed with empty
+    /// output — the shape `resolve_changed_paths` treats as `None`.
+    #[test]
+    fn upstream_fallback_diff_is_empty_when_upstream_matches_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+        commit_file(tmp.path(), "a.txt", "a");
+
+        let branch_out = Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git symbolic-ref must run");
+        assert!(branch_out.status.success());
+        let branch = String::from_utf8_lossy(&branch_out.stdout)
+            .trim()
+            .to_string();
+
+        // Track a same-commit local branch as upstream, so `@{upstream}`
+        // resolves but the diff against it is empty — without needing an
+        // actual remote.
+        for args in [
+            vec!["branch", "tracking", &branch],
+            vec!["branch", "--set-upstream-to=tracking", &branch],
+        ] {
+            let ok = Command::new("git")
+                .args(&args)
+                .current_dir(tmp.path())
+                .status()
+                .expect("git command must run")
+                .success();
+            assert!(ok, "git {args:?} must succeed");
+        }
+
+        let out = Command::new("git")
+            .args(["diff", "--name-only", "@{upstream}..HEAD"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git diff must run");
+
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            "identical upstream/HEAD must diff to no files"
+        );
+    }
+}

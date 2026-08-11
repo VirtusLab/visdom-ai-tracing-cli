@@ -231,6 +231,28 @@ async fn init_installs_git_pre_push_hook() {
     assert!(content.contains("tracevault sync"));
     assert!(content.contains("tracevault check"));
     assert!(!content.contains("tracevault push"));
+    // Stdin must be captured once and piped into `check` explicitly, rather
+    // than relying on `check` inheriting the hook process's stdin.
+    assert!(
+        content.contains("tracevault_prepush_stdin=$(cat)"),
+        "hook must capture git's pre-push stdin: {content}"
+    );
+    assert!(
+        content.contains("| tracevault check"),
+        "hook must pipe the captured stdin into `tracevault check`: {content}"
+    );
+
+    // `sh -n` parses without executing — catches quoting mistakes in the
+    // generated script that a string-equality assertion would miss.
+    let status = std::process::Command::new("sh")
+        .arg("-n")
+        .arg(&hook_path)
+        .status()
+        .expect("sh available");
+    assert!(
+        status.success(),
+        "generated pre-push hook must be valid shell"
+    );
 }
 
 #[tokio::test]
