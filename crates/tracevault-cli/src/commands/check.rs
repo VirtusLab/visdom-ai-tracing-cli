@@ -77,21 +77,52 @@ fn changed_files_for_refs(project_root: &Path, refs: &[PushRef]) -> Vec<String> 
             r.remote_sha.clone()
         };
         let out_bytes = Command::new("git")
-            .args(["diff", "--name-only", &format!("{base}..{}", r.local_sha)])
+            .args([
+                "diff",
+                "--name-only",
+                // `-z`: NUL-delimit output and disable git's default path
+                // quoting (`core.quotePath`), which otherwise renders any
+                // path outside plain ASCII — accents, CJK, a literal space
+                // in some locales — as an octal-escaped, double-quoted
+                // string that can never match the hook-recorded path.
+                "-z",
+                // Rename detection is on by default and reports only the
+                // destination path, hiding the source. A larger
+                // `changed_paths` only ever means less pruning, never a
+                // missed violation, so always disable it here.
+                "--no-renames",
+                &format!("{base}..{}", r.local_sha),
+            ])
             .current_dir(project_root)
             .output();
         let Ok(o) = out_bytes else { continue };
         if !o.status.success() {
             continue;
         }
-        for line in String::from_utf8_lossy(&o.stdout).lines() {
-            let p = line.trim();
-            if !p.is_empty() && seen.insert(p.to_string()) {
-                out.push(p.to_string());
+        for p in split_nul_delimited_paths(&o.stdout) {
+            if seen.insert(p.clone()) {
+                out.push(p);
             }
         }
     }
     out
+}
+
+/// Split `git diff -z` output into paths.
+///
+/// `-z` NUL-*terminates* each path rather than NUL-*separating* them, so a
+/// naive split always yields one trailing empty element — filtered out here,
+/// along with any other empty segment. Paths are NOT trimmed: a NUL-split
+/// path needs no trimming, and trimming could corrupt a path with legal
+/// leading/trailing whitespace. `String::from_utf8_lossy` is used rather than
+/// a strict UTF-8 parse so a non-UTF-8 path degrades gracefully instead of
+/// dropping the whole diff.
+fn split_nul_delimited_paths(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string())
+        .collect()
 }
 
 /// The well-known empty tree object, resolved via git so it is correct for
@@ -165,7 +196,11 @@ fn read_stdin_with_timeout(timeout: std::time::Duration) -> Option<String> {
 /// Order: git's pre-push stdin (authoritative — correct for new branches,
 /// force pushes, and multi-ref pushes), then `@{upstream}..HEAD`, then give
 /// up. `None` is safe: the server falls back to evaluating the raw AI-touched
-/// set, which over-blocks rather than under-blocks.
+/// set, which over-blocks rather than under-blocks. Once stdin has yielded
+/// usable refs, its diff is final — even if empty — and the function returns
+/// without trying `@{upstream}..HEAD`; that fallback is only for when stdin
+/// gave no usable refs at all, never a second opinion on an authoritative
+/// empty diff (see the comment inline below).
 fn resolve_changed_paths(project_root: &Path) -> Option<Vec<String>> {
     use std::io::IsTerminal;
 
@@ -178,27 +213,39 @@ fn resolve_changed_paths(project_root: &Path) -> Option<Vec<String>> {
         if let Some(buf) = read_stdin_with_timeout(STDIN_READ_TIMEOUT) {
             let refs = parse_push_refs(&buf);
             if !refs.is_empty() {
+                // Authoritative: stdin gave us real push refs, so whatever
+                // `changed_files_for_refs` returns for them — including
+                // nothing — IS the answer for this push. Do not fall through
+                // to the `@{upstream}..HEAD` fallback below: that is a
+                // DIFFERENT range that can contain files not in this push at
+                // all, and sending paths from the wrong range corrupts the
+                // server's intersection against AI-touched paths. An
+                // authoritative empty diff must resolve to `None`, not to
+                // whatever the fallback range happens to contain.
                 let files = changed_files_for_refs(project_root, &refs);
-                if !files.is_empty() {
-                    return Some(files);
-                }
+                return if files.is_empty() { None } else { Some(files) };
             }
         }
     }
 
+    // Only reached when stdin gave us no usable refs at all (no stdin, a
+    // terminal, a timeout, or every line malformed) — never as a fallback
+    // from an authoritative-but-empty diff above.
     let out = Command::new("git")
-        .args(["diff", "--name-only", "@{upstream}..HEAD"])
+        .args([
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "@{upstream}..HEAD",
+        ])
         .current_dir(project_root)
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
+    let files = split_nul_delimited_paths(&out.stdout);
     if files.is_empty() {
         None
     } else {
@@ -926,6 +973,103 @@ mod git_diff_tests {
     }
 
     #[test]
+    fn non_ascii_path_is_returned_raw_not_octal_quoted() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        let sha1 = commit_file(tmp.path(), "src/café.rs", "one");
+        let sha2 = commit_file(tmp.path(), "src/café.rs", "two");
+
+        let refs = vec![PushRef {
+            local_sha: sha2,
+            remote_sha: sha1,
+        }];
+        let files = changed_files_for_refs(tmp.path(), &refs);
+
+        // Without `-z`, git's default `core.quotePath` behaviour renders this
+        // as the 20-character literal string `"src/caf\303\251.rs"`
+        // (surrounding quotes included) instead of the real path — see the
+        // fix's doc comment. That string can never match the hook-recorded
+        // path, so the file is silently pruned from `changed_paths`.
+        assert_eq!(
+            files,
+            vec!["src/café.rs".to_string()],
+            "must be the raw UTF-8 path, not git's octal-quoted rendering; got {files:?}"
+        );
+    }
+
+    #[test]
+    fn path_containing_a_space_is_returned_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        let sha1 = commit_file(tmp.path(), "src/has space.rs", "one");
+        let sha2 = commit_file(tmp.path(), "src/has space.rs", "two");
+
+        let refs = vec![PushRef {
+            local_sha: sha2,
+            remote_sha: sha1,
+        }];
+        let files = changed_files_for_refs(tmp.path(), &refs);
+
+        assert_eq!(files, vec!["src/has space.rs".to_string()]);
+    }
+
+    #[test]
+    fn rename_reports_both_source_and_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let sha1 = commit_file(tmp.path(), "src/plain.rs", "identical content");
+
+        let ok = Command::new("git")
+            .args([
+                "-C",
+                &tmp.path().to_string_lossy(),
+                "mv",
+                "src/plain.rs",
+                "src/renamed.rs",
+            ])
+            .status()
+            .expect("git mv failed")
+            .success();
+        assert!(ok, "git mv must succeed");
+        let ok = Command::new("git")
+            .args([
+                "-C",
+                &tmp.path().to_string_lossy(),
+                "commit",
+                "-m",
+                "rename plain.rs to renamed.rs",
+            ])
+            .status()
+            .expect("git commit failed")
+            .success();
+        assert!(ok, "git commit must succeed");
+        let sha2 = head_sha(tmp.path());
+
+        let refs = vec![PushRef {
+            local_sha: sha2,
+            remote_sha: sha1,
+        }];
+        let mut files = changed_files_for_refs(tmp.path(), &refs);
+        files.sort();
+
+        // Git's rename detection is on by default, so a plain `git diff
+        // --name-only` here would report only `src/renamed.rs`, hiding the
+        // fact that `src/plain.rs` ever existed in this diff. If
+        // `src/plain.rs` were a protected path, that silence is exactly what
+        // lets an agent rename it away undetected.
+        assert_eq!(
+            files,
+            vec!["src/plain.rs".to_string(), "src/renamed.rs".to_string()],
+            "a rename must surface BOTH the source and destination path; got {files:?}"
+        );
+    }
+
+    #[test]
     fn git_empty_tree_sha_is_the_well_known_constant() {
         let tmp = tempfile::tempdir().unwrap();
         init_git_repo(tmp.path());
@@ -951,7 +1095,13 @@ mod git_diff_tests {
         commit_file(tmp.path(), "a.txt", "a");
 
         let out = Command::new("git")
-            .args(["diff", "--name-only", "@{upstream}..HEAD"])
+            .args([
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "@{upstream}..HEAD",
+            ])
             .current_dir(tmp.path())
             .output()
             .expect("git diff must run");
@@ -999,14 +1149,20 @@ mod git_diff_tests {
         }
 
         let out = Command::new("git")
-            .args(["diff", "--name-only", "@{upstream}..HEAD"])
+            .args([
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "@{upstream}..HEAD",
+            ])
             .current_dir(tmp.path())
             .output()
             .expect("git diff must run");
 
         assert!(out.status.success());
         assert!(
-            String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            out.stdout.is_empty(),
             "identical upstream/HEAD must diff to no files"
         );
     }
