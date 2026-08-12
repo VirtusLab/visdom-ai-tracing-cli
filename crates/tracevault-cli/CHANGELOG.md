@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.27.0...v0.28.0) - 2026-08-12
+
+### Added
+
+- *(check)* send the pushed file list as changed_paths (VIS-123) ([#41](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/41))
+
 ## [0.27.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.26.0...v0.27.0) - 2026-08-06
 
 ### Added
