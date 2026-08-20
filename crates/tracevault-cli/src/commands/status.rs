@@ -499,6 +499,33 @@ fn latest_active_binding_in(
     None
 }
 
+/// One clear rule for the "Workspace repo" check, shared by both arms of
+/// [`workspace_binding_check_in`] below: `Ok` only when
+/// `binding_repo_id_is_valid` — the SAME predicate `attribution_for` filters
+/// through before honoring a repo binding — passes. A corrupted/hand-edited
+/// session-state file can carry a `repo_id` that isn't a real UUID;
+/// `attribution_for` silently drops such a binding, so showing it as `Ok`
+/// here would be green for something the hook will not honor.
+/// `detail_suffix` carries the arm-specific "(session {id})" / "most recent
+/// session..." wording; the base "repo {id} via repo switch" text stays
+/// identical to before this check existed.
+fn workspace_repo_binding_check(
+    b: &crate::session_state::RepoBinding,
+    detail_suffix: &str,
+) -> Check {
+    let base = format!("repo {} via repo switch{detail_suffix}", b.repo_id);
+    if crate::commands::stream::binding_repo_id_is_valid(&b.repo_id) {
+        Check::ok("Workspace repo", base)
+    } else {
+        Check::warn(
+            "Workspace repo",
+            format!(
+                "{base} — this repo_id is not a valid id and will be dropped at capture time; run `tracevault repo switch <path>` to rewrite it"
+            ),
+        )
+    }
+}
+
 /// Resolve the workspace binding for `status` — the repo axis of
 /// attribution. With an explicit session id the user named a target, but a
 /// missing binding is only a Skip here: this check sees the repo axis alone,
@@ -524,13 +551,10 @@ fn workspace_binding_check_in(
         Some(id) => {
             let state = crate::session_state::load_from(sessions_dir, id);
             match state.active {
-                Some(b) => (
-                    Check::ok(
-                        "Workspace repo",
-                        format!("repo {} via repo switch (session {id})", b.repo_id),
-                    ),
-                    Some(b),
-                ),
+                Some(b) => {
+                    let check = workspace_repo_binding_check(&b, &format!(" (session {id})"));
+                    (check, Some(b))
+                }
                 None => (
                     Check::skip(
                         "Workspace repo",
@@ -541,16 +565,13 @@ fn workspace_binding_check_in(
             }
         }
         None => match latest_active_binding_in(sessions_dir) {
-            Some((id, b)) => (
-                Check::ok(
-                    "Workspace repo",
-                    format!(
-                        "repo {} via repo switch — most recent session with a binding: {id} (may be another repo; pass --session-id to target one)",
-                        b.repo_id
-                    ),
-                ),
-                Some(b),
-            ),
+            Some((id, b)) => {
+                let suffix = format!(
+                    " — most recent session with a binding: {id} (may be another repo; pass --session-id to target one)"
+                );
+                let check = workspace_repo_binding_check(&b, &suffix);
+                (check, Some(b))
+            }
             None => (
                 Check::skip("Workspace repo", "no active workspace binding found"),
                 None,
@@ -595,26 +616,27 @@ fn project_label(binding: &crate::session_state::ProjectBinding) -> &str {
 /// DISPLAY ONLY: this outcome never feeds [`recording_check`]'s verdict — see
 /// that function's doc comment for why.
 ///
-/// - `ConfigDefault` and `Deduced` are tiers `capture_project` does NOT
-///   honor (it excludes the config `default_project` outright, and never
-///   deduces server-side) — so neither renders `Ok`. Showing `Ok` for a tier
-///   the capture path ignores would print a green Project line directly
-///   above a red Recording line for the same session: the display would
-///   contradict the verdict, which is the exact confusion this command
-///   exists to eliminate. Both render Warn, naming the tier and that it is
-///   not used for attribution at capture time.
-/// - Every other resolved tier (flag/subagent/session-active/user-default)
-///   IS honored by `capture_project` → a confident, live attribution → Ok.
-/// - `Err` — the ambiguous "this repo belongs to multiple projects" case, or
-///   any transport/5xx failure of the deduction call (`resolve_effective_project`
-///   propagates both the same way via `?`) — is also at most a Warn, never an
-///   Error: this axis is display-only, so a network blip must never be able
-///   to redden the exit code on its own. Matches how the rest of `status`
-///   treats transport failure (`GetMeError::Network`, a failed `list_repos`)
-///   as Warn, not Error.
-/// - `None` (nothing bound on this axis) is a Skip — severity for "nothing
-///   will be recorded" is [`recording_check`]'s job, since only it consults
-///   the actual recording gate.
+/// One rule decides `Ok`: the tier must be one `capture_project` itself
+/// honors (flag/subagent/session-active/user-default — NOT `ConfigDefault`
+/// or `Deduced`, which it excludes/never produces), AND the binding's
+/// `project_id` must parse as a UUID, since `capture_project` ends with
+/// `.parse::<uuid::Uuid>().ok()?` and silently drops anything that doesn't.
+/// Either failure renders `Warn`, not `Ok` — showing green for a binding the
+/// capture path will not honor is the exact confusion this command exists to
+/// eliminate (a hand-edited or corrupted `user_project.toml` with a garbage
+/// `project_id` is a real way to hit the id-validity half of this).
+///
+/// `Err` — the ambiguous "this repo belongs to multiple projects" case, or
+/// any transport/5xx failure of the deduction call (`resolve_effective_project`
+/// propagates both the same way via `?`) — is also at most a `Warn`, never an
+/// `Error`: this axis is display-only, so a network blip must never be able
+/// to redden the exit code on its own. Matches how the rest of `status`
+/// treats transport failure (`GetMeError::Network`, a failed `list_repos`) as
+/// Warn, not Error.
+///
+/// `None` (nothing bound on this axis) is a `Skip` — severity for "nothing
+/// will be recorded" is [`recording_check`]'s job, since only it consults the
+/// actual recording gate.
 fn project_binding_check(outcome: &ProjectOutcome) -> Check {
     match outcome {
         Err(e) => Check::warn("Project", e.to_string()),
@@ -622,21 +644,55 @@ fn project_binding_check(outcome: &ProjectOutcome) -> Check {
             "Project",
             "not bound — run `tracevault project switch --user \"<name>\"`, or `tracevault repo switch <path>` inside a checkout",
         ),
-        Ok(Some((binding, source)))
-            if matches!(source, ProjectSource::ConfigDefault | ProjectSource::Deduced) =>
-        {
-            Check::warn(
-                "Project",
-                format!(
-                    "{} — {source}, not used for attribution at capture time; set one explicitly with `tracevault project switch <name>` or --project",
-                    project_label(binding)
-                ),
-            )
-        }
         Ok(Some((binding, source))) => {
-            Check::ok("Project", format!("{} — {source}", project_label(binding)))
+            let honored_tier = matches!(
+                source,
+                ProjectSource::ProjectFlag
+                    | ProjectSource::Subagent
+                    | ProjectSource::SessionActive
+                    | ProjectSource::UserDefault
+            );
+            let label = project_label(binding);
+            if !honored_tier {
+                Check::warn(
+                    "Project",
+                    format!(
+                        "{label} — {source}, not used for attribution at capture time; set one explicitly with `tracevault project switch <name>` or --project"
+                    ),
+                )
+            } else if binding.project_id.parse::<uuid::Uuid>().is_err() {
+                Check::warn(
+                    "Project",
+                    format!(
+                        "{label} — {source}, but the saved project_id is not a valid id and will be dropped at capture time; run `tracevault project switch <name>` to rewrite it"
+                    ),
+                )
+            } else {
+                Check::ok("Project", format!("{label} — {source}"))
+            }
         }
     }
+}
+
+/// Surfaces a `.tracevault/config.toml` `default_project` NAME that failed
+/// to resolve to a real project (network failure, no matching name, or a
+/// case mismatch — names are matched case-sensitively). Without this, the
+/// tier is silently dropped: `commands::project`'s `status` warns for the
+/// same gap (project.rs:284-289) via a plain `eprintln!`, but `status` has
+/// no equivalent, so a stale/misspelled `default_project` is invisible here.
+///
+/// Always a `Warn`, and the wording says so explicitly: even a `default_project`
+/// that DOES resolve is a `ConfigDefault` tier `capture_project` excludes (see
+/// [`project_binding_check`]), so this unresolved case must not imply fixing
+/// the name would make attribution work at capture time — it would still need
+/// `tracevault project switch <name>` or `--project`.
+fn unresolved_config_default_check(name: &str) -> Check {
+    Check::warn(
+        "Project default",
+        format!(
+            "configured default_project '{name}' could not be resolved (network error, or no matching project); even if it resolved, this tier is not used for attribution at capture time — set one with `tracevault project switch <name>` or --project instead"
+        ),
+    )
 }
 
 /// The one check that reflects whether anything will record this session at
@@ -1114,6 +1170,14 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
     let config_default_name = config.as_ref().and_then(|c| c.default_project.clone());
     let user_default_project = crate::user_project_default::load();
     let project_git_url = git_remote_url(cwd);
+    // Set when a configured `default_project` NAME fails to resolve (network
+    // error, or no matching/case-matching project) — surfaced below rather
+    // than silently dropped, mirroring `commands::project`'s `status`
+    // (project.rs:284-289). `None` in EITHER arm: the offline arm never
+    // attempts resolution at all (no client to call `list_projects` with),
+    // which is a different, already-visible gap (no credential -> an Error
+    // from the Authentication section).
+    let mut config_default_unresolved: Option<String> = None;
 
     let project_outcome: ProjectOutcome = match (auth.credential.clone(), auth.server_url.as_ref())
     {
@@ -1122,15 +1186,21 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
             // A configured default_project is a NAME; resolving it into a
             // binding needs the project list, same as project.rs's status.
             let config_default = match config_default_name.as_deref() {
-                Some(name) => client.list_projects().await.ok().and_then(|items| {
-                    items.into_iter().find(|p| p.name == name).map(|p| {
-                        crate::session_state::ProjectBinding {
-                            project_id: p.id.to_string(),
-                            project_name: p.name,
-                            updated_at: chrono::Utc::now().to_rfc3339(),
-                        }
-                    })
-                }),
+                Some(name) => {
+                    let resolved = client.list_projects().await.ok().and_then(|items| {
+                        items.into_iter().find(|p| p.name == name).map(|p| {
+                            crate::session_state::ProjectBinding {
+                                project_id: p.id.to_string(),
+                                project_name: p.name,
+                                updated_at: chrono::Utc::now().to_rfc3339(),
+                            }
+                        })
+                    });
+                    if resolved.is_none() {
+                        config_default_unresolved = Some(name.to_string());
+                    }
+                    resolved
+                }
                 None => None,
             };
             let inputs = ProjectResolveInputs {
@@ -1164,6 +1234,9 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
     }
     attribution_v.push(binding_check);
     attribution_v.push(project_binding_check(&project_outcome));
+    if let Some(name) = config_default_unresolved {
+        attribution_v.push(unresolved_config_default_check(&name));
+    }
 
     let server_checks_v =
         server_repo_checks(project_root, &auth, config.as_ref(), authoritative_binding).await;
@@ -1750,6 +1823,70 @@ mod tests {
         assert!(binding.is_none());
     }
 
+    #[test]
+    fn workspace_binding_explicit_id_malformed_repo_id_is_warn_not_ok() {
+        // `attribution_for` filters a resolved binding through
+        // `binding_repo_id_is_valid` and drops it if the check fails; a
+        // corrupted session-state file with a non-UUID `repo_id` must not
+        // read Ok here either.
+        let dir = tempfile::tempdir().unwrap();
+        let st = crate::session_state::SessionState {
+            active: Some(crate::session_state::RepoBinding {
+                repo_id: "not-a-uuid".into(),
+                git_url: None,
+                remote_id: None,
+                codebase_name: None,
+                updated_at: "t".into(),
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.path().join("sess-bad.toml"),
+            toml::to_string(&st).unwrap(),
+        )
+        .unwrap();
+        let (check, binding) = workspace_binding_check_in(dir.path(), Some("sess-bad"));
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("not a valid id"),
+            "detail: {}",
+            check.detail
+        );
+        // The raw binding is still returned (unchanged mode signal for
+        // callers) — only this check's OWN severity changes.
+        assert_eq!(binding.unwrap().repo_id, "not-a-uuid");
+    }
+
+    #[test]
+    fn workspace_binding_scan_malformed_repo_id_is_warn_not_ok() {
+        // Same rule, scan arm: `latest_active_binding_in` doesn't validate
+        // either, so the same corrupted binding could surface via a scan.
+        let dir = tempfile::tempdir().unwrap();
+        let st = crate::session_state::SessionState {
+            active: Some(crate::session_state::RepoBinding {
+                repo_id: "not-a-uuid".into(),
+                git_url: None,
+                remote_id: None,
+                codebase_name: None,
+                updated_at: "t".into(),
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.path().join("sess-bad.toml"),
+            toml::to_string(&st).unwrap(),
+        )
+        .unwrap();
+        let (check, binding) = workspace_binding_check_in(dir.path(), None);
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("not a valid id"),
+            "detail: {}",
+            check.detail
+        );
+        assert_eq!(binding.unwrap().repo_id, "not-a-uuid");
+    }
+
     fn repo_item(id: &str, name: &str) -> crate::api_client::RepoListItem {
         crate::api_client::RepoListItem {
             id: id.parse().unwrap(),
@@ -1947,11 +2084,15 @@ mod tests {
         // Only the tiers `capture_project` itself resolves at capture time
         // read Ok: a `--project`-equivalent flag, the subagent/session-active
         // overrides, and the user-level default. `ConfigDefault` and
-        // `Deduced` are covered separately — they must NOT appear here.
+        // `Deduced` are covered separately — they must NOT appear here. Uses
+        // a well-formed UUID id: an honored tier still needs a parseable
+        // `project_id` to read Ok (see the malformed-id tests below).
         use crate::resolution::ProjectSource::*;
         for source in [ProjectFlag, Subagent, SessionActive, UserDefault] {
-            let outcome: ProjectOutcome =
-                Ok(Some((project_binding("pid-1", "My Project"), source)));
+            let outcome: ProjectOutcome = Ok(Some((
+                project_binding("33333333-3333-4333-8333-333333333333", "My Project"),
+                source,
+            )));
             let check = project_binding_check(&outcome);
             assert_eq!(check.level, Level::Ok, "source={source} should read Ok");
             assert!(
@@ -1999,6 +2140,28 @@ mod tests {
             "detail: {}",
             check.detail
         );
+    }
+
+    #[test]
+    fn project_binding_check_malformed_project_id_is_warn_not_ok() {
+        // Aikido's finding: `capture_project` ends with
+        // `.parse::<uuid::Uuid>().ok()?`, so a saved binding with a
+        // non-UUID `project_id` (a hand-edited or corrupted
+        // `user_project.toml`, or a corrupted session-state file) is
+        // silently dropped at capture time. An honored tier with such an id
+        // must not read Ok. Covers SessionActive and UserDefault.
+        use crate::resolution::ProjectSource::{SessionActive, UserDefault};
+        for source in [SessionActive, UserDefault] {
+            let outcome: ProjectOutcome =
+                Ok(Some((project_binding("not-a-uuid", "My Project"), source)));
+            let check = project_binding_check(&outcome);
+            assert_eq!(check.level, Level::Warn, "source={source}");
+            assert!(
+                check.detail.contains("not a valid id"),
+                "source={source} detail: {}",
+                check.detail
+            );
+        }
     }
 
     #[test]
@@ -2293,5 +2456,108 @@ mod tests {
             None,
         );
         assert_eq!(missed, None);
+    }
+
+    #[test]
+    fn verdict_malformed_project_id_leaves_project_axis_unbound() {
+        // Pins that the display fix (`project_binding_check`) and the real
+        // verdict (`recording_attribution` -> `capture_project`) cannot
+        // diverge: a malformed `project_id` must be dropped by both.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+
+        let state = crate::session_state::SessionState {
+            active_project: Some(project_binding("not-a-uuid", "My Project")),
+            ..Default::default()
+        };
+        let sessions_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sessions_dir.path().join("sess-bad-project.toml"),
+            toml::to_string(&state).unwrap(),
+        )
+        .unwrap();
+
+        let cwd = tempfile::tempdir().unwrap();
+        let (attribution, _worktree) = recording_attribution(
+            Some(sessions_dir.path()),
+            Some("sess-bad-project"),
+            cwd.path(),
+            None,
+        );
+        assert_eq!(
+            attribution, None,
+            "a malformed project_id must not resolve an attribution"
+        );
+        assert_eq!(
+            recording_check(Some("s"), attribution.as_ref()).map(|c| c.level),
+            Some(Level::Error)
+        );
+    }
+
+    #[test]
+    fn verdict_malformed_repo_id_with_nothing_else_bound_is_error() {
+        // Same principle, repo axis: `attribution_for` drops a binding whose
+        // `repo_id` fails `binding_repo_id_is_valid`, so nothing else bound
+        // must still error, matching `workspace_binding_*_malformed_repo_id_*`.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+
+        let state = crate::session_state::SessionState {
+            active: Some(crate::session_state::RepoBinding {
+                repo_id: "not-a-uuid".into(),
+                git_url: None,
+                remote_id: None,
+                codebase_name: None,
+                updated_at: "t".into(),
+            }),
+            ..Default::default()
+        };
+        let sessions_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sessions_dir.path().join("sess-bad-repo.toml"),
+            toml::to_string(&state).unwrap(),
+        )
+        .unwrap();
+
+        let cwd = tempfile::tempdir().unwrap();
+        let (attribution, _worktree) = recording_attribution(
+            Some(sessions_dir.path()),
+            Some("sess-bad-repo"),
+            cwd.path(),
+            None,
+        );
+        assert_eq!(
+            attribution, None,
+            "a malformed repo_id must not resolve an attribution"
+        );
+        assert_eq!(
+            recording_check(Some("s"), attribution.as_ref()).map(|c| c.level),
+            Some(Level::Error)
+        );
+    }
+
+    #[test]
+    fn unresolved_config_default_check_names_it_and_is_warn() {
+        let check = unresolved_config_default_check("payments-platform");
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("payments-platform"),
+            "detail: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains("not used for attribution at capture time"),
+            "detail should not imply resolving it would make capture-time \
+             attribution work: {}",
+            check.detail
+        );
     }
 }

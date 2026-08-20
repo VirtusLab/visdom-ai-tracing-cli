@@ -222,7 +222,11 @@ pub fn resolve_session_paths(
 /// A resolved binding is usable for hook attribution only if its repo_id is a
 /// real UUID — guards against a corrupted/edited session-state file injecting
 /// path separators into the pending-<repo_id>.jsonl filename.
-fn binding_repo_id_is_valid(repo_id: &str) -> bool {
+///
+/// `pub(crate)`: also called by `commands::status`, so a binding with a
+/// malformed `repo_id` is never displayed as bound (`Check::ok`) when this
+/// same check means the hook will not actually honor it.
+pub(crate) fn binding_repo_id_is_valid(repo_id: &str) -> bool {
     uuid::Uuid::parse_str(repo_id).is_ok()
 }
 
