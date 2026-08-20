@@ -251,7 +251,12 @@ pub(crate) fn resolve_stream_binding(
 /// Repo config `default_project` (a name) is intentionally excluded: honoring it
 /// would need a per-event `list_projects` call. `None` -> fall back to the
 /// repo-scoped stream (server deduces).
-fn capture_project(
+///
+/// `pub(crate)`: also called by `commands::status`, which reuses this
+/// function (plus `resolve_stream_binding`/`attribution_for`) as the
+/// authoritative "will this session record anything" gate, so the status
+/// verdict can never drift from what this hook actually does.
+pub(crate) fn capture_project(
     session: &crate::session_state::SessionState,
     worktree_path: Option<&str>,
 ) -> Option<uuid::Uuid> {
