@@ -7,7 +7,10 @@
 use crate::api_client::{ApiClient, GetMeError};
 use crate::config::TracevaultConfig;
 use crate::credentials::{Credential, Credentials};
-use crate::resolution::{git_remote_url, git_repo_name};
+use crate::resolution::{
+    effective_project, git_remote_url, git_repo_name, resolve_effective_project,
+    ProjectResolveInputs, ProjectSource,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -496,12 +499,23 @@ fn latest_active_binding_in(
     None
 }
 
-/// Resolve the workspace binding for `status`. With an explicit session id the
-/// user named a target, so a missing binding is a Warn. Without one, best-effort
-/// scan across all sessions (state is global): show the most recent that HAS a
-/// binding, and stay quiet (Skip) when none does — so a bound-mode user with a
-/// stray empty session file isn't warned. Returns the Check AND the resolved
-/// binding (reused by the caller as the `has_binding` mode signal).
+/// Resolve the workspace binding for `status` — the repo axis of
+/// attribution. With an explicit session id the user named a target, but a
+/// missing binding is only a Skip here: this check sees the repo axis alone,
+/// so it cannot tell a genuinely unbound machine (nothing will record) from
+/// one that's fully attributed via the project axis (`project switch
+/// --user`). Only [`recording_check`], which sees both axes, can make that
+/// call — so it also owns the escalation and the remediation hint; this
+/// check states the bare fact and stops (in particular, it does NOT suggest
+/// `tracevault repo switch …`: since v0.28.0 that command takes a checkout
+/// path and rejects binding by session name, which is exactly the situation
+/// on the repo-less machine this check is describing).
+///
+/// Without an explicit id, best-effort scan across all sessions (state is
+/// global): show the most recent that HAS a binding, and stay quiet (Skip)
+/// when none does — so a bound-mode user with a stray empty session file
+/// isn't warned. Returns the Check AND the resolved binding (reused by the
+/// caller as the `has_binding` mode signal).
 fn workspace_binding_check_in(
     sessions_dir: &Path,
     explicit_session_id: Option<&str>,
@@ -512,17 +526,15 @@ fn workspace_binding_check_in(
             match state.active {
                 Some(b) => (
                     Check::ok(
-                        "Workspace binding",
+                        "Workspace repo",
                         format!("repo {} via repo switch (session {id})", b.repo_id),
                     ),
                     Some(b),
                 ),
                 None => (
-                    Check::warn(
-                        "Workspace binding",
-                        format!(
-                            "session {id} has no active binding — run `tracevault repo switch …`"
-                        ),
+                    Check::skip(
+                        "Workspace repo",
+                        format!("session {id} has no active binding"),
                     ),
                     None,
                 ),
@@ -531,7 +543,7 @@ fn workspace_binding_check_in(
         None => match latest_active_binding_in(sessions_dir) {
             Some((id, b)) => (
                 Check::ok(
-                    "Workspace binding",
+                    "Workspace repo",
                     format!(
                         "repo {} via repo switch — most recent session with a binding: {id} (may be another repo; pass --session-id to target one)",
                         b.repo_id
@@ -540,11 +552,106 @@ fn workspace_binding_check_in(
                 Some(b),
             ),
             None => (
-                Check::skip("Workspace binding", "no active workspace binding found"),
+                Check::skip("Workspace repo", "no active workspace binding found"),
                 None,
             ),
         },
     }
+}
+
+// --- Attribution: project axis + the combined recording verdict ---
+
+/// The already-resolved project-attribution outcome consumed by
+/// [`project_binding_check`]: either the full server-aware chain
+/// (`resolve_effective_project`) or, when no API client is available, the
+/// pure local tiers (`effective_project`) wrapped in `Ok` so both code paths
+/// in `run_status` produce the same shape. Reuses `resolution.rs`'s own
+/// `Option<(ProjectBinding, ProjectSource)>`/`Box<dyn Error>` types rather
+/// than introducing a parallel enum, so `ProjectSource`'s tier labels (and
+/// its `Display` impl) stay the single source of truth.
+type ProjectOutcome = Result<
+    Option<(crate::session_state::ProjectBinding, ProjectSource)>,
+    Box<dyn std::error::Error>,
+>;
+
+/// Display label for a project binding: the friendly name, falling back to
+/// the id when unset (a `Deduced` binding carries an empty `project_name` —
+/// `resolve_effective_project` doesn't enrich it, and enriching it here would
+/// cost an extra `list_projects` call this read-only inspector doesn't need).
+fn project_label(binding: &crate::session_state::ProjectBinding) -> &str {
+    if binding.project_name.is_empty() {
+        &binding.project_id
+    } else {
+        &binding.project_name
+    }
+}
+
+/// Maps the resolved project-attribution outcome to the "Project" check.
+/// Pure and network-free — the resolution already happened in `run_status`.
+///
+/// - An explicit tier (flag/subagent/session/config-default/user-default) is
+///   a confident attribution → Ok.
+/// - `Deduced` (server-side inference from the repo's git remote) → Warn: it
+///   mirrors the stderr warning `resolve_effective_project` already prints
+///   when it lands on this tier — attribution happened, but wasn't explicit.
+/// - The chain returning `Err` is the ambiguous "this repo belongs to
+///   multiple projects" case. Unlike `project status` (`commands/project.rs`),
+///   which swallows this as informational since it has nothing to act on,
+///   here it is an Error: `recording_check` needs a definitive "this axis
+///   failed", not merely "unresolved".
+/// - `None` (nothing bound on this axis) is a Skip — severity for "nothing
+///   bound at all" is [`recording_check`]'s job, since only it sees both axes.
+fn project_binding_check(outcome: &ProjectOutcome) -> Check {
+    match outcome {
+        Err(e) => Check::err("Project", e.to_string()),
+        Ok(None) => Check::skip(
+            "Project",
+            "not bound — run `tracevault project switch --user \"<name>\"`, or `tracevault repo switch <path>` inside a checkout",
+        ),
+        Ok(Some((binding, ProjectSource::Deduced))) => Check::warn(
+            "Project",
+            format!(
+                "{} — attribution deduced from the repo, not explicit; set one with `tracevault project switch <name>` or --project",
+                project_label(binding)
+            ),
+        ),
+        Ok(Some((binding, source))) => {
+            Check::ok("Project", format!("{} — {source}", project_label(binding)))
+        }
+    }
+}
+
+/// The one check that weighs BOTH attribution axes at once: whether anything
+/// will record this session at all. Only fires for an explicitly named
+/// session (`--session-id` / `$TRACEVAULT_SESSION_ID`) — a bare scan has no
+/// committed target, so there is nothing to escalate about (and this keeps
+/// the scan path out of the escalation by construction).
+///
+/// This is the bug this whole change exists to fix: `workspace_binding_check_in`
+/// alone only sees the repo axis, so a session bound purely via the project
+/// axis (`project switch --user`, the supported repo-less path) used to look
+/// identical — a lone Warn — to a session that is bound on NEITHER axis and
+/// will therefore record nothing at all. Only this function has enough
+/// information to tell those apart, so it's also the only place that can name
+/// the right remediation for each case (repo-less vs. inside a checkout).
+fn recording_check(
+    repo_bound: bool,
+    project_bound: bool,
+    explicit_session: bool,
+    session_id: Option<&str>,
+) -> Option<Check> {
+    if explicit_session && !repo_bound && !project_bound {
+        let id = session_id.unwrap_or("<unknown>");
+        return Some(Check::err(
+            "Recording",
+            format!(
+                "nothing will be recorded — session {id} is bound on neither the repo nor the \
+                 project axis; run `tracevault project switch --user \"<name>\"` on a repo-less \
+                 machine, or `tracevault repo switch <path>` inside a checkout"
+            ),
+        ));
+    }
+    None
 }
 
 // --- Server repo ---
@@ -867,7 +974,7 @@ pub async fn run_status(project_root: &Path, session_id: Option<&str>) -> i32 {
     let (binding_check, binding) = match sessions_dir.as_deref() {
         Some(dir) => workspace_binding_check_in(dir, session_id),
         None => (
-            Check::skip("Workspace binding", "cannot determine session state dir"),
+            Check::skip("Workspace repo", "cannot determine session state dir"),
             None,
         ),
     };
@@ -892,7 +999,79 @@ pub async fn run_status(project_root: &Path, session_id: Option<&str>) -> i32 {
         has_global,
         has_binding,
     );
-    let binding_v = vec![binding_check];
+
+    // Resolve the project axis ONCE, mirroring `commands::project`'s `status`
+    // path (project.rs:228-334): load the session state for `session_id`,
+    // read the worktree-relative default_project + the user-level default,
+    // and run the full precedence chain if a client can be built from the
+    // existing `auth`. Best-effort like that path: no credential/client
+    // degrades to the pure local tiers via `effective_project`, which need no
+    // network — an unauthenticated run already carries an Error from the
+    // Authentication section, so there's no false-red risk in degrading
+    // quietly here.
+    let project_session = match session_id {
+        Some(id) => crate::session_state::load(id),
+        None => crate::session_state::SessionState::default(),
+    };
+    let worktree = crate::paths::worktree_toplevel(project_root);
+    let config_default_name = config.as_ref().and_then(|c| c.default_project.clone());
+    let user_default = crate::user_project_default::load();
+    let project_git_url = git_remote_url(project_root);
+
+    let project_outcome: ProjectOutcome = match (auth.credential.clone(), auth.server_url.as_ref())
+    {
+        (Some(credential), Some(server_url)) => {
+            let client = ApiClient::with_credential(server_url, Some(credential));
+            // A configured default_project is a NAME; resolving it into a
+            // binding needs the project list, same as project.rs's status.
+            let config_default = match config_default_name.as_deref() {
+                Some(name) => client.list_projects().await.ok().and_then(|items| {
+                    items.into_iter().find(|p| p.name == name).map(|p| {
+                        crate::session_state::ProjectBinding {
+                            project_id: p.id.to_string(),
+                            project_name: p.name,
+                            updated_at: chrono::Utc::now().to_rfc3339(),
+                        }
+                    })
+                }),
+                None => None,
+            };
+            let inputs = ProjectResolveInputs {
+                project_flag: None,
+                session: &project_session,
+                worktree_path: Some(&worktree),
+                config_default,
+            };
+            resolve_effective_project(&inputs, user_default, project_git_url.as_deref(), &client)
+                .await
+        }
+        _ => {
+            let inputs = ProjectResolveInputs {
+                project_flag: None,
+                session: &project_session,
+                worktree_path: Some(&worktree),
+                config_default: None,
+            };
+            Ok(effective_project(&inputs))
+        }
+    };
+
+    // Repo axis: an active binding on an explicitly named session, OR a
+    // loaded project config (bound mode) — omitting the config half would
+    // turn a normal dev repo run (a `--session-id` but no `repo switch`) red.
+    let repo_bound = has_binding || config.is_some();
+    // Project axis: `Deduced` counts as bound (something WILL be recorded,
+    // via inferred attribution) even though `project_binding_check` reads it
+    // as a Warn rather than an Ok.
+    let project_bound = matches!(project_outcome, Ok(Some(_)));
+
+    let mut attribution_v = Vec::new();
+    if let Some(c) = recording_check(repo_bound, project_bound, explicit_session, session_id) {
+        attribution_v.push(c);
+    }
+    attribution_v.push(binding_check);
+    attribution_v.push(project_binding_check(&project_outcome));
+
     let server_checks_v =
         server_repo_checks(project_root, &auth, config.as_ref(), authoritative_binding).await;
     let session_checks_v = session_checks(project_root);
@@ -901,7 +1080,7 @@ pub async fn run_status(project_root: &Path, session_id: Option<&str>) -> i32 {
         ("Authentication", auth_checks_v),
         ("Installation", install_v),
         ("Project", proj_checks_v),
-        ("Workspace binding", binding_v),
+        ("Attribution", attribution_v),
         ("Server repo", server_checks_v),
         ("Sessions", session_checks_v),
     ];
@@ -1360,7 +1539,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_binding_explicit_id_without_binding_is_warn() {
+    fn workspace_binding_explicit_id_without_binding_is_skip() {
+        // Severity moved to `recording_check`, which is the only place that
+        // sees both attribution axes — this check alone can't tell a
+        // genuinely unbound machine from one attributed via the project axis.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("sess-empty.toml"),
@@ -1368,7 +1550,7 @@ mod tests {
         )
         .unwrap();
         let (check, binding) = workspace_binding_check_in(dir.path(), Some("sess-empty"));
-        assert_eq!(check.level, Level::Warn);
+        assert_eq!(check.level, Level::Skip);
         assert!(binding.is_none());
     }
 
@@ -1593,5 +1775,119 @@ mod tests {
         ); // non-empty whitespace is a real (if odd) id — NOT filtered
         assert_eq!(effective_session_id(None, Some("".into())), None);
         assert_eq!(effective_session_id(None, None), None);
+    }
+
+    fn project_binding(id: &str, name: &str) -> crate::session_state::ProjectBinding {
+        crate::session_state::ProjectBinding {
+            project_id: id.into(),
+            project_name: name.into(),
+            updated_at: "t".into(),
+        }
+    }
+
+    #[test]
+    fn recording_check_truth_table() {
+        // An Error fires ONLY for the (false, false, explicit=true) cell —
+        // every other combination of the two axes, crossed with
+        // explicit_session, must emit no check at all.
+        for repo_bound in [false, true] {
+            for project_bound in [false, true] {
+                for explicit_session in [false, true] {
+                    let got = recording_check(
+                        repo_bound,
+                        project_bound,
+                        explicit_session,
+                        Some("sess-1"),
+                    );
+                    let expect_error = explicit_session && !repo_bound && !project_bound;
+                    match got {
+                        Some(check) => {
+                            assert!(
+                                expect_error,
+                                "unexpected Some(_) for repo_bound={repo_bound} \
+                                 project_bound={project_bound} explicit_session={explicit_session}"
+                            );
+                            assert_eq!(check.level, Level::Error);
+                        }
+                        None => assert!(
+                            !expect_error,
+                            "expected an Error check for repo_bound={repo_bound} \
+                             project_bound={project_bound} explicit_session={explicit_session}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recording_check_error_names_project_switch_and_session() {
+        // Defect (2): the stale `repo switch <name>` hint has to be gone and
+        // the repo-less remediation (`project switch --user`) has to be
+        // present, or a regression to the old text wouldn't be caught by a
+        // plain level assertion.
+        let check = recording_check(false, false, true, Some("3f27a336-abcd"))
+            .expect("expected an Error check");
+        assert_eq!(check.level, Level::Error);
+        assert!(
+            check.detail.contains("project switch"),
+            "detail: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("3f27a336-abcd"),
+            "detail: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn project_binding_check_explicit_source_is_ok() {
+        let outcome: ProjectOutcome = Ok(Some((
+            project_binding("pid-1", "My Project"),
+            crate::resolution::ProjectSource::UserDefault,
+        )));
+        let check = project_binding_check(&outcome);
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check.detail.contains("My Project"),
+            "detail: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn project_binding_check_deduced_is_warn() {
+        let outcome: ProjectOutcome = Ok(Some((
+            project_binding("pid-2", ""),
+            crate::resolution::ProjectSource::Deduced,
+        )));
+        let check = project_binding_check(&outcome);
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("deduc"),
+            "detail should say attribution was deduced, not explicit: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn project_binding_check_ambiguous_err_is_error() {
+        let outcome: ProjectOutcome =
+            Err("this repo belongs to multiple projects; select one with `tracevault project switch <name>`".into());
+        let check = project_binding_check(&outcome);
+        assert_eq!(check.level, Level::Error);
+        assert!(
+            check.detail.contains("multiple projects"),
+            "detail: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn project_binding_check_none_is_skip() {
+        let outcome: ProjectOutcome = Ok(None);
+        let check = project_binding_check(&outcome);
+        assert_eq!(check.level, Level::Skip);
     }
 }
