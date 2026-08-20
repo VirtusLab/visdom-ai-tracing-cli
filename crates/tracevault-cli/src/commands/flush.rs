@@ -5,6 +5,17 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use tracevault_protocol::streaming::StreamEventRequest;
 
+/// Shared spelling of the offline-queue filenames. These are the ONLY place
+/// the shape is written down: `commands::stream` builds names from them and
+/// this module parses names with them, so the writer and the reader cannot
+/// drift apart. Drift would be silent — a name this module fails to classify
+/// is skipped, stranding the queue while `status` keeps counting it.
+pub(crate) const QUEUE_PREFIX: &str = "pending-";
+/// Repo-less queues. Note this EXTENDS `QUEUE_PREFIX`, which is what makes an
+/// older CLI skip these files rather than mis-drain them.
+pub(crate) const PROJECT_QUEUE_PREFIX: &str = "pending-project-";
+pub(crate) const QUEUE_SUFFIX: &str = ".jsonl";
+
 /// Extract the repo id from a per-repo pending queue filename
 /// (`pending-<repo_id>.jsonl`). Returns None for anything else (e.g. a legacy
 /// `pending.jsonl`).
@@ -14,8 +25,8 @@ use tracevault_protocol::streaming::StreamEventRequest;
 /// what keeps an older CLI from mis-draining those queues; callers here must
 /// try [`project_id_from_pending_filename`] FIRST.
 pub(crate) fn repo_id_from_pending_filename(name: &str) -> Option<&str> {
-    name.strip_prefix("pending-")?
-        .strip_suffix(".jsonl")
+    name.strip_prefix(QUEUE_PREFIX)?
+        .strip_suffix(QUEUE_SUFFIX)
         .filter(|s| !s.is_empty())
 }
 
@@ -23,8 +34,8 @@ pub(crate) fn repo_id_from_pending_filename(name: &str) -> Option<&str> {
 /// (`pending-project-<project_id>.jsonl`), written by the stream hook when a
 /// session has a project binding but no usable repo binding.
 pub(crate) fn project_id_from_pending_filename(name: &str) -> Option<&str> {
-    name.strip_prefix("pending-project-")?
-        .strip_suffix(".jsonl")
+    name.strip_prefix(PROJECT_QUEUE_PREFIX)?
+        .strip_suffix(QUEUE_SUFFIX)
         .filter(|s| !s.is_empty())
 }
 
@@ -461,6 +472,38 @@ mod queue_target_tests {
         assert_eq!(
             queue_target_from_filename(&format!("pending-{repo}.jsonl")),
             Some(QueueTarget::Repo(repo.to_string()))
+        );
+    }
+
+    /// The writer (`Attribution::pending_file_name`, in `commands::stream`)
+    /// and the reader (`queue_target_from_filename`, here) are the two halves
+    /// of one format that live in different modules. Nothing else fails if
+    /// they diverge — an unparsable name is silently skipped, stranding the
+    /// queue while `status` still counts it — so pin the round trip.
+    #[test]
+    fn every_attribution_round_trips_through_its_queue_filename() {
+        use crate::commands::stream::Attribution;
+
+        let repo = uuid::Uuid::new_v4();
+        assert_eq!(
+            queue_target_from_filename(
+                &Attribution::Repo {
+                    repo_id: repo.to_string(),
+                    project: Some(uuid::Uuid::new_v4()),
+                }
+                .pending_file_name()
+            ),
+            Some(QueueTarget::Repo(repo.to_string())),
+            "a repo queue must classify back to the same repo"
+        );
+
+        let pid = uuid::Uuid::new_v4();
+        assert_eq!(
+            queue_target_from_filename(
+                &Attribution::ProjectOnly { project_id: pid }.pending_file_name()
+            ),
+            Some(QueueTarget::Project(pid)),
+            "a repo-less queue must classify back to the same project, NOT to a repo"
         );
     }
 
