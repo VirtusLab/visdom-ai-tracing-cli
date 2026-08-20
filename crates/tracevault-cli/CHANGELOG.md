@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.2](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.28.1...v0.28.2) - 2026-08-20
+
+### Fixed
+
+- *(status)* report unbound-on-both-axes as an error and show project attribution (VIS-158) ([#45](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/45))
+
 ## [0.28.1](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.28.0...v0.28.1) - 2026-08-20
 
 ### Fixed
