@@ -222,7 +222,11 @@ pub fn resolve_session_paths(
 /// A resolved binding is usable for hook attribution only if its repo_id is a
 /// real UUID — guards against a corrupted/edited session-state file injecting
 /// path separators into the pending-<repo_id>.jsonl filename.
-fn binding_repo_id_is_valid(repo_id: &str) -> bool {
+///
+/// `pub(crate)`: also called by `commands::status`, so a binding with a
+/// malformed `repo_id` is never displayed as bound (`Check::ok`) when this
+/// same check means the hook will not actually honor it.
+pub(crate) fn binding_repo_id_is_valid(repo_id: &str) -> bool {
     uuid::Uuid::parse_str(repo_id).is_ok()
 }
 
@@ -251,7 +255,12 @@ pub(crate) fn resolve_stream_binding(
 /// Repo config `default_project` (a name) is intentionally excluded: honoring it
 /// would need a per-event `list_projects` call. `None` -> fall back to the
 /// repo-scoped stream (server deduces).
-fn capture_project(
+///
+/// `pub(crate)`: also called by `commands::status`, which reuses this
+/// function (plus `resolve_stream_binding`/`attribution_for`) as the
+/// authoritative "will this session record anything" gate, so the status
+/// verdict can never drift from what this hook actually does.
+pub(crate) fn capture_project(
     session: &crate::session_state::SessionState,
     worktree_path: Option<&str>,
 ) -> Option<uuid::Uuid> {

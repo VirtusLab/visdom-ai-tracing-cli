@@ -7,7 +7,10 @@
 use crate::api_client::{ApiClient, GetMeError};
 use crate::config::TracevaultConfig;
 use crate::credentials::{Credential, Credentials};
-use crate::resolution::{git_remote_url, git_repo_name};
+use crate::resolution::{
+    effective_project, git_remote_url, git_repo_name, resolve_effective_project,
+    ProjectResolveInputs, ProjectSource,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -496,12 +499,50 @@ fn latest_active_binding_in(
     None
 }
 
-/// Resolve the workspace binding for `status`. With an explicit session id the
-/// user named a target, so a missing binding is a Warn. Without one, best-effort
-/// scan across all sessions (state is global): show the most recent that HAS a
-/// binding, and stay quiet (Skip) when none does — so a bound-mode user with a
-/// stray empty session file isn't warned. Returns the Check AND the resolved
-/// binding (reused by the caller as the `has_binding` mode signal).
+/// One clear rule for the "Workspace repo" check, shared by both arms of
+/// [`workspace_binding_check_in`] below: `Ok` only when
+/// `binding_repo_id_is_valid` — the SAME predicate `attribution_for` filters
+/// through before honoring a repo binding — passes. A corrupted/hand-edited
+/// session-state file can carry a `repo_id` that isn't a real UUID;
+/// `attribution_for` silently drops such a binding, so showing it as `Ok`
+/// here would be green for something the hook will not honor.
+/// `detail_suffix` carries the arm-specific "(session {id})" / "most recent
+/// session..." wording; the base "repo {id} via repo switch" text stays
+/// identical to before this check existed.
+fn workspace_repo_binding_check(
+    b: &crate::session_state::RepoBinding,
+    detail_suffix: &str,
+) -> Check {
+    let base = format!("repo {} via repo switch{detail_suffix}", b.repo_id);
+    if crate::commands::stream::binding_repo_id_is_valid(&b.repo_id) {
+        Check::ok("Workspace repo", base)
+    } else {
+        Check::warn(
+            "Workspace repo",
+            format!(
+                "{base} — this repo_id is not a valid id and will be dropped at capture time; run `tracevault repo switch <path>` to rewrite it"
+            ),
+        )
+    }
+}
+
+/// Resolve the workspace binding for `status` — the repo axis of
+/// attribution. With an explicit session id the user named a target, but a
+/// missing binding is only a Skip here: this check sees the repo axis alone,
+/// so it cannot tell a genuinely unbound machine (nothing will record) from
+/// one that's fully attributed via the project axis (`project switch
+/// --user`). Only [`recording_check`], which sees both axes, can make that
+/// call — so it also owns the escalation and the remediation hint; this
+/// check states the bare fact and stops (in particular, it does NOT suggest
+/// `tracevault repo switch …`: since v0.28.0 that command takes a checkout
+/// path and rejects binding by session name, which is exactly the situation
+/// on the repo-less machine this check is describing).
+///
+/// Without an explicit id, best-effort scan across all sessions (state is
+/// global): show the most recent that HAS a binding, and stay quiet (Skip)
+/// when none does — so a bound-mode user with a stray empty session file
+/// isn't warned. Returns the Check AND the resolved binding (reused by the
+/// caller as the `has_binding` mode signal).
 fn workspace_binding_check_in(
     sessions_dir: &Path,
     explicit_session_id: Option<&str>,
@@ -510,41 +551,246 @@ fn workspace_binding_check_in(
         Some(id) => {
             let state = crate::session_state::load_from(sessions_dir, id);
             match state.active {
-                Some(b) => (
-                    Check::ok(
-                        "Workspace binding",
-                        format!("repo {} via repo switch (session {id})", b.repo_id),
-                    ),
-                    Some(b),
-                ),
+                Some(b) => {
+                    let check = workspace_repo_binding_check(&b, &format!(" (session {id})"));
+                    (check, Some(b))
+                }
                 None => (
-                    Check::warn(
-                        "Workspace binding",
-                        format!(
-                            "session {id} has no active binding — run `tracevault repo switch …`"
-                        ),
+                    Check::skip(
+                        "Workspace repo",
+                        format!("session {id} has no active binding"),
                     ),
                     None,
                 ),
             }
         }
         None => match latest_active_binding_in(sessions_dir) {
-            Some((id, b)) => (
-                Check::ok(
-                    "Workspace binding",
-                    format!(
-                        "repo {} via repo switch — most recent session with a binding: {id} (may be another repo; pass --session-id to target one)",
-                        b.repo_id
-                    ),
-                ),
-                Some(b),
-            ),
+            Some((id, b)) => {
+                let suffix = format!(
+                    " — most recent session with a binding: {id} (may be another repo; pass --session-id to target one)"
+                );
+                let check = workspace_repo_binding_check(&b, &suffix);
+                (check, Some(b))
+            }
             None => (
-                Check::skip("Workspace binding", "no active workspace binding found"),
+                Check::skip("Workspace repo", "no active workspace binding found"),
                 None,
             ),
         },
     }
+}
+
+// --- Attribution: project axis + the combined recording verdict ---
+
+/// The already-resolved project-attribution outcome consumed by
+/// [`project_binding_check`]: either the full server-aware chain
+/// (`resolve_effective_project`) or, when no API client is available, the
+/// pure local tiers (`effective_project`) wrapped in `Ok` so both code paths
+/// in `run_status` produce the same shape. Reuses `resolution.rs`'s own
+/// `Option<(ProjectBinding, ProjectSource)>`/`Box<dyn Error>` types rather
+/// than introducing a parallel enum, so `ProjectSource`'s tier labels (and
+/// its `Display` impl) stay the single source of truth.
+type ProjectOutcome = Result<
+    Option<(crate::session_state::ProjectBinding, ProjectSource)>,
+    Box<dyn std::error::Error>,
+>;
+
+/// Display label for a project binding: the friendly name, falling back to
+/// the id when unset. A `Deduced` binding carries an empty `project_name`
+/// (`resolve_effective_project` doesn't enrich it) and is shown by id rather
+/// than name: the credentialed arm below only ever calls `list_projects`
+/// when a config `default_project` is set, so a name lookup for `Deduced` is
+/// not reliably available — falling back to the id keeps this consistent
+/// across both cases rather than sometimes showing a name and sometimes an
+/// id depending on unrelated config state.
+fn project_label(binding: &crate::session_state::ProjectBinding) -> &str {
+    if binding.project_name.is_empty() {
+        &binding.project_id
+    } else {
+        &binding.project_name
+    }
+}
+
+/// Maps the resolved project-attribution outcome to the "Project" check.
+/// Pure and network-free — the resolution already happened in `run_status`.
+/// DISPLAY ONLY: this outcome never feeds [`recording_check`]'s verdict — see
+/// that function's doc comment for why.
+///
+/// One rule decides `Ok`: the tier must be one `capture_project` itself
+/// honors (flag/subagent/session-active/user-default — NOT `ConfigDefault`
+/// or `Deduced`, which it excludes/never produces), AND the binding's
+/// `project_id` must parse as a UUID, since `capture_project` ends with
+/// `.parse::<uuid::Uuid>().ok()?` and silently drops anything that doesn't.
+/// Either failure renders `Warn`, not `Ok` — showing green for a binding the
+/// capture path will not honor is the exact confusion this command exists to
+/// eliminate (a hand-edited or corrupted `user_project.toml` with a garbage
+/// `project_id` is a real way to hit the id-validity half of this).
+///
+/// `Err` — the ambiguous "this repo belongs to multiple projects" case, or
+/// any transport/5xx failure of the deduction call (`resolve_effective_project`
+/// propagates both the same way via `?`) — is also at most a `Warn`, never an
+/// `Error`: this axis is display-only, so a network blip must never be able
+/// to redden the exit code on its own. Matches how the rest of `status`
+/// treats transport failure (`GetMeError::Network`, a failed `list_repos`) as
+/// Warn, not Error.
+///
+/// `None` (nothing bound on this axis) is a `Skip` — severity for "nothing
+/// will be recorded" is [`recording_check`]'s job, since only it consults the
+/// actual recording gate.
+fn project_binding_check(outcome: &ProjectOutcome) -> Check {
+    match outcome {
+        Err(e) => Check::warn("Project", e.to_string()),
+        Ok(None) => Check::skip(
+            "Project",
+            "not bound — run `tracevault project switch --user \"<name>\"`, or `tracevault repo switch <path>` inside a checkout",
+        ),
+        Ok(Some((binding, source))) => {
+            let honored_tier = matches!(
+                source,
+                ProjectSource::ProjectFlag
+                    | ProjectSource::Subagent
+                    | ProjectSource::SessionActive
+                    | ProjectSource::UserDefault
+            );
+            let label = project_label(binding);
+            if !honored_tier {
+                Check::warn(
+                    "Project",
+                    format!(
+                        "{label} — {source}, not used for attribution at capture time; set one explicitly with `tracevault project switch <name>` or --project"
+                    ),
+                )
+            } else if binding.project_id.parse::<uuid::Uuid>().is_err() {
+                Check::warn(
+                    "Project",
+                    format!(
+                        "{label} — {source}, but the saved project_id is not a valid id and will be dropped at capture time; run `tracevault project switch <name>` to rewrite it"
+                    ),
+                )
+            } else {
+                Check::ok("Project", format!("{label} — {source}"))
+            }
+        }
+    }
+}
+
+/// Surfaces a `.tracevault/config.toml` `default_project` NAME that failed
+/// to resolve to a real project (network failure, no matching name, or a
+/// case mismatch — names are matched case-sensitively). Without this, the
+/// tier is silently dropped: `commands::project`'s `status` warns for the
+/// same gap (project.rs:284-289) via a plain `eprintln!`, but `status` has
+/// no equivalent, so a stale/misspelled `default_project` is invisible here.
+///
+/// Always a `Warn`, and the wording says so explicitly: even a `default_project`
+/// that DOES resolve is a `ConfigDefault` tier `capture_project` excludes (see
+/// [`project_binding_check`]), so this unresolved case must not imply fixing
+/// the name would make attribution work at capture time — it would still need
+/// `tracevault project switch <name>` or `--project`.
+fn unresolved_config_default_check(name: &str) -> Check {
+    Check::warn(
+        "Project default",
+        format!(
+            "configured default_project '{name}' could not be resolved (network error, or no matching project); even if it resolved, this tier is not used for attribution at capture time — set one with `tracevault project switch <name>` or --project instead"
+        ),
+    )
+}
+
+/// The one check that reflects whether anything will record this session at
+/// all. Takes the ALREADY-RESOLVED [`crate::commands::stream::Attribution`] —
+/// the exact same value `attribution_for(resolve_stream_binding(...),
+/// capture_project(...))` the `stream` hook itself computes before deciding
+/// to no-op — rather than a hand-built approximation of the two axes. Coupling
+/// to the hook's own gate this way is load-bearing: the repo axis has tiers
+/// (`repo switch --user`, a config with no `repo_id`) and the project axis has
+/// tiers (`project switch --user` with no credential, `Deduced`/`ConfigDefault`
+/// display values `capture_project` doesn't honor) that a hand-rolled
+/// `repo_bound`/`project_bound` pair would have to re-derive and could get
+/// wrong; calling the real functions means the two can't drift apart.
+///
+/// Only fires for an explicitly named session (`--session-id` /
+/// `$TRACEVAULT_SESSION_ID`, i.e. `session_id.is_some()`) — a bare scan has no
+/// committed target, so there's nothing to escalate about. Pure and
+/// network-free: `attribution` is computed by the caller from purely local
+/// tiers (mirroring the hook), so this check — and the verdict it drives —
+/// can never be swayed by a network hiccup.
+fn recording_check(
+    session_id: Option<&str>,
+    attribution: Option<&crate::commands::stream::Attribution>,
+) -> Option<Check> {
+    let id = session_id?;
+    if attribution.is_some() {
+        return None;
+    }
+    Some(Check::err(
+        "Recording",
+        format!(
+            "nothing will be recorded — session {id} is bound on neither the repo nor the \
+             project axis; run `tracevault project switch --user \"<name>\"` on a repo-less \
+             machine, or `tracevault repo switch <path>` inside a checkout"
+        ),
+    ))
+}
+
+/// Compose the "will this session record anything" gate exactly as
+/// `run_status` and the `stream` hook do: load the session state, derive the
+/// worktree key from `cwd`, extract a bound-config `RepoBinding` (if any),
+/// and call `resolve_stream_binding` -> `capture_project` -> `attribution_for`
+/// with those inputs. Pure and synchronous — network-free, matching the two
+/// functions it calls. Returns the worktree key alongside the attribution so
+/// callers that also need it (the project-display resolution in `run_status`)
+/// don't re-shell out to git for the same value.
+///
+/// Deliberately derives its OWN worktree key from `cwd` (via
+/// `crate::paths::worktree_toplevel`) rather than taking a pre-computed key as
+/// a parameter: `cwd` is the toplevel a `stream` hook invocation actually runs
+/// from, which for a LINKED worktree is NOT the same string as `project_root`
+/// (the PRIMARY worktree's root, from `resolve_project_root`'s
+/// `git rev-parse --git-common-dir`) — subagent overrides are keyed by the
+/// former. Keeping the derivation INSIDE this function, with every attribution
+/// test calling it directly rather than re-deriving the key by hand, is what
+/// makes `recording_attribution_finds_subagent_override_via_linked_worktree_cwd`
+/// able to catch a regression back to a primary-root path.
+fn recording_attribution(
+    sessions_dir: Option<&Path>,
+    session_id: Option<&str>,
+    cwd: &Path,
+    config: Option<&TracevaultConfig>,
+) -> (Option<crate::commands::stream::Attribution>, String) {
+    let session = match (sessions_dir, session_id) {
+        (Some(dir), Some(id)) => crate::session_state::load_from(dir, id),
+        _ => crate::session_state::SessionState::default(),
+    };
+    let worktree = crate::paths::worktree_toplevel(cwd);
+    let bound = config.and_then(crate::resolution::binding_from_config);
+    let user_default_repo = crate::user_default::load();
+    let stream_binding = crate::commands::stream::resolve_stream_binding(
+        &session,
+        &worktree,
+        bound,
+        user_default_repo,
+    );
+    let capture_pid = crate::commands::stream::capture_project(&session, Some(&worktree));
+    let attribution =
+        crate::commands::stream::attribution_for(stream_binding.as_ref(), capture_pid);
+    (attribution, worktree)
+}
+
+/// The project axis's offline/no-client display fallback: the pure local
+/// tiers (`effective_project`) plus the user-level project default as the
+/// lowest tier. `effective_project` alone never consults the user default —
+/// only `resolve_effective_project` (the networked chain) does — so without
+/// this, a repo-less pod attributed solely via `project switch --user`, with
+/// no credential/server URL configured, would show "not bound" on the
+/// "Project" line while `recording_attribution` (which reads this same tier
+/// independently via `capture_project`) correctly shows the session as
+/// recording. Pulled out as its own pure function so this fallback is
+/// unit-testable without driving all of `run_status`.
+fn offline_project_outcome(
+    inputs: &ProjectResolveInputs,
+    user_default_project: Option<crate::session_state::ProjectBinding>,
+) -> ProjectOutcome {
+    Ok(effective_project(inputs)
+        .or_else(|| user_default_project.map(|b| (b, ProjectSource::UserDefault))))
 }
 
 // --- Server repo ---
@@ -846,7 +1092,7 @@ pub fn effective_session_id(arg: Option<String>, env: Option<String>) -> Option<
         .or_else(|| env.filter(|s| !s.is_empty()))
 }
 
-pub async fn run_status(project_root: &Path, session_id: Option<&str>) -> i32 {
+pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str>) -> i32 {
     let auth = resolve_auth();
 
     // ~/.claude/settings.json — None when the home dir can't be resolved. Do
@@ -867,7 +1113,7 @@ pub async fn run_status(project_root: &Path, session_id: Option<&str>) -> i32 {
     let (binding_check, binding) = match sessions_dir.as_deref() {
         Some(dir) => workspace_binding_check_in(dir, session_id),
         None => (
-            Check::skip("Workspace binding", "cannot determine session state dir"),
+            Check::skip("Workspace repo", "cannot determine session state dir"),
             None,
         ),
     };
@@ -892,7 +1138,106 @@ pub async fn run_status(project_root: &Path, session_id: Option<&str>) -> i32 {
         has_global,
         has_binding,
     );
-    let binding_v = vec![binding_check];
+
+    // The recording verdict: call the hook's own gate (stream.rs) via
+    // `recording_attribution` — see that function's doc comment for why its
+    // composition, including the worktree-key derivation, lives there rather
+    // than inline here. Its worktree key is reused below for the project
+    // display resolution, which needs the same value.
+    let (attribution, worktree) =
+        recording_attribution(sessions_dir.as_deref(), session_id, cwd, config.as_ref());
+
+    // The project axis for DISPLAY needs its own full `SessionState` (more
+    // than `workspace_binding_check_in`'s bare `RepoBinding`, e.g.
+    // `active_project`/`subagent_projects`) — unlike the verdict above, which
+    // lives entirely inside `recording_attribution`. Loaded separately
+    // (rather than sharing `recording_attribution`'s internal session load)
+    // so that function's session load stays self-contained.
+    let project_session = match (sessions_dir.as_deref(), session_id) {
+        (Some(dir), Some(id)) => crate::session_state::load_from(dir, id),
+        _ => crate::session_state::SessionState::default(),
+    };
+
+    // --- The project axis for DISPLAY only, mirroring `commands::project`'s
+    // `status` path (project.rs:228-334): read the worktree-relative
+    // default_project + the user-level default, and run the full precedence
+    // chain (including server-side deduction) if a client can be built from
+    // the existing `auth`. Best-effort like that path: no credential/client
+    // degrades to the pure local tiers via `effective_project`, which need no
+    // network. Whatever this resolves to (including a deduction failure) is
+    // shown to the user but — unlike the verdict above — can never affect the
+    // exit code beyond a Warn; see `project_binding_check`.
+    let config_default_name = config.as_ref().and_then(|c| c.default_project.clone());
+    let user_default_project = crate::user_project_default::load();
+    let project_git_url = git_remote_url(cwd);
+    // Set when a configured `default_project` NAME fails to resolve (network
+    // error, or no matching/case-matching project) — surfaced below rather
+    // than silently dropped, mirroring `commands::project`'s `status`
+    // (project.rs:284-289). `None` in EITHER arm: the offline arm never
+    // attempts resolution at all (no client to call `list_projects` with),
+    // which is a different, already-visible gap (no credential -> an Error
+    // from the Authentication section).
+    let mut config_default_unresolved: Option<String> = None;
+
+    let project_outcome: ProjectOutcome = match (auth.credential.clone(), auth.server_url.as_ref())
+    {
+        (Some(credential), Some(server_url)) => {
+            let client = ApiClient::with_credential(server_url, Some(credential));
+            // A configured default_project is a NAME; resolving it into a
+            // binding needs the project list, same as project.rs's status.
+            let config_default = match config_default_name.as_deref() {
+                Some(name) => {
+                    let resolved = client.list_projects().await.ok().and_then(|items| {
+                        items.into_iter().find(|p| p.name == name).map(|p| {
+                            crate::session_state::ProjectBinding {
+                                project_id: p.id.to_string(),
+                                project_name: p.name,
+                                updated_at: chrono::Utc::now().to_rfc3339(),
+                            }
+                        })
+                    });
+                    if resolved.is_none() {
+                        config_default_unresolved = Some(name.to_string());
+                    }
+                    resolved
+                }
+                None => None,
+            };
+            let inputs = ProjectResolveInputs {
+                project_flag: None,
+                session: &project_session,
+                worktree_path: Some(&worktree),
+                config_default,
+            };
+            resolve_effective_project(
+                &inputs,
+                user_default_project,
+                project_git_url.as_deref(),
+                &client,
+            )
+            .await
+        }
+        _ => {
+            let inputs = ProjectResolveInputs {
+                project_flag: None,
+                session: &project_session,
+                worktree_path: Some(&worktree),
+                config_default: None,
+            };
+            offline_project_outcome(&inputs, user_default_project)
+        }
+    };
+
+    let mut attribution_v = Vec::new();
+    if let Some(c) = recording_check(session_id, attribution.as_ref()) {
+        attribution_v.push(c);
+    }
+    attribution_v.push(binding_check);
+    attribution_v.push(project_binding_check(&project_outcome));
+    if let Some(name) = config_default_unresolved {
+        attribution_v.push(unresolved_config_default_check(&name));
+    }
+
     let server_checks_v =
         server_repo_checks(project_root, &auth, config.as_ref(), authoritative_binding).await;
     let session_checks_v = session_checks(project_root);
@@ -901,7 +1246,7 @@ pub async fn run_status(project_root: &Path, session_id: Option<&str>) -> i32 {
         ("Authentication", auth_checks_v),
         ("Installation", install_v),
         ("Project", proj_checks_v),
-        ("Workspace binding", binding_v),
+        ("Attribution", attribution_v),
         ("Server repo", server_checks_v),
         ("Sessions", session_checks_v),
     ];
@@ -1360,7 +1705,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_binding_explicit_id_without_binding_is_warn() {
+    fn workspace_binding_explicit_id_without_binding_is_skip() {
+        // Severity moved to `recording_check`, which is the only place that
+        // sees both attribution axes — this check alone can't tell a
+        // genuinely unbound machine from one attributed via the project axis.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("sess-empty.toml"),
@@ -1368,7 +1716,7 @@ mod tests {
         )
         .unwrap();
         let (check, binding) = workspace_binding_check_in(dir.path(), Some("sess-empty"));
-        assert_eq!(check.level, Level::Warn);
+        assert_eq!(check.level, Level::Skip);
         assert!(binding.is_none());
     }
 
@@ -1473,6 +1821,70 @@ mod tests {
         let (check, binding) = workspace_binding_check_in(dir.path(), None);
         assert_eq!(check.level, Level::Skip);
         assert!(binding.is_none());
+    }
+
+    #[test]
+    fn workspace_binding_explicit_id_malformed_repo_id_is_warn_not_ok() {
+        // `attribution_for` filters a resolved binding through
+        // `binding_repo_id_is_valid` and drops it if the check fails; a
+        // corrupted session-state file with a non-UUID `repo_id` must not
+        // read Ok here either.
+        let dir = tempfile::tempdir().unwrap();
+        let st = crate::session_state::SessionState {
+            active: Some(crate::session_state::RepoBinding {
+                repo_id: "not-a-uuid".into(),
+                git_url: None,
+                remote_id: None,
+                codebase_name: None,
+                updated_at: "t".into(),
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.path().join("sess-bad.toml"),
+            toml::to_string(&st).unwrap(),
+        )
+        .unwrap();
+        let (check, binding) = workspace_binding_check_in(dir.path(), Some("sess-bad"));
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("not a valid id"),
+            "detail: {}",
+            check.detail
+        );
+        // The raw binding is still returned (unchanged mode signal for
+        // callers) — only this check's OWN severity changes.
+        assert_eq!(binding.unwrap().repo_id, "not-a-uuid");
+    }
+
+    #[test]
+    fn workspace_binding_scan_malformed_repo_id_is_warn_not_ok() {
+        // Same rule, scan arm: `latest_active_binding_in` doesn't validate
+        // either, so the same corrupted binding could surface via a scan.
+        let dir = tempfile::tempdir().unwrap();
+        let st = crate::session_state::SessionState {
+            active: Some(crate::session_state::RepoBinding {
+                repo_id: "not-a-uuid".into(),
+                git_url: None,
+                remote_id: None,
+                codebase_name: None,
+                updated_at: "t".into(),
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.path().join("sess-bad.toml"),
+            toml::to_string(&st).unwrap(),
+        )
+        .unwrap();
+        let (check, binding) = workspace_binding_check_in(dir.path(), None);
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("not a valid id"),
+            "detail: {}",
+            check.detail
+        );
+        assert_eq!(binding.unwrap().repo_id, "not-a-uuid");
     }
 
     fn repo_item(id: &str, name: &str) -> crate::api_client::RepoListItem {
@@ -1593,5 +2005,559 @@ mod tests {
         ); // non-empty whitespace is a real (if odd) id — NOT filtered
         assert_eq!(effective_session_id(None, Some("".into())), None);
         assert_eq!(effective_session_id(None, None), None);
+    }
+
+    fn project_binding(id: &str, name: &str) -> crate::session_state::ProjectBinding {
+        crate::session_state::ProjectBinding {
+            project_id: id.into(),
+            project_name: name.into(),
+            updated_at: "t".into(),
+        }
+    }
+
+    /// `id` must be a real UUID string — `attribution_for` only accepts a
+    /// repo binding whose `repo_id` parses as one (`binding_repo_id_is_valid`
+    /// in stream.rs); a non-UUID id degrades to `ProjectOnly`/`None` instead.
+    fn repo_binding_for_attribution(id: &str) -> crate::session_state::RepoBinding {
+        crate::session_state::RepoBinding {
+            repo_id: id.into(),
+            git_url: None,
+            remote_id: None,
+            codebase_name: None,
+            updated_at: "t".into(),
+        }
+    }
+
+    #[test]
+    fn recording_check_truth_table() {
+        // Literal expected outcomes, NOT a restatement of `recording_check`'s
+        // own condition (a computed `expect_error` formula could pass even if
+        // the implementation's condition drifted, since both would drift
+        // together).
+        let repo_attr = crate::commands::stream::Attribution::Repo {
+            repo_id: "11111111-1111-4111-8111-111111111111".into(),
+            project: None,
+        };
+        let project_attr = crate::commands::stream::Attribution::ProjectOnly {
+            project_id: uuid::Uuid::from_u128(1),
+        };
+
+        // session_id: None (no explicit session — a bare scan): never fires,
+        // no matter what attribution is.
+        assert!(recording_check(None, None).is_none());
+        assert!(recording_check(None, Some(&repo_attr)).is_none());
+        assert!(recording_check(None, Some(&project_attr)).is_none());
+
+        // session_id: Some, something resolved (either shape): no check.
+        assert!(recording_check(Some("s"), Some(&repo_attr)).is_none());
+        assert!(recording_check(Some("s"), Some(&project_attr)).is_none());
+
+        // session_id: Some, nothing resolved: the ONLY firing cell.
+        assert_eq!(
+            recording_check(Some("s"), None).map(|c| c.level),
+            Some(Level::Error)
+        );
+    }
+
+    #[test]
+    fn recording_check_error_names_project_switch_and_session() {
+        // Defect (2): the stale `repo switch <name>` hint has to be gone and
+        // the repo-less remediation (`project switch --user`) has to be
+        // present, or a regression to the old text wouldn't be caught by a
+        // plain level assertion.
+        let check = recording_check(Some("3f27a336-abcd"), None).expect("expected an Error check");
+        assert_eq!(check.level, Level::Error);
+        assert!(
+            check.detail.contains("project switch"),
+            "detail: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("3f27a336-abcd"),
+            "detail: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn project_binding_check_tiers_capture_project_honors_are_ok() {
+        // Only the tiers `capture_project` itself resolves at capture time
+        // read Ok: a `--project`-equivalent flag, the subagent/session-active
+        // overrides, and the user-level default. `ConfigDefault` and
+        // `Deduced` are covered separately — they must NOT appear here. Uses
+        // a well-formed UUID id: an honored tier still needs a parseable
+        // `project_id` to read Ok (see the malformed-id tests below).
+        use crate::resolution::ProjectSource::*;
+        for source in [ProjectFlag, Subagent, SessionActive, UserDefault] {
+            let outcome: ProjectOutcome = Ok(Some((
+                project_binding("33333333-3333-4333-8333-333333333333", "My Project"),
+                source,
+            )));
+            let check = project_binding_check(&outcome);
+            assert_eq!(check.level, Level::Ok, "source={source} should read Ok");
+            assert!(
+                check.detail.contains("My Project"),
+                "source={source} detail: {}",
+                check.detail
+            );
+        }
+    }
+
+    #[test]
+    fn project_binding_check_config_default_is_warn_not_ok() {
+        // `capture_project` deliberately excludes the config `default_project`
+        // tier, so displaying it as Ok would print a green Project line
+        // directly above a red Recording line for the same session.
+        let outcome: ProjectOutcome = Ok(Some((
+            project_binding("pid-3", "My Project"),
+            crate::resolution::ProjectSource::ConfigDefault,
+        )));
+        let check = project_binding_check(&outcome);
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check
+                .detail
+                .contains("not used for attribution at capture time"),
+            "detail: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn project_binding_check_deduced_is_warn() {
+        // `capture_project` never deduces server-side, so this tier can't
+        // read Ok either — same reasoning as `ConfigDefault` above.
+        let outcome: ProjectOutcome = Ok(Some((
+            project_binding("pid-2", ""),
+            crate::resolution::ProjectSource::Deduced,
+        )));
+        let check = project_binding_check(&outcome);
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check
+                .detail
+                .contains("not used for attribution at capture time"),
+            "detail: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn project_binding_check_malformed_project_id_is_warn_not_ok() {
+        // Aikido's finding: `capture_project` ends with
+        // `.parse::<uuid::Uuid>().ok()?`, so a saved binding with a
+        // non-UUID `project_id` (a hand-edited or corrupted
+        // `user_project.toml`, or a corrupted session-state file) is
+        // silently dropped at capture time. An honored tier with such an id
+        // must not read Ok. Covers SessionActive and UserDefault.
+        use crate::resolution::ProjectSource::{SessionActive, UserDefault};
+        for source in [SessionActive, UserDefault] {
+            let outcome: ProjectOutcome =
+                Ok(Some((project_binding("not-a-uuid", "My Project"), source)));
+            let check = project_binding_check(&outcome);
+            assert_eq!(check.level, Level::Warn, "source={source}");
+            assert!(
+                check.detail.contains("not a valid id"),
+                "source={source} detail: {}",
+                check.detail
+            );
+        }
+    }
+
+    #[test]
+    fn project_binding_check_ambiguous_err_is_warn_not_error() {
+        // This axis is display-only — the verdict comes from
+        // `recording_check`'s real gate, which never deduces — so ANY failure
+        // of the deduction call (genuinely ambiguous, or a transport/5xx
+        // error propagated the same way) must read as Warn, never Error: a
+        // network blip on this axis must not be able to redden the exit code.
+        let outcome: ProjectOutcome =
+            Err("this repo belongs to multiple projects; select one with `tracevault project switch <name>`".into());
+        let check = project_binding_check(&outcome);
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("multiple projects"),
+            "detail: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn project_binding_check_none_is_skip() {
+        let outcome: ProjectOutcome = Ok(None);
+        let check = project_binding_check(&outcome);
+        assert_eq!(check.level, Level::Skip);
+    }
+
+    // --- Verdict composition: every test below drives `recording_attribution`
+    // directly (rather than re-deriving its session-load/worktree-key/bound-
+    // config composition by hand), so a regression in that composition —
+    // e.g. the worktree key coming from the wrong path — fails a test instead
+    // of only a full end-to-end run (see `recording_attribution_finds_
+    // subagent_override_via_linked_worktree_cwd` below).
+    //
+    // ISOLATION: `recording_attribution` -> `capture_project` always
+    // consults `user_project_default::load()` once its local tiers miss, and
+    // `recording_attribution` itself calls `user_default::load()`
+    // unconditionally — both are backed by `dirs::config_dir()`/
+    // `dirs::home_dir()`, which read the REAL developer config on the machine
+    // running the test unless overridden. EVERY test below therefore
+    // redirects both `XDG_CONFIG_HOME` (the path on Linux) and `HOME` (the
+    // path `dirs` actually uses on macOS, and `home_dir()`'s own first
+    // choice) to the same empty temp dir — even tests that don't care about
+    // either default, since a developer machine that has ever run
+    // `project switch --user` or `repo switch --user` would otherwise inject
+    // a real, non-deterministic tier and flip the test's outcome. Three of
+    // these tests call the public `save()` (not just `load()`), so getting
+    // this isolation wrong doesn't just make a test flaky — it overwrites
+    // that developer's real config file.
+
+    #[test]
+    fn verdict_repo_user_default_alone_is_not_an_error() {
+        // `repo switch --user` is `resolve_stream_binding`'s lowest tier.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+
+        crate::user_default::save(&repo_binding_for_attribution(
+            "11111111-1111-4111-8111-111111111111",
+        ))
+        .unwrap();
+
+        let cwd = tempfile::tempdir().unwrap();
+        let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), None);
+        assert_eq!(
+            attribution,
+            Some(crate::commands::stream::Attribution::Repo {
+                repo_id: "11111111-1111-4111-8111-111111111111".into(),
+                project: None,
+            })
+        );
+        assert!(recording_check(Some("s"), attribution.as_ref()).is_none());
+    }
+
+    #[test]
+    fn verdict_project_user_default_alone_is_not_an_error() {
+        // `project switch --user` with no credential configured: the display
+        // half of this same fallback is pinned separately by
+        // `offline_project_outcome_falls_back_to_saved_user_default`.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+
+        let pb = crate::session_state::ProjectBinding {
+            project_id: uuid::Uuid::from_u128(7).to_string(),
+            project_name: "p".into(),
+            updated_at: "".into(),
+        };
+        crate::user_project_default::save(&pb).unwrap();
+
+        let cwd = tempfile::tempdir().unwrap();
+        let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), None);
+        assert_eq!(
+            attribution,
+            Some(crate::commands::stream::Attribution::ProjectOnly {
+                project_id: uuid::Uuid::from_u128(7)
+            })
+        );
+        assert!(recording_check(Some("s"), attribution.as_ref()).is_none());
+    }
+
+    #[test]
+    fn verdict_config_without_repo_id_and_nothing_else_is_error() {
+        // A loaded `config.toml` with no `repo_id` must not count as bound —
+        // `binding_from_config` returns `None` for it.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+
+        let config = crate::config::TracevaultConfig::default();
+        assert!(
+            crate::resolution::binding_from_config(&config).is_none(),
+            "a repo_id-less config must not bind"
+        );
+
+        let cwd = tempfile::tempdir().unwrap();
+        let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), Some(&config));
+        assert_eq!(
+            recording_check(Some("s"), attribution.as_ref()).map(|c| c.level),
+            Some(Level::Error)
+        );
+    }
+
+    #[test]
+    fn verdict_nothing_anywhere_is_error() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+
+        let cwd = tempfile::tempdir().unwrap();
+        let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), None);
+        assert_eq!(
+            recording_check(Some("s"), attribution.as_ref()).map(|c| c.level),
+            Some(Level::Error)
+        );
+    }
+
+    #[test]
+    fn verdict_deduced_project_display_does_not_suppress_recording_error() {
+        // A `Deduced` DISPLAY value must not make the project axis count as
+        // bound for the verdict — `capture_project` never deduces.
+        let outcome: ProjectOutcome = Ok(Some((
+            project_binding("pid", ""),
+            crate::resolution::ProjectSource::Deduced,
+        )));
+        assert_eq!(project_binding_check(&outcome).level, Level::Warn);
+
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+
+        let cwd = tempfile::tempdir().unwrap();
+        let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), None);
+        assert_eq!(
+            recording_check(Some("s"), attribution.as_ref()).map(|c| c.level),
+            Some(Level::Error),
+            "a Deduced display value must not suppress the Recording error"
+        );
+    }
+
+    #[test]
+    fn verdict_deduction_failure_is_warn_and_does_not_affect_recording() {
+        // A deduction failure (network blip, 5xx, or genuinely Ambiguous)
+        // must render at most Warn, and — since `recording_check` never even
+        // sees `project_outcome` — cannot suppress or trigger the Recording
+        // verdict either way.
+        let outcome: ProjectOutcome = Err("this repo belongs to multiple projects".into());
+        assert_eq!(project_binding_check(&outcome).level, Level::Warn);
+
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+
+        let config = crate::config::TracevaultConfig {
+            repo_id: Some("22222222-2222-4222-8222-222222222222".into()),
+            ..Default::default()
+        };
+        let cwd = tempfile::tempdir().unwrap();
+        let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), Some(&config));
+        // Repo bound (via config) independently of the deduction failure
+        // above -> no error, and nothing about the `Err` outcome forced one.
+        assert!(recording_check(Some("s"), attribution.as_ref()).is_none());
+    }
+
+    #[test]
+    fn offline_project_outcome_falls_back_to_saved_user_default() {
+        // A saved `project switch --user` default must surface as Ok, not
+        // Skip, in the credential-less path — not just the pure local tiers,
+        // which `effective_project` alone covers.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+
+        let pb = crate::session_state::ProjectBinding {
+            project_id: uuid::Uuid::from_u128(9).to_string(),
+            project_name: "My Project".into(),
+            updated_at: "".into(),
+        };
+        crate::user_project_default::save(&pb).unwrap();
+
+        let session = crate::session_state::SessionState::default();
+        let inputs = ProjectResolveInputs {
+            project_flag: None,
+            session: &session,
+            worktree_path: None,
+            config_default: None,
+        };
+        // Same call `run_status`'s credential-less arm makes.
+        let user_default_project = crate::user_project_default::load();
+        let outcome = offline_project_outcome(&inputs, user_default_project);
+        let check = project_binding_check(&outcome);
+        assert_eq!(check.level, Level::Ok, "detail: {}", check.detail);
+        assert!(
+            check.detail.contains("My Project"),
+            "detail: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn recording_attribution_finds_subagent_override_via_linked_worktree_cwd() {
+        // The subagent override is keyed by the LINKED worktree's own
+        // toplevel, not the primary repo's — resolving from the wrong one
+        // must miss it.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+
+        let base = tempfile::tempdir().unwrap();
+        let repo_dir = base.path().join("repo");
+        let wt_dir = base.path().join("wt");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        crate::test_helpers::init_git_repo(&repo_dir);
+        crate::test_helpers::add_worktree(&repo_dir, &wt_dir);
+
+        let wt_key = crate::paths::worktree_toplevel(&wt_dir);
+        let project_id = uuid::Uuid::from_u128(42);
+        let mut subagent_projects = std::collections::HashMap::new();
+        subagent_projects.insert(
+            wt_key,
+            crate::session_state::ProjectBinding {
+                project_id: project_id.to_string(),
+                project_name: "linked".into(),
+                updated_at: "t".into(),
+            },
+        );
+        let state = crate::session_state::SessionState {
+            subagent_projects,
+            ..Default::default()
+        };
+        let sessions_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sessions_dir.path().join("sess-linked.toml"),
+            toml::to_string(&state).unwrap(),
+        )
+        .unwrap();
+
+        // From the LINKED worktree cwd, the subagent override resolves.
+        let (found, _worktree) = recording_attribution(
+            Some(sessions_dir.path()),
+            Some("sess-linked"),
+            &wt_dir,
+            None,
+        );
+        assert_eq!(
+            found,
+            Some(crate::commands::stream::Attribution::ProjectOnly { project_id })
+        );
+
+        // From the PRIMARY worktree root instead, the key doesn't match, so
+        // nothing resolves.
+        let (missed, _worktree) = recording_attribution(
+            Some(sessions_dir.path()),
+            Some("sess-linked"),
+            &repo_dir,
+            None,
+        );
+        assert_eq!(missed, None);
+    }
+
+    #[test]
+    fn verdict_malformed_project_id_leaves_project_axis_unbound() {
+        // Pins that the display fix (`project_binding_check`) and the real
+        // verdict (`recording_attribution` -> `capture_project`) cannot
+        // diverge: a malformed `project_id` must be dropped by both.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+
+        let state = crate::session_state::SessionState {
+            active_project: Some(project_binding("not-a-uuid", "My Project")),
+            ..Default::default()
+        };
+        let sessions_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sessions_dir.path().join("sess-bad-project.toml"),
+            toml::to_string(&state).unwrap(),
+        )
+        .unwrap();
+
+        let cwd = tempfile::tempdir().unwrap();
+        let (attribution, _worktree) = recording_attribution(
+            Some(sessions_dir.path()),
+            Some("sess-bad-project"),
+            cwd.path(),
+            None,
+        );
+        assert_eq!(
+            attribution, None,
+            "a malformed project_id must not resolve an attribution"
+        );
+        assert_eq!(
+            recording_check(Some("s"), attribution.as_ref()).map(|c| c.level),
+            Some(Level::Error)
+        );
+    }
+
+    #[test]
+    fn verdict_malformed_repo_id_with_nothing_else_bound_is_error() {
+        // Same principle, repo axis: `attribution_for` drops a binding whose
+        // `repo_id` fails `binding_repo_id_is_valid`, so nothing else bound
+        // must still error, matching `workspace_binding_*_malformed_repo_id_*`.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+
+        let state = crate::session_state::SessionState {
+            active: Some(crate::session_state::RepoBinding {
+                repo_id: "not-a-uuid".into(),
+                git_url: None,
+                remote_id: None,
+                codebase_name: None,
+                updated_at: "t".into(),
+            }),
+            ..Default::default()
+        };
+        let sessions_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sessions_dir.path().join("sess-bad-repo.toml"),
+            toml::to_string(&state).unwrap(),
+        )
+        .unwrap();
+
+        let cwd = tempfile::tempdir().unwrap();
+        let (attribution, _worktree) = recording_attribution(
+            Some(sessions_dir.path()),
+            Some("sess-bad-repo"),
+            cwd.path(),
+            None,
+        );
+        assert_eq!(
+            attribution, None,
+            "a malformed repo_id must not resolve an attribution"
+        );
+        assert_eq!(
+            recording_check(Some("s"), attribution.as_ref()).map(|c| c.level),
+            Some(Level::Error)
+        );
+    }
+
+    #[test]
+    fn unresolved_config_default_check_names_it_and_is_warn() {
+        let check = unresolved_config_default_check("payments-platform");
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("payments-platform"),
+            "detail: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains("not used for attribution at capture time"),
+            "detail should not imply resolving it would make capture-time \
+             attribution work: {}",
+            check.detail
+        );
     }
 }

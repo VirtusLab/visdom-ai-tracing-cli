@@ -485,7 +485,8 @@ async fn main() {
                 session_id,
                 std::env::var("TRACEVAULT_SESSION_ID").ok(),
             );
-            let code = commands::status::run_status(&project_root, effective.as_deref()).await;
+            let code =
+                commands::status::run_status(&project_root, &cwd, effective.as_deref()).await;
             if code != 0 {
                 std::process::exit(code);
             }
