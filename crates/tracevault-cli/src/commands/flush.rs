@@ -49,10 +49,11 @@ pub(crate) fn queue_target_from_filename(name: &str) -> Option<QueueTarget> {
     Some(QueueTarget::Repo(repo_id.to_string()))
 }
 
-/// Classify a session dir's pending queue files. Returns (path, repo_id) pairs;
-/// per-repo files carry their own id, the legacy `pending.jsonl` is attributed
-/// to `bound_repo_id` (skipped entirely when None).
-/// Per-repo files are only included if their derived repo_id is a valid UUID.
+/// Classify a session dir's pending queue files. Returns
+/// `(path, QueueTarget)` pairs: per-repo and repo-less project files each
+/// carry their own id (see [`queue_target_from_filename`]), and the legacy
+/// `pending.jsonl` is attributed to `bound_repo_id` (skipped entirely when
+/// None). Files whose embedded id is not a valid UUID are excluded.
 fn pending_queues_in(
     session_dir: &Path,
     bound_repo_id: Option<&str>,
@@ -113,7 +114,7 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
         .collect();
 
     for session_entry in session_entries {
-        // Collect (path, repo_id) pairs for every pending queue in this
+        // Collect (path, QueueTarget) pairs for every pending queue in this
         // session directory before draining, to keep the borrow/async loop
         // below simple.
         let pending_queues = pending_queues_in(&session_entry.path(), bound_repo_id.as_deref())?;

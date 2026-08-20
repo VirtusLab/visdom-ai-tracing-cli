@@ -330,7 +330,15 @@ fn deterministic_client_error_kind(e: &dyn std::error::Error) -> Option<ClientEr
 /// repo-scoped endpoint (server-side deduction/refusal). Factored out so both
 /// the pending-flush loop and the live send share one branch.
 ///
-/// When `capture_pid` is `Some(_)` and the project-scoped send fails with a
+/// Routing is decided by the [`Attribution`] resolved before the send:
+/// `Repo` with no project goes to the repo-scoped endpoint (the server
+/// deduces the project); `Repo` with a project goes to the project-scoped
+/// endpoint carrying `repo_id`; `ProjectOnly` goes to the project-scoped
+/// endpoint with no `repo_id` at all and has NO fallback available, so every
+/// error from it propagates for the caller to buffer.
+///
+/// When the attribution carries BOTH a repo and a project and the
+/// project-scoped send fails with a
 /// deterministic client error (the bound project doesn't apply to this repo:
 /// not a member, or the caller lacks `TracePush` on it, or — after a prior
 /// fallback — the repo-scoped 409 multi-project refusal), this falls back to
