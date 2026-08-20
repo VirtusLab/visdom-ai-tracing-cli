@@ -464,6 +464,23 @@ mod queue_target_tests {
         );
     }
 
+    /// Traversal-shaped names are rejected by the UUID parse on both arms.
+    /// `pending_queues_in` builds its paths from `fs::read_dir`, which never
+    /// yields `.` or `..` as entries, so a traversal component cannot reach
+    /// here in the first place — this pins the second line of defence, the
+    /// one that would still hold if the source of the names ever changed.
+    #[test]
+    fn traversal_shaped_names_are_rejected() {
+        for name in [
+            "pending-../../etc/passwd.jsonl",
+            "pending-project-../../etc/passwd.jsonl",
+            "pending-..%2f..%2fetc.jsonl",
+            "pending-/etc/passwd.jsonl",
+        ] {
+            assert_eq!(queue_target_from_filename(name), None, "accepted: {name}");
+        }
+    }
+
     /// Non-UUID ids are rejected on both arms — these names can only come
     /// from a corrupted or hand-created file.
     #[test]
