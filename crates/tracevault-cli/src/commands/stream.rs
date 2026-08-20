@@ -115,11 +115,83 @@ pub fn drain_pending(pending_path: &Path) -> Result<Vec<String>, io::Error> {
     Ok(lines)
 }
 
-/// Offline-queue path for a specific repo binding. Keyed by repo id so a
-/// mid-session rebind (workspace mode) can never flush one repo's queued
-/// events to another.
-fn pending_path_for(session_dir: &Path, repo_id: &str) -> std::path::PathBuf {
-    session_dir.join(format!("pending-{repo_id}.jsonl"))
+/// How a stream event is attributed on the wire, resolved from the local repo
+/// and project bindings before anything is sent.
+///
+/// The rule this type encodes: an event ships when EITHER a repo or a project
+/// resolves. Before this existed the hook required a repo binding and dropped
+/// the event otherwise, which silently discarded every event of a repo-less
+/// session even when its project was bound — despite the server supporting
+/// exactly that shape (`ProjectStreamQuery::repo_id` is `Option<Uuid>`:
+/// "repo-less (0-repo) projects are supported").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Attribution {
+    /// A usable repo binding resolved. `project` is the capture-time project
+    /// overlay; when `None` the server deduces the project from the repo.
+    Repo {
+        repo_id: String,
+        project: Option<uuid::Uuid>,
+    },
+    /// No usable repo binding, but a project did — repo-less project-scoped
+    /// ingest.
+    ProjectOnly { project_id: uuid::Uuid },
+}
+
+impl Attribution {
+    /// Offline-queue filename for this attribution. Keyed by whatever
+    /// identifies the target so a mid-session rebind (workspace mode) can
+    /// never flush one target's queued events to another.
+    ///
+    /// The `project-` infix is load-bearing for back-compat: an older CLI's
+    /// `repo_id_from_pending_filename` extracts `project-<uuid>` from this
+    /// name, fails its UUID check, and skips the file — so a downgrade leaves
+    /// these queues alone instead of trying to POST them at a repo endpoint.
+    pub(crate) fn pending_file_name(&self) -> String {
+        use crate::commands::flush::{PROJECT_QUEUE_PREFIX, QUEUE_PREFIX, QUEUE_SUFFIX};
+        match self {
+            Self::Repo { repo_id, .. } => format!("{QUEUE_PREFIX}{repo_id}{QUEUE_SUFFIX}"),
+            Self::ProjectOnly { project_id } => {
+                format!("{PROJECT_QUEUE_PREFIX}{project_id}{QUEUE_SUFFIX}")
+            }
+        }
+    }
+}
+
+/// Pure attribution resolver: fold the repo binding and the capture-time
+/// project into the target this event will be sent to. `None` means neither
+/// resolved and the hook must no-op.
+///
+/// A binding whose `repo_id` is not a UUID degrades to `ProjectOnly` rather
+/// than dropping the event — a corrupted session-state file should cost the
+/// repo attribution, not the whole trace, when a project is available.
+///
+/// `project` here is whatever `capture_project` resolved, and its lowest tier
+/// is the MACHINE-GLOBAL `project switch --user` default — not just
+/// session-scoped bindings. That tier is therefore now a sufficient condition
+/// for an event to ship, where previously it could only redirect an event that
+/// was already shipping because a repo bound. This is deliberate: it is the
+/// only binding a container can establish before the agent session exists and
+/// before the repo is cloned, which is the case this whole path serves.
+/// `resolve_stream_binding` has the same machine-global tier for repos, so the
+/// two sides stay symmetric. Consequence worth knowing: a session started in an
+/// unrelated directory, with no repo and no `.tracevault/`, will attribute to
+/// that default project.
+pub(crate) fn attribution_for(
+    binding: Option<&crate::session_state::RepoBinding>,
+    project: Option<uuid::Uuid>,
+) -> Option<Attribution> {
+    match binding.filter(|b| binding_repo_id_is_valid(&b.repo_id)) {
+        Some(b) => Some(Attribution::Repo {
+            repo_id: b.repo_id.clone(),
+            project,
+        }),
+        None => project.map(|project_id| Attribution::ProjectOnly { project_id }),
+    }
+}
+
+/// Offline-queue path for an attribution target.
+fn pending_path_for(session_dir: &Path, attribution: &Attribution) -> std::path::PathBuf {
+    session_dir.join(attribution.pending_file_name())
 }
 
 /// Resolve the project root and session directory for a stream hook invocation.
@@ -193,6 +265,17 @@ fn capture_project(
     .map(|(b, _)| b)
     .or_else(crate::user_project_default::load)?;
     local.project_id.parse::<uuid::Uuid>().ok()
+}
+
+/// The one-line warning printed when a repo-less event is dropped as
+/// permanently undeliverable. Pure, so the wording is asserted directly.
+fn undeliverable_warning(pid: uuid::Uuid) -> String {
+    format!(
+        "tracevault: warning: project {pid} does not resolve (400/404/409); this session has no \
+         repo binding, so there is nothing to attribute these events to and they are being \
+         DROPPED rather than queued. Run `tracevault project switch <name>` to bind a project \
+         that exists."
+    )
 }
 
 /// True when a stream-send error's rendered message carries a `(4xx ...)`
@@ -273,7 +356,22 @@ fn deterministic_client_error_kind(e: &dyn std::error::Error) -> Option<ClientEr
 /// repo-scoped endpoint (server-side deduction/refusal). Factored out so both
 /// the pending-flush loop and the live send share one branch.
 ///
-/// When `capture_pid` is `Some(_)` and the project-scoped send fails with a
+/// Routing is decided by the [`Attribution`] resolved before the send:
+/// `Repo` with no project goes to the repo-scoped endpoint (the server
+/// deduces the project); `Repo` with a project goes to the project-scoped
+/// endpoint carrying `repo_id`; `ProjectOnly` goes to the project-scoped
+/// endpoint with no `repo_id` at all. Having no fallback endpoint, it decides
+/// instead between buffering and dropping: a `Scoping` 4xx (the project does
+/// not resolve) can never succeed on retry — the offline queue is keyed by
+/// that same project id — so it warns and returns `Ok(None)`, while a 403 or
+/// any transient error propagates to be buffered. See the arm itself for why
+/// the two differ.
+///
+/// `Ok(None)` therefore means "deliberately dropped, do not queue": callers
+/// must treat it like a success for offset/queue purposes, not like an error.
+///
+/// When the attribution carries BOTH a repo and a project and the
+/// project-scoped send fails with a
 /// deterministic client error (the bound project doesn't apply to this repo:
 /// not a member, or the caller lacks `TracePush` on it, or — after a prior
 /// fallback — the repo-scoped 409 multi-project refusal), this falls back to
@@ -282,32 +380,74 @@ fn deterministic_client_error_kind(e: &dyn std::error::Error) -> Option<ClientEr
 /// network/transport, timeout) is NOT retried here — it propagates so the
 /// caller's existing buffer/retry logic runs unchanged.
 ///
-/// `fallback_warned` is shared across every call made for a single hook
+/// `warned` is shared across every call made for a single hook
 /// invocation (both the pending-flush loop and the live send). The
 /// pending-flush loop only `break`s on `Err`, not on a fallback that itself
 /// returns `Ok` — so a stale binding whose repo-scoped fallback keeps
 /// succeeding would otherwise print the warning once per buffered event.
-/// Gating on `*fallback_warned` caps it at one warning per invocation while
-/// leaving the fallback behavior itself unchanged.
+/// Gating on `*warned` caps it at one warning per invocation while leaving the
+/// fallback behavior itself unchanged. The repo-less drop warning shares the
+/// flag for the same reason: draining a queue of undeliverable events would
+/// otherwise print one line per buffered event.
 async fn send_stream_event(
     client: &crate::api_client::ApiClient,
-    repo_id: &str,
-    capture_pid: Option<uuid::Uuid>,
+    attribution: &Attribution,
     req: &StreamEventRequest,
-    fallback_warned: &mut bool,
-) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn std::error::Error>> {
+    warned: &mut bool,
+) -> Result<Option<tracevault_protocol::streaming::StreamEventResponse>, Box<dyn std::error::Error>>
+{
+    let (repo_id, capture_pid) = match attribution {
+        // Repo-less: there is no repo-scoped endpoint to fall back TO, so the
+        // only choice is buffer-for-retry vs. drop, and that turns on whether
+        // a retry could EVER succeed.
+        //
+        // `Scoping` (400/404/409) means the project itself does not resolve.
+        // The offline queue is keyed by that same project id
+        // (`pending-project-<uuid>.jsonl`), so re-binding to a project that
+        // does exist writes to a DIFFERENT file and these events are never
+        // retried under the corrected binding — they would accumulate forever,
+        // one per tool call, each hook fire re-reading and re-appending the
+        // whole queue. Warn and drop instead: undeliverable is undeliverable,
+        // and a growing queue only hides it.
+        //
+        // `Forbidden` (403) is deliberately NOT dropped. It can mean the
+        // account lacks the realm role entirely, which an administrator can
+        // grant — after which the buffered events do deliver. Same for any
+        // transient error. Both propagate so the caller queues them.
+        Attribution::ProjectOnly { project_id } => {
+            let attempt = client
+                .stream_event_for_project(*project_id, None, req)
+                .await;
+            return match attempt {
+                Ok(r) => Ok(Some(r)),
+                Err(e) => match deterministic_client_error_kind(e.as_ref()) {
+                    Some(ClientErrorKind::Scoping) => {
+                        if !*warned {
+                            eprintln!("{}", undeliverable_warning(*project_id));
+                            *warned = true;
+                        }
+                        Ok(None)
+                    }
+                    _ => Err(e),
+                },
+            };
+        }
+        Attribution::Repo { repo_id, project } => (repo_id.as_str(), *project),
+    };
     match capture_pid {
-        None => client.stream_event(repo_id, req).await,
+        None => client.stream_event(repo_id, req).await.map(Some),
         Some(pid) => {
-            let attempt = client.stream_event_for_project(pid, repo_id, req).await;
+            let attempt = client
+                .stream_event_for_project(pid, Some(repo_id), req)
+                .await;
             let kind = match &attempt {
                 Ok(_) => None,
                 Err(e) => deterministic_client_error_kind(e.as_ref()),
             };
             match (attempt, kind) {
-                (Ok(r), _) => Ok(r),
+                (Ok(r), _) => Ok(Some(r)),
                 (Err(_), Some(kind)) => {
-                    if !*fallback_warned {
+                    if !*warned {
                         // Since Keycloak, a 403 has a SECOND and now more common
                         // cause: the account has no `tracing` realm role at all,
                         // in which case nothing this hook does will work and
@@ -316,10 +456,10 @@ async fn send_stream_event(
                         // isn't distinguishable from here (see
                         // `ClientErrorKind`), so the wording names both.
                         eprintln!("{}", fallback_warning(pid, &kind));
-                        *fallback_warned = true;
+                        *warned = true;
                     }
                     // Repo-scoped fallback: the server deduces the project itself.
-                    client.stream_event(repo_id, req).await
+                    client.stream_event(repo_id, req).await.map(Some)
                 }
                 // transient — propagate for buffer/retry
                 (Err(e), None) => Err(e),
@@ -613,51 +753,43 @@ pub async fn run_stream(
         println!("{}", serde_json::to_string(&response)?);
         Ok(())
     };
-    let Some(binding) = binding else {
-        // No repo resolves.
+    // Explicit local project binding (if any) overrides server-side repo
+    // deduction. Computed BEFORE the attribution gate below, reusing the
+    // already-loaded session + worktree used just above for the repo-binding
+    // resolution: a repo-less session is attributable by project alone, so the
+    // project must be known before deciding whether this event can be sent.
+    let capture_pid = capture_project(&session, Some(worktree_top.as_str()));
+
+    // Ship if EITHER a repo or a project resolved; no-op only when neither
+    // did. (`binding_repo_id_is_valid` guards a corrupted/hand-edited
+    // session-state file whose repo_id could carry path separators into the
+    // pending filename — such a binding degrades to project-only inside
+    // `attribution_for` rather than dropping the event.)
+    let Some(attribution) = attribution_for(binding.as_ref(), capture_pid) else {
         no_op_allow()?;
         return Ok(());
     };
-    if !binding_repo_id_is_valid(&binding.repo_id) {
-        // A corrupted/hand-edited session-state file could contain a
-        // repo_id with path separators, which would otherwise land in the
-        // `pending-<repo_id>.jsonl` filename below.
-        no_op_allow()?;
-        return Ok(());
-    }
-    let repo_id = binding.repo_id.as_str();
-
-    // Explicit local project binding (if any) overrides server-side repo
-    // deduction. Computed once, reusing the already-loaded session + worktree
-    // used just above for the repo-binding resolution.
-    let capture_pid = capture_project(&session, Some(worktree_top.as_str()));
 
     // 8. Create ApiClient
     let server_url = server_url.ok_or("server_url not configured")?;
     let client = crate::api_client::ApiClient::with_credential(&server_url, credential);
 
     // 9. Try drain pending queue and send
-    let pending_path = pending_path_for(&session_dir, repo_id);
+    let pending_path = pending_path_for(&session_dir, &attribution);
     let pending_events = drain_pending(&pending_path)?;
 
     let mut send_failed = false;
     // Spans the whole invocation (pending-flush loop + live send below) so a
     // stale binding whose repo-scoped fallback keeps succeeding warns at most
     // once, not once per buffered event.
-    let mut fallback_warned = false;
+    let mut warned = false;
 
     // Send pending events first
     for pending_json in &pending_events {
         if let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(pending_json) {
-            if send_stream_event(
-                &client,
-                repo_id,
-                capture_pid,
-                &pending_req,
-                &mut fallback_warned,
-            )
-            .await
-            .is_err()
+            if send_stream_event(&client, &attribution, &pending_req, &mut warned)
+                .await
+                .is_err()
             {
                 // Re-queue all remaining pending events
                 for evt in &pending_events {
@@ -685,7 +817,7 @@ pub async fn run_stream(
             fs::write(&offset_path, new_offset.to_string())?;
         }
     } else {
-        match send_stream_event(&client, repo_id, capture_pid, &req, &mut fallback_warned).await {
+        match send_stream_event(&client, &attribution, &req, &mut warned).await {
             Ok(_) => {
                 // 10. On success update .stream_offset
                 fs::write(&offset_path, new_offset.to_string())?;
@@ -1052,6 +1184,115 @@ mod tests {
         assert_eq!(got.unwrap().repo_id, "bound");
     }
 
+    // ── attribution_for: repo-or-project gate ────────────────────────────────
+
+    fn binding_with(repo_id: &str) -> crate::session_state::RepoBinding {
+        crate::session_state::RepoBinding {
+            repo_id: repo_id.into(),
+            git_url: None,
+            remote_id: None,
+            codebase_name: None,
+            updated_at: String::new(),
+        }
+    }
+
+    /// The regression this whole change exists for: a session with a project
+    /// binding and NO repo binding must still ship, repo-less, instead of
+    /// being dropped by the hook.
+    #[test]
+    fn attribution_falls_back_to_project_when_no_repo_binds() {
+        let pid = uuid::Uuid::new_v4();
+        assert_eq!(
+            attribution_for(None, Some(pid)),
+            Some(Attribution::ProjectOnly { project_id: pid })
+        );
+    }
+
+    /// Neither binding resolves — the only case that may still no-op.
+    #[test]
+    fn attribution_is_none_when_neither_repo_nor_project_binds() {
+        assert_eq!(attribution_for(None, None), None);
+    }
+
+    /// A repo alone keeps the pre-existing repo-scoped behaviour, with the
+    /// server left to deduce the project.
+    #[test]
+    fn attribution_uses_repo_with_no_project_overlay() {
+        let repo = uuid::Uuid::new_v4().to_string();
+        let b = binding_with(&repo);
+        assert_eq!(
+            attribution_for(Some(&b), None),
+            Some(Attribution::Repo {
+                repo_id: repo,
+                project: None
+            })
+        );
+    }
+
+    /// Both bound: the project overlays the repo (project-scoped ingest
+    /// carrying repo_id), unchanged from before.
+    #[test]
+    fn attribution_overlays_project_on_repo() {
+        let repo = uuid::Uuid::new_v4().to_string();
+        let pid = uuid::Uuid::new_v4();
+        let b = binding_with(&repo);
+        assert_eq!(
+            attribution_for(Some(&b), Some(pid)),
+            Some(Attribution::Repo {
+                repo_id: repo,
+                project: Some(pid)
+            })
+        );
+    }
+
+    /// A corrupted repo_id costs the repo attribution, not the trace: it
+    /// degrades to project-only rather than dropping the event.
+    #[test]
+    fn attribution_degrades_a_corrupt_repo_id_to_project_only() {
+        let pid = uuid::Uuid::new_v4();
+        let b = binding_with("../../escape");
+        assert_eq!(
+            attribution_for(Some(&b), Some(pid)),
+            Some(Attribution::ProjectOnly { project_id: pid })
+        );
+    }
+
+    /// ...but with no project to fall back to, a corrupt repo_id still drops,
+    /// so it can never reach the pending filename.
+    #[test]
+    fn attribution_drops_a_corrupt_repo_id_with_no_project() {
+        let b = binding_with("../../escape");
+        assert_eq!(attribution_for(Some(&b), None), None);
+    }
+
+    // ── pending queue filenames ──────────────────────────────────────────────
+
+    /// The repo filename is unchanged, so queues buffered by earlier releases
+    /// are still found and drained after this upgrade.
+    #[test]
+    fn pending_file_name_for_a_repo_is_unchanged() {
+        let repo = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            Attribution::Repo {
+                repo_id: repo.clone(),
+                project: Some(uuid::Uuid::new_v4())
+            }
+            .pending_file_name(),
+            format!("pending-{repo}.jsonl")
+        );
+    }
+
+    /// Repo-less queues carry the `project-` infix, which an older CLI reads
+    /// as a non-UUID repo id and skips (see the doc comment).
+    #[test]
+    fn pending_file_name_for_a_project_is_distinct() {
+        let pid = uuid::Uuid::new_v4();
+        assert_eq!(
+            Attribution::ProjectOnly { project_id: pid }.pending_file_name(),
+            format!("pending-project-{pid}.jsonl")
+        );
+    }
+
     // ── binding_repo_id_is_valid: hook-attribution UUID guard ────────────────
 
     #[test]
@@ -1113,18 +1354,41 @@ mod tests {
         assert_eq!(req.protocol_version, 1);
     }
 
-    // ── pending_path_for: repo-scoped offline queue ──────────────────────────
+    // ── pending_path_for: per-target offline queue ───────────────────────────
+
+    fn repo_attr(repo_id: &str) -> Attribution {
+        Attribution::Repo {
+            repo_id: repo_id.into(),
+            project: None,
+        }
+    }
 
     #[test]
     fn pending_path_is_repo_scoped() {
         let dir = std::path::Path::new("/tmp/sess");
         assert_eq!(
-            pending_path_for(dir, "repo-a"),
+            pending_path_for(dir, &repo_attr("repo-a")),
             std::path::Path::new("/tmp/sess/pending-repo-a.jsonl")
         );
         assert_ne!(
-            pending_path_for(dir, "repo-a"),
-            pending_path_for(dir, "repo-b"),
+            pending_path_for(dir, &repo_attr("repo-a")),
+            pending_path_for(dir, &repo_attr("repo-b")),
+        );
+    }
+
+    /// A repo-less session must not share a queue file with any repo, so its
+    /// buffered events can never be flushed to a repo endpoint.
+    #[test]
+    fn pending_path_for_a_project_never_collides_with_a_repo() {
+        let dir = std::path::Path::new("/tmp/sess");
+        let pid = uuid::Uuid::from_u128(9);
+        assert_eq!(
+            pending_path_for(dir, &Attribution::ProjectOnly { project_id: pid }),
+            std::path::Path::new(&format!("/tmp/sess/pending-project-{pid}.jsonl"))
+        );
+        assert_ne!(
+            pending_path_for(dir, &Attribution::ProjectOnly { project_id: pid }),
+            pending_path_for(dir, &repo_attr(&pid.to_string())),
         );
     }
 
@@ -1364,17 +1628,22 @@ mod tests {
         let client = crate::api_client::ApiClient::new(&base, Some("tok"));
         let req = sample_stream_event_request();
 
-        let mut fallback_warned = false;
+        let mut warned = false;
         let got = send_stream_event(
             &client,
-            "11111111-1111-1111-1111-111111111111",
-            capture_pid,
+            &Attribution::Repo {
+                repo_id: "11111111-1111-1111-1111-111111111111".into(),
+                project: capture_pid,
+            },
             &req,
-            &mut fallback_warned,
+            &mut warned,
         )
         .await
         .expect("send_stream_event must succeed");
-        assert_eq!(got.status, "accepted");
+        assert_eq!(
+            got.expect("a successful send returns a response").status,
+            "accepted"
+        );
 
         let line = rx
             .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
@@ -1410,17 +1679,22 @@ mod tests {
         let client = crate::api_client::ApiClient::new(&base, Some("tok"));
         let req = sample_stream_event_request();
 
-        let mut fallback_warned = false;
+        let mut warned = false;
         let got = send_stream_event(
             &client,
-            "11111111-1111-1111-1111-111111111111",
-            capture_pid,
+            &Attribution::Repo {
+                repo_id: "11111111-1111-1111-1111-111111111111".into(),
+                project: capture_pid,
+            },
             &req,
-            &mut fallback_warned,
+            &mut warned,
         )
         .await
         .expect("send_stream_event must succeed");
-        assert_eq!(got.status, "accepted");
+        assert_eq!(
+            got.expect("a successful send returns a response").status,
+            "accepted"
+        );
 
         let line = rx
             .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
@@ -1494,17 +1768,22 @@ mod tests {
         let req = sample_stream_event_request();
         let pid = uuid::Uuid::from_u128(42);
 
-        let mut fallback_warned = false;
+        let mut warned = false;
         let got = send_stream_event(
             &client,
-            "11111111-1111-1111-1111-111111111111",
-            Some(pid),
+            &Attribution::Repo {
+                repo_id: "11111111-1111-1111-1111-111111111111".into(),
+                project: Some(pid),
+            },
             &req,
-            &mut fallback_warned,
+            &mut warned,
         )
         .await
         .expect("a deterministic 400 must fall back to repo-scoped and succeed");
-        assert_eq!(got.status, "accepted");
+        assert_eq!(
+            got.expect("a successful send returns a response").status,
+            "accepted"
+        );
 
         let first = rx
             .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
@@ -1520,6 +1799,135 @@ mod tests {
         assert!(
             second.starts_with("POST /api/v1/repos/11111111-1111-1111-1111-111111111111/stream "),
             "second request must fall back to the repo-scoped endpoint, got: {second}"
+        );
+    }
+
+    /// The repo-less send: a `ProjectOnly` attribution must hit the bare
+    /// project endpoint with NO `repo_id` query pair. This is the wire shape
+    /// the server documents as "repo-less (0-repo) projects are supported".
+    #[tokio::test]
+    async fn send_stream_event_project_only_omits_repo_id() {
+        let resp = ok_stream_response();
+        let (base, rx) = spawn_once_capturing_request(Box::leak(resp.into_boxed_str()));
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let req = sample_stream_event_request();
+        let pid = uuid::Uuid::from_u128(11);
+
+        let mut warned = false;
+        let got = send_stream_event(
+            &client,
+            &Attribution::ProjectOnly { project_id: pid },
+            &req,
+            &mut warned,
+        )
+        .await
+        .expect("a repo-less project send must succeed");
+        assert_eq!(
+            got.expect("a successful send returns a response").status,
+            "accepted"
+        );
+
+        let line = rx
+            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
+            .expect("no request captured");
+        assert!(
+            line.starts_with(&format!("POST /api/v1/projects/{pid}/stream ")),
+            "expected a bare project path with no query string, got: {line}"
+        );
+        assert!(
+            !warned,
+            "a repo-less send has no fallback and must not warn about one"
+        );
+    }
+
+    /// A `Scoping` 4xx is permanently undeliverable for a repo-less session:
+    /// the queue is keyed by the very project id the server says does not
+    /// resolve, so a corrected binding writes to a different file and these
+    /// events would never be retried — they would just accumulate, one per
+    /// tool call. They must be DROPPED (`Ok(None)`), loudly, and must not
+    /// trigger a second, impossible request.
+    #[tokio::test]
+    async fn send_stream_event_project_only_drops_on_scoping_4xx() {
+        let body = "no such project";
+        let resp_404 = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        // TWO responses are staged although only one request is expected. With
+        // a single response the helper drops its sender the moment the list is
+        // exhausted, so the "no second request" assertion below would pass on
+        // `Disconnected` whether or not a second request happened — a vacuous
+        // check. Staging a spare keeps the server accepting, so a stray
+        // request really is captured and really fails the test.
+        let (base, rx) = spawn_n_capturing_requests(vec![
+            Box::leak(resp_404.clone().into_boxed_str()),
+            Box::leak(resp_404.into_boxed_str()),
+        ]);
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let req = sample_stream_event_request();
+        let pid = uuid::Uuid::from_u128(12);
+
+        let mut warned = false;
+        let got = send_stream_event(
+            &client,
+            &Attribution::ProjectOnly { project_id: pid },
+            &req,
+            &mut warned,
+        )
+        .await
+        .expect("an undeliverable repo-less event is dropped, not surfaced as Err");
+        assert!(
+            got.is_none(),
+            "Ok(None) signals the deliberate drop; Some(_) would read as a real send"
+        );
+        assert!(
+            warned,
+            "dropping data silently is the failure mode to avoid"
+        );
+
+        let first = rx
+            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
+            .expect("no request captured");
+        assert!(
+            first.contains(&format!("/projects/{pid}/stream")),
+            "must hit the project-scoped endpoint, got: {first}"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "a repo-less send must make exactly one request — no fallback exists"
+        );
+    }
+
+    /// A 403 is NOT dropped. It can mean the account lacks the realm role,
+    /// which an administrator can grant — after which the buffered events do
+    /// deliver. It must propagate so the caller queues them.
+    #[tokio::test]
+    async fn send_stream_event_project_only_buffers_on_403() {
+        let body = "forbidden";
+        let resp_403 = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (base, _rx) = spawn_n_capturing_requests(vec![Box::leak(resp_403.into_boxed_str())]);
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let req = sample_stream_event_request();
+
+        let mut warned = false;
+        let err = send_stream_event(
+            &client,
+            &Attribution::ProjectOnly {
+                project_id: uuid::Uuid::from_u128(13),
+            },
+            &req,
+            &mut warned,
+        )
+        .await
+        .expect_err("a 403 is recoverable by a role grant, so it must buffer, not drop");
+        assert!(
+            err.to_string().contains("403"),
+            "propagated error must reflect the status, got: {err}"
         );
     }
 
@@ -1540,13 +1948,15 @@ mod tests {
         let req = sample_stream_event_request();
         let pid = uuid::Uuid::from_u128(7);
 
-        let mut fallback_warned = false;
+        let mut warned = false;
         let err = send_stream_event(
             &client,
-            "11111111-1111-1111-1111-111111111111",
-            Some(pid),
+            &Attribution::Repo {
+                repo_id: "11111111-1111-1111-1111-111111111111".into(),
+                project: Some(pid),
+            },
             &req,
-            &mut fallback_warned,
+            &mut warned,
         )
         .await
         .expect_err("a transient 503 must propagate as Err, not be swallowed by a fallback");

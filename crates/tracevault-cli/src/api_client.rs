@@ -676,24 +676,37 @@ impl ApiClient {
     }
 
     /// Project-scoped variant of `stream_event`: posts to the project's
-    /// stream endpoint with `repo_id` as a query param instead of a path
-    /// segment. The query is built with `Url::query_pairs_mut`, mirroring
-    /// `resolve_project`'s `?git_url=`, so `repo_id` is percent-encoded
-    /// rather than string-interpolated into the URL.
+    /// stream endpoint with the project in the path and `repo_id` — when
+    /// there is one — as a query param rather than a path segment. The query
+    /// is built with `Url::query_pairs_mut`, mirroring `resolve_project`'s
+    /// `?git_url=`, so `repo_id` is percent-encoded rather than
+    /// string-interpolated into the URL.
     ///
-    /// Called from `commands::stream::send_stream_event` when a local
-    /// project binding resolves for the capturing event.
+    /// `repo_id` is `None` for a repo-less session, and the pair is then
+    /// omitted entirely: the server declares it optional
+    /// (`ProjectStreamQuery::repo_id: Option<Uuid>`) and would reject an
+    /// empty value as a malformed UUID.
+    ///
+    /// Called from `commands::stream::send_stream_event` for both the
+    /// `Attribution::Repo { project: Some(_) }` and `Attribution::ProjectOnly`
+    /// routes.
     pub async fn stream_event_for_project(
         &self,
         project_id: uuid::Uuid,
-        repo_id: &str,
+        repo_id: Option<&str>,
         req: &tracevault_protocol::streaming::StreamEventRequest,
     ) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn Error>> {
         let mut url = Url::parse(&format!(
             "{}/api/v1/projects/{}/stream",
             self.base_url, project_id
         ))?;
-        url.query_pairs_mut().append_pair("repo_id", repo_id);
+        // `repo_id` is OPTIONAL server-side (`ProjectStreamQuery::repo_id:
+        // Option<Uuid>` — "repo-less (0-repo) projects are supported"), so a
+        // repo-less session must omit the pair entirely. Appending an empty
+        // value instead would be parsed as a malformed UUID and 400.
+        if let Some(repo_id) = repo_id {
+            url.query_pairs_mut().append_pair("repo_id", repo_id);
+        }
         let builder = self.client.post(url).json(req);
         self.authed_send_json(builder, |status| {
             format!("Project stream failed ({status})")

@@ -1146,6 +1146,15 @@ mod tests {
     #[test]
     fn is_pending_queue_filename_matches_per_repo_only() {
         assert!(!is_pending_queue_filename("pending.jsonl"));
+        // Repo-less queues must be counted too. This holds today only
+        // because `repo_id_from_pending_filename` matches the shared
+        // `pending-` prefix and `status` never validates the id — i.e. by
+        // accident. Pin it, so tightening that helper to reject the project
+        // shape (which its name invites) cannot silently make `status` report
+        // "0 pending" over a non-empty queue that `flush` still drains.
+        assert!(is_pending_queue_filename(
+            "pending-project-018f0000-0000-7000-8000-000000000abc.jsonl"
+        ));
         assert!(is_pending_queue_filename("pending-a.jsonl"));
     }
 

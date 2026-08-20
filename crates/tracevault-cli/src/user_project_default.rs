@@ -1,10 +1,14 @@
 //! User-level default project binding: a session-independent binding any Claude
 //! Code session inherits when nothing more specific resolves. Set by
 //! `tracevault project switch --user` (or a no-session `project switch`); read by
-//! `project status` as the lowest-precedence tier. (The capture path — `stream`
-//! hooks — does not yet consume this; wiring the resolved project into ingest is
-//! future work, tracked separately from this binding store.) Lets a container
-//! bind its project *before* Claude launches — no session id required.
+//! `project status` as the lowest-precedence tier, and by the capture path:
+//! `commands::stream::capture_project` reads it as its last tier, so this
+//! store can decide the project an event is attributed to. Since repo-less
+//! ingest landed it can do more than that — for a session with no repo
+//! binding it is the sole reason the event ships at all (see
+//! `commands::stream::attribution_for`). Lets a container bind its project
+//! *before* Claude launches — no session id required, which is exactly why it
+//! is the tier that carries pre-clone runs.
 
 use std::path::{Path, PathBuf};
 
