@@ -117,7 +117,11 @@ async fn stream_event_for_project_targets_project_endpoint() {
     let req = sample_stream_event_request();
 
     let got = client
-        .stream_event_for_project(project_id, "11111111-1111-1111-1111-111111111111", &req)
+        .stream_event_for_project(
+            project_id,
+            Some("11111111-1111-1111-1111-111111111111"),
+            &req,
+        )
         .await
         .unwrap();
     assert_eq!(got.status, "accepted");
@@ -128,5 +132,40 @@ async fn stream_event_for_project_targets_project_endpoint() {
             "POST /api/v1/projects/00000000-0000-0000-0000-000000000000/stream?repo_id=11111111-1111-1111-1111-111111111111 "
         ),
         "got: {line}"
+    );
+}
+
+/// Repo-less project ingest: the server declares `ProjectStreamQuery::repo_id`
+/// optional ("repo-less (0-repo) projects are supported"), so a `None` repo
+/// must produce a bare project path with NO `repo_id` query pair — not an
+/// empty one, which the server would try to parse as a UUID and reject 400.
+#[tokio::test]
+async fn stream_event_for_project_omits_repo_id_when_absent() {
+    let response_body =
+        serde_json::to_string(&tracevault_protocol::streaming::StreamEventResponse {
+            session_db_id: uuid::Uuid::nil(),
+            event_db_id: Some(uuid::Uuid::nil()),
+            status: "accepted".to_string(),
+        })
+        .unwrap();
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        response_body.len(),
+        response_body
+    );
+    let (base, rx) = spawn_once(Box::leak(resp.into_boxed_str()));
+    let client = ApiClient::new(&base, Some("tok"));
+    let req = sample_stream_event_request();
+
+    let got = client
+        .stream_event_for_project(uuid::Uuid::nil(), None, &req)
+        .await
+        .unwrap();
+    assert_eq!(got.status, "accepted");
+
+    let line = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
+    assert!(
+        line.starts_with("POST /api/v1/projects/00000000-0000-0000-0000-000000000000/stream "),
+        "expected a bare project path with no query string, got: {line}"
     );
 }

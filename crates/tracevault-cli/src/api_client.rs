@@ -686,14 +686,20 @@ impl ApiClient {
     pub async fn stream_event_for_project(
         &self,
         project_id: uuid::Uuid,
-        repo_id: &str,
+        repo_id: Option<&str>,
         req: &tracevault_protocol::streaming::StreamEventRequest,
     ) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn Error>> {
         let mut url = Url::parse(&format!(
             "{}/api/v1/projects/{}/stream",
             self.base_url, project_id
         ))?;
-        url.query_pairs_mut().append_pair("repo_id", repo_id);
+        // `repo_id` is OPTIONAL server-side (`ProjectStreamQuery::repo_id:
+        // Option<Uuid>` — "repo-less (0-repo) projects are supported"), so a
+        // repo-less session must omit the pair entirely. Appending an empty
+        // value instead would be parsed as a malformed UUID and 400.
+        if let Some(repo_id) = repo_id {
+            url.query_pairs_mut().append_pair("repo_id", repo_id);
+        }
         let builder = self.client.post(url).json(req);
         self.authed_send_json(builder, |status| {
             format!("Project stream failed ({status})")
