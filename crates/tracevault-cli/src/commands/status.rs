@@ -575,9 +575,13 @@ type ProjectOutcome = Result<
 >;
 
 /// Display label for a project binding: the friendly name, falling back to
-/// the id when unset (a `Deduced` binding carries an empty `project_name` —
-/// `resolve_effective_project` doesn't enrich it, and enriching it here would
-/// cost an extra `list_projects` call this read-only inspector doesn't need).
+/// the id when unset. A `Deduced` binding carries an empty `project_name`
+/// (`resolve_effective_project` doesn't enrich it) and is shown by id rather
+/// than name: the credentialed arm below only ever calls `list_projects`
+/// when a config `default_project` is set, so a name lookup for `Deduced` is
+/// not reliably available — falling back to the id keeps this consistent
+/// across both cases rather than sometimes showing a name and sometimes an
+/// id depending on unrelated config state.
 fn project_label(binding: &crate::session_state::ProjectBinding) -> &str {
     if binding.project_name.is_empty() {
         &binding.project_id
@@ -588,25 +592,26 @@ fn project_label(binding: &crate::session_state::ProjectBinding) -> &str {
 
 /// Maps the resolved project-attribution outcome to the "Project" check.
 /// Pure and network-free — the resolution already happened in `run_status`.
-/// DISPLAY ONLY: this outcome (in particular its server-side deduction tier)
-/// never feeds [`recording_check`] — see that function's doc comment for why.
+/// DISPLAY ONLY: this outcome never feeds [`recording_check`]'s verdict — see
+/// that function's doc comment for why.
 ///
-/// - An explicit tier (flag/subagent/session/config-default/user-default) is
-///   a confident attribution → Ok.
-/// - `Deduced` (server-side inference from the repo's git remote) → Warn: it
-///   mirrors the stderr warning `resolve_effective_project` already prints
-///   when it lands on this tier — attribution happened, but wasn't explicit.
-/// - The chain returning `Err` — the ambiguous "this repo belongs to multiple
-///   projects" case, but ALSO any transport/5xx failure of the deduction
-///   call, since `resolve_effective_project` propagates those with the same
-///   `?` — is at most a Warn, never an Error. A prior version of this check
-///   made it an Error on the theory that this axis "genuinely fails at
-///   runtime"; that was wrong, because this axis is display-only now (the
-///   verdict comes from `recording_check`/the hook's own gate, which never
-///   deduces) — a network blip here must never be able to redden an
-///   otherwise-healthy machine's exit code. Matches how the rest of `status`
-///   already treats transport failure (`GetMeError::Network`, a failed
-///   `list_repos`) as Warn, not Error.
+/// - `ConfigDefault` and `Deduced` are tiers `capture_project` does NOT
+///   honor (it excludes the config `default_project` outright, and never
+///   deduces server-side) — so neither renders `Ok`. Showing `Ok` for a tier
+///   the capture path ignores would print a green Project line directly
+///   above a red Recording line for the same session: the display would
+///   contradict the verdict, which is the exact confusion this command
+///   exists to eliminate. Both render Warn, naming the tier and that it is
+///   not used for attribution at capture time.
+/// - Every other resolved tier (flag/subagent/session-active/user-default)
+///   IS honored by `capture_project` → a confident, live attribution → Ok.
+/// - `Err` — the ambiguous "this repo belongs to multiple projects" case, or
+///   any transport/5xx failure of the deduction call (`resolve_effective_project`
+///   propagates both the same way via `?`) — is also at most a Warn, never an
+///   Error: this axis is display-only, so a network blip must never be able
+///   to redden the exit code on its own. Matches how the rest of `status`
+///   treats transport failure (`GetMeError::Network`, a failed `list_repos`)
+///   as Warn, not Error.
 /// - `None` (nothing bound on this axis) is a Skip — severity for "nothing
 ///   will be recorded" is [`recording_check`]'s job, since only it consults
 ///   the actual recording gate.
@@ -617,13 +622,17 @@ fn project_binding_check(outcome: &ProjectOutcome) -> Check {
             "Project",
             "not bound — run `tracevault project switch --user \"<name>\"`, or `tracevault repo switch <path>` inside a checkout",
         ),
-        Ok(Some((binding, ProjectSource::Deduced))) => Check::warn(
-            "Project",
-            format!(
-                "{} — attribution deduced from the repo, not explicit; set one with `tracevault project switch <name>` or --project",
-                project_label(binding)
-            ),
-        ),
+        Ok(Some((binding, source)))
+            if matches!(source, ProjectSource::ConfigDefault | ProjectSource::Deduced) =>
+        {
+            Check::warn(
+                "Project",
+                format!(
+                    "{} — {source}, not used for attribution at capture time; set one explicitly with `tracevault project switch <name>` or --project",
+                    project_label(binding)
+                ),
+            )
+        }
         Ok(Some((binding, source))) => {
             Check::ok("Project", format!("{} — {source}", project_label(binding)))
         }
@@ -632,45 +641,38 @@ fn project_binding_check(outcome: &ProjectOutcome) -> Check {
 
 /// The one check that reflects whether anything will record this session at
 /// all. Takes the ALREADY-RESOLVED [`crate::commands::stream::Attribution`] —
-/// i.e. the exact same
-/// `attribution_for(resolve_stream_binding(...), capture_project(...))` call
-/// the `stream` hook itself makes before deciding to no-op — rather than
-/// re-deriving an approximation of it from hand-built booleans. An earlier
-/// version of this check computed `repo_bound`/`project_bound` from
-/// `has_binding`/`config.is_some()`/a network-backed project outcome, and
-/// that approximation was wrong in both directions: it missed the
-/// `repo switch --user`/config-without-`repo_id` tiers on the repo side and
-/// the `project switch --user` tier in the offline fallback on the project
-/// side, AND it let a `Deduced` (or `ConfigDefault`) *display* value count as
-/// "bound" even though `capture_project` never deduces and excludes
-/// `config_default` outright — silently reintroducing the exact false-green
-/// this whole fix exists to kill. Calling the hook's own gate means the two
-/// definitions cannot drift apart again.
+/// the exact same value `attribution_for(resolve_stream_binding(...),
+/// capture_project(...))` the `stream` hook itself computes before deciding
+/// to no-op — rather than a hand-built approximation of the two axes. Coupling
+/// to the hook's own gate this way is load-bearing: the repo axis has tiers
+/// (`repo switch --user`, a config with no `repo_id`) and the project axis has
+/// tiers (`project switch --user` with no credential, `Deduced`/`ConfigDefault`
+/// display values `capture_project` doesn't honor) that a hand-rolled
+/// `repo_bound`/`project_bound` pair would have to re-derive and could get
+/// wrong; calling the real functions means the two can't drift apart.
 ///
 /// Only fires for an explicitly named session (`--session-id` /
-/// `$TRACEVAULT_SESSION_ID`) — a bare scan has no committed target, so
-/// there's nothing to escalate about (this keeps the scan path out of the
-/// escalation by construction). Pure and network-free: `attribution` is
-/// computed by the caller from purely local tiers (mirroring the hook), so
-/// this check — and the verdict it drives — can never be swayed by a network
-/// hiccup.
+/// `$TRACEVAULT_SESSION_ID`, i.e. `session_id.is_some()`) — a bare scan has no
+/// committed target, so there's nothing to escalate about. Pure and
+/// network-free: `attribution` is computed by the caller from purely local
+/// tiers (mirroring the hook), so this check — and the verdict it drives —
+/// can never be swayed by a network hiccup.
 fn recording_check(
-    explicit_session: bool,
     session_id: Option<&str>,
     attribution: Option<&crate::commands::stream::Attribution>,
 ) -> Option<Check> {
-    if explicit_session && attribution.is_none() {
-        let id = session_id.unwrap_or("<unknown>");
-        return Some(Check::err(
-            "Recording",
-            format!(
-                "nothing will be recorded — session {id} is bound on neither the repo nor the \
-                 project axis; run `tracevault project switch --user \"<name>\"` on a repo-less \
-                 machine, or `tracevault repo switch <path>` inside a checkout"
-            ),
-        ));
+    let id = session_id?;
+    if attribution.is_some() {
+        return None;
     }
-    None
+    Some(Check::err(
+        "Recording",
+        format!(
+            "nothing will be recorded — session {id} is bound on neither the repo nor the \
+             project axis; run `tracevault project switch --user \"<name>\"` on a repo-less \
+             machine, or `tracevault repo switch <path>` inside a checkout"
+        ),
+    ))
 }
 
 /// Compose the "will this session record anything" gate exactly as
@@ -678,29 +680,26 @@ fn recording_check(
 /// worktree key from `cwd`, extract a bound-config `RepoBinding` (if any),
 /// and call `resolve_stream_binding` -> `capture_project` -> `attribution_for`
 /// with those inputs. Pure and synchronous — network-free, matching the two
-/// functions it calls — and this is exactly why it's worth extracting: it's
-/// the ONLY thing standing between a regression in this composition and a
-/// silent divergence from what the hook actually does.
+/// functions it calls. Returns the worktree key alongside the attribution so
+/// callers that also need it (the project-display resolution in `run_status`)
+/// don't re-shell out to git for the same value.
 ///
 /// Deliberately derives its OWN worktree key from `cwd` (via
-/// `crate::paths::worktree_toplevel`) rather than taking a pre-computed key
-/// as a parameter: `cwd` is the toplevel a `stream` hook invocation actually
-/// runs from, which for a LINKED worktree is NOT the same string as
-/// `project_root` (the PRIMARY worktree's root, from `resolve_project_root`'s
-/// `git rev-parse --git-common-dir`). An earlier version of this composition
-/// was inlined into `run_status` and briefly used `project_root` for this —
-/// a bug that shipped once in this very task and was caught only by human
-/// review, because no test forced the caller to supply the right path.
-/// Deriving the key HERE, and pointing every attribution test at this
-/// function itself rather than re-deriving the key by hand in each test,
-/// means a future revert back to a primary-root path fails
-/// `recording_attribution_finds_subagent_override_via_linked_worktree_cwd`.
+/// `crate::paths::worktree_toplevel`) rather than taking a pre-computed key as
+/// a parameter: `cwd` is the toplevel a `stream` hook invocation actually runs
+/// from, which for a LINKED worktree is NOT the same string as `project_root`
+/// (the PRIMARY worktree's root, from `resolve_project_root`'s
+/// `git rev-parse --git-common-dir`) — subagent overrides are keyed by the
+/// former. Keeping the derivation INSIDE this function, with every attribution
+/// test calling it directly rather than re-deriving the key by hand, is what
+/// makes `recording_attribution_finds_subagent_override_via_linked_worktree_cwd`
+/// able to catch a regression back to a primary-root path.
 fn recording_attribution(
     sessions_dir: Option<&Path>,
     session_id: Option<&str>,
     cwd: &Path,
     config: Option<&TracevaultConfig>,
-) -> Option<crate::commands::stream::Attribution> {
+) -> (Option<crate::commands::stream::Attribution>, String) {
     let session = match (sessions_dir, session_id) {
         (Some(dir), Some(id)) => crate::session_state::load_from(dir, id),
         _ => crate::session_state::SessionState::default(),
@@ -715,20 +714,21 @@ fn recording_attribution(
         user_default_repo,
     );
     let capture_pid = crate::commands::stream::capture_project(&session, Some(&worktree));
-    crate::commands::stream::attribution_for(stream_binding.as_ref(), capture_pid)
+    let attribution =
+        crate::commands::stream::attribution_for(stream_binding.as_ref(), capture_pid);
+    (attribution, worktree)
 }
 
 /// The project axis's offline/no-client display fallback: the pure local
 /// tiers (`effective_project`) plus the user-level project default as the
 /// lowest tier. `effective_project` alone never consults the user default —
 /// only `resolve_effective_project` (the networked chain) does — so without
-/// this, a repo-less pod that already ran `project switch --user` but has no
-/// credential/server URL configured was told, on the "Project" line, to run
-/// the exact command it had already run (finding 2's display half; the
-/// verdict half was already fixed by `recording_attribution`, which reads
-/// this same tier independently via `capture_project`). Pulled out as its
-/// own pure function so this fallback is unit-testable without driving all
-/// of `run_status`.
+/// this, a repo-less pod attributed solely via `project switch --user`, with
+/// no credential/server URL configured, would show "not bound" on the
+/// "Project" line while `recording_attribution` (which reads this same tier
+/// independently via `capture_project`) correctly shows the session as
+/// recording. Pulled out as its own pure function so this fallback is
+/// unit-testable without driving all of `run_status`.
 fn offline_project_outcome(
     inputs: &ProjectResolveInputs,
     user_default_project: Option<crate::session_state::ProjectBinding>,
@@ -1083,24 +1083,24 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
         has_binding,
     );
 
-    // The recording verdict: call the hook's own gate (stream.rs), via
-    // `recording_attribution`, instead of re-deriving an approximation of it
-    // inline. Entirely local/network-free by construction — see that
-    // function's doc comment for why its composition (in particular, using
-    // `cwd` rather than `project_root` for the worktree key) is extracted
-    // rather than inlined here.
-    let attribution =
+    // The recording verdict: call the hook's own gate (stream.rs) via
+    // `recording_attribution` — see that function's doc comment for why its
+    // composition, including the worktree-key derivation, lives there rather
+    // than inline here. Its worktree key is reused below for the project
+    // display resolution, which needs the same value.
+    let (attribution, worktree) =
         recording_attribution(sessions_dir.as_deref(), session_id, cwd, config.as_ref());
 
     // The project axis for DISPLAY needs its own full `SessionState` (more
     // than `workspace_binding_check_in`'s bare `RepoBinding`, e.g.
-    // `active_project`/`subagent_projects`) and worktree key — unlike the
-    // verdict above, which now lives entirely inside `recording_attribution`.
+    // `active_project`/`subagent_projects`) — unlike the verdict above, which
+    // lives entirely inside `recording_attribution`. Loaded separately
+    // (rather than sharing `recording_attribution`'s internal session load)
+    // so that function's session load stays self-contained.
     let project_session = match (sessions_dir.as_deref(), session_id) {
         (Some(dir), Some(id)) => crate::session_state::load_from(dir, id),
         _ => crate::session_state::SessionState::default(),
     };
-    let worktree = crate::paths::worktree_toplevel(cwd);
 
     // --- The project axis for DISPLAY only, mirroring `commands::project`'s
     // `status` path (project.rs:228-334): read the worktree-relative
@@ -1159,7 +1159,7 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
     };
 
     let mut attribution_v = Vec::new();
-    if let Some(c) = recording_check(explicit_session, session_id, attribution.as_ref()) {
+    if let Some(c) = recording_check(session_id, attribution.as_ref()) {
         attribution_v.push(c);
     }
     attribution_v.push(binding_check);
@@ -1905,32 +1905,20 @@ mod tests {
             project_id: uuid::Uuid::from_u128(1),
         };
 
-        // explicit_session=false: never fires, no matter what attribution is.
-        assert!(recording_check(false, Some("s"), None).is_none());
-        assert!(recording_check(false, Some("s"), Some(&repo_attr)).is_none());
-        assert!(recording_check(false, Some("s"), Some(&project_attr)).is_none());
-        assert!(recording_check(false, None, None).is_none());
+        // session_id: None (no explicit session — a bare scan): never fires,
+        // no matter what attribution is.
+        assert!(recording_check(None, None).is_none());
+        assert!(recording_check(None, Some(&repo_attr)).is_none());
+        assert!(recording_check(None, Some(&project_attr)).is_none());
 
-        // explicit_session=true, something resolved (either shape): no check.
-        assert!(recording_check(true, Some("s"), Some(&repo_attr)).is_none());
-        assert!(recording_check(true, Some("s"), Some(&project_attr)).is_none());
+        // session_id: Some, something resolved (either shape): no check.
+        assert!(recording_check(Some("s"), Some(&repo_attr)).is_none());
+        assert!(recording_check(Some("s"), Some(&project_attr)).is_none());
 
-        // explicit_session=true, nothing resolved: the ONLY firing cell.
+        // session_id: Some, nothing resolved: the ONLY firing cell.
         assert_eq!(
-            recording_check(true, Some("s"), None).map(|c| c.level),
+            recording_check(Some("s"), None).map(|c| c.level),
             Some(Level::Error)
-        );
-
-        // session_id: None with explicit_session=true — the `<unknown>`
-        // fallback branch — still fires; the id is cosmetic, not part of the
-        // gate.
-        let check =
-            recording_check(true, None, None).expect("expected an Error check for session_id=None");
-        assert_eq!(check.level, Level::Error);
-        assert!(
-            check.detail.contains("<unknown>"),
-            "detail: {}",
-            check.detail
         );
     }
 
@@ -1940,8 +1928,7 @@ mod tests {
         // the repo-less remediation (`project switch --user`) has to be
         // present, or a regression to the old text wouldn't be caught by a
         // plain level assertion.
-        let check =
-            recording_check(true, Some("3f27a336-abcd"), None).expect("expected an Error check");
+        let check = recording_check(Some("3f27a336-abcd"), None).expect("expected an Error check");
         assert_eq!(check.level, Level::Error);
         assert!(
             check.detail.contains("project switch"),
@@ -1956,16 +1943,13 @@ mod tests {
     }
 
     #[test]
-    fn project_binding_check_all_explicit_sources_are_ok() {
-        // All five explicit tiers read as Ok, not just one of them.
+    fn project_binding_check_tiers_capture_project_honors_are_ok() {
+        // Only the tiers `capture_project` itself resolves at capture time
+        // read Ok: a `--project`-equivalent flag, the subagent/session-active
+        // overrides, and the user-level default. `ConfigDefault` and
+        // `Deduced` are covered separately — they must NOT appear here.
         use crate::resolution::ProjectSource::*;
-        for source in [
-            ProjectFlag,
-            Subagent,
-            SessionActive,
-            ConfigDefault,
-            UserDefault,
-        ] {
+        for source in [ProjectFlag, Subagent, SessionActive, UserDefault] {
             let outcome: ProjectOutcome =
                 Ok(Some((project_binding("pid-1", "My Project"), source)));
             let check = project_binding_check(&outcome);
@@ -1979,7 +1963,29 @@ mod tests {
     }
 
     #[test]
+    fn project_binding_check_config_default_is_warn_not_ok() {
+        // `capture_project` deliberately excludes the config `default_project`
+        // tier, so displaying it as Ok would print a green Project line
+        // directly above a red Recording line for the same session.
+        let outcome: ProjectOutcome = Ok(Some((
+            project_binding("pid-3", "My Project"),
+            crate::resolution::ProjectSource::ConfigDefault,
+        )));
+        let check = project_binding_check(&outcome);
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check
+                .detail
+                .contains("not used for attribution at capture time"),
+            "detail: {}",
+            check.detail
+        );
+    }
+
+    #[test]
     fn project_binding_check_deduced_is_warn() {
+        // `capture_project` never deduces server-side, so this tier can't
+        // read Ok either — same reasoning as `ConfigDefault` above.
         let outcome: ProjectOutcome = Ok(Some((
             project_binding("pid-2", ""),
             crate::resolution::ProjectSource::Deduced,
@@ -1987,20 +1993,21 @@ mod tests {
         let check = project_binding_check(&outcome);
         assert_eq!(check.level, Level::Warn);
         assert!(
-            check.detail.contains("deduc"),
-            "detail should say attribution was deduced, not explicit: {}",
+            check
+                .detail
+                .contains("not used for attribution at capture time"),
+            "detail: {}",
             check.detail
         );
     }
 
     #[test]
     fn project_binding_check_ambiguous_err_is_warn_not_error() {
-        // Finding 1: the project axis is display-only now (the verdict comes
-        // from `recording_check`'s real gate, which never deduces), so ANY
-        // failure of the deduction call — ambiguous OR transport/5xx, since
-        // `resolve_effective_project` propagates both the same way via `?` —
-        // must read as Warn, never Error. An Error here used to be able to
-        // redden an otherwise-healthy machine's exit code on a network blip.
+        // This axis is display-only — the verdict comes from
+        // `recording_check`'s real gate, which never deduces — so ANY failure
+        // of the deduction call (genuinely ambiguous, or a transport/5xx
+        // error propagated the same way) must read as Warn, never Error: a
+        // network blip on this axis must not be able to redden the exit code.
         let outcome: ProjectOutcome =
             Err("this repo belongs to multiple projects; select one with `tracevault project switch <name>`".into());
         let check = project_binding_check(&outcome);
@@ -2019,34 +2026,37 @@ mod tests {
         assert_eq!(check.level, Level::Skip);
     }
 
-    // --- Verdict composition: `recording_attribution` composed exactly as
-    // `run_status` does, fed into `recording_check`. Routing every test
-    // through the extracted function (rather than re-deriving its five
-    // composition lines by hand, as an earlier version of these tests did)
-    // means a regression in that composition — e.g. reverting the worktree
-    // key back to a primary-root path — fails a test here instead of
-    // failing silently (see `recording_attribution_finds_subagent_override_
-    // via_linked_worktree_cwd` below).
+    // --- Verdict composition: every test below drives `recording_attribution`
+    // directly (rather than re-deriving its session-load/worktree-key/bound-
+    // config composition by hand), so a regression in that composition —
+    // e.g. the worktree key coming from the wrong path — fails a test instead
+    // of only a full end-to-end run (see `recording_attribution_finds_
+    // subagent_override_via_linked_worktree_cwd` below).
     //
     // ISOLATION: `recording_attribution` -> `capture_project` always
-    // consults `user_project_default::load()` once its local tiers miss,
-    // and `recording_attribution` itself calls `user_default::load()`
-    // unconditionally — both read `dirs::config_dir()`. EVERY test below
-    // therefore redirects `XDG_CONFIG_HOME` to an empty temp dir, even the
-    // ones that don't care about either default: a developer machine that
-    // has ever run `project switch --user` or `repo switch --user` would
-    // otherwise inject a real, non-deterministic tier and flip the test's
-    // outcome. This is not hypothetical — round-2 review reproduced exactly
-    // this with a real `user_project.toml` present.
+    // consults `user_project_default::load()` once its local tiers miss, and
+    // `recording_attribution` itself calls `user_default::load()`
+    // unconditionally — both are backed by `dirs::config_dir()`/
+    // `dirs::home_dir()`, which read the REAL developer config on the machine
+    // running the test unless overridden. EVERY test below therefore
+    // redirects both `XDG_CONFIG_HOME` (the path on Linux) and `HOME` (the
+    // path `dirs` actually uses on macOS, and `home_dir()`'s own first
+    // choice) to the same empty temp dir — even tests that don't care about
+    // either default, since a developer machine that has ever run
+    // `project switch --user` or `repo switch --user` would otherwise inject
+    // a real, non-deterministic tier and flip the test's outcome. Three of
+    // these tests call the public `save()` (not just `load()`), so getting
+    // this isolation wrong doesn't just make a test flaky — it overwrites
+    // that developer's real config file.
 
     #[test]
     fn verdict_repo_user_default_alone_is_not_an_error() {
-        // `repo switch --user`: `resolve_stream_binding`'s lowest tier,
-        // absent from the old `repo_bound` approximation (finding 5).
+        // `repo switch --user` is `resolve_stream_binding`'s lowest tier.
         let _env_lock = crate::test_helpers::lock_env_mutation_sync();
         let cfg_tmp = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
 
         crate::user_default::save(&repo_binding_for_attribution(
             "11111111-1111-4111-8111-111111111111",
@@ -2054,20 +2064,27 @@ mod tests {
         .unwrap();
 
         let cwd = tempfile::tempdir().unwrap();
-        let attribution = recording_attribution(None, None, cwd.path(), None);
-        assert!(attribution.is_some());
-        assert!(recording_check(true, Some("s"), attribution.as_ref()).is_none());
+        let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), None);
+        assert_eq!(
+            attribution,
+            Some(crate::commands::stream::Attribution::Repo {
+                repo_id: "11111111-1111-4111-8111-111111111111".into(),
+                project: None,
+            })
+        );
+        assert!(recording_check(Some("s"), attribution.as_ref()).is_none());
     }
 
     #[test]
     fn verdict_project_user_default_alone_is_not_an_error() {
-        // `project switch --user`: the offline-fallback gap from finding 2's
-        // verdict half (the display half is pinned separately by
-        // `offline_project_outcome_falls_back_to_saved_user_default`).
+        // `project switch --user` with no credential configured: the display
+        // half of this same fallback is pinned separately by
+        // `offline_project_outcome_falls_back_to_saved_user_default`.
         let _env_lock = crate::test_helpers::lock_env_mutation_sync();
         let cfg_tmp = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
 
         let pb = crate::session_state::ProjectBinding {
             project_id: uuid::Uuid::from_u128(7).to_string(),
@@ -2077,24 +2094,25 @@ mod tests {
         crate::user_project_default::save(&pb).unwrap();
 
         let cwd = tempfile::tempdir().unwrap();
-        let attribution = recording_attribution(None, None, cwd.path(), None);
+        let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), None);
         assert_eq!(
             attribution,
             Some(crate::commands::stream::Attribution::ProjectOnly {
                 project_id: uuid::Uuid::from_u128(7)
             })
         );
-        assert!(recording_check(true, Some("s"), attribution.as_ref()).is_none());
+        assert!(recording_check(Some("s"), attribution.as_ref()).is_none());
     }
 
     #[test]
     fn verdict_config_without_repo_id_and_nothing_else_is_error() {
-        // Finding 6: a loaded `config.toml` with no `repo_id` must NOT count
-        // as bound — `config.is_some()` was the wrong test.
+        // A loaded `config.toml` with no `repo_id` must not count as bound —
+        // `binding_from_config` returns `None` for it.
         let _env_lock = crate::test_helpers::lock_env_mutation_sync();
         let cfg_tmp = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
 
         let config = crate::config::TracevaultConfig::default();
         assert!(
@@ -2103,9 +2121,9 @@ mod tests {
         );
 
         let cwd = tempfile::tempdir().unwrap();
-        let attribution = recording_attribution(None, None, cwd.path(), Some(&config));
+        let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), Some(&config));
         assert_eq!(
-            recording_check(true, Some("s"), attribution.as_ref()).map(|c| c.level),
+            recording_check(Some("s"), attribution.as_ref()).map(|c| c.level),
             Some(Level::Error)
         );
     }
@@ -2116,19 +2134,20 @@ mod tests {
         let cfg_tmp = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
 
         let cwd = tempfile::tempdir().unwrap();
-        let attribution = recording_attribution(None, None, cwd.path(), None);
+        let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), None);
         assert_eq!(
-            recording_check(true, Some("s"), attribution.as_ref()).map(|c| c.level),
+            recording_check(Some("s"), attribution.as_ref()).map(|c| c.level),
             Some(Level::Error)
         );
     }
 
     #[test]
     fn verdict_deduced_project_display_does_not_suppress_recording_error() {
-        // Finding 4: a `Deduced` DISPLAY value must not make the project axis
-        // count as bound for the verdict — `capture_project` never deduces.
+        // A `Deduced` DISPLAY value must not make the project axis count as
+        // bound for the verdict — `capture_project` never deduces.
         let outcome: ProjectOutcome = Ok(Some((
             project_binding("pid", ""),
             crate::resolution::ProjectSource::Deduced,
@@ -2139,11 +2158,12 @@ mod tests {
         let cfg_tmp = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
 
         let cwd = tempfile::tempdir().unwrap();
-        let attribution = recording_attribution(None, None, cwd.path(), None);
+        let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), None);
         assert_eq!(
-            recording_check(true, Some("s"), attribution.as_ref()).map(|c| c.level),
+            recording_check(Some("s"), attribution.as_ref()).map(|c| c.level),
             Some(Level::Error),
             "a Deduced display value must not suppress the Recording error"
         );
@@ -2151,10 +2171,10 @@ mod tests {
 
     #[test]
     fn verdict_deduction_failure_is_warn_and_does_not_affect_recording() {
-        // Finding 1: a deduction failure (network blip, 5xx, or genuinely
-        // Ambiguous) must render at most Warn, and — since `recording_check`
-        // never even sees `project_outcome` — cannot suppress or trigger the
-        // Recording verdict either way.
+        // A deduction failure (network blip, 5xx, or genuinely Ambiguous)
+        // must render at most Warn, and — since `recording_check` never even
+        // sees `project_outcome` — cannot suppress or trigger the Recording
+        // verdict either way.
         let outcome: ProjectOutcome = Err("this repo belongs to multiple projects".into());
         assert_eq!(project_binding_check(&outcome).level, Level::Warn);
 
@@ -2162,27 +2182,29 @@ mod tests {
         let cfg_tmp = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
 
         let config = crate::config::TracevaultConfig {
             repo_id: Some("22222222-2222-4222-8222-222222222222".into()),
             ..Default::default()
         };
         let cwd = tempfile::tempdir().unwrap();
-        let attribution = recording_attribution(None, None, cwd.path(), Some(&config));
+        let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), Some(&config));
         // Repo bound (via config) independently of the deduction failure
         // above -> no error, and nothing about the `Err` outcome forced one.
-        assert!(recording_check(true, Some("s"), attribution.as_ref()).is_none());
+        assert!(recording_check(Some("s"), attribution.as_ref()).is_none());
     }
 
     #[test]
     fn offline_project_outcome_falls_back_to_saved_user_default() {
-        // Finding 2's display half: a saved `project switch --user` default
-        // must surface as Ok, not Skip, in the credential-less path — not
-        // just the pure local tiers, which `effective_project` alone covers.
+        // A saved `project switch --user` default must surface as Ok, not
+        // Skip, in the credential-less path — not just the pure local tiers,
+        // which `effective_project` alone covers.
         let _env_lock = crate::test_helpers::lock_env_mutation_sync();
         let cfg_tmp = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
 
         let pb = crate::session_state::ProjectBinding {
             project_id: uuid::Uuid::from_u128(9).to_string(),
@@ -2212,16 +2234,14 @@ mod tests {
 
     #[test]
     fn recording_attribution_finds_subagent_override_via_linked_worktree_cwd() {
-        // Pins finding 3's exact bug class: a revert of the worktree key
-        // inside `recording_attribution` from `worktree_toplevel(cwd)` back
-        // to `worktree_toplevel(project_root)` would make the FIRST
-        // assertion below fail, because the primary worktree's toplevel is
-        // NOT the key `subagent_projects` is keyed by for a session running
-        // in a LINKED worktree.
+        // The subagent override is keyed by the LINKED worktree's own
+        // toplevel, not the primary repo's — resolving from the wrong one
+        // must miss it.
         let _env_lock = crate::test_helpers::lock_env_mutation_sync();
         let cfg_tmp = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path()); // see isolation note above
 
         let base = tempfile::tempdir().unwrap();
         let repo_dir = base.path().join("repo");
@@ -2253,7 +2273,7 @@ mod tests {
         .unwrap();
 
         // From the LINKED worktree cwd, the subagent override resolves.
-        let found = recording_attribution(
+        let (found, _worktree) = recording_attribution(
             Some(sessions_dir.path()),
             Some("sess-linked"),
             &wt_dir,
@@ -2264,10 +2284,9 @@ mod tests {
             Some(crate::commands::stream::Attribution::ProjectOnly { project_id })
         );
 
-        // From the PRIMARY worktree root instead — what a reverted
-        // `worktree_toplevel(project_root)` would effectively pass as `cwd`
-        // — the key doesn't match, so nothing resolves.
-        let missed = recording_attribution(
+        // From the PRIMARY worktree root instead, the key doesn't match, so
+        // nothing resolves.
+        let (missed, _worktree) = recording_attribution(
             Some(sessions_dir.path()),
             Some("sess-linked"),
             &repo_dir,
