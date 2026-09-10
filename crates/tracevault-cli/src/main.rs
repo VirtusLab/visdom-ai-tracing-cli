@@ -353,6 +353,7 @@ async fn main() {
                                 println!(
                                     "These apply to ALL Codex CLI sessions on this machine, not just this repo."
                                 );
+                                println!("{}", commands::init::codex_hook_trust_notice());
                             }
                             Err(e) => {
                                 eprintln!("Error: {e}");

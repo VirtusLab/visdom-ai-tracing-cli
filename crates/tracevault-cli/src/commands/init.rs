@@ -207,7 +207,10 @@ pub async fn init_in_directory(
                 claude_target.expect("claude settings target is resolved for the Claude agent");
             install_claude_hooks(project_root, target)?;
         }
-        crate::agent::Agent::Codex => install_codex_hooks(project_root)?,
+        crate::agent::Agent::Codex => {
+            install_codex_hooks(project_root)?;
+            println!("{}", codex_hook_trust_notice());
+        }
         crate::agent::Agent::Gsd => {
             // GSD (pi) loads extensions from the user-global ~/.gsd/, not from
             // anything in the repo, so even the repo-local `init` path installs
@@ -574,6 +577,21 @@ pub fn tracevault_hooks() -> serde_json::Value {
 }
 
 /// Codex CLI hook set, mirroring `tracevault_hooks()` but with Codex commands.
+/// What to tell the user after Codex hooks are installed.
+///
+/// Writing `hooks.json` is only half the setup: Codex >= 0.153 gates hooks
+/// behind persisted *hook trust*, and a non-interactive `codex exec` skips
+/// untrusted hooks without printing anything — so capture looks installed and
+/// silently produces no sessions until trust is granted once. Observed on
+/// Codex 0.153.4, where neither `codex doctor` nor `codex features` reports
+/// the trust state, which is why the CLI has to say it here.
+pub fn codex_hook_trust_notice() -> &'static str {
+    "Codex gates hooks behind hook trust: until it is granted, `codex exec` skips them \
+     silently and no session is captured. Run `codex` once interactively in a repo and \
+     approve the hook-trust prompt; unattended runs (CI) can pass \
+     `--dangerously-bypass-hook-trust` instead."
+}
+
 /// Capture hooks carry `--agent codex`; the injection hooks (session-start /
 /// user-prompt) are agent-agnostic. Matchers are `""` (all tools).
 ///
@@ -1102,6 +1120,32 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    /// Installing the hooks is not enough on Codex >= 0.153: they are gated
+    /// behind persisted hook trust, and `codex exec` skips untrusted hooks
+    /// silently. The notice must say how to grant that trust interactively and
+    /// name the flag that unblocks unattended runs — otherwise a user (or a CI
+    /// image) reads "Installed" and gets no capture at all.
+    #[test]
+    fn codex_hook_trust_notice_explains_how_to_grant_trust() {
+        let notice = codex_hook_trust_notice();
+        assert!(
+            notice.contains("hook trust"),
+            "notice must name what is missing: {notice}"
+        );
+        assert!(
+            notice.contains("codex") && notice.contains("approve"),
+            "notice must tell the user to run codex and approve the prompt: {notice}"
+        );
+        assert!(
+            notice.contains("--dangerously-bypass-hook-trust"),
+            "notice must name the flag for unattended/CI runs: {notice}"
+        );
+        assert!(
+            notice.contains("silently"),
+            "notice must say the failure is silent, which is why it needs saying: {notice}"
+        );
+    }
 
     /// Spawn a one-shot raw-HTTP server that returns `response` to the first
     /// request it accepts (mirrors `commands::repo`'s test module).
