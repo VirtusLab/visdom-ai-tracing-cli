@@ -115,7 +115,12 @@ struct AuthContext {
     url_override_mismatch: Option<(String, String)>,
 }
 
-fn resolve_auth() -> AuthContext {
+/// `config_server_url`/`config_api_key` are the lowest rung, mirroring
+/// `credentials::resolve_credentials`. Without them this inspector reported a
+/// repo authenticated purely through `.tracevault/config.toml` as "no
+/// credentials found" and exited non-zero, while every command using that same
+/// config worked — the inspector called a working setup broken.
+fn resolve_auth(config_server_url: Option<&str>, config_api_key: Option<&str>) -> AuthContext {
     // Env var wins. Match the server-side resolution order in
     // resolve_credentials (env > creds), except we treat the env var as
     // authoritative without looking at the credentials file email.
@@ -124,7 +129,10 @@ fn resolve_auth() -> AuthContext {
 
     if let Some(token) = env_key {
         return AuthContext {
-            server_url: env_url,
+            // `.or(config)` because `resolve_credentials` resolves the URL and
+            // the credential independently: an env key with the URL pinned only
+            // in the config is a working setup, not "no server URL".
+            server_url: env_url.or_else(|| config_server_url.map(str::to_string)),
             credential: Some(Credential::ApiKey(token)),
             source: "env (TRACEVAULT_API_KEY)",
             email_from_creds: None,
@@ -157,16 +165,23 @@ fn resolve_auth() -> AuthContext {
         };
     }
 
+    // Lowest rung: a hand-authored `config.toml` may carry `api_key` and
+    // `server_url`. Only reached when the env and the credentials file yielded
+    // nothing, exactly as in `resolve_credentials`.
     AuthContext {
-        server_url: env_url,
-        credential: None,
-        source: "none",
+        server_url: env_url.or_else(|| config_server_url.map(str::to_string)),
+        credential: config_api_key.map(|k| Credential::ApiKey(k.to_string())),
+        source: if config_api_key.is_some() {
+            "project config (.tracevault/config.toml)"
+        } else {
+            "none"
+        },
         email_from_creds: None,
         url_override_mismatch: None,
     }
 }
 
-async fn auth_checks(auth: &AuthContext) -> Vec<Check> {
+async fn auth_checks(auth: &AuthContext, config_server_url: Option<&str>) -> Vec<Check> {
     let mut out = Vec::new();
 
     match (auth.credential.as_ref(), auth.server_url.as_ref()) {
@@ -202,6 +217,29 @@ async fn auth_checks(auth: &AuthContext) -> Vec<Check> {
                  Commands will refuse to run rather than send that session's token to another \
                  instance. Unset TRACEVAULT_SERVER_URL, or run `tracevault login --server-url \
                  {env_url}`."
+            ),
+        ));
+    }
+
+    // Reported as a WARNING, not an error: unlike the override above, commands
+    // still run — they just use the login's instance while the repo's config
+    // says otherwise. Without this the inspector is actively misleading: it
+    // reads only the credentials file, so it would print a green "Logged in"
+    // against a URL the repo never asked for. Shares
+    // `credentials::config_url_conflict` with the resolution itself so the two
+    // cannot drift apart.
+    if let Some((file_url, config_url)) = crate::credentials::config_url_conflict(
+        config_server_url,
+        auth.server_url.as_deref(),
+        std::env::var("TRACEVAULT_SERVER_URL").is_ok(),
+    ) {
+        out.push(Check::warn(
+            "Server URL",
+            format!(
+                ".tracevault/config.toml pins '{config_url}' but the saved login is for \
+                 '{file_url}'. The config URL is ignored — commands use '{file_url}'. Run \
+                 `tracevault login --server-url {config_url}` to use the repo's instance, or \
+                 remove `server_url` from .tracevault/config.toml."
             ),
         ));
     }
@@ -1093,7 +1131,17 @@ pub fn effective_session_id(arg: Option<String>, env: Option<String>) -> Option<
 }
 
 pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str>) -> i32 {
-    let auth = resolve_auth();
+    // Loaded here rather than reused from `project_checks` below, which runs
+    // later and owns its own load. `try_load`, not `load`: `load` prints its own
+    // stderr line on malformed TOML, which would pre-empt (and duplicate) the
+    // structured parse error `project_checks` reports. A config that will not
+    // parse simply contributes nothing here.
+    let auth_config = TracevaultConfig::try_load(project_root).ok().flatten();
+    let config_server_url = auth_config.as_ref().and_then(|c| c.server_url.as_deref());
+    let auth = resolve_auth(
+        config_server_url,
+        auth_config.as_ref().and_then(|c| c.api_key.as_deref()),
+    );
 
     // ~/.claude/settings.json — None when the home dir can't be resolved. Do
     // NOT fall back to a relative `.claude/settings.json`: that would read the
@@ -1130,7 +1178,7 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
         None
     };
 
-    let auth_checks_v = auth_checks(&auth).await;
+    let auth_checks_v = auth_checks(&auth, config_server_url).await;
     let install_v = vec![global_check];
     let (proj_checks_v, config) = project_checks(
         project_root,
@@ -2211,6 +2259,95 @@ mod tests {
     // these tests call the public `save()` (not just `load()`), so getting
     // this isolation wrong doesn't just make a test flaky — it overwrites
     // that developer's real config file.
+
+    // ---- resolve_auth: `.tracevault/config.toml` is the lowest credential
+    // ---- rung in `resolve_credentials`, so the inspector must know it too.
+
+    /// Isolate the env and the credentials file so nothing on the developer's
+    /// machine can supply a credential these tests are asserting the absence of.
+    fn auth_fixture() -> (
+        tempfile::TempDir,
+        tokio::sync::MutexGuard<'static, ()>,
+        crate::test_helpers::EnvVarGuard,
+    ) {
+        let env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let dir = tempfile::tempdir().unwrap();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("XDG_CONFIG_HOME", dir.path());
+        guard.set("HOME", dir.path());
+        guard.remove("TRACEVAULT_API_KEY");
+        guard.remove("TRACEVAULT_SERVER_URL");
+        (dir, env_lock, guard)
+    }
+
+    /// The reported bug: a repo authenticated purely through `config.toml`
+    /// works for every command, but `status` called it "no credentials found"
+    /// and exited non-zero.
+    #[test]
+    fn a_config_only_setup_reads_as_logged_in() {
+        let (_dir, _lock, _guard) = auth_fixture();
+
+        let auth = resolve_auth(Some("http://localhost:8080"), Some("tvk_from_config"));
+
+        assert_eq!(auth.server_url.as_deref(), Some("http://localhost:8080"));
+        assert!(
+            matches!(auth.credential, Some(Credential::ApiKey(ref k)) if k == "tvk_from_config"),
+            "the config's key is the credential every command resolves"
+        );
+        assert_eq!(auth.source, "project config (.tracevault/config.toml)");
+    }
+
+    /// `resolve_credentials` resolves the URL and the credential independently,
+    /// so an env key with the URL pinned only in the config is a working setup
+    /// — it used to report "token found but no server URL".
+    #[test]
+    fn an_env_key_takes_its_url_from_the_config_when_the_env_has_none() {
+        let (_dir, _lock, mut guard) = auth_fixture();
+        guard.set("TRACEVAULT_API_KEY", "tvk_from_env");
+
+        let auth = resolve_auth(Some("http://localhost:8080"), None);
+
+        assert_eq!(auth.server_url.as_deref(), Some("http://localhost:8080"));
+        assert!(matches!(auth.credential, Some(Credential::ApiKey(ref k)) if k == "tvk_from_env"));
+        assert_eq!(auth.source, "env (TRACEVAULT_API_KEY)");
+    }
+
+    /// The config is the LOWEST rung: a credentials file still outranks it, and
+    /// its URL still wins, which is what the conflict warning then reports on.
+    #[test]
+    fn the_credentials_file_still_outranks_the_config() {
+        let (dir, _lock, _guard) = auth_fixture();
+        let creds_dir = dir.path().join("tracevault");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(
+            creds_dir.join("credentials.json"),
+            r#"{"server_url":"https://dev.example.com","token":"tvk_from_file","email":"a@b.com"}"#,
+        )
+        .unwrap();
+
+        let auth = resolve_auth(Some("http://localhost:8080"), Some("tvk_from_config"));
+
+        assert_eq!(auth.server_url.as_deref(), Some("https://dev.example.com"));
+        assert!(matches!(auth.credential, Some(Credential::ApiKey(ref k)) if k == "tvk_from_file"));
+        assert_eq!(auth.source, "credentials file (API key)");
+    }
+
+    /// Nothing anywhere is still "none" — the fallback must not start claiming
+    /// a credential just because a config exists without one.
+    #[test]
+    fn a_config_without_a_key_is_still_not_logged_in() {
+        let (_dir, _lock, _guard) = auth_fixture();
+
+        let auth = resolve_auth(Some("http://localhost:8080"), None);
+
+        assert!(auth.credential.is_none());
+        assert_eq!(auth.source, "none");
+        assert_eq!(
+            auth.server_url.as_deref(),
+            Some("http://localhost:8080"),
+            "the pin is still worth reporting"
+        );
+    }
 
     #[test]
     fn verdict_repo_user_default_alone_is_not_an_error() {
