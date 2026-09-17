@@ -524,6 +524,19 @@ pub fn resolve_credentials(
     let config_server_url = config.as_ref().and_then(|c| c.server_url.clone());
     let config_api_key = config.as_ref().and_then(|c| c.api_key.clone());
 
+    // Surface the pairing the guard below structurally cannot see. That guard's
+    // own comment notes it is "only reachable when TRACEVAULT_SERVER_URL is set:
+    // with it unset the URL comes from this same file, so the two match by
+    // construction" — true only because `config.toml` has already lost the
+    // precedence race on the next line, silently.
+    if let Some((file_url, config_url)) = config_url_conflict(
+        config_server_url.as_deref(),
+        creds.as_ref().map(|c| c.server_url.as_str()),
+        std::env::var("TRACEVAULT_SERVER_URL").is_ok(),
+    ) {
+        eprintln!("{}", config_mismatch_warning(file_url, config_url));
+    }
+
     // Resolve server URL: env > creds > config
     let server_url = std::env::var("TRACEVAULT_SERVER_URL")
         .ok()
@@ -567,6 +580,53 @@ pub fn resolve_credentials(
     };
 
     Ok((server_url, credential))
+}
+
+/// Whether a repo-local `config.toml` `server_url` disagrees with the
+/// credentials file's. Returns `(file_url, config_url)` when they conflict.
+///
+/// Deliberately a WARNING rather than a refusal, which is the whole difference
+/// from [`server_mismatch_error`]. There, the env-supplied URL is the one
+/// actually contacted, so refusing genuinely stops a token reaching a host it
+/// was not issued for. Here the config's URL has ALREADY lost the precedence
+/// race below and is never contacted, so refusing would prevent nothing — while
+/// handing anyone who can land a `.tracevault/config.toml` in a repo you clone a
+/// way to break every command (see
+/// `verification_phase::tests::a_committed_config_url_cannot_redirect_the_token`,
+/// which pins that a committed config URL is inert). The defect this addresses
+/// was never that the wrong URL got used; it was that the disagreement was
+/// SILENT — `tracevault sync` printed "Repo synced with server" while
+/// registering the repo on the logged-in instance instead of the pinned one.
+///
+/// `env_url_set` suppresses it: `TRACEVAULT_SERVER_URL` outranks both, so the
+/// pin is moot and the mismatch it can cause is already guarded below. Taken as
+/// a bool rather than read here so this stays pure and directly testable.
+pub(crate) fn config_url_conflict<'a>(
+    config_url: Option<&'a str>,
+    file_url: Option<&'a str>,
+    env_url_set: bool,
+) -> Option<(&'a str, &'a str)> {
+    if env_url_set {
+        return None;
+    }
+    let (config_url, file_url) = (config_url?, file_url?);
+    (!same_server(file_url, config_url)).then_some((file_url, config_url))
+}
+
+/// The warning text for [`config_url_conflict`].
+///
+/// Names BOTH URLs and says which one wins. `tracevault status` reports the
+/// credentials file's URL and does not read `config.toml` at all, so without
+/// naming them the user can see neither side of the disagreement — which is
+/// exactly how this went unnoticed long enough to register a repo on the wrong
+/// instance.
+fn config_mismatch_warning(file_url: &str, config_url: &str) -> String {
+    format!(
+        "tracevault: WARNING: this repo's .tracevault/config.toml pins '{config_url}', but you \
+         are logged in to '{file_url}' — using '{file_url}'. Run `tracevault login --server-url \
+         {config_url}` to use the repo's instance, or remove `server_url` from \
+         .tracevault/config.toml to silence this."
+    )
 }
 
 /// The error for "the saved credential is for a different TraceVault instance".
@@ -865,6 +925,155 @@ mod tests {
             Some(Credential::ApiKey(k)) => assert_eq!(k, "tvk_abc"),
             other => panic!("expected the env API key, got {other:?}"),
         }
+    }
+
+    // ---- config_url_conflict: a repo-local `.tracevault/config.toml`
+    // ---- `server_url` sits BELOW the credentials file, so it loses silently.
+    // ---- It stays losing — it must only stop being silent.
+
+    /// Write a project-level `.tracevault/config.toml` under `root`.
+    fn write_project_config(root: &std::path::Path, body: &str) {
+        let config_dir = root.join(".tracevault");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(config_dir.join("config.toml"), body).unwrap();
+    }
+
+    #[test]
+    fn a_config_url_differing_from_the_files_is_a_conflict() {
+        assert_eq!(
+            config_url_conflict(
+                Some("https://pinned.example.com"),
+                Some("https://login.example.com"),
+                false
+            ),
+            Some(("https://login.example.com", "https://pinned.example.com")),
+            "the file's URL is returned first, as the one actually used"
+        );
+    }
+
+    /// The config is hand-authored while the file records whatever `login` was
+    /// given, so the two are formatted independently. A trailing slash must not
+    /// read as a disagreement, or every correctly-configured repo warns forever
+    /// and the warning stops being read.
+    #[test]
+    fn a_trailing_slash_is_not_a_conflict() {
+        assert_eq!(
+            config_url_conflict(
+                Some("https://example.com"),
+                Some("https://example.com/"),
+                false
+            ),
+            None
+        );
+    }
+
+    /// `TRACEVAULT_SERVER_URL` outranks both, so the pin is moot and the
+    /// env-vs-file guard already covers that pairing.
+    #[test]
+    fn an_env_server_url_suppresses_the_conflict() {
+        assert_eq!(
+            config_url_conflict(
+                Some("https://pinned.example.com"),
+                Some("https://login.example.com"),
+                true
+            ),
+            None
+        );
+    }
+
+    /// Nothing to disagree with on either side.
+    #[test]
+    fn a_missing_side_is_never_a_conflict() {
+        assert_eq!(
+            config_url_conflict(None, Some("https://login.example.com"), false),
+            None
+        );
+        assert_eq!(
+            config_url_conflict(Some("https://pinned.example.com"), None, false),
+            None
+        );
+    }
+
+    /// The warning has to carry what neither `status` nor the success line ever
+    /// showed: both URLs, and which one is actually being used.
+    #[test]
+    fn the_warning_names_both_urls_and_the_winner() {
+        let msg = config_mismatch_warning("https://login.example.com", "http://localhost:8080");
+        assert!(
+            msg.contains("http://localhost:8080"),
+            "must name the pin: {msg}"
+        );
+        assert!(
+            msg.contains("https://login.example.com"),
+            "must name the login: {msg}"
+        );
+        assert!(
+            msg.contains("config.toml"),
+            "must name where the pin lives: {msg}"
+        );
+        assert!(
+            msg.contains("tracevault login"),
+            "must name the way forward: {msg}"
+        );
+    }
+
+    /// The behavioural contract, and the reason this is a warning and not a
+    /// refusal: a `config.toml` `server_url` remains inert. A committed one is
+    /// attacker-controlled (see
+    /// `verification_phase::tests::a_committed_config_url_cannot_redirect_the_token`),
+    /// so it must neither redirect the credential NOR break the command.
+    #[test]
+    fn a_conflicting_config_url_still_resolves_to_the_files_instance() {
+        for kind in ["keycloak session", "api key"] {
+            let (dir, _lock, _guard) = if kind == "keycloak session" {
+                resolve_fixture("https://instance-b.example.com", None)
+            } else {
+                resolve_fixture_api_key("https://instance-b.example.com", None)
+            };
+            write_project_config(dir.path(), "server_url = \"https://attacker.invalid\"\n");
+
+            let (url, credential) = resolve_credentials(dir.path())
+                .expect("a conflicting config must warn, never break the command");
+            assert_eq!(
+                url.as_deref(),
+                Some("https://instance-b.example.com"),
+                "{kind}: the config URL must stay inert"
+            );
+            assert!(credential.is_some(), "{kind}: the credential must survive");
+        }
+    }
+
+    /// A config carrying its own `api_key` changes nothing: the file still wins
+    /// both the URL and the credential, so the config's key is never sent
+    /// anywhere. It is only consulted when the file yields nothing.
+    #[test]
+    fn a_conflicting_config_with_its_own_key_still_resolves_to_the_file() {
+        let (dir, _lock, _guard) = resolve_fixture("https://instance-b.example.com", None);
+        write_project_config(
+            dir.path(),
+            "server_url = \"https://instance-a.example.com\"\napi_key = \"tvk_from_config\"\n",
+        );
+
+        let (url, credential) = resolve_credentials(dir.path()).unwrap();
+        assert_eq!(url.as_deref(), Some("https://instance-b.example.com"));
+        assert!(
+            matches!(credential, Some(Credential::Keycloak(_))),
+            "the file's session wins; the config key is never reached"
+        );
+    }
+
+    /// With no credentials file there is no disagreement, so the config's
+    /// `server_url` is used exactly as before.
+    #[test]
+    fn a_config_server_url_is_used_when_there_is_no_credentials_file() {
+        let (dir, _lock, _guard) = resolve_fixture_with(None, None);
+        write_project_config(
+            dir.path(),
+            "server_url = \"https://instance-a.example.com\"\n",
+        );
+
+        let (url, _credential) = resolve_credentials(dir.path()).unwrap();
+        assert_eq!(url.as_deref(), Some("https://instance-a.example.com"));
     }
 
     /// Old on-disk `credentials.json` files may still contain `org_slug`

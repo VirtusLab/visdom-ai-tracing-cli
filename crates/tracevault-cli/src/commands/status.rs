@@ -166,7 +166,7 @@ fn resolve_auth() -> AuthContext {
     }
 }
 
-async fn auth_checks(auth: &AuthContext) -> Vec<Check> {
+async fn auth_checks(auth: &AuthContext, config_server_url: Option<&str>) -> Vec<Check> {
     let mut out = Vec::new();
 
     match (auth.credential.as_ref(), auth.server_url.as_ref()) {
@@ -202,6 +202,29 @@ async fn auth_checks(auth: &AuthContext) -> Vec<Check> {
                  Commands will refuse to run rather than send that session's token to another \
                  instance. Unset TRACEVAULT_SERVER_URL, or run `tracevault login --server-url \
                  {env_url}`."
+            ),
+        ));
+    }
+
+    // Reported as a WARNING, not an error: unlike the override above, commands
+    // still run — they just use the login's instance while the repo's config
+    // says otherwise. Without this the inspector is actively misleading: it
+    // reads only the credentials file, so it would print a green "Logged in"
+    // against a URL the repo never asked for. Shares
+    // `credentials::config_url_conflict` with the resolution itself so the two
+    // cannot drift apart.
+    if let Some((file_url, config_url)) = crate::credentials::config_url_conflict(
+        config_server_url,
+        auth.server_url.as_deref(),
+        std::env::var("TRACEVAULT_SERVER_URL").is_ok(),
+    ) {
+        out.push(Check::warn(
+            "Server URL",
+            format!(
+                ".tracevault/config.toml pins '{config_url}' but the saved login is for \
+                 '{file_url}'. The config URL is ignored — commands use '{file_url}'. Run \
+                 `tracevault login --server-url {config_url}` to use the repo's instance, or \
+                 remove `server_url` from .tracevault/config.toml."
             ),
         ));
     }
@@ -1130,7 +1153,11 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
         None
     };
 
-    let auth_checks_v = auth_checks(&auth).await;
+    // Loaded here rather than reused from `project_checks` below, which runs
+    // after this and owns its own load. A malformed config warns there; here it
+    // simply yields no pin to compare against.
+    let config_server_url = TracevaultConfig::load(project_root).and_then(|c| c.server_url);
+    let auth_checks_v = auth_checks(&auth, config_server_url.as_deref()).await;
     let install_v = vec![global_check];
     let (proj_checks_v, config) = project_checks(
         project_root,
