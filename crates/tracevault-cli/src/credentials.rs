@@ -622,7 +622,7 @@ pub(crate) fn config_url_conflict<'a>(
 /// instance.
 fn config_mismatch_warning(file_url: &str, config_url: &str) -> String {
     format!(
-        "tracevault: WARNING: this repo's .tracevault/config.toml pins '{config_url}', but you \
+        "tracevault: warning: this repo's .tracevault/config.toml pins '{config_url}', but you \
          are logged in to '{file_url}' — using '{file_url}'. Run `tracevault login --server-url \
          {config_url}` to use the repo's instance, or remove `server_url` from \
          .tracevault/config.toml to silence this."

@@ -1154,9 +1154,14 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
     };
 
     // Loaded here rather than reused from `project_checks` below, which runs
-    // after this and owns its own load. A malformed config warns there; here it
-    // simply yields no pin to compare against.
-    let config_server_url = TracevaultConfig::load(project_root).and_then(|c| c.server_url);
+    // after this and owns its own load. `try_load`, not `load`: `load` prints
+    // its own stderr line on malformed TOML, which would pre-empt (and
+    // duplicate) the structured parse error `project_checks` reports. A config
+    // that will not parse simply yields no pin to compare against.
+    let config_server_url = TracevaultConfig::try_load(project_root)
+        .ok()
+        .flatten()
+        .and_then(|c| c.server_url);
     let auth_checks_v = auth_checks(&auth, config_server_url.as_deref()).await;
     let install_v = vec![global_check];
     let (proj_checks_v, config) = project_checks(
