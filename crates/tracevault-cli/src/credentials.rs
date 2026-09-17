@@ -503,6 +503,33 @@ impl Credentials {
 pub fn resolve_credentials(
     project_root: &Path,
 ) -> Result<(Option<String>, Option<Credential>), Box<dyn std::error::Error>> {
+    resolve_credentials_inner(project_root, true)
+}
+
+/// [`resolve_credentials`] without the config-conflict warning.
+///
+/// For the two callers where that warning is wrong or unbearable:
+///
+/// - `init`, which has just REWRITTEN the very pin the warning compares
+///   against, and whose `--server-url` then wins over the resolved URL
+///   (`effective_url` in `init_in_directory`). The warning claims the login's
+///   URL is being used, which on that path is simply false, and advises the
+///   user to do what they are already doing.
+/// - `stream`, the hook path: one process per captured event, so a repo with a
+///   losing pin would print the line on every single tool call, for the whole
+///   session. `Once` cannot help — each event is a fresh process.
+#[allow(clippy::type_complexity)]
+pub fn resolve_credentials_quiet(
+    project_root: &Path,
+) -> Result<(Option<String>, Option<Credential>), Box<dyn std::error::Error>> {
+    resolve_credentials_inner(project_root, false)
+}
+
+#[allow(clippy::type_complexity)]
+fn resolve_credentials_inner(
+    project_root: &Path,
+    warn_on_conflict: bool,
+) -> Result<(Option<String>, Option<Credential>), Box<dyn std::error::Error>> {
     // 1. Env var API key
     let env_key = std::env::var("TRACEVAULT_API_KEY").ok();
 
@@ -529,12 +556,20 @@ pub fn resolve_credentials(
     // with it unset the URL comes from this same file, so the two match by
     // construction" — true only because `config.toml` has already lost the
     // precedence race on the next line, silently.
-    if let Some((file_url, config_url)) = config_url_conflict(
-        config_server_url.as_deref(),
-        creds.as_ref().map(|c| c.server_url.as_str()),
-        std::env::var("TRACEVAULT_SERVER_URL").is_ok(),
-    ) {
-        eprintln!("{}", config_mismatch_warning(file_url, config_url));
+    if warn_on_conflict {
+        if let Some((file_url, config_url)) = config_url_conflict(
+            config_server_url.as_deref(),
+            creds.as_ref().map(|c| c.server_url.as_str()),
+            std::env::var("TRACEVAULT_SERVER_URL").is_ok(),
+        ) {
+            // Once per process: `repo status` resolves twice in one command
+            // (`resolve_repo_flag` and the codebase line), and printing the
+            // identical line back to back reads like a bug.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!("{}", config_mismatch_warning(file_url, config_url));
+            });
+        }
     }
 
     // Resolve server URL: env > creds > config
