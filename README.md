@@ -86,11 +86,25 @@ install hooks for (default `claude-code`):
 Both wire the same capture pipeline: the agent's hooks invoke `tracevault`, which streams the
 session (transcript, tokens, cost, file changes) to the server tagged with the agent, so
 Claude Code and Codex sessions show up side by side, each with its own badge. Codex file
-changes are read from the session rollout (`apply_patch`) rather than from typed tool events.
+changes come from the `apply_patch` tool event on Codex >= 0.153 (which carries the patch in
+its hook payload) and from the session rollout on older versions.
 
 `--claude-settings shared|local` chooses between `.claude/settings.json` (committed) and
 `.claude/settings.local.json` (git-ignored). It applies only to `--agent claude-code`; with
 `--agent codex` it is rejected (Codex always writes `.codex/hooks.json`).
+
+**Codex hook trust — required once, or nothing is captured**
+
+Codex >= 0.153 gates hooks behind persisted *hook trust*. Until it is granted, a
+non-interactive `codex exec` skips the hooks **silently**: `hooks.json` looks installed, and
+no session ever reaches the server. Neither `codex doctor` nor `codex features` reports the
+trust state, so there is nothing to check after the fact.
+
+After `tracevault init --agent codex` (or `--global --agent codex`), run `codex` once
+interactively in a repo and approve the hook-trust prompt. Trust then persists for
+`codex exec` runs too. For unattended use (CI images), pass
+`--dangerously-bypass-hook-trust` instead — it runs the hooks without a persisted trust
+record, which is appropriate when the hook source is your own installed CLI.
 
 **Global install — `--global`**
 
