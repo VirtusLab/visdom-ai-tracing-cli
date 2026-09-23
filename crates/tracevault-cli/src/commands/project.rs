@@ -31,11 +31,13 @@ pub enum ProjectCmd {
         session_id: Option<String>,
         /// Who owns attribution. `explicit` stamps the named project
         /// without a repo/project membership check and marks the session
-        /// forced. `switch` itself checks nothing: the requirement — a
-        /// Control Plane identity (never a `tvk_` API key) and Operator on
-        /// the project — is enforced at INGEST, which refuses the force with
-        /// a 403 and falls back to repo-derived attribution. A persisted
-        /// force lapses after ~one working day.
+        /// forced — so it also binds a project this checkout is not a member
+        /// of, which an ordinary switch refuses; it says so when it does.
+        /// `switch` itself checks nothing: the requirement — a Control Plane
+        /// identity (never a `tvk_` API key) and Operator on the project —
+        /// is enforced at INGEST, which refuses the force with a 403 and
+        /// queues the event rather than re-attributing it. A persisted force
+        /// lapses after ~one working day.
         #[arg(long, value_parser = ["derived", "explicit"], default_value = "derived")]
         project_attribution: String,
     },
@@ -97,25 +99,63 @@ fn resolve_project_name<'a>(
     })
 }
 
+/// What a `switch` does about a project that does not contain the current
+/// checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodebaseCheck {
+    /// Not performed at all: the user-level default is session-independent
+    /// and not tied to any checkout, so there is nothing to check it against.
+    Skip,
+    /// An ordinary session switch. Binding a project this checkout is not a
+    /// member of is almost always a typo, so it is an error.
+    Enforce,
+    /// `--project-attribution explicit`. Binding a project this checkout is
+    /// not a member of is the POINT of the flag — a repo deliberately shared
+    /// by two projects, or a launcher attributing work to a project the
+    /// checkout was never registered under. The requirement is a trust claim
+    /// the SERVER enforces at ingest (Operator on the project, and a Control
+    /// Plane identity), not something the client can or should adjudicate at
+    /// switch time; refusing here contradicts both the flag's help text and
+    /// the design. So: report the fact, never block on it.
+    Report,
+}
+
+/// Which [`CodebaseCheck`] a `switch` runs, from where it is persisting and
+/// whether the caller claimed attribution. The one place the rule is written
+/// down, so `switch` and its test cannot disagree about it.
+fn codebase_check_for(dest: &SwitchDest, explicit: bool) -> CodebaseCheck {
+    match (dest, explicit) {
+        // Session-independent: not tied to any checkout, nothing to check.
+        (SwitchDest::UserDefault, _) => CodebaseCheck::Skip,
+        (SwitchDest::Session(_), true) => CodebaseCheck::Report,
+        (SwitchDest::Session(_), false) => CodebaseCheck::Enforce,
+    }
+}
+
 /// Resolve `name` to a registered project (via `list_projects`) and, unless
-/// `check_codebase` is `false`, verify that project contains the current
-/// codebase (resolved from `cwd`'s git origin remote, mirroring
+/// `check` is [`CodebaseCheck::Skip`], test whether that project contains the
+/// current codebase (resolved from `cwd`'s git origin remote, mirroring
 /// `resolve_path_to_binding`). Kept separate from `switch` so the
 /// client-dependent flow is unit-testable with a mock `ApiClient`, mirroring
 /// `commands::repo::resolve_switch_binding`.
+///
+/// Returns the binding plus, for [`CodebaseCheck::Report`] when the check
+/// would have failed, the informational line the caller prints. A failing
+/// check under [`CodebaseCheck::Enforce`] is still an `Err`.
 async fn resolve_switch_project(
     name: &str,
     client: &ApiClient,
-    check_codebase: bool,
+    check: CodebaseCheck,
     cwd: &Path,
-) -> Result<ProjectBinding, Box<dyn std::error::Error>> {
+) -> Result<(ProjectBinding, Option<String>), Box<dyn std::error::Error>> {
     let items = client.list_projects().await?;
     let matched = resolve_project_name(&items, name)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let project_id = matched.id;
     let project_name = matched.name.clone();
+    let mut note = None;
 
-    if check_codebase {
+    if check != CodebaseCheck::Skip {
         if let Some(git_url) = git_remote_url(cwd) {
             if let Some(remote) = client.resolve_remote(&git_url).await? {
                 let codebase_repo_ids: HashSet<uuid::Uuid> = client
@@ -132,9 +172,18 @@ async fn resolve_switch_project(
                     .map(|r| r.id)
                     .collect();
                 if codebase_repo_ids.is_disjoint(&project_repo_ids) {
-                    return Err(
-                        format!("project '{name}' does not contain the current codebase").into(),
-                    );
+                    match check {
+                        CodebaseCheck::Enforce => {
+                            return Err(format!(
+                                "project '{name}' does not contain the current codebase"
+                            )
+                            .into())
+                        }
+                        // Deliberate, but the user should still learn the
+                        // fact — they are just not blocked by it.
+                        CodebaseCheck::Report => note = Some(forced_non_member_note(name)),
+                        CodebaseCheck::Skip => unreachable!("guarded above"),
+                    }
                 }
             }
             // Codebase not registered with the server → nothing to check
@@ -145,12 +194,29 @@ async fn resolve_switch_project(
         // to check against; allow the switch.
     }
 
-    Ok(ProjectBinding {
-        project_id: project_id.to_string(),
-        project_name,
-        updated_at: chrono::Utc::now().to_rfc3339(),
-        forced_until: None,
-    })
+    Ok((
+        ProjectBinding {
+            project_id: project_id.to_string(),
+            project_name,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            forced_until: None,
+        },
+        note,
+    ))
+}
+
+/// The line a forced switch prints when the project does not contain this
+/// checkout. Not a warning: with `--project-attribution explicit` this is the
+/// intended case, and the message says so — while still naming the fact, and
+/// where the requirement is actually enforced, so a user who reached it by
+/// typo is not left thinking the switch did what they meant.
+fn forced_non_member_note(name: &str) -> String {
+    format!(
+        "note: project '{name}' does not contain the current codebase — binding it anyway \
+         because --project-attribution explicit says this caller owns attribution. The \
+         server enforces that claim at ingest (Operator on the project, and a Control Plane \
+         identity — never a `tvk_` API key) and refuses it with a 403 otherwise."
+    )
 }
 
 /// Where a `project switch` should persist its binding: a specific session,
@@ -187,48 +253,68 @@ fn apply_force(mut binding: ProjectBinding, explicit: bool) -> ProjectBinding {
     binding
 }
 
-/// The lapse detail for a binding that carries a PERSISTED force.
+/// The state of the PERSISTED force stored on a binding — a fact about what
+/// is on disk, never a verdict about what this process will send.
+///
+/// That distinction is the whole point of the wording. The verdict is
+/// [`attribution_report`]'s first line, which is the only thing that can
+/// answer "derived or explicit?", because it is the only one that sees
+/// `TRACEVAULT_PROJECT_ATTRIBUTION` as well as this timestamp. An earlier
+/// version of this function rendered "attribution: derived (a force lapsed
+/// …; membership is checked again)", which read as a second, competing
+/// answer — and in a shell with `TRACEVAULT_PROJECT_ATTRIBUTION=explicit`
+/// and a lapsed persisted force it directly contradicted the true one while
+/// every hook in that shell sent `explicit`. Stating the fact instead makes
+/// the contradiction unrepresentable, whatever the environment says.
 ///
 /// Only ever called when `forced_until.is_some()` (see
-/// [`attribution_report`]): the `None` arm exists solely so the
-/// unparseable-timestamp case can fail safe by rendering identically to
-/// "no force", and must not be printed as a standalone verdict — the
-/// process-wide `TRACEVAULT_PROJECT_ATTRIBUTION` force leaves no
-/// `forced_until` anywhere, so "derived" here would contradict the header
-/// every hook in that shell is actually sending.
-fn format_force_line(forced_until: Option<&str>) -> String {
-    match forced_until.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) {
-        Some(until) if until > chrono::Utc::now() => format!(
-            "attribution: forced by this caller (membership not checked); lapses {}",
-            until.to_rfc3339()
+/// [`attribution_report`]), so there is no "no force at all" arm: that case
+/// prints no line.
+///
+/// An unparseable timestamp (hand-edited or corrupted state file) fails SAFE
+/// and says so: it is reported as not in force, matching
+/// `commands::stream::attribution_mode`, which is the function that actually
+/// decides the header. Both readers of this field treat "can't tell" as "not
+/// forced", never as `expect()`-worthy.
+fn format_force_line(forced_until: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(forced_until) {
+        Ok(until) if until > chrono::Utc::now() => {
+            format!("persisted force: active until {}", until.to_rfc3339())
+        }
+        Ok(until) => format!("persisted force: lapsed {}", until.to_rfc3339()),
+        Err(_) => format!(
+            "persisted force: unreadable timestamp ('{forced_until}'), treated as not in force"
         ),
-        Some(until) => format!(
-            "attribution: derived (a force lapsed {}; membership is checked again)",
-            until.to_rfc3339()
-        ),
-        None => "attribution: derived (TraceVault checks repo/project membership)".to_string(),
     }
 }
 
 /// The attribution lines both `project status` and `project switch` print
 /// for the binding they just reported or persisted.
 ///
-/// The FIRST line is the effective mode — the thing that actually decides the
-/// header — which incorporates `TRACEVAULT_PROJECT_ATTRIBUTION` as well as
-/// `b`'s own `forced_until`. The lapse detail follows ONLY when `b` really
-/// carries a persisted force, because that is the only case it describes.
+/// Exactly one line answers "derived or explicit?": the FIRST, the effective
+/// mode, which is the only one that sees both `TRACEVAULT_PROJECT_ATTRIBUTION`
+/// and `b`'s own `forced_until` — i.e. everything
+/// `commands::stream::attribution_mode` sees when it fills the header.
+/// [`format_force_line`] follows only when `b` carries a persisted force, and
+/// states a FACT about that stored force rather than a second verdict, so the
+/// two can never disagree.
 ///
-/// Printing `format_force_line` unconditionally was the bug this replaces: in
-/// a shell with `TRACEVAULT_PROJECT_ATTRIBUTION=explicit` and no persisted
-/// force, the two lines flatly contradicted each other —
+/// Two bugs are closed by that split, both reached the same way — a second
+/// line that answered a question it had no business answering:
 ///
-/// ```text
-/// attribution mode: explicit (this caller owns attribution; ...)
-/// attribution: derived (TraceVault checks repo/project membership)
-/// ```
+/// * printing the force line unconditionally, so a shell with
+///   `TRACEVAULT_PROJECT_ATTRIBUTION=explicit` and NO persisted force got
+///   "attribution mode: explicit …" followed by "attribution: derived
+///   (TraceVault checks repo/project membership)" (finding 3);
+/// * guarding it on `forced_until.is_some()`, which a LAPSED force still
+///   satisfies, so the same shell with an EXPIRED persisted force got
+///   "attribution mode: explicit …" followed by "attribution: derived (a
+///   force lapsed …; membership is checked again)" (Copilot on PR #54).
 ///
-/// — while every hook in that shell sent `explicit`. `switch` had the same
-/// lie with no mode line at all to offset it.
+/// In both cases every hook in that shell was in fact sending `explicit`.
+/// The `is_some()` guard is right and stays — a binding that was never
+/// forced has nothing to report — but the guard was never what made the
+/// output honest; the wording is.
 fn attribution_report(b: &ProjectBinding) -> Vec<String> {
     let mode = crate::commands::stream::attribution_mode(Some(b));
     // The gloss `format_force_line` used to carry is folded in here rather
@@ -240,17 +326,26 @@ fn attribution_report(b: &ProjectBinding) -> Vec<String> {
         "TraceVault checks repo/project membership"
     };
     let mut lines = vec![format!("attribution mode: {mode} ({gloss})")];
-    if b.forced_until.is_some() {
-        lines.push(format_force_line(b.forced_until.as_deref()));
+    if let Some(forced_until) = b.forced_until.as_deref() {
+        lines.push(format_force_line(forced_until));
     }
     lines
 }
 
 /// Everything `switch` prints once the binding is persisted: what was bound
-/// where, then [`attribution_report`]. Pulled out as a pure function so the
-/// wording — including the ABSENCE of a contradictory "attribution: derived"
-/// line — is assertable without capturing stdout.
-fn switch_report(dest: &SwitchDest, b: &ProjectBinding) -> Vec<String> {
+/// where, then `codebase_note` (see [`forced_non_member_note`]) when a forced
+/// switch bound a project this checkout is not a member of, then
+/// [`attribution_report`]. Pulled out as a pure function so the wording —
+/// including the ABSENCE of a contradictory "attribution: derived" line — is
+/// assertable without capturing stdout.
+///
+/// The note sits between the two because it explains why the force on the
+/// line below it is load-bearing rather than decorative.
+fn switch_report(
+    dest: &SwitchDest,
+    b: &ProjectBinding,
+    codebase_note: Option<&str>,
+) -> Vec<String> {
     let mut lines = match dest {
         SwitchDest::Session(id) => {
             vec![format!("bound session {id} to project {}", b.project_name)]
@@ -260,6 +355,7 @@ fn switch_report(dest: &SwitchDest, b: &ProjectBinding) -> Vec<String> {
             b.project_name
         )],
     };
+    lines.extend(codebase_note.map(str::to_string));
     lines.extend(attribution_report(b));
     lines
 }
@@ -275,9 +371,10 @@ async fn switch(
     let client = resolve_client(project_root)?;
     let session = crate::commands::repo::resolve_session_id(session_id).ok();
     let dest = switch_destination(user, session);
-    let check_codebase = matches!(dest, SwitchDest::Session(_));
-    let binding = resolve_switch_project(name, &client, check_codebase, cwd).await?;
-    let binding = apply_force(binding, project_attribution == "explicit");
+    let explicit = project_attribution == "explicit";
+    let check = codebase_check_for(&dest, explicit);
+    let (binding, codebase_note) = resolve_switch_project(name, &client, check, cwd).await?;
+    let binding = apply_force(binding, explicit);
 
     match &dest {
         SwitchDest::Session(id) => {
@@ -289,7 +386,7 @@ async fn switch(
             crate::user_project_default::save(&binding)?;
         }
     }
-    for line in switch_report(&dest, &binding) {
+    for line in switch_report(&dest, &binding, codebase_note.as_deref()) {
         println!("{line}");
     }
     Ok(())
@@ -722,45 +819,69 @@ mod tests {
         );
     }
 
-    /// Renamed from `status_names_the_mode_and_the_lapse`, which claimed to
-    /// cover the mode line and never called `attribution_mode` at all — it
-    /// would have kept passing if the mode line were deleted outright. The
-    /// mode line is covered by the `attribution_report_*` tests below; this
-    /// one covers exactly what it exercises, `format_force_line`'s two
-    /// lapse states.
+    /// `format_force_line` reports the STATE of the stored force and never a
+    /// verdict, so no output of it may contain the words the mode line owns.
+    /// A live force says when it runs out; a lapsed one says when it did.
     #[test]
-    fn format_force_line_names_a_live_force_and_the_unforced_default() {
+    fn format_force_line_distinguishes_a_live_force_from_a_lapsed_one() {
         let future = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
-        let line = format_force_line(Some(&future));
-        assert!(line.contains("forced"), "got: {line}");
+        let live = format_force_line(&future);
+        assert!(live.contains("active until"), "got: {live}");
+        assert!(live.contains(&future), "got: {live}");
 
-        let derived = format_force_line(None);
-        assert!(derived.contains("derived"), "got: {derived}");
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let lapsed = format_force_line(&past);
+        assert!(lapsed.contains("lapsed"), "got: {lapsed}");
+        assert!(lapsed.contains(&past), "got: {lapsed}");
+
+        // Neither may render a mode: that is `attribution_report`'s first
+        // line, and a second answer here is what produced both contradiction
+        // bugs (see `attribution_report`'s doc comment).
+        for line in [&live, &lapsed] {
+            assert!(!line.contains("derived"), "got: {line}");
+            assert!(!line.contains("explicit"), "got: {line}");
+            assert!(!line.contains("membership"), "got: {line}");
+        }
     }
 
     /// Discriminates the SIGN of the lapse comparison in `format_force_line`:
-    /// a `forced_until` already in the past must report as lapsed (back to
-    /// `derived`), not as still-forced. Complements
-    /// `format_force_line_names_a_live_force_and_the_unforced_default`,
-    /// which only exercises the future/none cases.
+    /// a `forced_until` already in the past must report as lapsed, not as
+    /// still active.
     #[test]
-    fn status_names_a_lapsed_force_as_derived_not_forced() {
+    fn status_names_a_lapsed_force_as_lapsed_not_active() {
         let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
-        let line = format_force_line(Some(&past));
-        assert!(line.contains("derived"), "got: {line}");
-        assert!(!line.contains("forced by"), "got: {line}");
+        let line = format_force_line(&past);
+        assert!(line.contains("lapsed"), "got: {line}");
+        assert!(!line.contains("active until"), "got: {line}");
     }
 
     /// A `forced_until` that doesn't even parse as RFC3339 (a hand-edited or
     /// corrupted `user_project.toml`/session-state file) must fail SAFE —
-    /// reported exactly like `None`, never as forced, and never a panic.
-    /// Pins the fail-safe direction against a future refactor to
-    /// `.expect(...)`; complements `commands::stream::attribution_mode`'s
-    /// equivalent test, since both are readers of this same field.
+    /// reported as not in force, never as active, and never a panic. Pins
+    /// the fail-safe direction against a future refactor to `.expect(...)`,
+    /// and pins that it agrees with `commands::stream::attribution_mode`,
+    /// the other reader of this same field and the one that fills the
+    /// header.
     #[test]
-    fn status_names_unparseable_forced_until_as_derived() {
-        let line = format_force_line(Some("not-a-timestamp"));
-        assert_eq!(line, format_force_line(None));
+    fn status_names_unparseable_forced_until_as_not_in_force() {
+        let line = format_force_line("not-a-timestamp");
+        assert!(line.contains("not in force"), "got: {line}");
+        assert!(!line.contains("active until"), "got: {line}");
+
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+        let b = ProjectBinding {
+            project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+            project_name: "payments".into(),
+            updated_at: "".into(),
+            forced_until: Some("not-a-timestamp".into()),
+        };
+        assert_eq!(
+            crate::commands::stream::attribution_mode(Some(&b)),
+            "derived",
+            "the reported state and the header must agree on an unreadable force"
+        );
     }
 
     /// VIS-305 whole-branch review, Important finding 3: `project status`
@@ -824,13 +945,15 @@ mod tests {
             "got: {}",
             lines[0]
         );
-        assert!(lines[1].contains("lapses"), "got: {}", lines[1]);
+        assert!(lines[1].contains("active until"), "got: {}", lines[1]);
         assert!(lines[1].contains(&until), "got: {}", lines[1]);
     }
 
-    /// A LAPSED persisted force is the one case where "attribution: derived"
-    /// is true AND worth printing: the binding really does carry a force,
-    /// it has simply run out, and saying when is the useful part.
+    /// A LAPSED persisted force still gets its detail line — the binding
+    /// really does carry a force, it has simply run out, and saying when is
+    /// the useful part. With no env override the mode line correctly reads
+    /// `derived`; the detail line states the lapse as a fact, and the two
+    /// agree without the detail line having to render a verdict of its own.
     #[test]
     fn attribution_report_reports_a_lapsed_persisted_force_as_derived() {
         let _env_lock = crate::test_helpers::lock_env_mutation_sync();
@@ -850,7 +973,62 @@ mod tests {
             "got: {}",
             lines[0]
         );
-        assert!(lines[1].contains("a force lapsed"), "got: {}", lines[1]);
+        assert!(
+            lines[1].starts_with("persisted force: lapsed"),
+            "got: {}",
+            lines[1]
+        );
+    }
+
+    /// Copilot on PR #54: the `is_some()` guard is the wrong test, because a
+    /// LAPSED force is still `is_some()`. With
+    /// `TRACEVAULT_PROJECT_ATTRIBUTION=explicit` and a binding whose
+    /// persisted force has expired, the report used to read
+    ///
+    /// ```text
+    /// attribution mode: explicit (this caller owns attribution; ...)
+    /// attribution: derived (a force lapsed ...; membership is checked again)
+    /// ```
+    ///
+    /// — the exact contradiction `attribution_report` exists to remove, just
+    /// reached by a different route than finding 3's. The fix is not a
+    /// narrower guard (the lapse time is still worth printing) but wording:
+    /// the second line states a FACT about the persisted binding, so it is
+    /// detail under the verdict rather than a competing verdict. The
+    /// unparseable case is the same shape and is covered too.
+    #[test]
+    fn a_lapsed_persisted_force_never_contradicts_an_env_force() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
+
+        let lapsed = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        for forced_until in [lapsed.as_str(), "not-a-timestamp"] {
+            let b = ProjectBinding {
+                project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+                project_name: "payments".into(),
+                updated_at: "".into(),
+                forced_until: Some(forced_until.to_string()),
+            };
+            let lines = attribution_report(&b);
+            assert_eq!(lines.len(), 2, "{forced_until}: got {lines:?}");
+            assert!(
+                lines[0].starts_with("attribution mode: explicit"),
+                "{forced_until}: the env force decides the mode: {lines:?}"
+            );
+            // The detail line may say the PERSISTED force has lapsed — that
+            // is a true fact about the stored binding — but it must not
+            // answer the question the mode line already answered.
+            assert!(
+                !lines[1].contains("derived"),
+                "{forced_until}: the detail line must not render a competing \
+                 verdict while the env force makes this send explicit: {lines:?}"
+            );
+            assert!(
+                !lines[1].contains("membership is checked"),
+                "{forced_until}: membership is NOT being checked here: {lines:?}"
+            );
+        }
     }
 
     /// VIS-305 whole-branch review, Important finding 4: Part C fixed
@@ -877,7 +1055,7 @@ mod tests {
             SwitchDest::Session("sess-1".to_string()),
             SwitchDest::UserDefault,
         ] {
-            let lines = switch_report(&dest, &b);
+            let lines = switch_report(&dest, &b, None);
             assert!(
                 lines[0].contains("payments"),
                 "the first line still says what was bound: {lines:?}"
@@ -914,14 +1092,18 @@ mod tests {
             },
             true,
         );
-        let lines = switch_report(&SwitchDest::Session("sess-1".to_string()), &b);
+        let lines = switch_report(&SwitchDest::Session("sess-1".to_string()), &b, None);
         assert_eq!(lines.len(), 3, "got: {lines:?}");
         assert!(
             lines[1].starts_with("attribution mode: explicit"),
             "got: {}",
             lines[1]
         );
-        assert!(lines[2].contains("lapses"), "got: {}", lines[2]);
+        assert!(
+            lines[2].starts_with("persisted force: active until"),
+            "got: {}",
+            lines[2]
+        );
     }
 
     fn pb(name: &str) -> ProjectBinding {
@@ -1276,11 +1458,13 @@ mod tests {
         let base = spawn_once(http_200(list));
         let client = ApiClient::new(&base, Some("tok"));
 
-        let binding = resolve_switch_project("web", &client, true, tmp.path())
-            .await
-            .expect("expected Ok binding");
+        let (binding, note) =
+            resolve_switch_project("web", &client, CodebaseCheck::Enforce, tmp.path())
+                .await
+                .expect("expected Ok binding");
         assert_eq!(binding.project_id, "22222222-2222-4222-8222-222222222222");
         assert_eq!(binding.project_name, "web");
+        assert_eq!(note, None, "no remote to check against, so nothing to note");
 
         let session_id = format!("project-switch-test-{}", uuid::Uuid::new_v4());
         let mut state = session_state::load(&session_id);
@@ -1299,9 +1483,14 @@ mod tests {
         let base = spawn_once(http_200(list));
         let client = ApiClient::new(&base, Some("tok"));
 
-        let err = resolve_switch_project("web", &client, false, Path::new("/nonexistent"))
-            .await
-            .expect_err("expected Err for an unknown project name");
+        let err = resolve_switch_project(
+            "web",
+            &client,
+            CodebaseCheck::Skip,
+            Path::new("/nonexistent"),
+        )
+        .await
+        .expect_err("expected Err for an unknown project name");
         let msg = err.to_string();
         assert!(msg.contains("not found"), "got: {msg}");
         assert!(msg.contains("payments"), "got: {msg}");
@@ -1344,13 +1533,121 @@ mod tests {
         ]);
         let client = ApiClient::new(&base, Some("tok"));
 
-        let err = resolve_switch_project("payments", &client, true, tmp.path())
+        let err = resolve_switch_project("payments", &client, CodebaseCheck::Enforce, tmp.path())
             .await
             .expect_err("expected Err: project doesn't contain the current codebase");
         assert!(
             err.to_string()
                 .contains("does not contain the current codebase"),
             "got: {err}"
+        );
+    }
+
+    /// Copilot on PR #54: `--project-attribution explicit` was refused for
+    /// exactly the projects it exists to bind. `check_codebase` was derived
+    /// from the destination alone, so inside any instrumented session (the
+    /// default whenever `TRACEVAULT_SESSION_ID` is set) `resolve_switch_project`
+    /// errored on a project that does not contain this checkout — a repo
+    /// deliberately shared by two projects, say. That contradicts the flag's
+    /// own help text and the design, which puts the requirement on the
+    /// SERVER at ingest.
+    ///
+    /// Same mock traffic as
+    /// `project_switch_errors_when_project_does_not_contain_codebase` — the
+    /// check genuinely runs and genuinely fails — but under
+    /// `CodebaseCheck::Report` it must bind anyway AND say so, so a user who
+    /// got here by typo still learns the fact.
+    #[tokio::test]
+    async fn explicit_attribution_binds_a_non_member_project_and_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        let ok = std::process::Command::new("git")
+            .args([
+                "-C",
+                &tmp.path().to_string_lossy(),
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:org/repo.git",
+            ])
+            .status()
+            .expect("git remote add failed")
+            .success();
+        assert!(ok, "git remote add must succeed");
+
+        let list =
+            r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"payments"}]"#.to_string();
+        let remote_id = "44000761-8d22-4256-bd2c-27a0ba278c6f";
+        let remote = format!(
+            r#"{{"remote_id":"{remote_id}","name":"repo","normalized_url":"github.com/org/repo","clone_status":"ready"}}"#
+        );
+        let codebase_repo_id = "55555555-5555-4555-8555-555555555555";
+        let detail = format!(
+            r#"{{"id":"{remote_id}","name":"repo","normalized_url":"github.com/org/repo","clone_url":"https://github.com/org/repo.git","clone_status":"ready","clone_error":null,"last_fetched_at":null,"repo_count":1,"created_at":"2026-01-01T00:00:00Z","repos":[{{"id":"{codebase_repo_id}","name":"repo"}}]}}"#
+        );
+        let project_detail = r#"{"repos":[{"id":"66666666-6666-4666-8666-666666666666"}]}"#;
+        let base = spawn_n(vec![
+            http_200(&list),
+            http_200(&remote),
+            http_200(&detail),
+            http_200(project_detail),
+        ]);
+        let client = ApiClient::new(&base, Some("tok"));
+
+        let (binding, note) =
+            resolve_switch_project("payments", &client, CodebaseCheck::Report, tmp.path())
+                .await
+                .expect("a forced switch must not be blocked by the containment check");
+        assert_eq!(binding.project_id, "11111111-1111-4111-8111-111111111111");
+
+        let note = note.expect("the user must still be told the project is not a member");
+        assert!(
+            note.contains("does not contain the current codebase"),
+            "the fact must be stated: {note}"
+        );
+        assert!(
+            note.contains("--project-attribution explicit"),
+            "must say what made it deliberate: {note}"
+        );
+        assert!(
+            note.contains("Operator") && note.contains("ingest"),
+            "must say where the requirement is actually enforced: {note}"
+        );
+
+        // It reads as a note, not a refusal: the switch succeeded.
+        assert!(
+            !note.starts_with("error"),
+            "this is informational, not a failure: {note}"
+        );
+    }
+
+    /// The other direction, and the reason `Report` is opt-in: without the
+    /// flag an ordinary session switch still `Enforce`s, so a typo'd project
+    /// name that happens to exist is caught exactly as before (the erroring
+    /// half is `project_switch_errors_when_project_does_not_contain_codebase`).
+    /// Calls the same [`codebase_check_for`] `switch` calls, so the mapping
+    /// cannot drift away from this test.
+    #[test]
+    fn only_an_explicit_session_switch_downgrades_the_containment_check() {
+        let session = SwitchDest::Session("s".into());
+        assert_eq!(
+            codebase_check_for(&session, true),
+            CodebaseCheck::Report,
+            "--project-attribution explicit must not be blocked"
+        );
+        assert_eq!(
+            codebase_check_for(&session, false),
+            CodebaseCheck::Enforce,
+            "an ordinary session switch keeps erroring"
+        );
+        // The user-level default is not tied to a checkout either way.
+        assert_eq!(
+            codebase_check_for(&SwitchDest::UserDefault, true),
+            CodebaseCheck::Skip
+        );
+        assert_eq!(
+            codebase_check_for(&SwitchDest::UserDefault, false),
+            CodebaseCheck::Skip
         );
     }
 

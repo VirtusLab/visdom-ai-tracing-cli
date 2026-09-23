@@ -108,6 +108,12 @@ day (~12h)**, after which the CLI quietly stops sending the header and attributi
 checked again — so a force nobody remembers granting cannot outlive its reason. Switching
 again without the flag clears the force immediately. The env-var form has no such lifetime.
 
+Because the caller owns the decision, a forced switch **also binds a project this checkout
+is not a member of** — a repo deliberately shared by two projects, say — which an ordinary
+switch refuses. It is not silent about it: the switch prints a note saying the project does
+not contain this codebase and that the force is what made that deliberate, so a typo still
+looks like a typo.
+
 Forcing is a trust claim and the server enforces it at ingest, not at `switch` time: it
 requires a Control Plane identity with `Operator` on the target project. A long-lived
 `tvk_` API key can never force. A refused force comes back as a `403`; the CLI prints an

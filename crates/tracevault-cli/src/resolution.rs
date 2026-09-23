@@ -275,9 +275,13 @@ pub fn effective_binding(inputs: ResolveInputs) -> Option<(RepoBinding, BindingS
 }
 
 /// The project that applies, and which tier produced it: `--project` flag →
-/// subagent worktree override → session active → config default → none.
-/// Pure; covers only the local tiers (flag → subagent → session.active_project
-/// → config_default). The user-level default (and, in the display chain only,
+/// subagent worktree override → `TRACEVAULT_PROJECT` → session active →
+/// config default → none.
+/// Pure; covers only the local tiers (flag → subagent → env_project →
+/// session.active_project → config_default). `env_project` is supplied BY THE
+/// CALLER — this module never reads the environment — and the capture path
+/// fills it from `commands::stream::env_project_binding`, which honours the
+/// UUID form only. The user-level default (and, in the display chain only,
 /// server-side deduction) are applied afterward by [`capture_project_binding`]
 /// / [`resolve_effective_project`], which call this function first and only
 /// fall through to those tiers when it returns `None`.
@@ -353,9 +357,9 @@ pub fn capture_project_id(binding: &ProjectBinding) -> Option<uuid::Uuid> {
 }
 
 /// DISPLAY chain for `commands::status`'s "Project" line: `--project` flag →
-/// subagent override → session active → config default (all pure, via
-/// [`effective_project`]; no network call) → user-level default → server-side
-/// deduction from the repo's git remote.
+/// subagent override → `TRACEVAULT_PROJECT` → session active → config default
+/// (all pure, via [`effective_project`]; no network call) → user-level default
+/// → server-side deduction from the repo's git remote.
 ///
 /// The user-level default outranks deduction because that is what ingest
 /// does: the capture chain ([`capture_project_binding`]) applies the user
@@ -376,7 +380,8 @@ pub async fn resolve_effective_project(
     git_url: Option<&str>,
     client: &ApiClient,
 ) -> Result<Option<(ProjectBinding, ProjectSource)>, Box<dyn std::error::Error>> {
-    // Local tiers: flag → subagent → session active → config default.
+    // Local tiers: flag → subagent → TRACEVAULT_PROJECT → session active →
+    // config default.
     if let Some(hit) = effective_project(inputs) {
         return Ok(Some(hit));
     }
