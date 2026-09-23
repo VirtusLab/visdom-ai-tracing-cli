@@ -305,24 +305,53 @@ fn format_deduction(
     }
 }
 
+/// Everything `project status` prints: `warnings` go to stderr, `lines`
+/// (the effective-project line, then the deduction line when shown) to
+/// stdout. Built by [`status_report`] so tests assert the exact output.
+#[derive(Debug, Default)]
+struct StatusReport {
+    warnings: Vec<String>,
+    lines: Vec<String>,
+}
+
 /// `tracevault project status`: a read-only inspector that always returns
-/// `Ok(())`. The effective project is the capture-time chain (local, no
-/// network); the server's deduction from the git remote is shown on its own
-/// line, best-effort, as what would apply if nothing were bound locally.
+/// `Ok(())`. Prints the [`StatusReport`] built by [`status_report`].
 async fn status(
     session_id: Option<&str>,
     project_flag_name: Option<&str>,
     project_root: &Path,
     cwd: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let report = status_report(session_id, project_flag_name, project_root, cwd).await;
+    for warning in &report.warnings {
+        eprintln!("{warning}");
+    }
+    for line in &report.lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The content of `project status`. The effective project is the
+/// capture-time chain (local, no network); the server's deduction from the
+/// git remote is shown on its own line, best-effort, as what would apply if
+/// nothing were bound locally. Never fails: every problem becomes a warning.
+async fn status_report(
+    session_id: Option<&str>,
+    project_flag_name: Option<&str>,
+    project_root: &Path,
+    cwd: &Path,
+) -> StatusReport {
+    let mut report = StatusReport::default();
     // Session state is best-effort: if a session id resolves, load it; else
     // warn and fall back to an empty SessionState.
     let session = match crate::commands::repo::resolve_session_id(session_id) {
         Ok(id) => session_state::load(&id),
         Err(_) => {
-            eprintln!(
+            report.warnings.push(
                 "warning: no session id (pass --session-id or set TRACEVAULT_SESSION_ID); \
                  showing binding without session context"
+                    .to_string(),
             );
             SessionState::default()
         }
@@ -338,7 +367,9 @@ async fn status(
     let client = match resolve_client(project_root) {
         Ok(client) => Some(client),
         Err(e) => {
-            eprintln!("warning: could not resolve credentials ({e}); server deduction not shown");
+            report.warnings.push(format!(
+                "warning: could not resolve credentials ({e}); server deduction not shown"
+            ));
             None
         }
     };
@@ -356,14 +387,14 @@ async fn status(
                     updated_at: chrono::Utc::now().to_rfc3339(),
                 });
             if flag.is_none() {
-                eprintln!(
+                report.warnings.push(format!(
                     "warning: --project '{name}' could not be resolved; ignoring the override"
-                );
+                ));
             }
             flag
         }
         (Some(name), None) => {
-            eprintln!("{}", offline_project_flag_warning(name));
+            report.warnings.push(offline_project_flag_warning(name));
             None
         }
         (None, _) => None,
@@ -371,18 +402,15 @@ async fn status(
 
     let (effective, invalid_id_warning) =
         status_effective(project_flag, &session, Some(&worktree), user_default);
-    if let Some(warning) = invalid_id_warning {
-        eprintln!("{warning}");
-    }
+    report.warnings.extend(invalid_id_warning);
 
     if let Some(name) = config_default_name.as_deref() {
-        eprintln!("{}", config_default_warning(name));
+        report.warnings.push(config_default_warning(name));
     }
 
-    println!(
-        "{}",
-        format_status(effective.as_ref().map(|(b, s)| (b, *s)))
-    );
+    report
+        .lines
+        .push(format_status(effective.as_ref().map(|(b, s)| (b, *s))));
 
     if let (Some(client), Some(url)) = (client.as_ref(), git_url.as_deref()) {
         // Best-effort and informational: an ambiguous or failed deduction is
@@ -394,9 +422,11 @@ async fn status(
             }
             _ => None,
         };
-        println!("{}", format_deduction(effective.is_some(), outcome, name));
+        report
+            .lines
+            .push(format_deduction(effective.is_some(), outcome, name));
     }
-    Ok(())
+    report
 }
 
 #[cfg(test)]
@@ -718,12 +748,11 @@ mod tests {
         // `$XDG_STATE_HOME`) to a tempdir for the duration of this test, so
         // it never touches the developer's real state dir.
         //
-        // SAFETY: test-scoped env mutation, mirroring the precedent in
-        // `commands::project`'s tests (`status_reports_ambiguous_deduction_
-        // as_informational_not_fatal`). No other test in this crate reads
-        // or sets XDG_STATE_HOME, so this can't race another test's
-        // expectations; restored in a guard so a panic mid-test still
-        // cleans up the process env.
+        // Held under the env lock: other tests (`flush`'s `run_flush` test,
+        // `status_in_the_orchestrator_configuration_names_the_user_default`)
+        // also set XDG_STATE_HOME. Restored in a guard so a panic mid-test
+        // still cleans up the process env.
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
         let state_tmp = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_STATE_HOME", state_tmp.path());
@@ -1042,10 +1071,9 @@ mod tests {
             .success();
         assert!(ok, "git remote add must succeed");
 
-        let base = spawn_once(
-            "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"error\":\"multiple\"}"
-                .to_string(),
-        );
+        // One 409 for `status`, one for `status_report`.
+        let conflict = "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"error\":\"multiple\"}";
+        let base = spawn_n(vec![conflict.to_string(), conflict.to_string()]);
 
         // Env mutation under `_env_lock`, restored by the guard even if
         // `status` panics. The config dir (and so any user default) is
@@ -1058,10 +1086,76 @@ mod tests {
         _guard.remove("TRACEVAULT_SESSION_ID");
 
         let result = status(None, None, tmp.path(), tmp.path()).await;
-
         assert!(
             result.is_ok(),
             "status must degrade gracefully on an ambiguous deduction, not propagate the error: {result:?}"
+        );
+
+        let report = status_report(None, None, tmp.path(), tmp.path()).await;
+        assert_eq!(
+            report.lines,
+            vec![
+                format_status(None),
+                format_deduction(false, Ok(ResolveProjectOutcome::Ambiguous), None),
+            ],
+            "the ambiguous deduction is reported on its own line"
+        );
+    }
+
+    /// VIS-316 orchestrator configuration: the container sets a machine-wide
+    /// user default B before the session exists, the session itself binds
+    /// nothing, and the server would deduce A from the git remote. `status`
+    /// must name B (what ingest uses) as effective, and show A only as an
+    /// unused deduction.
+    #[tokio::test]
+    async fn status_in_the_orchestrator_configuration_names_the_user_default() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::test_helpers::init_git_repo(&repo);
+        let ok = std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo.to_string_lossy(),
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:org/repo.git",
+            ])
+            .status()
+            .expect("git remote add failed")
+            .success();
+        assert!(ok, "git remote add must succeed");
+
+        let deduced_a = uuid::Uuid::from_u128(0xA);
+        let base = spawn_once(http_200(&format!(r#"{{"project_id":"{deduced_a}"}}"#)));
+
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("TRACEVAULT_SERVER_URL", &base);
+        _guard.set("TRACEVAULT_API_KEY", "tok");
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
+        _guard.set("XDG_STATE_HOME", tmp.path().join("state"));
+        _guard.remove("TRACEVAULT_SESSION_ID");
+
+        let default_b = ProjectBinding {
+            project_id: uuid::Uuid::from_u128(0xB).to_string(),
+            project_name: "project-b".into(),
+            updated_at: "".into(),
+        };
+        crate::user_project_default::save(&default_b).unwrap();
+
+        let report = status_report(None, None, &repo, &repo).await;
+
+        assert_eq!(
+            report.lines,
+            vec![
+                "project: project-b via user default (project switch --user)".to_string(),
+                format!(
+                    "server deduction for this repo: {deduced_a} (not used: the local binding above wins)"
+                ),
+            ]
         );
     }
 }
