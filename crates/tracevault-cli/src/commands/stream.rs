@@ -292,11 +292,13 @@ pub(crate) fn env_project_binding() -> Option<crate::session_state::ProjectBindi
 /// winning binding — makes both mistakes impossible: a force can only apply
 /// when it is attached to the binding actually being used.
 ///
-/// A lapsed persisted force reads as `derived` — not sending an `explicit`
-/// header IS the fallback, so ingest never starts failing because a force was
-/// forgotten. An unparseable `forced_until` (a hand-edited or corrupted file)
-/// also reads as `derived`, for the same fail-safe reason: both readers of
-/// this field treat "can't tell" as "not forced," never as `expect()`-worthy.
+/// Whether that force is live is [`crate::session_state::force_status`]'s
+/// answer, not this function's: `commands::project`'s status line reads the
+/// same field and must never disagree with the header this fills, so there is
+/// exactly one parse and one `Utc::now()` comparison. A lapsed persisted
+/// force reads as `derived` — not sending an `explicit` header IS the
+/// fallback, so ingest never starts failing because a force was forgotten —
+/// and so does an unparseable one, for the same fail-safe reason.
 ///
 /// An unrecognised (or absent) `TRACEVAULT_PROJECT_ATTRIBUTION` also reads as
 /// `derived`, deliberately asymmetric with the server, which 400s an unknown
@@ -317,8 +319,12 @@ pub(crate) fn attribution_mode(
         .unwrap_or(false);
     let binding_forced = effective
         .and_then(|b| b.forced_until.as_deref())
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .is_some_and(|until| until > chrono::Utc::now());
+        .is_some_and(|s| {
+            matches!(
+                crate::session_state::force_status(s),
+                crate::session_state::ForceStatus::Live(_)
+            )
+        });
     if env_forced || binding_forced {
         "explicit"
     } else {

@@ -271,18 +271,22 @@ fn apply_force(mut binding: ProjectBinding, explicit: bool) -> ProjectBinding {
 /// [`attribution_report`]), so there is no "no force at all" arm: that case
 /// prints no line.
 ///
-/// An unparseable timestamp (hand-edited or corrupted state file) fails SAFE
-/// and says so: it is reported as not in force, matching
-/// `commands::stream::attribution_mode`, which is the function that actually
-/// decides the header. Both readers of this field treat "can't tell" as "not
-/// forced", never as `expect()`-worthy.
+/// This only WORDS a verdict; it does not reach one.
+/// [`crate::session_state::force_status`] is the single parse-and-compare,
+/// shared with `commands::stream::attribution_mode`, which is the function
+/// that actually decides the header — so the line and the header cannot
+/// disagree about whether a stored force is live, lapsed or unreadable. An
+/// unparseable timestamp (hand-edited or corrupted state file) therefore
+/// fails SAFE here too, and says so.
 fn format_force_line(forced_until: &str) -> String {
-    match chrono::DateTime::parse_from_rfc3339(forced_until) {
-        Ok(until) if until > chrono::Utc::now() => {
+    match crate::session_state::force_status(forced_until) {
+        crate::session_state::ForceStatus::Live(until) => {
             format!("persisted force: active until {}", until.to_rfc3339())
         }
-        Ok(until) => format!("persisted force: lapsed {}", until.to_rfc3339()),
-        Err(_) => format!(
+        crate::session_state::ForceStatus::Lapsed(until) => {
+            format!("persisted force: lapsed {}", until.to_rfc3339())
+        }
+        crate::session_state::ForceStatus::Unreadable => format!(
             "persisted force: unreadable timestamp ('{forced_until}'), treated as not in force"
         ),
     }
@@ -858,10 +862,13 @@ mod tests {
     /// A `forced_until` that doesn't even parse as RFC3339 (a hand-edited or
     /// corrupted `user_project.toml`/session-state file) must fail SAFE —
     /// reported as not in force, never as active, and never a panic. Pins
-    /// the fail-safe direction against a future refactor to `.expect(...)`,
-    /// and pins that it agrees with `commands::stream::attribution_mode`,
-    /// the other reader of this same field and the one that fills the
-    /// header.
+    /// the fail-safe direction against a future refactor to `.expect(...)`.
+    ///
+    /// The second half — that the printed state agrees with
+    /// `commands::stream::attribution_mode`, the one that fills the header —
+    /// used to reconcile two independently written predicates. Both now go
+    /// through `session_state::force_status`, so it pins that neither reader
+    /// has quietly grown a second opinion around the shared one.
     #[test]
     fn status_names_unparseable_forced_until_as_not_in_force() {
         let line = format_force_line("not-a-timestamp");
