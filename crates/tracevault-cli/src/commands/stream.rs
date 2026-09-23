@@ -1577,9 +1577,26 @@ mod tests {
 
     // ── capture_project: local-only project resolver ──────────────────────────
 
+    /// ENV ISOLATION: `capture_project` READS `TRACEVAULT_PROJECT` (rung 3,
+    /// above `session.active_project`) since the A2 fix, and other tests in
+    /// this same binary SET it. The crate lock only serializes mutators
+    /// against each other, so a non-locking reader still races them — and
+    /// `std::env::set_var` concurrent with `std::env::var` is exactly the UB
+    /// the `unsafe` blocks in `EnvVarGuard` are annotated against. Take the
+    /// lock and pin the var UNSET, so the precedence assertions below
+    /// describe the tiers they name rather than whatever the ambient shell
+    /// (or a concurrent test) happens to export. `XDG_CONFIG_HOME` is
+    /// redirected for the same reason: the "empty session -> None" case
+    /// falls through to `user_project_default::load()`, which would
+    /// otherwise read the developer's real `user_project.toml`.
     #[test]
     fn capture_project_precedence_local_only() {
         use crate::session_state::{ProjectBinding, SessionState};
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.remove("TRACEVAULT_PROJECT");
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         let pb = |id: &str| ProjectBinding {
             project_id: id.into(),
             project_name: "n".into(),
@@ -1629,9 +1646,15 @@ mod tests {
     /// process-global disk read never saw a force written into SESSION
     /// state, which is where a plain `project switch --project-attribution
     /// explicit` — no `--user` — writes it).
+    /// ENV ISOLATION: see `capture_project_precedence_local_only` — this
+    /// test also calls `capture_project`, which reads `TRACEVAULT_PROJECT`
+    /// at a rung ABOVE the session-active binding it is asserting on.
     #[test]
     fn capture_project_preserves_forced_until_from_the_winning_tier() {
         use crate::session_state::{ProjectBinding, SessionState};
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.remove("TRACEVAULT_PROJECT");
         let pid = uuid::Uuid::from_u128(2);
         let future = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
         let s = SessionState {
@@ -1808,6 +1831,10 @@ mod tests {
         // accidentally-written user_project.toml.
         _guard.set("XDG_CONFIG_HOME", tmp.path());
         _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+        // `capture_project` reads `TRACEVAULT_PROJECT` ABOVE the
+        // session-active tier this test pins the force on; unset it so an
+        // ambient export can't redirect the capture at another project.
+        _guard.remove("TRACEVAULT_PROJECT");
 
         let pid = uuid::Uuid::from_u128(321);
         let future = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
@@ -2040,6 +2067,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", tmp.path());
+        // `capture_project` reads `TRACEVAULT_PROJECT` above the
+        // session-active tier asserted below — pin it unset.
+        _guard.remove("TRACEVAULT_PROJECT");
 
         let pid = uuid::Uuid::from_u128(99);
         let session = SessionState {
@@ -2113,8 +2143,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         // No user_project.toml under this isolated config dir, so there is no
-        // ambient user-level default to leak in.
+        // ambient user-level default to leak in — and no `TRACEVAULT_PROJECT`
+        // either, which `capture_project` would otherwise honour and turn
+        // this "nothing resolves" case into a project-scoped send.
         _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.remove("TRACEVAULT_PROJECT");
 
         let capture_binding = capture_project(&SessionState::default(), None);
         assert_eq!(capture_binding, None);

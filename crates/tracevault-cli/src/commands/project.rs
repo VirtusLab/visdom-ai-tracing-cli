@@ -997,6 +997,11 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("TRACEVAULT_SERVER_URL", &base);
         _guard.set("TRACEVAULT_API_KEY", "tok");
+        // `resolve_status_effective` reads `TRACEVAULT_PROJECT` at a rung
+        // ABOVE deduction, so an ambient export would resolve the binding
+        // locally and this test would never reach the 409 it exists to
+        // exercise — passing for the wrong reason.
+        _guard.remove("TRACEVAULT_PROJECT");
 
         let result = status(None, None, tmp.path(), tmp.path()).await;
 

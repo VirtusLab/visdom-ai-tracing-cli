@@ -2335,6 +2335,14 @@ mod tests {
     // these tests call the public `save()` (not just `load()`), so getting
     // this isolation wrong doesn't just make a test flaky — it overwrites
     // that developer's real config file.
+    //
+    // Every test below ALSO pins `TRACEVAULT_PROJECT` unset. Since the A2
+    // fix, `capture_project` reads it at a rung ABOVE `session.active_
+    // project`, so a developer who has exported it in their shell — or a
+    // concurrently-running test in this same binary that sets it — would
+    // otherwise silently change which project these verdicts resolve. The
+    // crate lock serializes mutators against each other, but only holding
+    // the lock AND declaring the var's value makes a reader safe.
 
     // ---- resolve_auth: `.tracevault/config.toml` is the lowest credential
     // ---- rung in `resolve_credentials`, so the inspector must know it too.
@@ -2433,6 +2441,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         crate::user_default::save(&repo_binding_for_attribution(
             "11111111-1111-4111-8111-111111111111",
@@ -2461,6 +2470,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let pb = crate::session_state::ProjectBinding {
             project_id: uuid::Uuid::from_u128(7).to_string(),
@@ -2490,6 +2500,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let config = crate::config::TracevaultConfig::default();
         assert!(
@@ -2512,6 +2523,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let cwd = tempfile::tempdir().unwrap();
         let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), None);
@@ -2536,6 +2548,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let cwd = tempfile::tempdir().unwrap();
         let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), None);
@@ -2560,6 +2573,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let config = crate::config::TracevaultConfig {
             repo_id: Some("22222222-2222-4222-8222-222222222222".into()),
@@ -2680,6 +2694,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let base = tempfile::tempdir().unwrap();
         let repo_dir = base.path().join("repo");
@@ -2744,6 +2759,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let state = crate::session_state::SessionState {
             active_project: Some(project_binding("not-a-uuid", "My Project")),
@@ -2783,6 +2799,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let state = crate::session_state::SessionState {
             active: Some(crate::session_state::RepoBinding {
