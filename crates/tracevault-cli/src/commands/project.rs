@@ -231,6 +231,34 @@ async fn status(
     project_root: &Path,
     cwd: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    match resolve_status_effective(session_id, project_flag_name, project_root, cwd).await {
+        Ok(effective) => {
+            println!(
+                "{}",
+                format_status(effective.as_ref().map(|(b, s)| (b, *s)))
+            );
+        }
+        // `status` is a read-only inspector: unlike the callers that need an
+        // authoritative binding to act on, an unresolvable rung here (notably
+        // the ambiguous/409 "belongs to multiple projects" case) is
+        // informational, not fatal — report it and exit 0 rather than
+        // propagating the error up through `run`/`main` as a hard failure.
+        Err(e) => println!("project: unresolved — {e}"),
+    }
+    Ok(())
+}
+
+/// The resolution core of `status`, pulled out so it can be exercised
+/// directly in tests (notably for `TRACEVAULT_PROJECT`) without capturing
+/// stdout: `status` itself is a thin wrapper that calls this, then prints
+/// `format_status` of the result (or the informational "unresolved" line on
+/// `Err`).
+async fn resolve_status_effective(
+    session_id: Option<&str>,
+    project_flag_name: Option<&str>,
+    project_root: &Path,
+    cwd: &Path,
+) -> Result<Option<(ProjectBinding, ProjectSource)>, Box<dyn std::error::Error>> {
     // Session state is best-effort: if a session id resolves, load it; else
     // warn and fall back to an empty SessionState.
     let session = match crate::commands::repo::resolve_session_id(session_id) {
@@ -315,30 +343,27 @@ async fn status(
                 worktree_path: Some(&worktree),
                 config_default,
             };
-            // `status` is a read-only inspector: unlike the callers that need
-            // an authoritative binding to act on, an unresolvable rung here
-            // (notably the ambiguous/409 "belongs to multiple projects" case)
-            // is informational, not fatal — report it and exit 0 rather than
-            // propagating the error up through `run`/`main` as a hard
-            // failure. `resolve_effective_project` itself keeps returning
-            // `Err` unchanged; only this call site swallows it.
             let resolved =
-                match resolve_effective_project(&inputs, user_default, git_url.as_deref(), &client)
-                    .await
-                {
-                    Ok(effective) => effective,
-                    Err(e) => {
-                        println!("project: unresolved — {e}");
-                        return Ok(());
-                    }
-                };
+                resolve_effective_project(&inputs, user_default, git_url.as_deref(), &client)
+                    .await?;
             enrich_deduced_name(resolved, items.as_deref())
         }
         Err(e) => {
             eprintln!("warning: could not resolve credentials ({e}); showing local status only");
+            // No client here, so — unlike the branch above — only the UUID
+            // form of `TRACEVAULT_PROJECT` can be honoured: a name needs
+            // `list_projects`, which needs a client.
+            let env_project = std::env::var("TRACEVAULT_PROJECT")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<uuid::Uuid>().ok())
+                .map(|id| ProjectBinding {
+                    project_id: id.to_string(),
+                    project_name: String::new(),
+                    updated_at: String::new(),
+                });
             let inputs = ProjectResolveInputs {
                 project_flag: None,
-                env_project: None,
+                env_project,
                 session: &session,
                 worktree_path: Some(&worktree),
                 config_default: None,
@@ -347,11 +372,7 @@ async fn status(
         }
     };
 
-    println!(
-        "{}",
-        format_status(effective.as_ref().map(|(b, s)| (b, *s)))
-    );
-    Ok(())
+    Ok(effective)
 }
 
 #[cfg(test)]
@@ -835,5 +856,92 @@ mod tests {
             result.is_ok(),
             "status must degrade gracefully on an ambiguous deduction, not propagate the error: {result:?}"
         );
+    }
+
+    /// A3, UUID form: with a client available, `TRACEVAULT_PROJECT` set to a
+    /// UUID must still resolve at the `Env` rung, not by falling through to
+    /// deduction/user-default. `spawn_once`'s listener only ever answers one
+    /// request — the broadened `items` fetch this env var now triggers — so
+    /// if resolution regressed to skipping the local `Env` rung and instead
+    /// fell through to `resolve_project` (deduction), the second HTTP call
+    /// would find no listener and the test would fail on that, not just on
+    /// the source assertion below.
+    #[tokio::test]
+    async fn status_resolves_env_uuid_as_the_effective_source() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let list =
+            r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"payments"}]"#.to_string();
+        let base = spawn_once(http_200(&list));
+
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("TRACEVAULT_SERVER_URL", &base);
+        _guard.set("TRACEVAULT_API_KEY", "tok");
+        let uuid = "22222222-2222-4222-8222-222222222222";
+        _guard.set("TRACEVAULT_PROJECT", uuid);
+
+        let (b, source) = resolve_status_effective(None, None, tmp.path(), tmp.path())
+            .await
+            .unwrap()
+            .expect("TRACEVAULT_PROJECT must resolve to a binding");
+        assert_eq!(source, ProjectSource::Env);
+        assert_eq!(b.project_id, uuid);
+    }
+
+    /// A3, name form: unlike the capture path (`stream::env_project_binding`,
+    /// UUID-only), `status` already has a client in scope, so a NAME in
+    /// `TRACEVAULT_PROJECT` must resolve via `list_projects` — the same
+    /// one-shot mock response the broadened `items` fetch consumes, so no
+    /// second request is made.
+    #[tokio::test]
+    async fn status_resolves_env_name_via_the_client() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let list =
+            r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"payments"}]"#.to_string();
+        let base = spawn_once(http_200(&list));
+
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("TRACEVAULT_SERVER_URL", &base);
+        _guard.set("TRACEVAULT_API_KEY", "tok");
+        _guard.set("TRACEVAULT_PROJECT", "payments");
+
+        let (b, source) = resolve_status_effective(None, None, tmp.path(), tmp.path())
+            .await
+            .unwrap()
+            .expect("a name should resolve via list_projects");
+        assert_eq!(source, ProjectSource::Env);
+        assert_eq!(b.project_name, "payments");
+        assert_eq!(b.project_id, "11111111-1111-4111-8111-111111111111");
+    }
+
+    /// A3, item 3: with credentials unresolved (no client at all — the
+    /// `Err` arm of `resolve_client`), `status`'s resolution core must still
+    /// honour the UUID form of `TRACEVAULT_PROJECT`, which needs no server
+    /// call. Only the NAME form is unavailable on this branch (it would need
+    /// `list_projects`), which is unchanged/untested here since it was
+    /// already correctly unresolved before this fix.
+    #[tokio::test]
+    async fn status_resolves_env_uuid_even_without_a_client() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.remove("TRACEVAULT_SERVER_URL");
+        _guard.remove("TRACEVAULT_API_KEY");
+        let uuid = "33333333-3333-4333-8333-333333333333";
+        _guard.set("TRACEVAULT_PROJECT", uuid);
+
+        let (b, source) = resolve_status_effective(None, None, tmp.path(), tmp.path())
+            .await
+            .unwrap()
+            .expect("TRACEVAULT_PROJECT (UUID form) must resolve even without a client");
+        assert_eq!(source, ProjectSource::Env);
+        assert_eq!(b.project_id, uuid);
     }
 }
