@@ -99,6 +99,31 @@ fn short_session_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
+/// The attribution mode to declare when flushing a repo-less project queue.
+///
+/// A buffered `pending-project-<uuid>.jsonl` file carries only the project
+/// id, not the `ProjectBinding` (with its `forced_until`) that decided it at
+/// capture time — so this cannot simply re-read a force the way the live
+/// send path does via `capture_project`. `forced_until` is stored PER-BINDING
+/// (see that field's own doc comment), so honouring a stale local force here
+/// requires confirming the CURRENT user-level default binding is still the
+/// one bound to THIS SAME project: if the user has since switched to a
+/// different project, applying its leftover force to an unrelated queue
+/// would be exactly the leak `attribution_mode`'s binding-scoping exists to
+/// prevent (see `attribution_mode`'s doc comment for the two-sided bug that
+/// motivated this).
+fn project_flush_attribution_mode(pid: uuid::Uuid) -> &'static str {
+    let user_default = crate::user_project_default::load();
+    let still_bound_to_this_project = user_default
+        .as_ref()
+        .is_some_and(|b| b.project_id == pid.to_string());
+    crate::commands::stream::attribution_mode(if still_bound_to_this_project {
+        user_default.as_ref()
+    } else {
+        None
+    })
+}
+
 pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let (server_url, credential) = resolve_credentials(project_root)?;
     let server_url = server_url.ok_or("server_url not configured")?;
@@ -138,6 +163,18 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
 
             let event_total = events.len();
             let mut failed_events: Vec<StreamEventRequest> = Vec::new();
+            // Resolved ONCE per target, above the per-event loop — not once
+            // per buffered event, which would mean a `user_project.toml` read
+            // and RFC3339 parse for every event in a backlog. The buffered
+            // queue carries only a project id, not the `ProjectBinding` that
+            // decided it, so `project_flush_attribution_mode` re-derives the
+            // mode from THIS process's environment/disk state at flush time —
+            // same as the live send path — rather than something captured at
+            // the original hook invocation.
+            let project_mode = match &target {
+                QueueTarget::Repo(_) => None, // stream_event carries no attribution header
+                QueueTarget::Project(pid) => Some(project_flush_attribution_mode(*pid)),
+            };
 
             for (i, mut event) in events.into_iter().enumerate() {
                 eprint!(
@@ -151,16 +188,12 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
                     QueueTarget::Repo(repo_id) => client.stream_event(repo_id, &event).await,
                     // Repo-less queue: drain to the project endpoint with no
                     // repo_id, the same shape the stream hook buffered it as.
-                    // The attribution mode is re-derived from THIS process's
-                    // environment/disk state at flush time, same as the live
-                    // send path — the buffered event itself doesn't carry the
-                    // mode it was originally captured under.
                     QueueTarget::Project(pid) => {
                         client
                             .stream_event_for_project(
                                 *pid,
                                 None,
-                                crate::commands::stream::attribution_mode(),
+                                project_mode.expect("resolved above for a Project target"),
                                 &event,
                             )
                             .await
@@ -255,10 +288,66 @@ fn append_pending(
 
 #[cfg(test)]
 mod tests {
-    use super::{pending_queues_in, repo_id_from_pending_filename, short_session_id, QueueTarget};
+    use super::{
+        pending_queues_in, project_flush_attribution_mode, repo_id_from_pending_filename,
+        short_session_id, QueueTarget,
+    };
     use crate::paths::resolve_project_root;
     use crate::test_helpers::{add_worktree, init_git_repo};
     use std::fs;
+
+    /// A live user-default force applies to a flushed queue only when the
+    /// default is STILL bound to the SAME project the queue is keyed by.
+    #[test]
+    fn project_flush_attribution_mode_honours_a_matching_live_force() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let pid = uuid::Uuid::from_u128(1);
+        let future = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
+        crate::user_project_default::save(&crate::session_state::ProjectBinding {
+            project_id: pid.to_string(),
+            project_name: "p".into(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            forced_until: Some(future),
+        })
+        .unwrap();
+
+        assert_eq!(project_flush_attribution_mode(pid), "explicit");
+    }
+
+    /// The flush-path echo of the "does a force leak onto a different
+    /// project" bug: a live force on the user-default binding for project A
+    /// must NOT apply when flushing a queue keyed by a DIFFERENT project B —
+    /// e.g. the user switched projects since these events were buffered.
+    #[test]
+    fn project_flush_attribution_mode_does_not_leak_onto_a_different_queued_project() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let project_a = uuid::Uuid::from_u128(1);
+        let future = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
+        crate::user_project_default::save(&crate::session_state::ProjectBinding {
+            project_id: project_a.to_string(),
+            project_name: "a".into(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            forced_until: Some(future),
+        })
+        .unwrap();
+
+        let project_b = uuid::Uuid::from_u128(2);
+        assert_eq!(
+            project_flush_attribution_mode(project_b),
+            "derived",
+            "a force bound to a DIFFERENT project's queue must not leak onto this one"
+        );
+    }
 
     #[test]
     fn repo_id_from_pending_filename_extracts_id() {

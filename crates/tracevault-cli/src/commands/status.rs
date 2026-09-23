@@ -815,7 +815,8 @@ fn recording_attribution(
         bound,
         user_default_repo,
     );
-    let capture_pid = crate::commands::stream::capture_project(&session, Some(&worktree));
+    let capture_pid = crate::commands::stream::capture_project(&session, Some(&worktree))
+        .and_then(|b| b.project_id.parse::<uuid::Uuid>().ok());
     let attribution =
         crate::commands::stream::attribution_for(stream_binding.as_ref(), capture_pid);
     (attribution, worktree)

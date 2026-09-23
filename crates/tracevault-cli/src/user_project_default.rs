@@ -71,24 +71,6 @@ pub fn clear() -> Result<(), Box<dyn std::error::Error>> {
 /// check that would have caught the binding going stale.
 pub const DEFAULT_FORCE_LIFETIME_HOURS: i64 = 12;
 
-fn load_with_force_from(dir: &Path) -> Option<(ProjectBinding, bool)> {
-    let binding = load_from(dir)?;
-    let live = binding
-        .forced_until
-        .as_deref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .is_some_and(|until| until > chrono::Utc::now());
-    Some((binding, live))
-}
-
-/// The user-level binding plus whether its force is still live. A lapsed force
-/// yields `(binding, false)` — attribution falls back to DERIVED, never to
-/// rejection, so a forgotten force quietly becomes correct again.
-pub fn load_with_force() -> Option<(ProjectBinding, bool)> {
-    let path = default_project_path()?;
-    load_with_force_from(path.parent()?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,39 +123,24 @@ mod tests {
         assert_eq!(load(), Some(pb));
     }
 
+    /// `forced_until` round-trips through the real `save`/`load` on-disk
+    /// format. The LIVENESS check itself (is a given `forced_until` still in
+    /// the future?) lives entirely in
+    /// `commands::stream::attribution_mode` now — this store only persists
+    /// the binding, it doesn't interpret it (see that function's doc comment
+    /// for why: a force is scoped to the binding that carries it, and this
+    /// module has no notion of "the binding that won").
     #[test]
-    fn a_lapsed_force_falls_back_to_derived_not_to_rejection() {
+    fn forced_until_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let until = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
         let binding = ProjectBinding {
             project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
             project_name: "p".into(),
             updated_at: chrono::Utc::now().to_rfc3339(),
-            forced_until: Some(past),
+            forced_until: Some(until),
         };
         save_in(dir.path(), &binding).unwrap();
-
-        let (loaded, force_live) = load_with_force_from(dir.path()).expect("binding survives");
-        assert_eq!(
-            loaded.project_id, binding.project_id,
-            "the BINDING still applies"
-        );
-        assert!(!force_live, "the force has lapsed");
-    }
-
-    #[test]
-    fn a_live_force_is_reported_live() {
-        let dir = tempfile::tempdir().unwrap();
-        let future = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
-        let binding = ProjectBinding {
-            project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
-            project_name: "p".into(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-            forced_until: Some(future),
-        };
-        save_in(dir.path(), &binding).unwrap();
-
-        let (_loaded, force_live) = load_with_force_from(dir.path()).unwrap();
-        assert!(force_live);
+        assert_eq!(load_from(dir.path()), Some(binding));
     }
 }
