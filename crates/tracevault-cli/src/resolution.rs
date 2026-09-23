@@ -219,11 +219,13 @@ pub enum ProjectSource {
     SessionActive,
     /// A pinned `.tracevault/config.toml` default_project (bound mode).
     ConfigDefault,
-    /// Repo deduction from the git remote, resolved server-side. Produced by
-    /// [`resolve_effective_project`], not [`effective_project`].
+    /// Repo deduction from the git remote, resolved server-side. Produced
+    /// only by the display chain [`resolve_effective_project`], never by the
+    /// capture chain [`capture_project_binding`].
     Deduced,
     /// A session-independent user-level default (`project switch --user`).
-    /// Produced by [`resolve_effective_project`], not [`effective_project`].
+    /// Produced by [`capture_project_binding`] and
+    /// [`resolve_effective_project`], not [`effective_project`].
     UserDefault,
 }
 
@@ -265,10 +267,10 @@ pub fn effective_binding(inputs: ResolveInputs) -> Option<(RepoBinding, BindingS
 /// The project that applies, and which tier produced it: `--project` flag →
 /// subagent worktree override → session active → config default → none.
 /// Pure; covers only the local tiers (flag → subagent → session.active_project
-/// → config_default). Server-side deduction and the user-level default are
-/// applied afterward by [`resolve_effective_project`], which calls this
-/// function first and only falls through to those tiers when it returns
-/// `None`.
+/// → config_default). The user-level default (and, in the display chain only,
+/// server-side deduction) are applied afterward by [`capture_project_binding`]
+/// / [`resolve_effective_project`], which call this function first and only
+/// fall through to those tiers when it returns `None`.
 pub fn effective_project(inputs: &ProjectResolveInputs) -> Option<(ProjectBinding, ProjectSource)> {
     if let Some(b) = &inputs.project_flag {
         return Some((b.clone(), ProjectSource::ProjectFlag));
@@ -287,18 +289,66 @@ pub fn effective_project(inputs: &ProjectResolveInputs) -> Option<(ProjectBindin
         .map(|b| (b, ProjectSource::ConfigDefault))
 }
 
-/// Full project-attribution precedence chain: `--project` flag → subagent
-/// override → session active → config default (all pure, via
-/// [`effective_project`]; no network call) → server-side deduction from the
-/// repo's git remote → user-level default. Deduction outranks the user-level
-/// default — this falls out of the ordering below: the user default is only
-/// consulted once deduction has returned `None`.
+/// Inputs to the capture-time project chain. Deliberately has NO
+/// `config_default` field: `.tracevault/config.toml` `default_project` is a
+/// NAME, resolving it needs a network call, and the stream hook (which fires
+/// per event) never does one — so no caller of this chain can feed it in.
+pub struct CaptureProjectInputs<'a> {
+    /// `--project` override (only `project status` supplies it; the hook passes `None`).
+    pub project_flag: Option<ProjectBinding>,
+    pub session: &'a SessionState,
+    pub worktree_path: Option<&'a str>,
+    /// `user_project_default::load()` — passed in so the function stays pure.
+    pub user_default: Option<ProjectBinding>,
+}
+
+/// THE capture-time project chain: `--project` flag → subagent worktree
+/// override → session `active_project` → user default → none. Pure, no
+/// network. `commands::stream::capture_project` (ingest) and
+/// `commands::project::status` both call this, so they cannot drift.
+pub fn capture_project_binding(
+    inputs: &CaptureProjectInputs<'_>,
+) -> Option<(ProjectBinding, ProjectSource)> {
+    effective_project(&ProjectResolveInputs {
+        project_flag: inputs.project_flag.clone(),
+        session: inputs.session,
+        worktree_path: inputs.worktree_path,
+        config_default: None,
+    })
+    .or_else(|| {
+        inputs
+            .user_default
+            .clone()
+            .map(|b| (b, ProjectSource::UserDefault))
+    })
+}
+
+/// The id the hook will actually send for a capture binding: `None` when the
+/// stored `project_id` is not a UUID (a hand-edited or corrupted
+/// `user_project.toml`/session file), in which case ingest treats the binding
+/// as absent and the event goes repo-scoped.
+pub fn capture_project_id(binding: &ProjectBinding) -> Option<uuid::Uuid> {
+    binding.project_id.parse::<uuid::Uuid>().ok()
+}
+
+/// DISPLAY chain for `commands::status`'s "Project" line: `--project` flag →
+/// subagent override → session active → config default (all pure, via
+/// [`effective_project`]; no network call) → user-level default → server-side
+/// deduction from the repo's git remote.
+///
+/// The user-level default outranks deduction because that is what ingest
+/// does: the capture chain ([`capture_project_binding`]) applies the user
+/// default and never deduces, so a display chain that ranked deduction above
+/// it would name a project no event is attributed to — exactly in the
+/// orchestrator's configuration (a pod bound via `project switch --user`). The
+/// server is only asked once every local tier, user default included, is empty.
 ///
 /// An `Ambiguous` deduction result is an error (the caller can't safely guess
-/// among several candidate projects); a `Resolved` deduction emits a warning
-/// so the user knows attribution wasn't explicit. Returns `Ok(None)` only when
-/// every tier in the chain is empty — the caller turns that into a "project
-/// required" error where appropriate.
+/// among several candidate projects). This resolver never prints: callers
+/// render the tier via [`ProjectSource`]'s `Display`. Returns `Ok(None)` only
+/// when every tier in the chain is empty. `commands::project::status` does not
+/// use this chain: it reports [`capture_project_binding`] and shows deduction
+/// on a separate line.
 pub async fn resolve_effective_project(
     inputs: &ProjectResolveInputs<'_>,
     user_default: Option<ProjectBinding>,
@@ -309,13 +359,14 @@ pub async fn resolve_effective_project(
     if let Some(hit) = effective_project(inputs) {
         return Ok(Some(hit));
     }
-    // Server-side deduction from the repo's git remote.
+    // User-level default: ingest honours it, so it outranks deduction.
+    if let Some(b) = user_default {
+        return Ok(Some((b, ProjectSource::UserDefault)));
+    }
+    // Server-side deduction from the repo's git remote (lowest tier).
     if let Some(url) = git_url {
         match client.resolve_project(url).await? {
             ResolveProjectOutcome::Resolved(pid) => {
-                eprintln!(
-                    "warning: no explicit project set; attributing to the project deduced from this repo ({pid}). Set one with `tracevault project switch <name>` or --project."
-                );
                 return Ok(Some((
                     ProjectBinding {
                         project_id: pid.to_string(),
@@ -335,8 +386,7 @@ pub async fn resolve_effective_project(
             ResolveProjectOutcome::None => { /* fall through */ }
         }
     }
-    // User-level default (lowest tier; only consulted once deduction is empty).
-    Ok(user_default.map(|b| (b, ProjectSource::UserDefault)))
+    Ok(None)
 }
 
 /// A RepoBinding from a pinned `.tracevault/config.toml` (bound mode), if it has
@@ -441,13 +491,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deduction_beats_user_default() {
-        // /projects/resolve -> 200 deduced; user_default present -> deduced still wins (decision 6)
-        let (addr, _h) = spawn_once(
-            "200 OK",
-            "{\"project_id\":\"22222222-2222-2222-2222-222222222222\"}",
-        );
-        let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
+    async fn user_default_beats_deduction() {
+        // Ingest applies the user default and never deduces, so the display
+        // chain must too: with a user default present, NO server request may
+        // be made. The client points at port 0 (nothing listens there), so a
+        // deduction attempt would surface as an Err rather than Ok(UserDefault).
+        let client = ApiClient::new("http://127.0.0.1:0", Some("k"));
         let ud = ProjectBinding {
             project_id: "user".into(),
             project_name: "u".into(),
@@ -460,6 +509,27 @@ mod tests {
             config_default: None,
         };
         let (b, src) = resolve_effective_project(&inputs, Some(ud), Some("git@x:y.git"), &client)
+            .await
+            .expect("a user default must resolve without any network call")
+            .unwrap();
+        assert_eq!(src, ProjectSource::UserDefault);
+        assert_eq!(b.project_id, "user");
+    }
+
+    #[tokio::test]
+    async fn deduction_used_when_no_local_tier_or_user_default() {
+        let (addr, _h) = spawn_once(
+            "200 OK",
+            "{\"project_id\":\"22222222-2222-2222-2222-222222222222\"}",
+        );
+        let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
+        let inputs = ProjectResolveInputs {
+            project_flag: None,
+            session: &SessionState::default(),
+            worktree_path: None,
+            config_default: None,
+        };
+        let (b, src) = resolve_effective_project(&inputs, None, Some("git@x:y.git"), &client)
             .await
             .unwrap()
             .unwrap();
@@ -484,52 +554,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_default_used_when_deduction_404() {
+    async fn domain_404_deduction_resolves_to_none() {
         // A domain 404 (server's `{"error": ...}` envelope) — the shape a
-        // real (non-skewed) server sends for "no project" — must still fall
-        // through to the user default, unlike a bare route-404.
+        // real (non-skewed) server sends for "no project" — falls through to
+        // `Ok(None)`, unlike a bare route-404. The user default is `None`
+        // here: a present user default now short-circuits before the
+        // deduction call (see `user_default_beats_deduction`).
         let (addr, _h) = spawn_once("404 Not Found", "{\"error\":\"no project\"}");
         let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
-        let ud = ProjectBinding {
-            project_id: "user".into(),
-            project_name: "u".into(),
-            updated_at: "".into(),
-        };
         let inputs = ProjectResolveInputs {
             project_flag: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: None,
         };
-        let (b, src) = resolve_effective_project(&inputs, Some(ud), Some("git@x:y.git"), &client)
+        let got = resolve_effective_project(&inputs, None, Some("git@x:y.git"), &client)
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(src, ProjectSource::UserDefault);
-        assert_eq!(b.project_id, "user");
+        assert!(got.is_none(), "got: {got:?}");
     }
 
     #[tokio::test]
     async fn deduction_bare_404_is_version_skew_err_not_fallthrough() {
         // A bare 404 (no JSON error body) is axum's "no route matched"
         // fallback, not a domain "no project" — it must propagate as an
-        // error instead of silently falling through to the user default.
+        // error instead of silently falling through to `Ok(None)`. No user
+        // default: one would short-circuit before the deduction call.
         let (addr, _h) = spawn_once("404 Not Found", "");
         let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
-        let ud = ProjectBinding {
-            project_id: "user".into(),
-            project_name: "u".into(),
-            updated_at: "".into(),
-        };
         let inputs = ProjectResolveInputs {
             project_flag: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: None,
         };
-        let err = resolve_effective_project(&inputs, Some(ud), Some("git@x:y.git"), &client)
+        let err = resolve_effective_project(&inputs, None, Some("git@x:y.git"), &client)
             .await
-            .expect_err("a bare 404 must not silently fall through to the user default");
+            .expect_err("a bare 404 must not silently fall through to Ok(None)");
         assert!(err.to_string().to_lowercase().contains("version mismatch"));
     }
 
@@ -731,6 +792,104 @@ mod tests {
             config_default: None,
         })
         .is_none());
+    }
+
+    /// Every tier of the capture chain, top to bottom, plus the empty case.
+    ///
+    /// A `.tracevault/config.toml` `default_project` cannot influence this
+    /// chain: `CaptureProjectInputs` has no `config_default` field at all, so
+    /// there is nothing a caller could pass (a negative compile test would
+    /// only restate that). The struct literals below are exhaustive — adding
+    /// such a field would break every one of them, forcing a deliberate
+    /// decision here.
+    #[test]
+    fn capture_project_binding_precedence() {
+        let pb = |n: &str| ProjectBinding {
+            project_id: n.into(),
+            project_name: n.into(),
+            updated_at: "".into(),
+        };
+        let mut subagent_projects = HashMap::new();
+        subagent_projects.insert("/wt".into(), pb("subagent"));
+        let session = SessionState {
+            active_project: Some(pb("session")),
+            subagent_projects,
+            ..Default::default()
+        };
+
+        // tier 1: flag wins over everything
+        let got = capture_project_binding(&CaptureProjectInputs {
+            project_flag: Some(pb("flag")),
+            session: &session,
+            worktree_path: Some("/wt"),
+            user_default: Some(pb("user")),
+        })
+        .unwrap();
+        assert_eq!(
+            (got.0.project_id.as_str(), got.1),
+            ("flag", ProjectSource::ProjectFlag)
+        );
+
+        // tier 2: subagent worktree override beats session active
+        let got = capture_project_binding(&CaptureProjectInputs {
+            project_flag: None,
+            session: &session,
+            worktree_path: Some("/wt"),
+            user_default: Some(pb("user")),
+        })
+        .unwrap();
+        assert_eq!(
+            (got.0.project_id.as_str(), got.1),
+            ("subagent", ProjectSource::Subagent)
+        );
+
+        // tier 3: session active when the worktree has no override
+        let got = capture_project_binding(&CaptureProjectInputs {
+            project_flag: None,
+            session: &session,
+            worktree_path: Some("/other"),
+            user_default: Some(pb("user")),
+        })
+        .unwrap();
+        assert_eq!(
+            (got.0.project_id.as_str(), got.1),
+            ("session", ProjectSource::SessionActive)
+        );
+
+        // tier 4: user default when the session has nothing
+        let got = capture_project_binding(&CaptureProjectInputs {
+            project_flag: None,
+            session: &SessionState::default(),
+            worktree_path: Some("/wt"),
+            user_default: Some(pb("user")),
+        })
+        .unwrap();
+        assert_eq!(
+            (got.0.project_id.as_str(), got.1),
+            ("user", ProjectSource::UserDefault)
+        );
+
+        // none: nothing anywhere
+        assert!(capture_project_binding(&CaptureProjectInputs {
+            project_flag: None,
+            session: &SessionState::default(),
+            worktree_path: None,
+            user_default: None,
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn capture_project_id_accepts_uuid_rejects_garbage() {
+        let pb = |id: &str| ProjectBinding {
+            project_id: id.into(),
+            project_name: "n".into(),
+            updated_at: "".into(),
+        };
+        let u = uuid::Uuid::from_u128(7);
+        assert_eq!(capture_project_id(&pb(&u.to_string())), Some(u));
+        assert_eq!(capture_project_id(&pb("not-a-uuid")), None);
+        assert_eq!(capture_project_id(&pb("")), None);
     }
 
     #[test]

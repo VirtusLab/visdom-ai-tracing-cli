@@ -249,12 +249,16 @@ pub(crate) fn resolve_stream_binding(
     .map(|(b, _)| b)
 }
 
-/// Resolve the capture-time project from LOCAL, UUID-bearing bindings only — no
-/// network (the hook fires per event in a short-lived process). Precedence:
-/// subagent worktree override -> session `active_project` -> user-level default.
-/// Repo config `default_project` (a name) is intentionally excluded: honoring it
-/// would need a per-event `list_projects` call. `None` -> fall back to the
-/// repo-scoped stream (server deduces).
+/// The capture-time project id for a stream event: a thin wrapper over the
+/// shared chain [`crate::resolution::capture_project_binding`] (subagent
+/// worktree override -> session `active_project` -> user-level default; no
+/// `--project` flag on the hook path) followed by
+/// [`crate::resolution::capture_project_id`], which drops a non-UUID stored id.
+/// Local only — no network (the hook fires per event in a short-lived
+/// process), which is why repo config `default_project` (a name) is not a
+/// tier. `None` -> fall back to the repo-scoped stream (server deduces).
+/// `commands::project::status` calls the same shared chain, so it reports
+/// exactly what this returns.
 ///
 /// `pub(crate)`: also called by `commands::status`, which reuses this
 /// function (plus `resolve_stream_binding`/`attribution_for`) as the
@@ -264,16 +268,14 @@ pub(crate) fn capture_project(
     session: &crate::session_state::SessionState,
     worktree_path: Option<&str>,
 ) -> Option<uuid::Uuid> {
-    use crate::resolution::{effective_project, ProjectResolveInputs};
-    let local = effective_project(&ProjectResolveInputs {
+    use crate::resolution::{capture_project_binding, capture_project_id, CaptureProjectInputs};
+    let (binding, _) = capture_project_binding(&CaptureProjectInputs {
         project_flag: None,
         session,
         worktree_path,
-        config_default: None,
-    })
-    .map(|(b, _)| b)
-    .or_else(crate::user_project_default::load)?;
-    local.project_id.parse::<uuid::Uuid>().ok()
+        user_default: crate::user_project_default::load(),
+    })?;
+    capture_project_id(&binding)
 }
 
 /// The one-line warning printed when a repo-less event is dropped as
