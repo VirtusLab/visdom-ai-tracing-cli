@@ -95,8 +95,173 @@ fn pending_queues_in(
 
 /// The progress line uses a short prefix of the session id for display; guards
 /// against a prior `[..8]` panic on session ids shorter than 8 bytes.
-fn short_session_id(id: &str) -> &str {
+fn display_prefix(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
+}
+
+/// What happened to one queued event on its way back to the server.
+#[derive(Debug)]
+pub(crate) enum QueuedSend {
+    Sent,
+    /// 413 even after truncation — dropped, never retried.
+    TooLarge,
+    /// Transient (5xx, network, 401, ...) — re-enqueue and retry later.
+    Failed(String),
+    /// The server deterministically refused the declared capture project
+    /// (400/403/404/409 on the project-scoped send). The rest of the queue
+    /// cannot succeed against the same binding, and sending the event
+    /// anywhere else would re-attribute it, so the caller stops draining.
+    Refused {
+        pid: uuid::Uuid,
+        kind: crate::commands::stream::ClientErrorKind,
+    },
+}
+
+/// The capture project a queue's events are sent under, resolved exactly as
+/// the stream hook resolves it: the session's state (`session_state::load`,
+/// keyed by the session directory's name) plus the worktree toplevel the hook
+/// recorded in the session dir's `origin` marker (see `run_stream`). Only
+/// repo queues consult it — a repo-less queue is already keyed by its project.
+///
+/// Without this, `flush` would drain a repo queue to the repo-scoped endpoint
+/// and let the server deduce a project, re-attributing the very events the
+/// hook queued because the server REFUSED the declared project.
+fn queue_capture_project(session_dir: &Path, target: &QueueTarget) -> Option<uuid::Uuid> {
+    if !matches!(target, QueueTarget::Repo(_)) {
+        return None;
+    }
+    let session_id = session_dir.file_name()?.to_str()?;
+    let session = crate::session_state::load(session_id);
+    // Trimmed like the other `origin` readers (`check`, `verification_phase`):
+    // the hook writes no trailing newline today, but a hand-edited marker
+    // must not silently miss the subagent worktree override.
+    let worktree = fs::read_to_string(session_dir.join("origin"))
+        .ok()
+        .map(|s| s.trim().to_string());
+    crate::commands::stream::capture_project(&session, worktree.as_deref())
+}
+
+/// Send one queued event to the endpoint its queue and the session's capture
+/// project select: a repo queue with a capture project goes to the
+/// project-scoped endpoint carrying the repo id, one without goes to the
+/// repo-scoped endpoint (the server deduces). A refused project-scoped send
+/// is reported as [`QueuedSend::Refused`] and is never retried at the
+/// repo-scoped endpoint — that would be the silent re-attribution VIS-316
+/// removes. A repo-less queue drains to the project endpoint with no repo id,
+/// the same shape the stream hook buffered it as, and keeps its old rules.
+pub(crate) async fn send_queued_event(
+    client: &ApiClient,
+    target: &QueueTarget,
+    capture_pid: Option<uuid::Uuid>,
+    event: &StreamEventRequest,
+) -> QueuedSend {
+    let (sent, refusable_pid) = match (target, capture_pid) {
+        (QueueTarget::Repo(repo_id), None) => (client.stream_event(repo_id, event).await, None),
+        (QueueTarget::Repo(repo_id), Some(pid)) => (
+            client
+                .stream_event_for_project(pid, Some(repo_id), event)
+                .await,
+            Some(pid),
+        ),
+        (QueueTarget::Project(pid), _) => (
+            client.stream_event_for_project(*pid, None, event).await,
+            None,
+        ),
+    };
+    let e = match sent {
+        Ok(_) => return QueuedSend::Sent,
+        Err(e) => e,
+    };
+    // Refusal is checked BEFORE the 413 rule: that rule is a bare substring
+    // match, and a refusal's body can name a UUID that contains "413".
+    if let Some(pid) = refusable_pid {
+        if let Some(kind) = crate::commands::stream::deterministic_client_error_kind(e.as_ref()) {
+            return QueuedSend::Refused { pid, kind };
+        }
+    }
+    let err_str = e.to_string();
+    if err_str.contains("413") {
+        QueuedSend::TooLarge
+    } else {
+        QueuedSend::Failed(err_str)
+    }
+}
+
+/// Drain one queue file: send each event, re-enqueue whatever must be
+/// retried (in order, to the SAME file), and return `(sent, failed)`. A
+/// refusal stops the drain: its line is printed once, and the refused event
+/// plus every event not yet attempted are re-enqueued and counted failed.
+async fn drain_queue(
+    client: &ApiClient,
+    pending_path: &Path,
+    target: &QueueTarget,
+    capture_pid: Option<uuid::Uuid>,
+) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+    let events = drain_pending(pending_path)?;
+    if events.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let event_total = events.len();
+    let mut sent = 0u64;
+    let mut failed = 0u64;
+    let mut failed_events: Vec<StreamEventRequest> = Vec::new();
+
+    // Label the progress and warning lines with the session directory the
+    // queue lives in. It is the same id the hook stamped on every event here
+    // (`run_stream` writes the queue under `.tracevault/sessions/<id>/`), but
+    // taken from the path rather than the payload: the label is a directory
+    // name, not data read out of the event.
+    let queue_dir_name = pending_path
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("?");
+
+    let mut events = events.into_iter().enumerate();
+    while let Some((i, mut event)) = events.next() {
+        eprint!(
+            "\r  Session {} — event {}/{} ...",
+            display_prefix(queue_dir_name),
+            i + 1,
+            event_total
+        );
+        event.truncate_large_fields();
+        match send_queued_event(client, target, capture_pid, &event).await {
+            QueuedSend::Sent => sent += 1,
+            QueuedSend::TooLarge => {
+                // Payload too large even after truncation — drop it.
+                eprintln!();
+                eprintln!(
+                    "  Warning: dropped event (session {queue_dir_name}) — still too large after truncation"
+                );
+                failed += 1;
+            }
+            QueuedSend::Failed(e) => {
+                eprintln!();
+                eprintln!("  Warning: failed to send event (session {queue_dir_name}): {e}");
+                failed_events.push(event);
+                failed += 1;
+            }
+            QueuedSend::Refused { pid, kind } => {
+                eprintln!();
+                eprintln!("{}", crate::commands::stream::refused_error(pid, &kind));
+                failed_events.push(event);
+                failed_events.extend(events.by_ref().map(|(_, e)| e));
+                // Everything not sent is failed: earlier failures, the refused
+                // event, and the untried rest.
+                failed = event_total as u64 - sent;
+                break;
+            }
+        }
+    }
+    eprintln!();
+
+    // Re-enqueue retryable events (not 413s) to the SAME per-target file.
+    if !failed_events.is_empty() {
+        append_pending(pending_path, &failed_events)?;
+    }
+    Ok((sent, failed))
 }
 
 pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -125,68 +290,18 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
         .collect();
 
     for session_entry in session_entries {
+        let session_dir = session_entry.path();
         // Collect (path, QueueTarget) pairs for every pending queue in this
         // session directory before draining, to keep the borrow/async loop
         // below simple.
-        let pending_queues = pending_queues_in(&session_entry.path(), bound_repo_id.as_deref())?;
+        let pending_queues = pending_queues_in(&session_dir, bound_repo_id.as_deref())?;
 
         for (pending_path, target) in pending_queues {
-            let events = drain_pending(&pending_path)?;
-            if events.is_empty() {
-                continue;
-            }
-
-            let event_total = events.len();
-            let mut failed_events: Vec<StreamEventRequest> = Vec::new();
-
-            for (i, mut event) in events.into_iter().enumerate() {
-                eprint!(
-                    "\r  Session {} — event {}/{} ...",
-                    short_session_id(&event.session_id),
-                    i + 1,
-                    event_total
-                );
-                event.truncate_large_fields();
-                let sent = match &target {
-                    QueueTarget::Repo(repo_id) => client.stream_event(repo_id, &event).await,
-                    // Repo-less queue: drain to the project endpoint with no
-                    // repo_id, the same shape the stream hook buffered it as.
-                    QueueTarget::Project(pid) => {
-                        client.stream_event_for_project(*pid, None, &event).await
-                    }
-                };
-                match sent {
-                    Ok(_) => {
-                        total_sent += 1;
-                    }
-                    Err(e) => {
-                        eprintln!();
-                        let err_str = e.to_string();
-                        if err_str.contains("413") {
-                            // Payload too large even after truncation — drop it.
-                            eprintln!(
-                                "  Warning: dropped event (session {}) — still too large after truncation",
-                                event.session_id
-                            );
-                            total_failed += 1;
-                        } else {
-                            eprintln!(
-                                "  Warning: failed to send event (session {}): {e}",
-                                event.session_id
-                            );
-                            failed_events.push(event);
-                            total_failed += 1;
-                        }
-                    }
-                }
-            }
-            eprintln!();
-
-            // Re-enqueue transiently failed events (not 413s) to the SAME
-            // per-repo file.
-            if !failed_events.is_empty() {
-                append_pending(&pending_path, &failed_events)?;
-            }
+            // Resolved once per queue, not per event.
+            let capture_pid = queue_capture_project(&session_dir, &target);
+            let (sent, failed) = drain_queue(&client, &pending_path, &target, capture_pid).await?;
+            total_sent += sent;
+            total_failed += failed;
         }
     }
 
@@ -244,7 +359,7 @@ fn append_pending(
 
 #[cfg(test)]
 mod tests {
-    use super::{pending_queues_in, repo_id_from_pending_filename, short_session_id, QueueTarget};
+    use super::{display_prefix, pending_queues_in, repo_id_from_pending_filename, QueueTarget};
     use crate::paths::resolve_project_root;
     use crate::test_helpers::{add_worktree, init_git_repo};
     use std::fs;
@@ -429,24 +544,24 @@ mod tests {
             .any(|(p, _)| p.ends_with("pending-not-a-uuid.jsonl")));
     }
 
-    // ── short_session_id: display-only truncation, no panic on short ids ─────
+    // ── display_prefix: display-only truncation, no panic on short ids ─────
 
     #[test]
-    fn short_session_id_truncates_long_id() {
+    fn display_prefix_truncates_long_id() {
         assert_eq!(
-            short_session_id("0190a1b2-cccc-dddd-eeee-ffffffffffff"),
+            display_prefix("0190a1b2-cccc-dddd-eeee-ffffffffffff"),
             "0190a1b2"
         );
     }
 
     #[test]
-    fn short_session_id_returns_whole_string_when_shorter_than_8() {
-        assert_eq!(short_session_id("x"), "x");
+    fn display_prefix_returns_whole_string_when_shorter_than_8() {
+        assert_eq!(display_prefix("x"), "x");
     }
 
     #[test]
-    fn short_session_id_handles_empty_string() {
-        assert_eq!(short_session_id(""), "");
+    fn display_prefix_handles_empty_string() {
+        assert_eq!(display_prefix(""), "");
     }
 }
 
@@ -535,5 +650,272 @@ mod queue_target_tests {
         );
         assert_eq!(queue_target_from_filename("pending-.jsonl"), None);
         assert_eq!(queue_target_from_filename("pending.jsonl"), None);
+    }
+}
+
+/// VIS-316: `flush` must drain a repo queue under the session's capture
+/// project, never re-attributing a refused event via the repo-scoped endpoint.
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+    use crate::test_helpers::{http_json, lock_env_mutation, spawn_seq, EnvVarGuard, RECV_TIMEOUT};
+    use std::time::Duration;
+    use tracevault_protocol::streaming::StreamEventType;
+
+    const REPO: &str = "11111111-1111-1111-1111-111111111111";
+
+    fn event(n: u128) -> StreamEventRequest {
+        StreamEventRequest {
+            protocol_version: 1,
+            tool: Some("claude-code".to_string()),
+            event_type: StreamEventType::ToolUse,
+            session_id: "sess-flush".into(),
+            timestamp: chrono::Utc::now(),
+            hook_event_name: Some("PostToolUse".into()),
+            tool_name: None,
+            tool_use_id: None,
+            tool_input: None,
+            tool_response: None,
+            tool_is_error: None,
+            event_index: None,
+            event_uuid: Some(uuid::Uuid::from_u128(n)),
+            transcript_lines: None,
+            transcript_offset: None,
+            model: None,
+            cwd: None,
+            final_stats: None,
+            flow_id: None,
+            labels: None,
+            params: None,
+        }
+    }
+
+    fn ok() -> String {
+        let body = serde_json::to_string(&tracevault_protocol::streaming::StreamEventResponse {
+            session_db_id: uuid::Uuid::nil(),
+            event_db_id: Some(uuid::Uuid::nil()),
+            status: "accepted".to_string(),
+        })
+        .unwrap();
+        http_json("200 OK", &body)
+    }
+
+    fn bad_request() -> String {
+        http_json(
+            "400 Bad Request",
+            r#"{"error":"repo is not a member of project"}"#,
+        )
+    }
+
+    /// The request line of a captured request (`spawn_seq` renders
+    /// `"<request line> | <headers> | <body>"`).
+    fn request_line(captured: &str) -> &str {
+        captured.split(" | ").next().unwrap_or_default()
+    }
+
+    /// Event uuids held by a queue file, in order; every line must parse.
+    fn queued_uuids(path: &Path) -> Vec<uuid::Uuid> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::from_str::<StreamEventRequest>(l)
+                    .expect("every queued line parses")
+                    .event_uuid
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn repo_queue_with_capture_project_goes_to_the_project_endpoint() {
+        let (base, rx) = spawn_seq(vec![ok()]);
+        let client = ApiClient::new(&base, Some("tok"));
+        let pid = uuid::Uuid::from_u128(0xA);
+
+        let got = send_queued_event(
+            &client,
+            &QueueTarget::Repo(REPO.into()),
+            Some(pid),
+            &event(1),
+        )
+        .await;
+        assert!(matches!(got, QueuedSend::Sent), "{got:?}");
+
+        let captured = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
+        assert!(
+            request_line(&captured).starts_with(&format!(
+                "POST /api/v1/projects/{pid}/stream?repo_id={REPO} "
+            )),
+            "got: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_queue_without_capture_project_goes_to_the_repo_endpoint() {
+        let (base, rx) = spawn_seq(vec![ok()]);
+        let client = ApiClient::new(&base, Some("tok"));
+
+        let got =
+            send_queued_event(&client, &QueueTarget::Repo(REPO.into()), None, &event(1)).await;
+        assert!(matches!(got, QueuedSend::Sent), "{got:?}");
+
+        let captured = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
+        assert!(
+            request_line(&captured).starts_with(&format!("POST /api/v1/repos/{REPO}/stream ")),
+            "got: {captured}"
+        );
+    }
+
+    /// A 400 on the project-scoped send is a refusal: exactly one request (a
+    /// spare 200 is staged so a repo-scoped retry WOULD be captured), and the
+    /// outcome says so, which is what makes `drain_queue` re-enqueue it.
+    #[tokio::test]
+    async fn refused_project_send_makes_one_request_and_is_classified_refused() {
+        use crate::commands::stream::ClientErrorKind;
+
+        let (base, rx) = spawn_seq(vec![bad_request(), ok()]);
+        let client = ApiClient::new(&base, Some("tok"));
+        let pid = uuid::Uuid::from_u128(0xB);
+
+        let got = send_queued_event(
+            &client,
+            &QueueTarget::Repo(REPO.into()),
+            Some(pid),
+            &event(1),
+        )
+        .await;
+        assert!(
+            matches!(
+                got,
+                QueuedSend::Refused { pid: p, kind: ClientErrorKind::Scoping } if p == pid
+            ),
+            "{got:?}"
+        );
+
+        let first = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
+        assert!(
+            request_line(&first).contains(&format!("/projects/{pid}/stream?repo_id={REPO}")),
+            "got: {first}"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "a refused event must not be re-sent to the repo-scoped endpoint"
+        );
+    }
+
+    /// A transient failure keeps today's per-event retry: `Failed`, not
+    /// `Refused`, so the drain goes on to the next event.
+    #[tokio::test]
+    async fn transient_project_send_failure_is_not_a_refusal() {
+        let (base, _rx) = spawn_seq(vec![http_json("503 Service Unavailable", "{}")]);
+        let client = ApiClient::new(&base, Some("tok"));
+
+        let got = send_queued_event(
+            &client,
+            &QueueTarget::Repo(REPO.into()),
+            Some(uuid::Uuid::from_u128(0xC)),
+            &event(1),
+        )
+        .await;
+        assert!(matches!(got, QueuedSend::Failed(_)), "{got:?}");
+    }
+
+    /// A refusal mid-queue stops the drain: the events already sent stay
+    /// sent, and the refused event plus every untried one are re-enqueued in
+    /// their original order and counted failed. The third event is never
+    /// attempted (the spare response stays unclaimed).
+    #[tokio::test]
+    async fn drain_queue_stops_at_a_refusal_and_requeues_the_rest_in_order() {
+        let (base, rx) = spawn_seq(vec![ok(), bad_request(), ok()]);
+        let client = ApiClient::new(&base, Some("tok"));
+        let pid = uuid::Uuid::from_u128(0xD);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("pending-{REPO}.jsonl"));
+        append_pending(&path, &[event(1), event(2), event(3)]).unwrap();
+
+        let (sent, failed) =
+            drain_queue(&client, &path, &QueueTarget::Repo(REPO.into()), Some(pid))
+                .await
+                .unwrap();
+
+        assert_eq!((sent, failed), (1, 2));
+        assert_eq!(
+            queued_uuids(&path),
+            vec![uuid::Uuid::from_u128(2), uuid::Uuid::from_u128(3)]
+        );
+        for _ in 0..2 {
+            let captured = rx.recv_timeout(RECV_TIMEOUT).expect("request missing");
+            assert!(
+                request_line(&captured).contains(&format!("/projects/{pid}/stream?repo_id=")),
+                "got: {captured}"
+            );
+        }
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "no request after the refusal"
+        );
+    }
+
+    /// End to end through `run_flush`: the capture project comes from the
+    /// session state the hook reads (`XDG_STATE_HOME`, keyed by the session
+    /// directory's name), and a refusal leaves every event in the queue.
+    #[tokio::test]
+    async fn run_flush_applies_the_session_capture_project_and_keeps_refused_events() {
+        let _env_lock = lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let mut guard = EnvVarGuard::new();
+        guard.set("XDG_STATE_HOME", tmp.path().join("state"));
+        guard.set("XDG_CONFIG_HOME", tmp.path().join("config"));
+        guard.set("HOME", tmp.path());
+
+        let (base, rx) = spawn_seq(vec![bad_request(), ok()]);
+        guard.set("TRACEVAULT_SERVER_URL", &base);
+        guard.set("TRACEVAULT_API_KEY", "tvk_test");
+
+        let session_id = "flush-session-1";
+        let pid = uuid::Uuid::from_u128(0xE);
+        crate::session_state::save(
+            session_id,
+            &crate::session_state::SessionState {
+                active_project: Some(crate::session_state::ProjectBinding {
+                    project_id: pid.to_string(),
+                    project_name: "p".into(),
+                    updated_at: String::new(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let session_dir = root.join(".tracevault").join("sessions").join(session_id);
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("origin"),
+            root.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let queue = session_dir.join(format!("pending-{REPO}.jsonl"));
+        append_pending(&queue, &[event(1), event(2)]).unwrap();
+
+        run_flush(&root).await.unwrap();
+
+        let first = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
+        assert!(
+            request_line(&first).starts_with(&format!(
+                "POST /api/v1/projects/{pid}/stream?repo_id={REPO} "
+            )),
+            "got: {first}"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "exactly one request: no repo-scoped fallback, no second event"
+        );
+        assert_eq!(
+            queued_uuids(&queue),
+            vec![uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)]
+        );
     }
 }
