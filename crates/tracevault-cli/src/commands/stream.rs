@@ -329,7 +329,8 @@ pub(crate) fn refused_error(pid: uuid::Uuid, kind: &ClientErrorKind) -> String {
         ClientErrorKind::Forbidden => format!(
             "tracevault: error: the server refused to attribute this event to active project \
              {pid} (403). Either that project does not apply to this repo (not a member, or \
-             missing TracePush) — run `tracevault project switch <name>` — or this account lacks \
+             missing TracePush) — run `tracevault project switch <name>` (add `--user` if the \
+             binding is the machine-wide default in `user_project.toml`) — or this account lacks \
              the `tracing` Keycloak realm role entirely, which an administrator must grant. The \
              event was NOT re-attributed elsewhere; it has been queued and will be retried once \
              the binding or the role is fixed."
@@ -338,7 +339,8 @@ pub(crate) fn refused_error(pid: uuid::Uuid, kind: &ClientErrorKind) -> String {
             "tracevault: error: active project {pid} does not apply to this repo (not a member, \
              missing permission, or the project no longer exists). The event was NOT \
              re-attributed elsewhere; it has been queued and will be retried once the binding is \
-             fixed. Run `tracevault project switch <name>` to update it."
+             fixed. Run `tracevault project switch <name>` (add `--user` if the binding is the \
+             machine-wide default in `user_project.toml`) to update it."
         ),
     }
 }
@@ -390,8 +392,10 @@ pub(crate) fn deterministic_client_error_kind(
 /// client error (the bound project doesn't apply to this repo: not a member,
 /// or the caller lacks `TracePush` on it) prints the refusal line to stderr
 /// and returns `Err(e)` with the original error, unchanged, so the caller's
-/// existing buffer/retry logic queues it under this project's pending file
-/// (mirrors the server-side rule from VIS-305: a declared project the server
+/// existing buffer/retry logic queues it in the REPO's pending file
+/// (`pending-<repo_id>.jsonl`, see [`Attribution::pending_file_name`]); the
+/// next drain (the hook's or `tracevault flush`'s) re-applies whatever capture
+/// project is in force at that time (mirrors the server-side rule from VIS-305: a declared project the server
 /// refuses is not silently re-attributed). A transient error (5xx,
 /// network/transport, timeout) also propagates as `Err`, and is handled
 /// identically by that same buffer/retry path.
@@ -1814,8 +1818,12 @@ mod tests {
             .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
             .expect("no first request captured");
         assert!(
-            first.contains(&format!("/projects/{pid}/stream")) && first.contains("repo_id="),
-            "first request must hit the project-scoped endpoint with repo_id, got: {first}"
+            first.contains(&format!("/projects/{pid}/stream")),
+            "first request must hit the project-scoped endpoint, got: {first}"
+        );
+        assert!(
+            first.contains("repo_id="),
+            "first request must carry repo_id, got: {first}"
         );
 
         assert!(
@@ -2179,6 +2187,13 @@ mod tests {
         );
 
         for s in [&forbidden, &scoping] {
+            // A machine-wide default is rebound with `--user`; without the
+            // hint, `project switch` in a session only shadows it.
+            assert!(s.contains("--user"), "must name the --user fix: {s}");
+            assert!(
+                s.contains("user_project.toml"),
+                "must name the machine-wide default's file: {s}"
+            );
             assert!(
                 !s.contains("repo deduction"),
                 "must never describe re-attribution to another project: {s}"
