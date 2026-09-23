@@ -14,7 +14,7 @@ cargo install tracevault-cli
 tracevault init        # Initialize in a repo
 tracevault status      # Show tracing status
 tracevault check       # Evaluate policies before push
-tracevault flush       # Retry any events that failed to stream live
+tracevault flush       # Retry any events that failed to stream live (honours the session's project binding; never re-attributes a refused event)
 ```
 
 **Per-repo initialization** — `tracevault init` sets up a repository with `.tracevault/` config,

@@ -310,7 +310,7 @@ fn undeliverable_warning(pid: uuid::Uuid) -> String {
 /// Which deterministic client error this is, so the refusal error can name a
 /// cause that is actually possible instead of assuming one.
 #[derive(Debug, PartialEq, Eq)]
-enum ClientErrorKind {
+pub(crate) enum ClientErrorKind {
     /// 403, which now has TWO plausible causes — see [`send_stream_event`].
     Forbidden,
     /// 400/404/409: a binding/scoping problem, and only that.
@@ -319,7 +319,7 @@ enum ClientErrorKind {
 
 /// The one-line error printed when the server refuses a project-scoped send.
 /// Pure, so the wording is asserted directly rather than by capturing stderr.
-fn refused_error(pid: uuid::Uuid, kind: &ClientErrorKind) -> String {
+pub(crate) fn refused_error(pid: uuid::Uuid, kind: &ClientErrorKind) -> String {
     match kind {
         // Since Keycloak, a 403 has a SECOND and now more common cause: the
         // account has no `tracing` realm role at all, in which case nothing this
@@ -343,7 +343,9 @@ fn refused_error(pid: uuid::Uuid, kind: &ClientErrorKind) -> String {
     }
 }
 
-fn deterministic_client_error_kind(e: &dyn std::error::Error) -> Option<ClientErrorKind> {
+pub(crate) fn deterministic_client_error_kind(
+    e: &dyn std::error::Error,
+) -> Option<ClientErrorKind> {
     let s = e.to_string();
     // 401 is deliberately excluded: it's an authentication failure (bad/expired
     // token), not a project-scoping problem, and the buffer/retry path already
