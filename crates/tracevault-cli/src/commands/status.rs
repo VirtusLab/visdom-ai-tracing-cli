@@ -1253,6 +1253,7 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
             };
             let inputs = ProjectResolveInputs {
                 project_flag: None,
+                env_project: None,
                 session: &project_session,
                 worktree_path: Some(&worktree),
                 config_default,
@@ -1268,6 +1269,7 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
         _ => {
             let inputs = ProjectResolveInputs {
                 project_flag: None,
+                env_project: None,
                 session: &project_session,
                 worktree_path: Some(&worktree),
                 config_default: None,
@@ -2516,6 +2518,7 @@ mod tests {
         let session = crate::session_state::SessionState::default();
         let inputs = ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &session,
             worktree_path: None,
             config_default: None,

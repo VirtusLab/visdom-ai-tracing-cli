@@ -175,6 +175,9 @@ pub struct ResolveInputs<'a> {
 /// come from the per-session state.
 pub struct ProjectResolveInputs<'a> {
     pub project_flag: Option<ProjectBinding>,
+    /// Parsed from `TRACEVAULT_PROJECT` by the caller, so this module stays
+    /// free of environment reads and remains a pure function of its inputs.
+    pub env_project: Option<ProjectBinding>,
     pub session: &'a SessionState,
     pub worktree_path: Option<&'a str>,
     pub config_default: Option<ProjectBinding>,
@@ -215,6 +218,12 @@ pub enum ProjectSource {
     ProjectFlag,
     /// A subagent's per-worktree override.
     Subagent,
+    /// The `TRACEVAULT_PROJECT` environment variable — a per-process
+    /// assertion, re-asserted at every launch and never written to disk.
+    /// Outranks every remembered tier so a stale `user_project.toml` or a
+    /// `.tracevault/config.toml` baked into a pod image cannot outrank the
+    /// launcher that started the process.
+    Env,
     /// The session's project-level active binding.
     SessionActive,
     /// A pinned `.tracevault/config.toml` default_project (bound mode).
@@ -232,6 +241,7 @@ impl std::fmt::Display for ProjectSource {
         let label = match self {
             ProjectSource::ProjectFlag => "--project override",
             ProjectSource::Subagent => "subagent worktree override",
+            ProjectSource::Env => "TRACEVAULT_PROJECT (environment)",
             ProjectSource::SessionActive => "session (project switch)",
             ProjectSource::ConfigDefault => "bound .tracevault/config.toml default_project",
             ProjectSource::Deduced => "repo deduction",
@@ -277,6 +287,9 @@ pub fn effective_project(inputs: &ProjectResolveInputs) -> Option<(ProjectBindin
         if let Some(b) = inputs.session.subagent_projects.get(wt) {
             return Some((b.clone(), ProjectSource::Subagent));
         }
+    }
+    if let Some(b) = &inputs.env_project {
+        return Some((b.clone(), ProjectSource::Env));
     }
     if let Some(b) = &inputs.session.active_project {
         return Some((b.clone(), ProjectSource::SessionActive));
@@ -455,6 +468,7 @@ mod tests {
         };
         let inputs = ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: None,
@@ -473,6 +487,7 @@ mod tests {
         let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
         let inputs = ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: None,
@@ -497,6 +512,7 @@ mod tests {
         };
         let inputs = ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: None,
@@ -523,6 +539,7 @@ mod tests {
         };
         let inputs = ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: None,
@@ -544,6 +561,7 @@ mod tests {
         };
         let inputs = ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: Some(cfg),
@@ -684,6 +702,7 @@ mod tests {
         // rung 1: flag wins over everything
         let got = effective_project(&ProjectResolveInputs {
             project_flag: Some(pb("flag")),
+            env_project: None,
             session: &session,
             worktree_path: Some("/wt"),
             config_default: Some(pb("cfg")),
@@ -695,6 +714,7 @@ mod tests {
         // rung 2: subagent (worktree) beats session.active
         let got = effective_project(&ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &session,
             worktree_path: Some("/wt"),
             config_default: Some(pb("cfg")),
@@ -706,6 +726,7 @@ mod tests {
         // rung 3: session.active when no subagent match
         let got = effective_project(&ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &session,
             worktree_path: Some("/other"),
             config_default: Some(pb("cfg")),
@@ -716,6 +737,7 @@ mod tests {
         // rung 3b: config_default when session empty
         let got = effective_project(&ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: Some(pb("cfg")),
@@ -726,11 +748,58 @@ mod tests {
         // none: nothing local
         assert!(effective_project(&ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: None,
         })
         .is_none());
+    }
+
+    #[test]
+    fn env_outranks_remembered_state_but_not_flag_or_subagent() {
+        let pb = |n: &str| ProjectBinding {
+            project_id: n.into(),
+            project_name: n.into(),
+            updated_at: "".into(),
+        };
+        let mut subagent_projects = HashMap::new();
+        subagent_projects.insert("/wt".to_string(), pb("subagent"));
+        let session = SessionState {
+            active_project: Some(pb("session")),
+            subagent_projects,
+            ..Default::default()
+        };
+
+        // env beats session active and config default
+        let got = effective_project(&ProjectResolveInputs {
+            project_flag: None,
+            env_project: Some(pb("env")),
+            session: &session,
+            worktree_path: None,
+            config_default: Some(pb("config")),
+        });
+        assert_eq!(got.unwrap().1, ProjectSource::Env);
+
+        // the subagent worktree override still beats env
+        let got = effective_project(&ProjectResolveInputs {
+            project_flag: None,
+            env_project: Some(pb("env")),
+            session: &session,
+            worktree_path: Some("/wt"),
+            config_default: None,
+        });
+        assert_eq!(got.unwrap().1, ProjectSource::Subagent);
+
+        // --project still beats env
+        let got = effective_project(&ProjectResolveInputs {
+            project_flag: Some(pb("flag")),
+            env_project: Some(pb("env")),
+            session: &session,
+            worktree_path: None,
+            config_default: None,
+        });
+        assert_eq!(got.unwrap().1, ProjectSource::ProjectFlag);
     }
 
     #[test]

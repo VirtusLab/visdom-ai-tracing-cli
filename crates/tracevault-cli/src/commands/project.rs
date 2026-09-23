@@ -291,6 +291,7 @@ async fn status(
 
             let inputs = ProjectResolveInputs {
                 project_flag,
+                env_project: None,
                 session: &session,
                 worktree_path: Some(&worktree),
                 config_default,
@@ -318,6 +319,7 @@ async fn status(
             eprintln!("warning: could not resolve credentials ({e}); showing local status only");
             let inputs = ProjectResolveInputs {
                 project_flag: None,
+                env_project: None,
                 session: &session,
                 worktree_path: Some(&worktree),
                 config_default: None,

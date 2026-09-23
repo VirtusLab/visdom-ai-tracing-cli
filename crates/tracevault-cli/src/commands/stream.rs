@@ -267,6 +267,7 @@ pub(crate) fn capture_project(
     use crate::resolution::{effective_project, ProjectResolveInputs};
     let local = effective_project(&ProjectResolveInputs {
         project_flag: None,
+        env_project: None,
         session,
         worktree_path,
         config_default: None,
