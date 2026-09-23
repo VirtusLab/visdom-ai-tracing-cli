@@ -268,6 +268,33 @@ pub(crate) fn env_project_binding() -> Option<crate::session_state::ProjectBindi
     })
 }
 
+/// Which attribution mode this process declares.
+///
+/// `explicit` comes either from `TRACEVAULT_PROJECT_ATTRIBUTION` (per-process,
+/// re-asserted at every launch, no expiry) or from a LIVE persisted force
+/// written by `project switch --project-attribution explicit`. A lapsed
+/// persisted force reads as `derived` — not sending the header IS the
+/// fallback, so ingest never starts failing because a force was forgotten.
+///
+/// An unrecognised (or absent) `TRACEVAULT_PROJECT_ATTRIBUTION` also reads as
+/// `derived`, deliberately asymmetric with the server, which 400s an unknown
+/// value: that strictness is for callers that bypass the CLI entirely, and
+/// failing a hook over a typo'd env var helps nobody — silently falling back
+/// to the always-checked default is the safe direction to fail in.
+pub(crate) fn attribution_mode() -> &'static str {
+    let env_forced = std::env::var("TRACEVAULT_PROJECT_ATTRIBUTION")
+        .map(|v| v.trim().eq_ignore_ascii_case("explicit"))
+        .unwrap_or(false);
+    let disk_forced = crate::user_project_default::load_with_force()
+        .map(|(_, live)| live)
+        .unwrap_or(false);
+    if env_forced || disk_forced {
+        "explicit"
+    } else {
+        "derived"
+    }
+}
+
 /// Resolve the capture-time project from LOCAL, UUID-bearing bindings only — no
 /// network (the hook fires per event in a short-lived process). Precedence:
 /// subagent worktree override -> `TRACEVAULT_PROJECT` -> session
@@ -447,7 +474,7 @@ async fn send_stream_event(
         // transient error. Both propagate so the caller queues them.
         Attribution::ProjectOnly { project_id } => {
             let attempt = client
-                .stream_event_for_project(*project_id, None, req)
+                .stream_event_for_project(*project_id, None, attribution_mode(), req)
                 .await;
             return match attempt {
                 Ok(r) => Ok(Some(r)),
@@ -469,7 +496,7 @@ async fn send_stream_event(
         None => client.stream_event(repo_id, req).await.map(Some),
         Some(pid) => {
             let attempt = client
-                .stream_event_for_project(pid, Some(repo_id), req)
+                .stream_event_for_project(pid, Some(repo_id), attribution_mode(), req)
                 .await;
             let kind = match &attempt {
                 Ok(_) => None,
@@ -1543,6 +1570,120 @@ mod tests {
 
         _guard.remove("TRACEVAULT_PROJECT");
         assert!(env_project_binding().is_none());
+    }
+
+    // ── attribution_mode ───────────────────────────────────────────────────
+
+    /// `attribution_mode` reads both `TRACEVAULT_PROJECT_ATTRIBUTION` and (via
+    /// `user_project_default::load_with_force`) `XDG_CONFIG_HOME` /
+    /// `user_project.toml`, so every test in this group isolates BOTH:
+    /// `XDG_CONFIG_HOME` to a fresh, normally-empty tempdir (so an ambient
+    /// forced binding on the machine running this test can't leak in and
+    /// change the verdict), and the env var itself via the guard. All hold
+    /// `_env_lock` (the crate's single `ENV_MUTATION_LOCK`), which also
+    /// serializes them against every other test in the crate that mutates
+    /// either var.
+    #[test]
+    fn env_force_is_explicit_and_needs_no_expiry() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
+
+        assert_eq!(attribution_mode(), "explicit");
+    }
+
+    #[test]
+    fn absent_or_unrecognised_env_is_derived() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+        assert_eq!(attribution_mode(), "derived");
+
+        // The CLI does not forward a value it does not recognise: the server
+        // would 400 it, and failing a hook over a typo'd env var helps
+        // nobody. The server's strictness is for callers that bypass the
+        // CLI.
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "yes-please");
+        assert_eq!(attribution_mode(), "derived");
+    }
+
+    /// The disk-persisted half of `attribution_mode`: a LIVE persisted force
+    /// (no env var involved) must also read as `explicit` — this is what
+    /// `project switch --project-attribution explicit` ultimately drives.
+    #[test]
+    fn live_disk_force_is_explicit_without_env() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let future = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
+        crate::user_project_default::save(&crate::session_state::ProjectBinding {
+            project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+            project_name: "p".into(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            forced_until: Some(future),
+        })
+        .unwrap();
+
+        assert_eq!(attribution_mode(), "explicit");
+    }
+
+    /// This is the test that would fail if a lapsed persisted force still
+    /// made it onto the wire: with no env override, a `forced_until` in the
+    /// past must make `attribution_mode` — the exact function that supplies
+    /// the header — report `derived`, not `explicit`. Not sending the header
+    /// IS the fallback to derived attribution.
+    #[test]
+    fn lapsed_disk_force_is_derived_without_env() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        crate::user_project_default::save(&crate::session_state::ProjectBinding {
+            project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+            project_name: "p".into(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            forced_until: Some(past),
+        })
+        .unwrap();
+
+        assert_eq!(attribution_mode(), "derived");
+    }
+
+    /// Env-provided force must be exempt from expiry in fact, not just by
+    /// coincidence of the OR: pairing it with a disk force that has ALREADY
+    /// LAPSED still yields `explicit`. If `attribution_mode` were refactored
+    /// to gate the env branch on any timestamp (disk or otherwise), this is
+    /// the test that would catch it — `lapsed_disk_force_is_derived_without_
+    /// env` alone couldn't, since it never sets the env var.
+    #[test]
+    fn env_force_is_explicit_even_with_a_lapsed_disk_force() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
+
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        crate::user_project_default::save(&crate::session_state::ProjectBinding {
+            project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+            project_name: "p".into(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            forced_until: Some(past),
+        })
+        .unwrap();
+
+        assert_eq!(attribution_mode(), "explicit");
     }
 
     // ── send_stream_event: endpoint routing based on capture_pid ──────────────

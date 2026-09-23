@@ -48,8 +48,14 @@ fn accept_with_deadline(listener: &TcpListener) -> Option<std::net::TcpStream> {
 
 /// Spawn a one-shot server that returns `response` (a full HTTP response) to
 /// the first request. Captures the HTTP request line (the first line, which
-/// carries the method + path + query) and sends it over the returned channel
-/// before writing the response. Returns (base_url, request_receiver).
+/// carries the method + path + query) followed by its headers (one per
+/// line), and sends the whole thing over the returned channel before writing
+/// the response. Returns (base_url, request_receiver).
+///
+/// Existing `line.starts_with(...)` assertions on the request line keep
+/// working unchanged: the request line is still the first line of the
+/// captured string. A new assertion can additionally check for a header via
+/// `.contains(...)`.
 fn spawn_once(response: &'static str) -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -60,9 +66,19 @@ fn spawn_once(response: &'static str) -> (String, mpsc::Receiver<String>) {
             // Read exactly the request line — a single `read()` could return a
             // partial buffer and make the query-string assertions flaky.
             let mut reader = BufReader::new(stream);
-            let mut request_line = String::new();
-            let _ = reader.read_line(&mut request_line);
-            let _ = tx.send(request_line);
+            let mut captured = String::new();
+            let _ = reader.read_line(&mut captured);
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                    break;
+                }
+                if header.trim().is_empty() {
+                    break;
+                }
+                captured.push_str(&header);
+            }
+            let _ = tx.send(captured);
             let mut stream = reader.into_inner();
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
@@ -120,6 +136,7 @@ async fn stream_event_for_project_targets_project_endpoint() {
         .stream_event_for_project(
             project_id,
             Some("11111111-1111-1111-1111-111111111111"),
+            "explicit",
             &req,
         )
         .await
@@ -131,6 +148,13 @@ async fn stream_event_for_project_targets_project_endpoint() {
         line.starts_with(
             "POST /api/v1/projects/00000000-0000-0000-0000-000000000000/stream?repo_id=11111111-1111-1111-1111-111111111111 "
         ),
+        "got: {line}"
+    );
+    // The `mode` argument must reach the wire verbatim as the attribution
+    // header — this is the one place outside the crate that can observe it.
+    assert!(
+        line.to_lowercase()
+            .contains("x-tracevault-project-attribution: explicit"),
         "got: {line}"
     );
 }
@@ -158,7 +182,7 @@ async fn stream_event_for_project_omits_repo_id_when_absent() {
     let req = sample_stream_event_request();
 
     let got = client
-        .stream_event_for_project(uuid::Uuid::nil(), None, &req)
+        .stream_event_for_project(uuid::Uuid::nil(), None, "derived", &req)
         .await
         .unwrap();
     assert_eq!(got.status, "accepted");
@@ -167,5 +191,10 @@ async fn stream_event_for_project_omits_repo_id_when_absent() {
     assert!(
         line.starts_with("POST /api/v1/projects/00000000-0000-0000-0000-000000000000/stream "),
         "expected a bare project path with no query string, got: {line}"
+    );
+    assert!(
+        line.to_lowercase()
+            .contains("x-tracevault-project-attribution: derived"),
+        "got: {line}"
     );
 }

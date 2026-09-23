@@ -88,10 +88,6 @@ fn load_with_force_from(dir: &Path) -> Option<(ProjectBinding, bool)> {
 /// The user-level binding plus whether its force is still live. A lapsed force
 /// yields `(binding, false)` — attribution falls back to DERIVED, never to
 /// rejection, so a forgotten force quietly becomes correct again.
-///
-/// `#[allow(dead_code)]`: wired in by `commands::stream::attribution_mode`
-/// (Task C2) — not yet a caller as of this commit.
-#[allow(dead_code)]
 pub fn load_with_force() -> Option<(ProjectBinding, bool)> {
     let path = default_project_path()?;
     load_with_force_from(path.parent()?)

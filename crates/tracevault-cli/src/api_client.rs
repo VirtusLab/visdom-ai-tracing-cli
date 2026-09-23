@@ -690,10 +690,18 @@ impl ApiClient {
     /// Called from `commands::stream::send_stream_event` for both the
     /// `Attribution::Repo { project: Some(_) }` and `Attribution::ProjectOnly`
     /// routes.
+    ///
+    /// `mode` is `"derived"` or `"explicit"` (see
+    /// `commands::stream::attribution_mode`) and is sent verbatim as the
+    /// `x-tracevault-project-attribution` header. The server ignores an
+    /// unrecognised value from an older CLI build talking to a newer server,
+    /// and an older server simply doesn't read the header at all — either way
+    /// this fails closed to derived attribution, never open.
     pub async fn stream_event_for_project(
         &self,
         project_id: uuid::Uuid,
         repo_id: Option<&str>,
+        mode: &str,
         req: &tracevault_protocol::streaming::StreamEventRequest,
     ) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn Error>> {
         let mut url = Url::parse(&format!(
@@ -707,7 +715,11 @@ impl ApiClient {
         if let Some(repo_id) = repo_id {
             url.query_pairs_mut().append_pair("repo_id", repo_id);
         }
-        let builder = self.client.post(url).json(req);
+        let builder = self
+            .client
+            .post(url)
+            .header("x-tracevault-project-attribution", mode)
+            .json(req);
         self.authed_send_json(builder, |status| {
             format!("Project stream failed ({status})")
         })

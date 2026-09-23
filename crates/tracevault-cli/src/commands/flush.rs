@@ -151,8 +151,19 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
                     QueueTarget::Repo(repo_id) => client.stream_event(repo_id, &event).await,
                     // Repo-less queue: drain to the project endpoint with no
                     // repo_id, the same shape the stream hook buffered it as.
+                    // The attribution mode is re-derived from THIS process's
+                    // environment/disk state at flush time, same as the live
+                    // send path — the buffered event itself doesn't carry the
+                    // mode it was originally captured under.
                     QueueTarget::Project(pid) => {
-                        client.stream_event_for_project(*pid, None, &event).await
+                        client
+                            .stream_event_for_project(
+                                *pid,
+                                None,
+                                crate::commands::stream::attribution_mode(),
+                                &event,
+                            )
+                            .await
                     }
                 };
                 match sent {
