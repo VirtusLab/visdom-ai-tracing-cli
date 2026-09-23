@@ -324,10 +324,11 @@ fn attribution_report(b: &ProjectBinding) -> Vec<String> {
     // The gloss `format_force_line` used to carry is folded in here rather
     // than dropped: it is the part that tells a reader what the mode MEANS,
     // and it applies to every mode, not only to a persisted force.
-    let gloss = if mode == "explicit" {
-        "this caller owns attribution; membership is not checked"
-    } else {
-        "TraceVault checks repo/project membership"
+    let gloss = match mode {
+        crate::api_client::AttributionMode::Explicit => {
+            "this caller owns attribution; membership is not checked"
+        }
+        crate::api_client::AttributionMode::Derived => "TraceVault checks repo/project membership",
     };
     let mut lines = vec![format!("attribution mode: {mode} ({gloss})")];
     if let Some(forced_until) = b.forced_until.as_deref() {
@@ -886,7 +887,7 @@ mod tests {
         };
         assert_eq!(
             crate::commands::stream::attribution_mode(Some(&b)),
-            "derived",
+            crate::api_client::AttributionMode::Derived,
             "the reported state and the header must agree on an unreadable force"
         );
     }

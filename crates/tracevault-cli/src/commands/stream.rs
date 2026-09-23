@@ -268,6 +268,50 @@ pub(crate) fn env_project_binding() -> Option<crate::session_state::ProjectBindi
     })
 }
 
+/// WHICH of the two force sources put a send into `explicit` attribution —
+/// the reason behind [`attribution_mode`]'s verdict, not a second opinion on
+/// it.
+///
+/// The two sources are not interchangeable and, crucially, are not undone
+/// the same way: the env var is process-wide and cleared by unsetting it,
+/// while a persisted force lives on the binding and is cleared by switching
+/// again without the flag. Any message that tells an operator how to STOP
+/// forcing therefore has to know which one is actually in effect — telling
+/// someone whose force came from `TRACEVAULT_PROJECT_ATTRIBUTION` to drop a
+/// CLI flag is advice that silently changes nothing (Copilot on PR #54).
+///
+/// This carries the reason alongside the verdict instead of letting the
+/// message-building code re-derive it, because re-deriving it would mean a
+/// second copy of the env-var read and the `forced_until` parse — exactly
+/// the two-codepaths-for-one-fact shape whose removal is the whole point of
+/// [`attribution_mode`] taking the winning binding as a parameter.
+///
+/// `Default` is "neither source is forcing", i.e. plain derived attribution
+/// — the ordinary case, and what a test that cares about routing rather
+/// than attribution wants to pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct AttributionForce {
+    /// `TRACEVAULT_PROJECT_ATTRIBUTION=explicit` is set in this process's
+    /// environment. Never expires; only unsetting it stops the forcing.
+    pub(crate) env: bool,
+    /// The winning binding carries a LIVE `forced_until`. Lapses on its own
+    /// (~12h); `project switch` without `--project-attribution explicit`
+    /// clears it immediately.
+    pub(crate) binding: bool,
+}
+
+impl AttributionForce {
+    /// The verdict these sources add up to. Either source alone forces;
+    /// neither does not.
+    pub(crate) fn mode(self) -> crate::api_client::AttributionMode {
+        if self.env || self.binding {
+            crate::api_client::AttributionMode::Explicit
+        } else {
+            crate::api_client::AttributionMode::Derived
+        }
+    }
+}
+
 /// Which attribution mode THIS PARTICULAR winning binding declares.
 ///
 /// `explicit` comes either from `TRACEVAULT_PROJECT_ATTRIBUTION` (per-process,
@@ -306,29 +350,46 @@ pub(crate) fn env_project_binding() -> Option<crate::session_state::ProjectBindi
 /// failing a hook over a typo'd env var helps nobody — silently falling back
 /// to the always-checked default is the safe direction to fail in.
 ///
-/// This always returns one of the two strings and the caller always sends it
-/// as the header — including the `"derived"` case. The server treats an
-/// absent header and an explicit `derived` value identically, but nothing
-/// here omits the header; "always emits one of two values" is simpler to
-/// reason about than "sometimes sends a header, sometimes doesn't."
+/// This always returns one of the two variants and the caller always sends
+/// it as the header — including the
+/// [`crate::api_client::AttributionMode::Derived`] case. The
+/// server treats an absent header and an explicit `derived` value
+/// identically, but nothing here omits the header; "always emits one of two
+/// values" is simpler to reason about than "sometimes sends a header,
+/// sometimes doesn't."
+///
+/// A verdict only. Callers that must also explain THE REASON — the refusal
+/// remediation, which has to name the force source it is telling the
+/// operator to remove — take [`attribution_force`] instead and call
+/// [`AttributionForce::mode`] on it; both spellings run the one evaluation
+/// below.
 pub(crate) fn attribution_mode(
     effective: Option<&crate::session_state::ProjectBinding>,
-) -> &'static str {
-    let env_forced = std::env::var("TRACEVAULT_PROJECT_ATTRIBUTION")
-        .map(|v| v.trim().eq_ignore_ascii_case("explicit"))
-        .unwrap_or(false);
-    let binding_forced = effective
-        .and_then(|b| b.forced_until.as_deref())
-        .is_some_and(|s| {
-            matches!(
-                crate::session_state::force_status(s),
-                crate::session_state::ForceStatus::Live(_)
-            )
-        });
-    if env_forced || binding_forced {
-        "explicit"
-    } else {
-        "derived"
+) -> crate::api_client::AttributionMode {
+    attribution_force(effective).mode()
+}
+
+/// The single evaluation behind [`attribution_mode`]: reads both force
+/// sources ONCE and reports each separately, so the verdict and any
+/// explanation of it are the same fact viewed twice rather than two facts
+/// that can drift. See [`AttributionForce`] for why the distinction is
+/// load-bearing, and [`attribution_mode`]'s doc comment for why each source
+/// is read the way it is.
+pub(crate) fn attribution_force(
+    effective: Option<&crate::session_state::ProjectBinding>,
+) -> AttributionForce {
+    AttributionForce {
+        env: std::env::var("TRACEVAULT_PROJECT_ATTRIBUTION")
+            .map(|v| v.trim().eq_ignore_ascii_case("explicit"))
+            .unwrap_or(false),
+        binding: effective
+            .and_then(|b| b.forced_until.as_deref())
+            .is_some_and(|s| {
+                matches!(
+                    crate::session_state::force_status(s),
+                    crate::session_state::ForceStatus::Live(_)
+                )
+            }),
     }
 }
 
@@ -431,20 +492,38 @@ pub(crate) enum ClientErrorKind {
 /// The one-line error printed when the server refuses a project-scoped send.
 /// Pure, so the wording is asserted directly rather than by capturing stderr.
 ///
-/// `mode` is the attribution mode this send actually declared — the same
-/// value [`attribution_mode`] put in the `x-tracevault-project-attribution`
-/// header, so the message and the wire can never disagree. It matters because
-/// the force gate also refuses with a 403: "not Operator on the project", or
-/// "`explicit` from a `tvk_` key". Without naming it, an operator who asked
-/// for `explicit` got an error about membership and realm roles and was never
-/// told the force itself was what got refused. Failing closed on trust is
-/// right; failing closed silently is the defect.
+/// `force` is the force situation this send actually declared — the exact
+/// [`AttributionForce`] whose [`AttributionForce::mode`] filled the
+/// `x-tracevault-project-attribution` header, so the message and the wire
+/// can never disagree. It matters because the force gate also refuses with a
+/// 403: "not Operator on the project", or "`explicit` from a `tvk_` key".
+/// Without naming it, an operator who asked for `explicit` got an error about
+/// membership and realm roles and was never told the force itself was what
+/// got refused. Failing closed on trust is right; failing closed silently is
+/// the defect.
+///
+/// The force clause takes the whole `AttributionForce`, not just the mode,
+/// because its remediation has to name the source ACTUALLY in effect. The
+/// two are undone differently and only one of them by a CLI flag: an earlier
+/// wording told everyone to switch again without `--project-attribution
+/// explicit`, which for an env-sourced force clears a persisted
+/// `forced_until` that may not even exist while [`attribution_force`] goes
+/// on reading `TRACEVAULT_PROJECT_ATTRIBUTION` and every subsequent send
+/// keeps declaring `explicit` — advice that silently does nothing, handed
+/// out on the one code path a confused operator reaches (Copilot on PR #54).
+/// [`force_remediation`] derives the fix from the same struct the header
+/// came from, so it cannot name a source that is not set, or miss one that
+/// is.
 ///
 /// The extra clause is attached to `Forbidden` ONLY. A `Scoping` 4xx
 /// (400/404/409) means the project id itself does not resolve — the force
 /// gate never ran — so blaming the force there would be a new wrong
 /// explanation of exactly the kind this fixes.
-pub(crate) fn refused_error(pid: uuid::Uuid, kind: &ClientErrorKind, mode: &str) -> String {
+pub(crate) fn refused_error(
+    pid: uuid::Uuid,
+    kind: &ClientErrorKind,
+    force: AttributionForce,
+) -> String {
     let base = match kind {
         // Since Keycloak, a 403 has a SECOND and now more common cause: the
         // account has no `tracing` realm role at all, in which case nothing this
@@ -468,16 +547,51 @@ pub(crate) fn refused_error(pid: uuid::Uuid, kind: &ClientErrorKind, mode: &str)
              machine-wide default in `user_project.toml`) to update it."
         ),
     };
-    if mode == "explicit" && matches!(kind, ClientErrorKind::Forbidden) {
+    if force.mode() == crate::api_client::AttributionMode::Explicit
+        && matches!(kind, ClientErrorKind::Forbidden)
+    {
         return format!(
             "{base} This send declared `explicit` attribution, so the refusal may be of the \
              FORCE itself: forcing needs `Operator` on that project AND a Control Plane \
-             identity (a `tvk_` API key can never force). Drop the force with `tracevault \
-             project switch <name>` (no `--project-attribution explicit`) if membership \
-             attribution is what you want."
+             identity (a `tvk_` API key can never force). If membership attribution is what \
+             you want, {}",
+            force_remediation(force)
         );
     }
     base
+}
+
+/// How to STOP forcing, given which source(s) are doing it.
+///
+/// A sentence fragment completing "If membership attribution is what you
+/// want, ...", so the caller keeps the framing and this keeps the facts.
+///
+/// Only ever reached with at least one source set (see [`refused_error`]'s
+/// guard, which is `force.mode() == Explicit` — i.e. `env || binding`), so
+/// the all-false arm is unreachable in practice. It still has to say
+/// something rather than panic: this runs while printing an error on the
+/// capture path, and a hook that panics mid-diagnostic is strictly worse
+/// than one that prints a slightly vague line. The fallback names both ways,
+/// which is wrong about emphasis but never wrong about the fix.
+///
+/// When BOTH are set the message says so explicitly: removing one alone
+/// leaves the other still forcing, which would look exactly like the fix not
+/// working.
+fn force_remediation(force: AttributionForce) -> String {
+    let env_fix = "unset `TRACEVAULT_PROJECT_ATTRIBUTION` in this environment (it is \
+                   process-wide and never expires, so no switch clears it)";
+    let binding_fix = "run `tracevault project switch <name>` WITHOUT \
+                       `--project-attribution explicit` (add `--user` if the forced binding \
+                       is the machine-wide default in `user_project.toml`)";
+    match (force.env, force.binding) {
+        (true, false) => format!("{env_fix}."),
+        (false, true) => format!("{binding_fix}."),
+        // Both: neither fix is sufficient alone.
+        (true, true) => {
+            format!("BOTH forces are in effect and both must go — {env_fix}, and {binding_fix}.")
+        }
+        (false, false) => format!("{env_fix}, or {binding_fix}."),
+    }
 }
 
 pub(crate) fn deterministic_client_error_kind(
@@ -544,18 +658,20 @@ pub(crate) fn deterministic_client_error_kind(
 /// reason: draining a queue of undeliverable events would otherwise print one
 /// line per buffered event.
 ///
-/// `mode` is the invocation's attribution mode — [`attribution_mode`] applied
-/// to the capture binding — sent verbatim as the
-/// `x-tracevault-project-attribution` header on every project-scoped send.
-/// Taken as a parameter rather than derived here because the binding is
-/// invariant across a whole hook invocation while this function runs once per
-/// buffered event, and the mode costs a `user_project.toml` read plus an
-/// RFC3339 parse. `commands::flush` resolves it once per queue for the same
-/// reason.
+/// `force` is the invocation's attribution force — [`attribution_force`]
+/// applied to the capture binding. Its [`AttributionForce::mode`] goes on
+/// every project-scoped send as the `x-tracevault-project-attribution`
+/// header, and the same value is handed to [`refused_error`], which needs
+/// the SOURCES and not only the verdict to tell the operator how to stop
+/// forcing. Taken as a parameter rather than derived here because the
+/// binding is invariant across a whole hook invocation while this function
+/// runs once per buffered event, and the evaluation costs an env read plus
+/// an RFC3339 parse. `commands::flush` resolves it once per queue for the
+/// same reason.
 async fn send_stream_event(
     client: &crate::api_client::ApiClient,
     attribution: &Attribution,
-    mode: &str,
+    force: AttributionForce,
     req: &StreamEventRequest,
     warned: &mut bool,
 ) -> Result<Option<tracevault_protocol::streaming::StreamEventResponse>, Box<dyn std::error::Error>>
@@ -580,7 +696,7 @@ async fn send_stream_event(
         // transient error. Both propagate so the caller queues them.
         Attribution::ProjectOnly { project_id } => {
             let attempt = client
-                .stream_event_for_project(*project_id, None, mode, req)
+                .stream_event_for_project(*project_id, None, force.mode(), req)
                 .await;
             return match attempt {
                 Ok(r) => Ok(Some(r)),
@@ -602,7 +718,7 @@ async fn send_stream_event(
         None => client.stream_event(repo_id, req).await.map(Some),
         Some(pid) => {
             let attempt = client
-                .stream_event_for_project(pid, Some(repo_id), mode, req)
+                .stream_event_for_project(pid, Some(repo_id), force.mode(), req)
                 .await;
             let kind = match &attempt {
                 Ok(_) => None,
@@ -619,7 +735,7 @@ async fn send_stream_event(
                         // code path users hit most. The server's 403 envelope
                         // isn't distinguishable from here (see
                         // `ClientErrorKind`), so the wording names both.
-                        eprintln!("{}", refused_error(pid, &kind, mode));
+                        eprintln!("{}", refused_error(pid, &kind, force));
                         *warned = true;
                     }
                     // The caller declared this project; the server refused it.
@@ -935,10 +1051,12 @@ pub async fn run_stream(
         .as_ref()
         .and_then(crate::resolution::capture_project_id);
     // Resolved once per invocation, not per event — the binding is invariant
-    // across the pending-flush loop and the live send below, while the mode
-    // read costs a `user_project.toml` read and an RFC3339 parse.
-    // `commands::flush` resolves it once per queue for the same reason.
-    let mode = attribution_mode(capture_binding.as_ref());
+    // across the pending-flush loop and the live send below, while the
+    // evaluation costs an env read and an RFC3339 parse. `commands::flush`
+    // resolves it once per queue for the same reason. The whole
+    // `AttributionForce` travels, not just its mode: a refusal has to name
+    // the force source it is telling the operator to remove.
+    let force = attribution_force(capture_binding.as_ref());
 
     // Ship if EITHER a repo or a project resolved; no-op only when neither
     // did. (`binding_repo_id_is_valid` guards a corrupted/hand-edited
@@ -967,7 +1085,7 @@ pub async fn run_stream(
     // Send pending events first
     for (i, pending_json) in pending_events.iter().enumerate() {
         if let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(pending_json) {
-            if send_stream_event(&client, &attribution, mode, &pending_req, &mut warned)
+            if send_stream_event(&client, &attribution, force, &pending_req, &mut warned)
                 .await
                 .is_err()
             {
@@ -1002,7 +1120,7 @@ pub async fn run_stream(
             fs::write(&offset_path, new_offset.to_string())?;
         }
     } else {
-        match send_stream_event(&client, &attribution, mode, &req, &mut warned).await {
+        match send_stream_event(&client, &attribution, force, &req, &mut warned).await {
             Ok(_) => {
                 // 10. On success update .stream_offset
                 fs::write(&offset_path, new_offset.to_string())?;
@@ -1028,6 +1146,7 @@ pub async fn run_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_client::AttributionMode;
     use crate::config::UserContext;
     use crate::context::{Context, EffectiveContext};
     use std::collections::BTreeMap;
@@ -1779,7 +1898,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
 
-        assert_eq!(attribution_mode(None), "explicit");
+        assert_eq!(attribution_mode(None), AttributionMode::Explicit);
     }
 
     #[test]
@@ -1788,14 +1907,14 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
 
         _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
-        assert_eq!(attribution_mode(None), "derived");
+        assert_eq!(attribution_mode(None), AttributionMode::Derived);
 
         // The CLI does not forward a value it does not recognise: the server
         // would 400 it, and failing a hook over a typo'd env var helps
         // nobody. The server's strictness is for callers that bypass the
         // CLI.
         _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "yes-please");
-        assert_eq!(attribution_mode(None), "derived");
+        assert_eq!(attribution_mode(None), AttributionMode::Derived);
     }
 
     /// The binding-persisted half of `attribution_mode`: a LIVE `forced_until`
@@ -1812,7 +1931,7 @@ mod tests {
         let future = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
         let binding = forced_binding(Some(&future));
 
-        assert_eq!(attribution_mode(Some(&binding)), "explicit");
+        assert_eq!(attribution_mode(Some(&binding)), AttributionMode::Explicit);
     }
 
     /// This is the test that would fail if a lapsed persisted force still
@@ -1830,7 +1949,7 @@ mod tests {
         let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
         let binding = forced_binding(Some(&past));
 
-        assert_eq!(attribution_mode(Some(&binding)), "derived");
+        assert_eq!(attribution_mode(Some(&binding)), AttributionMode::Derived);
     }
 
     /// A `forced_until` that doesn't even parse as RFC3339 (a hand-edited or
@@ -1845,7 +1964,7 @@ mod tests {
 
         let binding = forced_binding(Some("not-a-timestamp"));
 
-        assert_eq!(attribution_mode(Some(&binding)), "derived");
+        assert_eq!(attribution_mode(Some(&binding)), AttributionMode::Derived);
     }
 
     /// Env-provided force must be exempt from expiry in fact, not just by
@@ -1863,7 +1982,7 @@ mod tests {
         let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
         let binding = forced_binding(Some(&past));
 
-        assert_eq!(attribution_mode(Some(&binding)), "explicit");
+        assert_eq!(attribution_mode(Some(&binding)), AttributionMode::Explicit);
     }
 
     /// VIS-305 Part C review, Important finding 1: a SESSION-scoped force
@@ -1917,7 +2036,7 @@ mod tests {
         let got = send_stream_event(
             &client,
             &Attribution::ProjectOnly { project_id: pid },
-            attribution_mode(capture_binding.as_ref()),
+            attribution_force(capture_binding.as_ref()),
             &req,
             &mut warned,
         )
@@ -1979,7 +2098,7 @@ mod tests {
 
         assert_eq!(
             attribution_mode(capture_binding.as_ref()),
-            "derived",
+            AttributionMode::Derived,
             "a force on the user-default project must not leak onto a DIFFERENT, \
              higher-precedence project that never asked to be forced"
         );
@@ -2181,7 +2300,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: capture_pid,
             },
-            attribution_mode(capture_binding.as_ref()),
+            attribution_force(capture_binding.as_ref()),
             &req,
             &mut warned,
         )
@@ -2246,7 +2365,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: None,
             },
-            attribution_mode(capture_binding.as_ref()),
+            attribution_force(capture_binding.as_ref()),
             &req,
             &mut warned,
         )
@@ -2333,7 +2452,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: Some(pid),
             },
-            attribution_mode(None),
+            attribution_force(None),
             &req,
             &mut warned,
         )
@@ -2393,7 +2512,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: Some(pid),
             },
-            attribution_mode(None),
+            attribution_force(None),
             &req,
             &mut warned,
         )
@@ -2452,7 +2571,7 @@ mod tests {
             send_stream_event(
                 &client,
                 &attribution,
-                attribution_mode(None),
+                attribution_force(None),
                 &req,
                 &mut warned
             )
@@ -2466,7 +2585,7 @@ mod tests {
             send_stream_event(
                 &client,
                 &attribution,
-                attribution_mode(None),
+                attribution_force(None),
                 &req,
                 &mut warned
             )
@@ -2522,7 +2641,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: Some(pid),
             },
-            attribution_mode(Some(&forced)),
+            attribution_force(Some(&forced)),
             &req,
             &mut warned,
         )
@@ -2579,7 +2698,7 @@ mod tests {
         let got = send_stream_event(
             &client,
             &Attribution::ProjectOnly { project_id: pid },
-            attribution_mode(None),
+            attribution_force(None),
             &req,
             &mut warned,
         )
@@ -2640,7 +2759,7 @@ mod tests {
         let got = send_stream_event(
             &client,
             &Attribution::ProjectOnly { project_id: pid },
-            attribution_mode(None),
+            attribution_force(None),
             &req,
             &mut warned,
         )
@@ -2689,7 +2808,7 @@ mod tests {
             &Attribution::ProjectOnly {
                 project_id: uuid::Uuid::from_u128(13),
             },
-            attribution_mode(None),
+            attribution_force(None),
             &req,
             &mut warned,
         )
@@ -2725,7 +2844,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: Some(pid),
             },
-            attribution_mode(None),
+            attribution_force(None),
             &req,
             &mut warned,
         )
@@ -2804,7 +2923,11 @@ mod tests {
     fn refused_error_names_both_403_causes_and_never_claims_re_attribution() {
         let pid = uuid::Uuid::from_u128(7);
 
-        let forbidden = refused_error(pid, &ClientErrorKind::Forbidden, "derived");
+        let forbidden = refused_error(
+            pid,
+            &ClientErrorKind::Forbidden,
+            AttributionForce::default(),
+        );
         assert!(forbidden.contains("403"), "{forbidden}");
         assert!(
             forbidden.contains("realm role"),
@@ -2822,7 +2945,7 @@ mod tests {
 
         // A 400/404/409 genuinely IS a binding problem, so that wording stays
         // unhedged — hedging everything would dilute the useful case.
-        let scoping = refused_error(pid, &ClientErrorKind::Scoping, "derived");
+        let scoping = refused_error(pid, &ClientErrorKind::Scoping, AttributionForce::default());
         assert!(scoping.contains("project switch"), "{scoping}");
         assert!(
             !scoping.contains("realm role"),
@@ -2862,7 +2985,14 @@ mod tests {
     fn the_403_error_says_the_force_was_refused_when_the_send_declared_explicit() {
         let pid = uuid::Uuid::from_u128(7);
 
-        let explicit = refused_error(pid, &ClientErrorKind::Forbidden, "explicit");
+        let explicit = refused_error(
+            pid,
+            &ClientErrorKind::Forbidden,
+            AttributionForce {
+                env: false,
+                binding: true,
+            },
+        );
         assert!(
             explicit.contains("FORCE"),
             "the refusal of the force itself must be named: {explicit}"
@@ -2893,7 +3023,11 @@ mod tests {
         // refused and the clause must not appear. This is the discriminating
         // half — without it the test would pass on a message that blamed the
         // force unconditionally, which is just a different wrong story.
-        let derived = refused_error(pid, &ClientErrorKind::Forbidden, "derived");
+        let derived = refused_error(
+            pid,
+            &ClientErrorKind::Forbidden,
+            AttributionForce::default(),
+        );
         assert!(
             !derived.contains("FORCE"),
             "a `derived` send never forced anything: {derived}"
@@ -2907,12 +3041,128 @@ mod tests {
     #[test]
     fn an_explicit_scoping_failure_does_not_blame_the_force() {
         let pid = uuid::Uuid::from_u128(7);
-        let scoping = refused_error(pid, &ClientErrorKind::Scoping, "explicit");
+        let scoping = refused_error(
+            pid,
+            &ClientErrorKind::Scoping,
+            AttributionForce {
+                env: true,
+                binding: true,
+            },
+        );
         assert!(!scoping.contains("FORCE"), "{scoping}");
         assert_eq!(
             scoping,
-            refused_error(pid, &ClientErrorKind::Scoping, "derived"),
+            refused_error(pid, &ClientErrorKind::Scoping, AttributionForce::default()),
             "the scoping wording does not depend on the mode"
+        );
+    }
+
+    /// Copilot on PR #54: the remediation told EVERY forced sender to switch
+    /// again without `--project-attribution explicit`. That clears a
+    /// persisted `forced_until` and nothing else — so when the force came
+    /// from `TRACEVAULT_PROJECT_ATTRIBUTION`, [`attribution_force`] goes on
+    /// reading the environment, every later send still declares `explicit`,
+    /// and the advice silently does nothing. On the one code path a confused
+    /// operator reaches.
+    ///
+    /// Each case is driven through `attribution_force` and a REAL exported
+    /// variable rather than a hand-built struct, so what this pins is the
+    /// whole path: the value that decides the header is the value the
+    /// wording is derived from, and the two cannot describe different
+    /// worlds.
+    ///
+    /// Discriminating in both directions — each case asserts the fix that
+    /// applies AND the absence of the one that doesn't — because a message
+    /// that simply listed both remediations every time would pass a
+    /// one-sided test while being the same "advice that may not apply"
+    /// defect in a longer form.
+    #[test]
+    fn the_403_remediation_names_the_force_source_actually_in_effect() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        let pid = uuid::Uuid::from_u128(7);
+        let live = forced_binding(Some(
+            &(chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339(),
+        ));
+        let never_forced = forced_binding(None);
+
+        // ENV ONLY. The binding carries no force at all, so "switch again
+        // without the flag" would change precisely nothing: the next send
+        // reads the same variable and declares `explicit` again.
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
+        let env_only = refused_error(
+            pid,
+            &ClientErrorKind::Forbidden,
+            attribution_force(Some(&never_forced)),
+        );
+        assert!(
+            env_only.contains("FORCE"),
+            "an env-sourced force is still a force: {env_only}"
+        );
+        assert!(
+            env_only.contains("unset `TRACEVAULT_PROJECT_ATTRIBUTION`"),
+            "must name the variable that is doing the forcing: {env_only}"
+        );
+        assert!(
+            !env_only.contains("--project-attribution"),
+            "must NOT tell the operator to drop a flag that would change \
+             nothing here — this is the bug: {env_only}"
+        );
+
+        // BINDING ONLY. Now the flag advice is the right one, and naming the
+        // env var would send the operator hunting for an export that isn't
+        // set.
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+        let binding_only = refused_error(
+            pid,
+            &ClientErrorKind::Forbidden,
+            attribution_force(Some(&live)),
+        );
+        assert!(
+            binding_only.contains("--project-attribution"),
+            "a persisted force IS cleared by switching without the flag: {binding_only}"
+        );
+        assert!(
+            !binding_only.contains("TRACEVAULT_PROJECT_ATTRIBUTION"),
+            "must not send the operator after an unset variable: {binding_only}"
+        );
+
+        // BOTH. Removing either one alone leaves the other forcing, which
+        // would look exactly like the fix not working — so the message has
+        // to say both must go.
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
+        let both = refused_error(
+            pid,
+            &ClientErrorKind::Forbidden,
+            attribution_force(Some(&live)),
+        );
+        assert!(
+            both.contains("TRACEVAULT_PROJECT_ATTRIBUTION")
+                && both.contains("--project-attribution"),
+            "both sources are in effect and both must be named: {both}"
+        );
+        assert!(
+            both.contains("BOTH"),
+            "must say that removing only one is not enough: {both}"
+        );
+    }
+
+    /// The remediation is built from the same `AttributionForce` the header
+    /// is, so it can never describe a force the send did not declare: with
+    /// no source set there is no force clause at all, whatever the wording
+    /// of the fixes would have been.
+    #[test]
+    fn no_force_means_no_remediation_clause() {
+        let pid = uuid::Uuid::from_u128(7);
+        let none = refused_error(
+            pid,
+            &ClientErrorKind::Forbidden,
+            AttributionForce::default(),
+        );
+        assert!(
+            !none.contains("TRACEVAULT_PROJECT_ATTRIBUTION")
+                && !none.contains("--project-attribution"),
+            "a derived send has no force to remove: {none}"
         );
     }
 }

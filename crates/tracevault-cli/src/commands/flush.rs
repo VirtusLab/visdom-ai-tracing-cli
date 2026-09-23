@@ -99,9 +99,11 @@ fn display_prefix(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
-/// The attribution mode a whole queue declares on the wire, resolved once per
-/// queue (not per event: it reads `user_project.toml` and parses an RFC3339
-/// timestamp).
+/// The attribution force a whole queue declares on the wire, resolved once
+/// per queue (not per event: it reads the environment and parses an RFC3339
+/// timestamp). The whole [`crate::commands::stream::AttributionForce`]
+/// rather than just its mode, for the same reason the live path carries it:
+/// a refusal has to name the force source it tells the operator to remove.
 ///
 /// Both queue kinds read it off the capture binding [`queue_capture_binding`]
 /// resolved — the same binding, and therefore the same rule, the live send
@@ -117,17 +119,17 @@ fn display_prefix(id: &str) -> &str {
 /// `attribution_mode`'s binding-scoping exists to prevent (see
 /// `attribution_mode`'s doc comment for the two-sided bug that motivated
 /// this).
-fn queue_attribution_mode(
+fn queue_attribution_force(
     target: &QueueTarget,
     capture_binding: Option<&crate::session_state::ProjectBinding>,
-) -> &'static str {
+) -> crate::commands::stream::AttributionForce {
     let speaks_for_this_queue = match target {
         QueueTarget::Repo(_) => capture_binding,
         QueueTarget::Project(pid) => {
             capture_binding.filter(|b| crate::resolution::capture_project_id(b) == Some(*pid))
         }
     };
-    crate::commands::stream::attribution_mode(speaks_for_this_queue)
+    crate::commands::stream::attribution_force(speaks_for_this_queue)
 }
 
 /// What happened to one queued event on its way back to the server.
@@ -159,14 +161,14 @@ pub(crate) enum QueuedSend {
 /// `commands::stream::capture_binding` takes no repo at all. Which endpoint
 /// the queue then drains to is [`send_queued_event`]'s decision, and what the
 /// binding is allowed to say about a repo-less queue is
-/// [`queue_attribution_mode`]'s.
+/// [`queue_attribution_force`]'s.
 ///
 /// Without this, `flush` would drain a repo queue to the repo-scoped endpoint
 /// and let the server deduce a project, re-attributing the very events the
 /// hook queued because the server REFUSED the declared project.
 ///
 /// The whole binding, not just its id: its `forced_until` is what
-/// [`queue_attribution_mode`] reads, so a flushed event declares the same
+/// [`queue_attribution_force`] reads, so a flushed event declares the same
 /// attribution mode the live send would have (see
 /// `commands::stream::attribution_mode` for why the force must come from the
 /// binding that actually won, and no other).
@@ -191,28 +193,28 @@ fn queue_capture_binding(session_dir: &Path) -> Option<crate::session_state::Pro
 /// removes. A repo-less queue drains to the project endpoint with no repo id,
 /// the same shape the stream hook buffered it as, and keeps its old rules.
 ///
-/// `mode` is the queue's attribution mode ([`queue_attribution_mode`]), sent
-/// verbatim as the `x-tracevault-project-attribution` header on every
-/// project-scoped send, so a flushed event declares exactly what the live
-/// send would have.
+/// `force` is the queue's attribution force ([`queue_attribution_force`]);
+/// its mode goes on every project-scoped send as the
+/// `x-tracevault-project-attribution` header, so a flushed event declares
+/// exactly what the live send would have.
 pub(crate) async fn send_queued_event(
     client: &ApiClient,
     target: &QueueTarget,
     capture_pid: Option<uuid::Uuid>,
-    mode: &str,
+    force: crate::commands::stream::AttributionForce,
     event: &StreamEventRequest,
 ) -> QueuedSend {
     let (sent, refusable_pid) = match (target, capture_pid) {
         (QueueTarget::Repo(repo_id), None) => (client.stream_event(repo_id, event).await, None),
         (QueueTarget::Repo(repo_id), Some(pid)) => (
             client
-                .stream_event_for_project(pid, Some(repo_id), mode, event)
+                .stream_event_for_project(pid, Some(repo_id), force.mode(), event)
                 .await,
             Some(pid),
         ),
         (QueueTarget::Project(pid), _) => (
             client
-                .stream_event_for_project(*pid, None, mode, event)
+                .stream_event_for_project(*pid, None, force.mode(), event)
                 .await,
             None,
         ),
@@ -245,7 +247,7 @@ async fn drain_queue(
     pending_path: &Path,
     target: &QueueTarget,
     capture_pid: Option<uuid::Uuid>,
-    mode: &str,
+    force: crate::commands::stream::AttributionForce,
 ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
     let events = drain_pending(pending_path)?;
     if events.is_empty() {
@@ -277,7 +279,7 @@ async fn drain_queue(
             event_total
         );
         event.truncate_large_fields();
-        match send_queued_event(client, target, capture_pid, mode, &event).await {
+        match send_queued_event(client, target, capture_pid, force, &event).await {
             QueuedSend::Sent => sent += 1,
             QueuedSend::TooLarge => {
                 // Payload too large even after truncation — drop it.
@@ -297,7 +299,7 @@ async fn drain_queue(
                 eprintln!();
                 eprintln!(
                     "{}",
-                    crate::commands::stream::refused_error(pid, &kind, mode)
+                    crate::commands::stream::refused_error(pid, &kind, force)
                 );
                 failed_events.push(event);
                 failed_events.extend(events.by_ref().map(|(_, e)| e));
@@ -350,15 +352,15 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
         let pending_queues = pending_queues_in(&session_dir, bound_repo_id.as_deref())?;
 
         for (pending_path, target) in pending_queues {
-            // Resolved once per queue, not per event — the mode read costs a
-            // `user_project.toml` read and an RFC3339 parse.
+            // Resolved once per queue, not per event — the force read costs
+            // an env read and an RFC3339 parse.
             let capture_binding = queue_capture_binding(&session_dir);
             let capture_pid = capture_binding
                 .as_ref()
                 .and_then(crate::resolution::capture_project_id);
-            let mode = queue_attribution_mode(&target, capture_binding.as_ref());
+            let force = queue_attribution_force(&target, capture_binding.as_ref());
             let (sent, failed) =
-                drain_queue(&client, &pending_path, &target, capture_pid, mode).await?;
+                drain_queue(&client, &pending_path, &target, capture_pid, force).await?;
             total_sent += sent;
             total_failed += failed;
         }
@@ -717,6 +719,8 @@ mod queue_target_tests {
 #[cfg(test)]
 mod send_tests {
     use super::*;
+    use crate::api_client::AttributionMode;
+    use crate::commands::stream::AttributionForce;
     use crate::test_helpers::{http_json, lock_env_mutation, spawn_seq, EnvVarGuard, RECV_TIMEOUT};
     use std::path::PathBuf;
     use std::time::Duration;
@@ -798,7 +802,7 @@ mod send_tests {
             &client,
             &QueueTarget::Repo(REPO.into()),
             Some(pid),
-            "derived",
+            AttributionForce::default(),
             &event(1),
         )
         .await;
@@ -814,7 +818,7 @@ mod send_tests {
     }
 
     /// VIS-305: a flushed event declares the SAME attribution mode the live
-    /// send would have. `queue_attribution_mode` reads it off the capture
+    /// send would have. `queue_attribution_force` reads it off the capture
     /// binding that decided the repo queue's project — so a live
     /// `forced_until` on that binding must reach the wire as `explicit`, and
     /// an unforced one as `derived`. Without this, a queued event would
@@ -838,13 +842,16 @@ mod send_tests {
         };
         let target = QueueTarget::Repo(REPO.into());
 
-        for (binding, expected) in [(&forced, "explicit"), (&unforced, "derived")] {
-            let mode = queue_attribution_mode(&target, Some(binding));
-            assert_eq!(mode, expected, "mode for {binding:?}");
+        for (binding, expected) in [
+            (&forced, AttributionMode::Explicit),
+            (&unforced, AttributionMode::Derived),
+        ] {
+            let force = queue_attribution_force(&target, Some(binding));
+            assert_eq!(force.mode(), expected, "mode for {binding:?}");
 
             let (base, rx) = spawn_seq(vec![ok()]);
             let client = ApiClient::new(&base, Some("tok"));
-            let got = send_queued_event(&client, &target, Some(pid), mode, &event(1)).await;
+            let got = send_queued_event(&client, &target, Some(pid), force, &event(1)).await;
             assert!(matches!(got, QueuedSend::Sent), "{got:?}");
 
             let captured = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
@@ -931,12 +938,16 @@ mod send_tests {
         );
 
         let target = QueueTarget::Project(pid);
-        let mode = queue_attribution_mode(&target, binding.as_ref());
-        assert_eq!(mode, "explicit", "a live session force must not be dropped");
+        let force = queue_attribution_force(&target, binding.as_ref());
+        assert_eq!(
+            force.mode(),
+            AttributionMode::Explicit,
+            "a live session force must not be dropped"
+        );
 
         let (base, rx) = spawn_seq(vec![ok()]);
         let client = ApiClient::new(&base, Some("tok"));
-        let got = send_queued_event(&client, &target, None, mode, &event(1)).await;
+        let got = send_queued_event(&client, &target, None, force, &event(1)).await;
         assert!(matches!(got, QueuedSend::Sent), "{got:?}");
         let captured = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
         assert!(
@@ -975,13 +986,13 @@ mod send_tests {
 
         let binding = queue_capture_binding(&session_dir);
         assert_eq!(
-            queue_attribution_mode(&QueueTarget::Project(project_a), binding.as_ref()),
-            "explicit",
+            queue_attribution_force(&QueueTarget::Project(project_a), binding.as_ref()).mode(),
+            AttributionMode::Explicit,
             "the queue the force was resolved FOR still gets it"
         );
         assert_eq!(
-            queue_attribution_mode(&QueueTarget::Project(project_b), binding.as_ref()),
-            "derived",
+            queue_attribution_force(&QueueTarget::Project(project_b), binding.as_ref()).mode(),
+            AttributionMode::Derived,
             "a force resolved for a DIFFERENT project must not leak onto this queue"
         );
     }
@@ -1020,15 +1031,16 @@ mod send_tests {
 
         let binding = queue_capture_binding(&session_dir);
         assert_eq!(
-            queue_attribution_mode(&QueueTarget::Project(pid), binding.as_ref()),
-            "explicit"
+            queue_attribution_force(&QueueTarget::Project(pid), binding.as_ref()).mode(),
+            AttributionMode::Explicit
         );
         assert_eq!(
-            queue_attribution_mode(
+            queue_attribution_force(
                 &QueueTarget::Project(uuid::Uuid::from_u128(0xD)),
                 binding.as_ref()
-            ),
-            "derived",
+            )
+            .mode(),
+            AttributionMode::Derived,
             "and still does not leak onto another project's queue"
         );
     }
@@ -1042,7 +1054,7 @@ mod send_tests {
             &client,
             &QueueTarget::Repo(REPO.into()),
             None,
-            "derived",
+            AttributionForce::default(),
             &event(1),
         )
         .await;
@@ -1070,7 +1082,7 @@ mod send_tests {
             &client,
             &QueueTarget::Repo(REPO.into()),
             Some(pid),
-            "derived",
+            AttributionForce::default(),
             &event(1),
         )
         .await;
@@ -1104,7 +1116,7 @@ mod send_tests {
             &client,
             &QueueTarget::Repo(REPO.into()),
             Some(uuid::Uuid::from_u128(0xC)),
-            "derived",
+            AttributionForce::default(),
             &event(1),
         )
         .await;
@@ -1129,7 +1141,7 @@ mod send_tests {
             &path,
             &QueueTarget::Repo(REPO.into()),
             Some(pid),
-            "derived",
+            AttributionForce::default(),
         )
         .await
         .unwrap();

@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tracevault_cli::api_client::ApiClient;
+use tracevault_cli::api_client::{ApiClient, AttributionMode};
 use tracevault_protocol::streaming::{StreamEventRequest, StreamEventType};
 
 /// How long a test waits for the captured request before failing (rather than
@@ -136,7 +136,7 @@ async fn stream_event_for_project_targets_project_endpoint() {
         .stream_event_for_project(
             project_id,
             Some("11111111-1111-1111-1111-111111111111"),
-            "explicit",
+            AttributionMode::Explicit,
             &req,
         )
         .await
@@ -150,8 +150,9 @@ async fn stream_event_for_project_targets_project_endpoint() {
         ),
         "got: {line}"
     );
-    // The `mode` argument must reach the wire verbatim as the attribution
-    // header — this is the one place outside the crate that can observe it.
+    // The `mode` argument must reach the wire as the attribution header,
+    // rendered by `AttributionMode::as_header_value` — this is the one place
+    // outside the crate that can observe the spelling.
     assert!(
         line.to_lowercase()
             .contains("x-tracevault-project-attribution: explicit"),
@@ -182,7 +183,7 @@ async fn stream_event_for_project_omits_repo_id_when_absent() {
     let req = sample_stream_event_request();
 
     let got = client
-        .stream_event_for_project(uuid::Uuid::nil(), None, "derived", &req)
+        .stream_event_for_project(uuid::Uuid::nil(), None, AttributionMode::Derived, &req)
         .await
         .unwrap();
     assert_eq!(got.status, "accepted");
