@@ -249,12 +249,32 @@ pub(crate) fn resolve_stream_binding(
     .map(|(b, _)| b)
 }
 
+/// `TRACEVAULT_PROJECT` as a binding, UUID form only.
+///
+/// A project NAME would require a `list_projects` round trip, and the capture
+/// path fires per event in a short-lived process — the same reason
+/// `capture_project` already ignores the repo config's `default_project`. The
+/// name form is honoured by the interactive commands, which already have a
+/// client in hand.
+pub(crate) fn env_project_binding() -> Option<crate::session_state::ProjectBinding> {
+    let raw = std::env::var("TRACEVAULT_PROJECT").ok()?;
+    let raw = raw.trim();
+    let parsed = raw.parse::<uuid::Uuid>().ok()?;
+    Some(crate::session_state::ProjectBinding {
+        project_id: parsed.to_string(),
+        project_name: String::new(),
+        updated_at: String::new(),
+    })
+}
+
 /// Resolve the capture-time project from LOCAL, UUID-bearing bindings only — no
 /// network (the hook fires per event in a short-lived process). Precedence:
-/// subagent worktree override -> session `active_project` -> user-level default.
-/// Repo config `default_project` (a name) is intentionally excluded: honoring it
-/// would need a per-event `list_projects` call. `None` -> fall back to the
-/// repo-scoped stream (server deduces).
+/// subagent worktree override -> `TRACEVAULT_PROJECT` -> session
+/// `active_project` -> user-level default. Repo config `default_project` (a
+/// name) is intentionally excluded: honoring it would need a per-event
+/// `list_projects` call, and `TRACEVAULT_PROJECT` is honoured in its UUID form
+/// only for the same reason. `None` -> fall back to the repo-scoped stream
+/// (server deduces).
 ///
 /// `pub(crate)`: also called by `commands::status`, which reuses this
 /// function (plus `resolve_stream_binding`/`attribution_for`) as the
@@ -267,7 +287,7 @@ pub(crate) fn capture_project(
     use crate::resolution::{effective_project, ProjectResolveInputs};
     let local = effective_project(&ProjectResolveInputs {
         project_flag: None,
-        env_project: None,
+        env_project: env_project_binding(),
         session,
         worktree_path,
         config_default: None,
@@ -1493,6 +1513,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(capture_project(&bad, None), None);
+    }
+
+    #[test]
+    fn env_project_binding_takes_a_uuid_and_ignores_a_name() {
+        // A name would need a `list_projects` round trip, and this path runs
+        // per-event in a short-lived hook process. Same rule already excludes
+        // `config_default` here.
+        let uuid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+
+        temp_env::with_var("TRACEVAULT_PROJECT", Some(uuid), || {
+            let got = env_project_binding().expect("uuid form is honoured");
+            assert_eq!(got.project_id, uuid);
+        });
+
+        temp_env::with_var("TRACEVAULT_PROJECT", Some("my-project"), || {
+            assert!(
+                env_project_binding().is_none(),
+                "a name is ignored on the network-free capture path"
+            );
+        });
+
+        temp_env::with_var("TRACEVAULT_PROJECT", None::<&str>, || {
+            assert!(env_project_binding().is_none());
+        });
     }
 
     // ── send_stream_event: endpoint routing based on capture_pid ──────────────
