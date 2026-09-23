@@ -5,9 +5,9 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::api_client::{resolve_client, ApiClient, ProjectListItem};
+use crate::api_client::{resolve_client, ApiClient, ProjectListItem, ResolveProjectOutcome};
 use crate::resolution::{
-    effective_project, git_remote_url, resolve_effective_project, ProjectResolveInputs,
+    capture_project_binding, capture_project_id, git_remote_url, CaptureProjectInputs,
     ProjectSource,
 };
 use crate::session_state::{self, ProjectBinding, SessionState};
@@ -44,9 +44,10 @@ pub enum ProjectCmd {
         /// Session to target; defaults to $TRACEVAULT_SESSION_ID.
         #[arg(long)]
         session_id: Option<String>,
-        /// One-off: resolve this project name and feed it in at the
-        /// `--project` precedence tier instead of the session/config
-        /// bindings.
+        /// What-if, display only: resolve this project name and feed it in at
+        /// the top of the precedence chain, above the session and user-default
+        /// bindings, to preview what `status` would report. It binds nothing;
+        /// use `project switch` to change what events are attributed to.
         #[arg(long)]
         project: Option<String>,
     },
@@ -294,21 +295,53 @@ async fn switch(
     Ok(())
 }
 
+/// The project `project status` treats as effective: exactly the capture-time
+/// chain ingest uses ([`capture_project_binding`]: `--project` flag →
+/// subagent worktree override → `TRACEVAULT_PROJECT` → session
+/// `active_project` → user default).
+/// Pure — `status` supplies `user_default` from `user_project_default::load()`
+/// and `env_project` from `commands::stream::env_project_binding()`, the same
+/// file and the same reader `commands::stream::capture_project` uses, so the
+/// two cannot drift (pinned by
+/// `project_status_effective_project_matches_capture_project`).
+///
+/// A binding whose stored id is not a UUID is dropped exactly as ingest drops
+/// it ([`capture_project_id`] → `None`), so the effective project is `None`
+/// and the second element carries the warning naming the tier it came from.
+fn status_effective(
+    project_flag: Option<ProjectBinding>,
+    env_project: Option<ProjectBinding>,
+    session: &SessionState,
+    worktree: Option<&str>,
+    user_default: Option<ProjectBinding>,
+) -> (Option<(ProjectBinding, ProjectSource)>, Option<String>) {
+    match capture_project_binding(&CaptureProjectInputs {
+        project_flag,
+        env_project,
+        session,
+        worktree_path: worktree,
+        user_default,
+    }) {
+        Some((binding, source)) if capture_project_id(&binding).is_none() => {
+            let warning = invalid_capture_id_warning(&binding, source);
+            (None, Some(warning))
+        }
+        other => (other, None),
+    }
+}
+
 /// Fill in a binding's friendly `project_name` from an already-fetched
 /// projects list, when the binding has none.
 ///
-/// Two tiers arrive nameless: `Deduced` (`resolve_effective_project` doesn't
-/// enrich it — see the comment there) and the UUID form of
-/// `TRACEVAULT_PROJECT`, which is parsed locally and never looked up. This
-/// used to gate on `source == Deduced`, which meant `status` broadened its
-/// `items` fetch for any `TRACEVAULT_PROJECT` and then threw the result away
-/// for the UUID form, printing a bare id. Gating on the EMPTY NAME instead —
-/// the condition actually being repaired — covers both without special-casing
-/// either. A binding that already has a name is untouched.
+/// The UUID form of `TRACEVAULT_PROJECT` arrives nameless: it is parsed
+/// locally by `commands::stream::env_project_binding` and never looked up, so
+/// without this `status` prints a bare UUID for a tier it just named. Gating
+/// on the EMPTY NAME rather than on a particular [`ProjectSource`] keeps this
+/// to the condition actually being repaired; a binding that already has a
+/// name is untouched.
 ///
-/// Kept simple: this never triggers an extra API call just for cosmetic
-/// enrichment; if no list is in scope, the name stays empty and
-/// `format_status` falls back to printing the id.
+/// Cosmetic only, and it never changes WHICH project is effective — the id is
+/// not touched — so it cannot make `status` disagree with ingest.
 fn enrich_project_name(
     effective: Option<(ProjectBinding, ProjectSource)>,
     items: Option<&[ProjectListItem]>,
@@ -327,101 +360,161 @@ fn enrich_project_name(
     })
 }
 
-/// The `project status` annotation for a `TRACEVAULT_PROJECT` that holds a
-/// NAME rather than a UUID.
+/// Warning for a `TRACEVAULT_PROJECT` that holds a NAME rather than a UUID.
 ///
-/// Mirrors the `Env` arm of `commands::status`'s `project_binding_check`, and
-/// exists for the same reason: the name resolves HERE (this command has a
-/// client) and nowhere on the capture path, so reporting the `Env` tier
-/// without qualification claims a tier the wire ignores. `uuid_form` is the
-/// capture path's own verdict — `env_project_binding().is_some()` — so the
-/// two surfaces cannot drift.
-fn env_name_form_note(source: ProjectSource, uuid_form: bool) -> Option<String> {
-    (source == ProjectSource::Env && !uuid_form).then(|| {
-        "note: TRACEVAULT_PROJECT holds a NAME, resolved here for display only; the capture \
-         path honours only the UUID form, so hooks in this shell attribute via the next tier"
-            .to_string()
-    })
+/// Same rule, and the same shape of warning, as [`config_default_warning`]:
+/// resolving a name needs a `list_projects` round trip, the per-event capture
+/// path never makes one, so the variable decides nothing and attribution
+/// falls through to the next tier. `status` therefore does NOT resolve it
+/// either — reporting a name-resolved project as effective would be exactly
+/// the status/ingest disagreement this command exists to remove.
+fn env_name_form_warning(raw: &str) -> String {
+    format!(
+        "warning: TRACEVAULT_PROJECT '{raw}' is a NAME; only the UUID form is used for attribution at capture time, so this value is ignored — export the project's id instead, or bind it with `tracevault project switch <name>`"
+    )
 }
 
-/// Pure formatter for `project status`'s output: which project is
-/// attributed, and via which precedence tier. Mirrors
-/// `commands::repo::format_status`. A `Deduced` binding carries an empty
-/// `project_name` (resolution.rs doesn't enrich it), so this falls back to
-/// the id for display.
-fn format_status(effective: Option<(&ProjectBinding, ProjectSource)>) -> String {
-    match effective {
-        Some((b, source)) => {
-            let label = if b.project_name.is_empty() {
-                &b.project_id
-            } else {
-                &b.project_name
-            };
-            format!("project: {label} via {source}")
-        }
-        None => "no project bound".to_string(),
+/// Display label for a binding: the friendly name, falling back to the id.
+fn binding_label(b: &ProjectBinding) -> &str {
+    if b.project_name.is_empty() {
+        &b.project_id
+    } else {
+        &b.project_name
     }
 }
 
+/// Pure formatter for `project status`'s effective-project line: the project
+/// ingest attributes events to, and via which precedence tier. Mirrors
+/// `commands::repo::format_status`. `None` means ingest sends events
+/// repo-scoped and leaves attribution to the server.
+fn format_status(effective: Option<(&ProjectBinding, ProjectSource)>) -> String {
+    match effective {
+        Some((b, source)) => format!("project: {} via {source}", binding_label(b)),
+        None => "no project bound locally; if a repo is bound, events are sent repo-scoped and the server deduces the project from the repo".to_string(),
+    }
+}
+
+/// Warning for a capture binding whose stored `project_id` is not a UUID:
+/// ingest drops it (`capture_project_id` → `None`), so `status` reports the
+/// session as unbound. Same rule and wording as `commands::status`'s
+/// `project_binding_check`.
+fn invalid_capture_id_warning(binding: &ProjectBinding, source: ProjectSource) -> String {
+    format!(
+        "warning: project {} — {source}, but the saved project_id is not a valid id and is dropped at capture time; run `tracevault project switch <name>` to rewrite it",
+        binding_label(binding)
+    )
+}
+
+/// Warning for a `.tracevault/config.toml` `default_project`: it is a name,
+/// ingest never resolves it (that would be a per-event network call), so it
+/// never decides attribution. `status` neither resolves it nor feeds it into
+/// the chain.
+fn config_default_warning(name: &str) -> String {
+    format!(
+        "warning: .tracevault/config.toml default_project '{name}' is not used for attribution at capture time; bind explicitly with `tracevault project switch <name>`"
+    )
+}
+
+/// Warning for `--project <name>` when no credentials resolved: the name
+/// cannot be looked up, so the override is ignored.
+fn offline_project_flag_warning(name: &str) -> String {
+    format!(
+        "warning: --project '{name}' cannot be resolved without server credentials; ignoring the override"
+    )
+}
+
+/// The name of a deduced project id, if the projects list is already in
+/// scope (fetched for `--project`). Never triggers an API call of its own:
+/// the name is cosmetic, and the id is printed when it is unknown.
+fn deduced_project_name(pid: uuid::Uuid, items: Option<&[ProjectListItem]>) -> Option<&str> {
+    items?.iter().find(|p| p.id == pid).map(|p| p.name.as_str())
+}
+
+/// Pure formatter for the server-deduction line: what the server would deduce
+/// from this repo's git remote if no local binding were set. Shown separately
+/// from the effective project because ingest never deduces client-side — it
+/// only matters when nothing is bound locally. `resolved_name` is the name of
+/// a `Resolved` project when already known (see [`deduced_project_name`]);
+/// otherwise the id is printed.
+fn format_deduction(
+    effective_is_bound: bool,
+    outcome: Result<ResolveProjectOutcome, String>,
+    resolved_name: Option<&str>,
+) -> String {
+    const PREFIX: &str = "server deduction for this repo:";
+    match outcome {
+        Ok(ResolveProjectOutcome::Resolved(pid)) => {
+            let pid = pid.to_string();
+            let label = resolved_name.unwrap_or(&pid);
+            if effective_is_bound {
+                format!("{PREFIX} {label} (not used: the local binding above wins)")
+            } else {
+                format!("{PREFIX} {label} (events will land here if a repo is bound)")
+            }
+        }
+        Ok(ResolveProjectOutcome::Ambiguous) => {
+            if effective_is_bound {
+                format!(
+                    "{PREFIX} ambiguous (multiple projects) — not used, the local binding above wins"
+                )
+            } else {
+                format!(
+                    "{PREFIX} ambiguous (multiple projects) — if a repo is bound, events will be refused until you run `tracevault project switch <name>`"
+                )
+            }
+        }
+        Ok(ResolveProjectOutcome::None) => format!("{PREFIX} none"),
+        Err(msg) => format!("{PREFIX} unavailable ({msg})"),
+    }
+}
+
+/// Everything `project status` prints: `warnings` go to stderr, `lines`
+/// (the effective-project line, then the deduction line when shown) to
+/// stdout. Built by [`status_report`] so tests assert the exact output.
+#[derive(Debug, Default)]
+struct StatusReport {
+    warnings: Vec<String>,
+    lines: Vec<String>,
+}
+
+/// `tracevault project status`: a read-only inspector that always returns
+/// `Ok(())`. Prints the [`StatusReport`] built by [`status_report`].
 async fn status(
     session_id: Option<&str>,
     project_flag_name: Option<&str>,
     project_root: &Path,
     cwd: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match resolve_status_effective(session_id, project_flag_name, project_root, cwd).await {
-        Ok(effective) => {
-            println!(
-                "{}",
-                format_status(effective.as_ref().map(|(b, s)| (b, *s)))
-            );
-            if let Some((b, source)) = &effective {
-                if let Some(note) = env_name_form_note(
-                    *source,
-                    crate::commands::stream::env_project_binding().is_some(),
-                ) {
-                    println!("{note}");
-                }
-                for line in attribution_report(b) {
-                    println!("{line}");
-                }
-            }
-        }
-        // `status` is a read-only inspector: unlike the callers that need an
-        // authoritative binding to act on, an unresolvable rung here (notably
-        // the ambiguous/409 "belongs to multiple projects" case) is
-        // informational, not fatal — report it and exit 0 rather than
-        // propagating the error up through `run`/`main` as a hard failure.
-        Err(e) => println!("project: unresolved — {e}"),
+    let report = status_report(session_id, project_flag_name, project_root, cwd).await;
+    for warning in &report.warnings {
+        eprintln!("{warning}");
+    }
+    for line in &report.lines {
+        println!("{line}");
     }
     Ok(())
 }
 
-/// The resolution core of `status`, pulled out so it can be exercised
-/// directly in tests (notably for `TRACEVAULT_PROJECT`) without capturing
-/// stdout: `status` itself is a thin wrapper that calls this, then prints
-/// `format_status` of the result (or the informational "unresolved" line on
-/// `Err`).
-///
-/// This chain is deliberately RICHER than the one `capture_project` runs at
-/// send time — it has a client, so it also resolves names and can deduce
-/// from the repo — which means the binding it picks, and therefore the
-/// attribution mode reported from that binding's `forced_until`, is
-/// indicative of what a hook will do rather than authoritative about it.
-async fn resolve_status_effective(
+/// The content of `project status`. The effective project is the
+/// capture-time chain (local, no network); the server's deduction from the
+/// git remote is shown on its own line, best-effort, as what would apply if
+/// nothing were bound locally. Never fails: every problem becomes a warning.
+async fn status_report(
     session_id: Option<&str>,
     project_flag_name: Option<&str>,
     project_root: &Path,
     cwd: &Path,
-) -> Result<Option<(ProjectBinding, ProjectSource)>, Box<dyn std::error::Error>> {
+) -> StatusReport {
+    let mut report = StatusReport::default();
     // Session state is best-effort: if a session id resolves, load it; else
     // warn and fall back to an empty SessionState.
     let session = match crate::commands::repo::resolve_session_id(session_id) {
         Ok(id) => session_state::load(&id),
         Err(_) => {
-            eprintln!(
+            report.warnings.push(
                 "warning: no session id (pass --session-id or set TRACEVAULT_SESSION_ID); \
                  showing binding without session context"
+                    .to_string(),
             );
             SessionState::default()
         }
@@ -432,118 +525,110 @@ async fn resolve_status_effective(
     let user_default = crate::user_project_default::load();
     let git_url = git_remote_url(cwd);
 
-    // Resolving a project *name* (--project override, or the config-file
-    // default_project) into a binding needs the server; running the full
-    // rung 4/5 chain (deduction, user default) needs it too. Best-effort: no
-    // client degrades to the pure local rungs (flag/config_default stay
-    // unresolved) rather than failing the whole inspector.
-    let effective = match resolve_client(project_root) {
-        Ok(client) => {
-            let items = if project_flag_name.is_some()
-                || config_default_name.is_some()
-                || std::env::var("TRACEVAULT_PROJECT").is_ok()
-            {
-                client.list_projects().await.ok()
-            } else {
-                None
-            };
-            let to_binding = |name: &str| -> Option<ProjectBinding> {
-                let matched = items
-                    .as_ref()
-                    .and_then(|items| resolve_project_name(items, name).ok())?;
-                Some(ProjectBinding {
+    // `TRACEVAULT_PROJECT` enters the chain through the capture path's OWN
+    // reader, which is UUID-only: `status` must not resolve a NAME into the
+    // chain, or it would report a project ingest never attributes to. The
+    // name form gets a warning instead.
+    let env_project = crate::commands::stream::env_project_binding();
+    let env_raw = std::env::var("TRACEVAULT_PROJECT")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty());
+    if env_project.is_none() {
+        if let Some(raw) = env_raw.as_deref() {
+            report.warnings.push(env_name_form_warning(raw));
+        }
+    }
+
+    // The server is needed only to resolve a `--project` NAME, to put a
+    // friendly name on the env binding's bare UUID, and to show the
+    // deduction line; the effective project itself is computed locally.
+    let client = match resolve_client(project_root) {
+        Ok(client) => Some(client),
+        Err(e) => {
+            report.warnings.push(format!(
+                "warning: could not resolve credentials ({e}); server deduction not shown"
+            ));
+            None
+        }
+    };
+
+    let mut items: Option<Vec<ProjectListItem>> = None;
+    let project_flag = match (project_flag_name, client.as_ref()) {
+        (Some(name), Some(client)) => {
+            items = client.list_projects().await.ok();
+            let flag = items
+                .as_deref()
+                .and_then(|items| resolve_project_name(items, name).ok())
+                .map(|matched| ProjectBinding {
                     project_id: matched.id.to_string(),
                     project_name: matched.name.clone(),
                     updated_at: chrono::Utc::now().to_rfc3339(),
                     forced_until: None,
-                })
-            };
-
-            let project_flag = project_flag_name.and_then(to_binding);
-            if let Some(name) = project_flag_name {
-                if project_flag.is_none() {
-                    eprintln!(
-                        "warning: --project '{name}' could not be resolved; ignoring the override"
-                    );
-                }
-            }
-            let config_default = config_default_name.as_deref().and_then(to_binding);
-            if let Some(name) = config_default_name.as_deref() {
-                if config_default.is_none() {
-                    eprintln!(
-                        "warning: configured default_project '{name}' could not be resolved; ignoring it"
-                    );
-                }
-            }
-
-            let env_project = match std::env::var("TRACEVAULT_PROJECT").ok() {
-                Some(raw) if !raw.trim().is_empty() => {
-                    let raw = raw.trim().to_string();
-                    match raw.parse::<uuid::Uuid>() {
-                        Ok(id) => Some(ProjectBinding {
-                            project_id: id.to_string(),
-                            project_name: String::new(),
-                            updated_at: String::new(),
-                            forced_until: None,
-                        }),
-                        // A name: resolvable here because `status` already has a client.
-                        Err(_) => {
-                            let resolved = to_binding(&raw);
-                            // Mirrors the `--project` and `default_project`
-                            // warnings above. The design's failure-mode table
-                            // calls for "CLI resolution error at the command"
-                            // here; dropping it silently left the operator
-                            // staring at whichever lower tier won instead.
-                            if resolved.is_none() {
-                                eprintln!(
-                                    "warning: TRACEVAULT_PROJECT '{raw}' could not be resolved; ignoring it"
-                                );
-                            }
-                            resolved
-                        }
-                    }
-                }
-                _ => None,
-            };
-
-            let inputs = ProjectResolveInputs {
-                project_flag,
-                env_project,
-                session: &session,
-                worktree_path: Some(&worktree),
-                config_default,
-            };
-            let resolved =
-                resolve_effective_project(&inputs, user_default, git_url.as_deref(), &client)
-                    .await?;
-            enrich_project_name(resolved, items.as_deref())
-        }
-        Err(e) => {
-            eprintln!("warning: could not resolve credentials ({e}); showing local status only");
-            // No client here, so — unlike the branch above — only the UUID
-            // form of `TRACEVAULT_PROJECT` can be honoured: a name needs
-            // `list_projects`, which needs a client.
-            let env_project = std::env::var("TRACEVAULT_PROJECT")
-                .ok()
-                .and_then(|raw| raw.trim().parse::<uuid::Uuid>().ok())
-                .map(|id| ProjectBinding {
-                    project_id: id.to_string(),
-                    project_name: String::new(),
-                    updated_at: String::new(),
-                    forced_until: None,
                 });
-            let inputs = ProjectResolveInputs {
-                project_flag: None,
-                env_project,
-                session: &session,
-                worktree_path: Some(&worktree),
-                config_default: None,
-            };
-            effective_project(&inputs)
+            if flag.is_none() {
+                report.warnings.push(format!(
+                    "warning: --project '{name}' could not be resolved; ignoring the override"
+                ));
+            }
+            flag
         }
+        (Some(name), None) => {
+            report.warnings.push(offline_project_flag_warning(name));
+            None
+        }
+        (None, _) => None,
     };
 
-    Ok(effective)
+    // The UUID form of `TRACEVAULT_PROJECT` resolves to a NAMELESS binding
+    // (no lookup on the capture path), so fetch the list once here purely to
+    // print a friendly name for it. Cosmetic: the id, and therefore which
+    // project is effective, is unaffected either way.
+    if items.is_none() && env_project.is_some() {
+        if let Some(client) = client.as_ref() {
+            items = client.list_projects().await.ok();
+        }
+    }
+
+    let (effective, invalid_id_warning) = status_effective(
+        project_flag,
+        env_project,
+        &session,
+        Some(&worktree),
+        user_default,
+    );
+    report.warnings.extend(invalid_id_warning);
+    let effective = enrich_project_name(effective, items.as_deref());
+
+    if let Some(name) = config_default_name.as_deref() {
+        report.warnings.push(config_default_warning(name));
+    }
+
+    report
+        .lines
+        .push(format_status(effective.as_ref().map(|(b, s)| (b, *s))));
+    // The attribution mode of the binding that actually won, read off THAT
+    // binding (plus `TRACEVAULT_PROJECT_ATTRIBUTION`) — the same value
+    // `commands::stream::send_stream_event` puts in the header.
+    if let Some((b, _)) = effective.as_ref() {
+        report.lines.extend(attribution_report(b));
+    }
+
+    if let (Some(client), Some(url)) = (client.as_ref(), git_url.as_deref()) {
+        // Best-effort and informational: an ambiguous or failed deduction is
+        // reported, never propagated — `status` exits 0 regardless.
+        let outcome = client.resolve_project(url).await.map_err(|e| e.to_string());
+        let name = match &outcome {
+            Ok(ResolveProjectOutcome::Resolved(pid)) => {
+                deduced_project_name(*pid, items.as_deref())
+            }
+            _ => None,
+        };
+        report
+            .lines
+            .push(format_deduction(effective.is_some(), outcome, name));
+    }
+    report
 }
 
 #[cfg(test)]
@@ -849,8 +934,11 @@ mod tests {
     }
 
     #[test]
-    fn format_status_none() {
-        assert_eq!(format_status(None), "no project bound");
+    fn format_status_unbound() {
+        assert_eq!(
+            format_status(None),
+            "no project bound locally; if a repo is bound, events are sent repo-scoped and the server deduces the project from the repo"
+        );
     }
 
     #[test]
@@ -872,16 +960,18 @@ mod tests {
     }
 
     #[test]
-    fn format_status_deduced_falls_back_to_id_when_name_empty() {
+    fn format_status_falls_back_to_id_when_name_empty() {
+        // `Deduced` can no longer be the effective tier (the capture chain
+        // never deduces); a bound tier with an empty name still prints the id.
         let b = ProjectBinding {
-            project_id: "deduced-id".into(),
+            project_id: "some-id".into(),
             project_name: String::new(),
             updated_at: "".into(),
             forced_until: None,
         };
         assert_eq!(
-            format_status(Some((&b, ProjectSource::Deduced))),
-            "project: deduced-id via repo deduction"
+            format_status(Some((&b, ProjectSource::UserDefault))),
+            "project: some-id via user default (project switch --user)"
         );
     }
 
@@ -892,6 +982,212 @@ mod tests {
             format_status(Some((&b, ProjectSource::Env))),
             "project: payments via TRACEVAULT_PROJECT (environment)"
         );
+    }
+
+    #[test]
+    fn invalid_capture_id_warning_names_tier_and_rewrite_command() {
+        let b = ProjectBinding {
+            project_id: "not-a-uuid".into(),
+            project_name: "payments".into(),
+            updated_at: "".into(),
+            forced_until: None,
+        };
+        assert_eq!(
+            invalid_capture_id_warning(&b, ProjectSource::UserDefault),
+            "warning: project payments — user default (project switch --user), but the saved project_id is not a valid id and is dropped at capture time; run `tracevault project switch <name>` to rewrite it"
+        );
+    }
+
+    /// `status`'s own drop rule: a non-UUID binding is not effective, and the
+    /// warning returned for it names the tier it came from.
+    #[test]
+    fn status_effective_drops_a_non_uuid_binding_with_a_warning_naming_the_tier() {
+        let session = SessionState {
+            active_project: Some(ProjectBinding {
+                project_id: "not-a-uuid".into(),
+                project_name: "payments".into(),
+                updated_at: "".into(),
+                forced_until: None,
+            }),
+            ..Default::default()
+        };
+        let (effective, warning) = status_effective(None, None, &session, None, None);
+        assert!(effective.is_none(), "{effective:?}");
+        let warning = warning.expect("a dropped binding must be explained");
+        assert!(
+            warning.contains("session (project switch)"),
+            "must name the tier: {warning}"
+        );
+        assert!(warning.contains("payments"), "{warning}");
+
+        // A valid binding is effective and carries no warning.
+        let pid = uuid::Uuid::from_u128(5);
+        let valid = SessionState {
+            active_project: Some(ProjectBinding {
+                project_id: pid.to_string(),
+                project_name: "web".into(),
+                updated_at: "".into(),
+                forced_until: None,
+            }),
+            ..Default::default()
+        };
+        let (effective, warning) = status_effective(None, None, &valid, None, None);
+        assert_eq!(
+            effective.map(|(b, s)| (b.project_id, s)),
+            Some((pid.to_string(), ProjectSource::SessionActive))
+        );
+        assert_eq!(warning, None);
+    }
+
+    /// `TRACEVAULT_PROJECT` is the `Env` rung of the SAME chain ingest runs,
+    /// so `status_effective` must place it above session-active and the user
+    /// default, and below `--project`. Pure: the binding is passed in, as
+    /// `status_report` passes what `stream::env_project_binding` returned.
+    #[test]
+    fn status_effective_places_env_at_rung_three() {
+        let u = uuid::Uuid::from_u128;
+        let bind = |id: uuid::Uuid, name: &str| ProjectBinding {
+            project_id: id.to_string(),
+            project_name: name.into(),
+            updated_at: "".into(),
+            forced_until: None,
+        };
+        let session = SessionState {
+            active_project: Some(bind(u(2), "session")),
+            ..Default::default()
+        };
+
+        // env beats session active and the user default
+        let (effective, _) = status_effective(
+            None,
+            Some(bind(u(9), "env")),
+            &session,
+            None,
+            Some(bind(u(3), "user")),
+        );
+        assert_eq!(
+            effective.map(|(b, s)| (b.project_id, s)),
+            Some((u(9).to_string(), ProjectSource::Env))
+        );
+
+        // --project still beats env
+        let (effective, _) = status_effective(
+            Some(bind(u(1), "flag")),
+            Some(bind(u(9), "env")),
+            &session,
+            None,
+            Some(bind(u(3), "user")),
+        );
+        assert_eq!(
+            effective.map(|(b, s)| (b.project_id, s)),
+            Some((u(1).to_string(), ProjectSource::ProjectFlag))
+        );
+    }
+
+    #[test]
+    fn offline_project_flag_warning_says_the_override_is_ignored() {
+        assert_eq!(
+            offline_project_flag_warning("web"),
+            "warning: --project 'web' cannot be resolved without server credentials; ignoring the override"
+        );
+    }
+
+    /// The NAME form of `TRACEVAULT_PROJECT` is not resolved into the chain
+    /// (that would need a per-event `list_projects` the hook never makes), so
+    /// `status` warns instead of reporting a tier ingest ignores.
+    #[test]
+    fn env_name_form_warning_says_only_the_uuid_form_is_used() {
+        let warning = env_name_form_warning("payments");
+        assert!(warning.contains("payments"), "{warning}");
+        assert!(warning.contains("UUID form"), "{warning}");
+        assert!(
+            warning.contains("not used") || warning.contains("ignored"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn config_default_warning_says_it_is_not_used_at_capture_time() {
+        assert_eq!(
+            config_default_warning("web"),
+            "warning: .tracevault/config.toml default_project 'web' is not used for attribution at capture time; bind explicitly with `tracevault project switch <name>`"
+        );
+    }
+
+    const DEDUCED: uuid::Uuid = uuid::Uuid::from_u128(2);
+
+    #[test]
+    fn format_deduction_resolved_bound() {
+        assert_eq!(
+            format_deduction(true, Ok(ResolveProjectOutcome::Resolved(DEDUCED)), None),
+            format!(
+                "server deduction for this repo: {DEDUCED} (not used: the local binding above wins)"
+            )
+        );
+    }
+
+    #[test]
+    fn format_deduction_resolved_unbound() {
+        assert_eq!(
+            format_deduction(false, Ok(ResolveProjectOutcome::Resolved(DEDUCED)), None),
+            format!("server deduction for this repo: {DEDUCED} (events will land here if a repo is bound)")
+        );
+    }
+
+    #[test]
+    fn format_deduction_resolved_uses_name_when_known() {
+        let items = items();
+        let name = deduced_project_name(DEDUCED, Some(&items));
+        assert_eq!(name, Some("web"));
+        assert_eq!(
+            format_deduction(false, Ok(ResolveProjectOutcome::Resolved(DEDUCED)), name),
+            "server deduction for this repo: web (events will land here if a repo is bound)"
+        );
+    }
+
+    #[test]
+    fn deduced_project_name_none_without_list_or_match() {
+        assert_eq!(deduced_project_name(DEDUCED, None), None);
+        assert_eq!(
+            deduced_project_name(uuid::Uuid::from_u128(999), Some(&items())),
+            None
+        );
+    }
+
+    #[test]
+    fn format_deduction_ambiguous_bound() {
+        assert_eq!(
+            format_deduction(true, Ok(ResolveProjectOutcome::Ambiguous), None),
+            "server deduction for this repo: ambiguous (multiple projects) — not used, the local binding above wins"
+        );
+    }
+
+    #[test]
+    fn format_deduction_ambiguous_unbound() {
+        assert_eq!(
+            format_deduction(false, Ok(ResolveProjectOutcome::Ambiguous), None),
+            "server deduction for this repo: ambiguous (multiple projects) — if a repo is bound, events will be refused until you run `tracevault project switch <name>`"
+        );
+    }
+
+    #[test]
+    fn format_deduction_none() {
+        for bound in [true, false] {
+            assert_eq!(
+                format_deduction(bound, Ok(ResolveProjectOutcome::None), None),
+                "server deduction for this repo: none"
+            );
+        }
+    }
+
+    #[test]
+    fn format_deduction_err() {
+        for bound in [true, false] {
+            assert_eq!(
+                format_deduction(bound, Err("connection refused".into()), None),
+                "server deduction for this repo: unavailable (connection refused)"
+            );
+        }
     }
 
     #[test]
@@ -967,12 +1263,11 @@ mod tests {
         // `$XDG_STATE_HOME`) to a tempdir for the duration of this test, so
         // it never touches the developer's real state dir.
         //
-        // SAFETY: test-scoped env mutation, mirroring the precedent in
-        // `commands::project`'s tests (`status_reports_ambiguous_deduction_
-        // as_informational_not_fatal`). No other test in this crate reads
-        // or sets XDG_STATE_HOME, so this can't race another test's
-        // expectations; restored in a guard so a panic mid-test still
-        // cleans up the process env.
+        // Held under the env lock: other tests (`flush`'s `run_flush` test,
+        // `status_in_the_orchestrator_configuration_names_the_user_default`)
+        // also set XDG_STATE_HOME. Restored in a guard so a panic mid-test
+        // still cleans up the process env.
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
         let state_tmp = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_STATE_HOME", state_tmp.path());
@@ -1170,7 +1465,12 @@ mod tests {
         ]
     }
 
-    fn deduced(id: uuid::Uuid) -> (ProjectBinding, ProjectSource) {
+    /// A nameless binding at a given tier. The UUID form of
+    /// `TRACEVAULT_PROJECT` is the one such tier that can be EFFECTIVE (the
+    /// capture path parses the id locally and never looks the name up);
+    /// `Deduced` is nameless too, but only ever reaches the separate
+    /// deduction line, which has [`deduced_project_name`] of its own.
+    fn nameless(id: uuid::Uuid, source: ProjectSource) -> (ProjectBinding, ProjectSource) {
         (
             ProjectBinding {
                 project_id: id.to_string(),
@@ -1178,28 +1478,31 @@ mod tests {
                 updated_at: "".into(),
                 forced_until: None,
             },
-            ProjectSource::Deduced,
+            source,
         )
     }
 
+    /// Small finding 8: the UUID form of `TRACEVAULT_PROJECT` never goes
+    /// through a name lookup, so its binding arrives nameless and the
+    /// operator would see a bare UUID on the effective line.
     #[test]
     fn enrich_project_name_fills_in_name_when_id_found_in_list() {
-        let effective = Some(deduced(uuid::Uuid::from_u128(2)));
+        let effective = Some(nameless(uuid::Uuid::from_u128(2), ProjectSource::Env));
         let (b, source) = enrich_project_name(effective, Some(&items())).unwrap();
         assert_eq!(b.project_name, "web");
-        assert_eq!(source, ProjectSource::Deduced);
+        assert_eq!(source, ProjectSource::Env);
     }
 
     #[test]
     fn enrich_project_name_leaves_empty_when_no_list_available() {
-        let effective = Some(deduced(uuid::Uuid::from_u128(2)));
+        let effective = Some(nameless(uuid::Uuid::from_u128(2), ProjectSource::Env));
         let (b, _source) = enrich_project_name(effective, None).unwrap();
         assert_eq!(b.project_name, "");
     }
 
     #[test]
     fn enrich_project_name_leaves_empty_when_id_not_in_list() {
-        let effective = Some(deduced(uuid::Uuid::from_u128(999)));
+        let effective = Some(nameless(uuid::Uuid::from_u128(999), ProjectSource::Env));
         let (b, _source) = enrich_project_name(effective, Some(&items())).unwrap();
         assert_eq!(b.project_name, "");
     }
@@ -1216,53 +1519,150 @@ mod tests {
         assert_eq!(source, ProjectSource::SessionActive);
     }
 
-    /// Small finding 8: `status` broadens its `items` fetch for ANY
-    /// `TRACEVAULT_PROJECT`, but the UUID form never goes through
-    /// `to_binding`, so its binding arrives nameless. Gating enrichment on
-    /// `source == Deduced` meant the list was fetched and thrown away and
-    /// the operator saw a bare UUID.
-    #[test]
-    fn enrich_project_name_fills_in_an_env_sourced_uuid_binding() {
-        let (mut b, _) = deduced(uuid::Uuid::from_u128(2));
-        b.project_name = String::new();
-        let effective = Some((b, ProjectSource::Env));
-        let (out, source) = enrich_project_name(effective, Some(&items())).unwrap();
-        assert_eq!(out.project_name, "web");
-        assert_eq!(source, ProjectSource::Env);
-    }
-
     #[test]
     fn enrich_project_name_passes_through_none() {
         assert!(enrich_project_name(None, Some(&items())).is_none());
     }
 
-    /// Item 2, `project status`'s half: a NAME in `TRACEVAULT_PROJECT` is
-    /// resolved here for display but ignored by the capture path, so the
-    /// `Env` line must be annotated rather than reported flat — the same
-    /// rule `commands::status`'s `project_binding_check` applies.
-    #[test]
-    fn env_name_form_note_fires_only_for_a_name_at_the_env_tier() {
-        let note = env_name_form_note(ProjectSource::Env, false).expect("a NAME must be noted");
-        assert!(note.contains("UUID form"), "got: {note}");
-        assert!(note.contains("display only"), "got: {note}");
+    /// VIS-316 pin: the project `project status` reports as effective is the
+    /// project ingest attributes events to. For each configuration, the id
+    /// `status` would treat as effective (`status_effective`, the function
+    /// `status` itself calls, including its non-UUID drop rule) must equal `commands::stream::capture_project`. Both sides read
+    /// the user default through `user_project_default::load()`, from a
+    /// `user_project.toml` written under a temp config dir (`XDG_CONFIG_HOME`
+    /// on Linux, `HOME` for macOS's `dirs::config_dir()`), with the env lock
+    /// held for the whole test. Each case also asserts the expected id, so
+    /// the equality can't pass vacuously with both sides `None`.
+    #[tokio::test]
+    async fn project_status_effective_project_matches_capture_project() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
 
-        assert!(
-            env_name_form_note(ProjectSource::Env, true).is_none(),
-            "the UUID form is honoured at capture time and needs no caveat"
+        let u = uuid::Uuid::from_u128;
+        let bind = |id: String| ProjectBinding {
+            project_id: id,
+            project_name: "n".into(),
+            updated_at: "".into(),
+            forced_until: None,
+        };
+        let worktree = "/wt";
+        let subagent_session = {
+            let mut s = SessionState {
+                active_project: Some(bind(u(2).to_string())),
+                ..Default::default()
+            };
+            s.subagent_projects
+                .insert(worktree.into(), bind(u(1).to_string()));
+            s
+        };
+        let active_session = SessionState {
+            active_project: Some(bind(u(2).to_string())),
+            ..Default::default()
+        };
+        let bad_active_session = SessionState {
+            active_project: Some(bind("not-a-uuid".into())),
+            ..Default::default()
+        };
+
+        // (label, session, user default written to user_project.toml,
+        //  TRACEVAULT_PROJECT, expected id)
+        type Case = (
+            &'static str,
+            SessionState,
+            Option<String>,
+            Option<String>,
+            Option<uuid::Uuid>,
         );
-        assert!(
-            env_name_form_note(ProjectSource::SessionActive, false).is_none(),
-            "no other tier reads TRACEVAULT_PROJECT"
-        );
+        let cases: Vec<Case> = vec![
+            (
+                "(a) subagent override + session active + user default",
+                subagent_session,
+                Some(u(3).to_string()),
+                None,
+                Some(u(1)),
+            ),
+            (
+                "(b) session active + user default",
+                active_session.clone(),
+                Some(u(3).to_string()),
+                None,
+                Some(u(2)),
+            ),
+            (
+                "(c) user default only",
+                SessionState::default(),
+                Some(u(3).to_string()),
+                None,
+                Some(u(3)),
+            ),
+            ("(d) nothing", SessionState::default(), None, None, None),
+            (
+                "(e) user default with a non-UUID project_id",
+                SessionState::default(),
+                Some("not-a-uuid".into()),
+                None,
+                None,
+            ),
+            (
+                "(f) non-UUID session active shadows a valid user default",
+                bad_active_session,
+                Some(u(3).to_string()),
+                None,
+                None,
+            ),
+            // The `Env` rung is part of the SAME shared chain, so it has to
+            // be covered here too or `status` and ingest could drift on it.
+            (
+                "(g) TRACEVAULT_PROJECT (UUID) outranks session active and the user default",
+                active_session.clone(),
+                Some(u(3).to_string()),
+                Some(u(4).to_string()),
+                Some(u(4)),
+            ),
+            // A NAME in TRACEVAULT_PROJECT is not a tier on either side:
+            // both must fall through to the session's active binding.
+            (
+                "(h) TRACEVAULT_PROJECT (NAME) is ignored by both",
+                active_session,
+                Some(u(3).to_string()),
+                Some("payments".into()),
+                Some(u(2)),
+            ),
+        ];
+
+        for (label, session, user_default, env_project, expected) in cases {
+            match &user_default {
+                Some(id) => crate::user_project_default::save(&bind(id.clone())).unwrap(),
+                None => crate::user_project_default::clear().unwrap(),
+            }
+            match &env_project {
+                Some(v) => _guard.set("TRACEVAULT_PROJECT", v),
+                None => _guard.remove("TRACEVAULT_PROJECT"),
+            }
+            let status_pid = status_effective(
+                None,
+                crate::commands::stream::env_project_binding(),
+                &session,
+                Some(worktree),
+                crate::user_project_default::load(),
+            )
+            .0
+            .and_then(|(b, _)| capture_project_id(&b));
+            let ingest_pid = crate::commands::stream::capture_project(&session, Some(worktree));
+            assert_eq!(
+                status_pid, ingest_pid,
+                "{label}: status and ingest disagree"
+            );
+            assert_eq!(status_pid, expected, "{label}");
+        }
+        crate::user_project_default::clear().unwrap();
     }
 
-    /// F1: an ambiguous ("this repo belongs to multiple projects") deduction
-    /// result is a hard `Err` from `resolve_effective_project` — but `status`
-    /// is a read-only inspector, so it must swallow that into an
-    /// informational line and still exit `Ok`, not propagate the error up
-    /// through `run`/`main` as a fatal exit. Mocks the `/projects/resolve`
-    /// endpoint with a 409, mirroring resolution.rs's
-    /// `ambiguous_deduction_errors_when_no_higher_rung`.
+    /// F1: `status` returns `Ok` when the `/projects/resolve` deduction
+    /// answers 409 (ambiguous) — the deduction is informational, never fatal.
     #[tokio::test]
     async fn status_reports_ambiguous_deduction_as_informational_not_fatal() {
         let _env_lock = crate::test_helpers::lock_env_mutation().await;
@@ -1282,122 +1682,228 @@ mod tests {
             .success();
         assert!(ok, "git remote add must succeed");
 
-        let base = spawn_once(
-            "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"error\":\"multiple\"}"
-                .to_string(),
-        );
+        // One 409 for `status`, one for `status_report`.
+        let conflict = "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"error\":\"multiple\"}";
+        let base = spawn_n(vec![conflict.to_string(), conflict.to_string()]);
 
-        // SAFETY: test-scoped env mutation, mirroring the precedent in
-        // `commands::login`'s tests, restored in a guard so a panic in
-        // `status` still cleans up the process env. `_env_lock` (taken
-        // above) serializes this against any other test in the crate that
-        // reads or sets TRACEVAULT_SERVER_URL/TRACEVAULT_API_KEY (e.g.
-        // `switch_without_session_or_user_flag_skips_codebase_check`, whose
-        // credential resolution would otherwise observe these values while
-        // they're set here and get routed at this test's mock server instead
-        // of its own).
+        // Env mutation under `_env_lock`, restored by the guard even if
+        // `status` panics. The config dir (and so any user default) is
+        // isolated to the tempdir, and no ambient session id leaks in.
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("TRACEVAULT_SERVER_URL", &base);
         _guard.set("TRACEVAULT_API_KEY", "tok");
-        // `resolve_status_effective` reads `TRACEVAULT_PROJECT` at a rung
-        // ABOVE deduction, so an ambient export would resolve the binding
-        // locally and this test would never reach the 409 it exists to
-        // exercise — passing for the wrong reason.
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
+        _guard.remove("TRACEVAULT_SESSION_ID");
+        // `status_effective` takes `TRACEVAULT_PROJECT` at a rung ABOVE the
+        // "nothing is bound" state this test asserts, and an env-sourced
+        // binding also triggers an extra `list_projects` call this mock does
+        // not stage — an ambient export would make the test fail, or pass,
+        // for the wrong reason.
         _guard.remove("TRACEVAULT_PROJECT");
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
 
         let result = status(None, None, tmp.path(), tmp.path()).await;
-
         assert!(
             result.is_ok(),
             "status must degrade gracefully on an ambiguous deduction, not propagate the error: {result:?}"
         );
+
+        let report = status_report(None, None, tmp.path(), tmp.path()).await;
+        assert_eq!(
+            report.lines,
+            vec![
+                format_status(None),
+                format_deduction(false, Ok(ResolveProjectOutcome::Ambiguous), None),
+            ],
+            "the ambiguous deduction is reported on its own line"
+        );
     }
 
-    /// A3, UUID form: with a client available, `TRACEVAULT_PROJECT` set to a
-    /// UUID must still resolve at the `Env` rung, not by falling through to
-    /// deduction/user-default. `spawn_once`'s listener only ever answers one
-    /// request — the broadened `items` fetch this env var now triggers — so
-    /// if resolution regressed to skipping the local `Env` rung and instead
-    /// fell through to `resolve_project` (deduction), the second HTTP call
-    /// would find no listener and the test would fail on that, not just on
-    /// the source assertion below.
+    /// VIS-316 orchestrator configuration: the container sets a machine-wide
+    /// user default B before the session exists, the session itself binds
+    /// nothing, and the server would deduce A from the git remote. `status`
+    /// must name B (what ingest uses) as effective, and show A only as an
+    /// unused deduction.
     #[tokio::test]
-    async fn status_resolves_env_uuid_as_the_effective_source() {
+    async fn status_in_the_orchestrator_configuration_names_the_user_default() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::test_helpers::init_git_repo(&repo);
+        let ok = std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo.to_string_lossy(),
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:org/repo.git",
+            ])
+            .status()
+            .expect("git remote add failed")
+            .success();
+        assert!(ok, "git remote add must succeed");
+
+        let deduced_a = uuid::Uuid::from_u128(0xA);
+        let base = spawn_once(http_200(&format!(r#"{{"project_id":"{deduced_a}"}}"#)));
+
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("TRACEVAULT_SERVER_URL", &base);
+        _guard.set("TRACEVAULT_API_KEY", "tok");
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
+        _guard.set("XDG_STATE_HOME", tmp.path().join("state"));
+        _guard.remove("TRACEVAULT_SESSION_ID");
+        // Both would change which project is effective / which mode is
+        // reported, and the env binding would also trigger a `list_projects`
+        // call this one-shot mock does not stage.
+        _guard.remove("TRACEVAULT_PROJECT");
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let default_b = ProjectBinding {
+            project_id: uuid::Uuid::from_u128(0xB).to_string(),
+            project_name: "project-b".into(),
+            updated_at: "".into(),
+            forced_until: None,
+        };
+        crate::user_project_default::save(&default_b).unwrap();
+
+        let report = status_report(None, None, &repo, &repo).await;
+
+        assert_eq!(
+            report.lines,
+            vec![
+                "project: project-b via user default (project switch --user)".to_string(),
+                "attribution mode: derived (TraceVault checks repo/project membership)"
+                    .to_string(),
+                format!(
+                    "server deduction for this repo: {deduced_a} (not used: the local binding above wins)"
+                ),
+            ]
+        );
+    }
+
+    /// A3, UUID form, through the whole report: `TRACEVAULT_PROJECT` set to
+    /// a UUID resolves at the `Env` rung, and the one `list_projects` call
+    /// the env binding triggers is used to put its friendly name on the line
+    /// (small finding 8 — otherwise a bare UUID is printed). `spawn_once`'s
+    /// listener only ever answers one request, so a regression that fell
+    /// through to the `/projects/resolve` deduction would fail on the
+    /// missing listener as well as on the line itself.
+    #[tokio::test]
+    async fn status_reports_env_uuid_as_the_effective_tier_with_its_name() {
         let _env_lock = crate::test_helpers::lock_env_mutation().await;
         let tmp = tempfile::tempdir().unwrap();
 
-        let list =
-            r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"payments"}]"#.to_string();
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let list = format!(r#"[{{"id":"{uuid}","name":"payments"}}]"#);
         let base = spawn_once(http_200(&list));
 
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
         _guard.set("TRACEVAULT_SERVER_URL", &base);
         _guard.set("TRACEVAULT_API_KEY", "tok");
-        let uuid = "22222222-2222-4222-8222-222222222222";
         _guard.set("TRACEVAULT_PROJECT", uuid);
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+        _guard.remove("TRACEVAULT_SESSION_ID");
 
-        let (b, source) = resolve_status_effective(None, None, tmp.path(), tmp.path())
-            .await
-            .unwrap()
-            .expect("TRACEVAULT_PROJECT must resolve to a binding");
-        assert_eq!(source, ProjectSource::Env);
-        assert_eq!(b.project_id, uuid);
+        let report = status_report(None, None, tmp.path(), tmp.path()).await;
+        assert_eq!(
+            report.lines[0], "project: payments via TRACEVAULT_PROJECT (environment)",
+            "got: {:?}",
+            report.lines
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|w| !w.contains("TRACEVAULT_PROJECT")),
+            "the UUID form is honoured at capture time and needs no caveat: {:?}",
+            report.warnings
+        );
     }
 
-    /// A3, name form: unlike the capture path (`stream::env_project_binding`,
-    /// UUID-only), `status` already has a client in scope, so a NAME in
-    /// `TRACEVAULT_PROJECT` must resolve via `list_projects` — the same
-    /// one-shot mock response the broadened `items` fetch consumes, so no
-    /// second request is made.
+    /// A3, name form: unlike our earlier design, `status` does NOT resolve a
+    /// NAME in `TRACEVAULT_PROJECT` into the chain. VIS-316's rule is that
+    /// `project status` reports what ingest does, and the capture path is
+    /// UUID-only (a name would need a per-event `list_projects`), so a
+    /// resolved name would be a project no event is attributed to. The value
+    /// is reported as an ignored tier instead, and the session's own binding
+    /// stays effective.
     #[tokio::test]
-    async fn status_resolves_env_name_via_the_client() {
-        let _env_lock = crate::test_helpers::lock_env_mutation().await;
-        let tmp = tempfile::tempdir().unwrap();
-
-        let list =
-            r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"payments"}]"#.to_string();
-        let base = spawn_once(http_200(&list));
-
-        let mut _guard = crate::test_helpers::EnvVarGuard::new();
-        _guard.set("XDG_CONFIG_HOME", tmp.path());
-        _guard.set("TRACEVAULT_SERVER_URL", &base);
-        _guard.set("TRACEVAULT_API_KEY", "tok");
-        _guard.set("TRACEVAULT_PROJECT", "payments");
-
-        let (b, source) = resolve_status_effective(None, None, tmp.path(), tmp.path())
-            .await
-            .unwrap()
-            .expect("a name should resolve via list_projects");
-        assert_eq!(source, ProjectSource::Env);
-        assert_eq!(b.project_name, "payments");
-        assert_eq!(b.project_id, "11111111-1111-4111-8111-111111111111");
-    }
-
-    /// A3, item 3: with credentials unresolved (no client at all — the
-    /// `Err` arm of `resolve_client`), `status`'s resolution core must still
-    /// honour the UUID form of `TRACEVAULT_PROJECT`, which needs no server
-    /// call. Only the NAME form is unavailable on this branch (it would need
-    /// `list_projects`), which is unchanged/untested here since it was
-    /// already correctly unresolved before this fix.
-    #[tokio::test]
-    async fn status_resolves_env_uuid_even_without_a_client() {
+    async fn status_warns_that_an_env_name_is_not_used_and_falls_through() {
         let _env_lock = crate::test_helpers::lock_env_mutation().await;
         let tmp = tempfile::tempdir().unwrap();
 
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
+        _guard.set("XDG_STATE_HOME", tmp.path().join("state"));
         _guard.remove("TRACEVAULT_SERVER_URL");
         _guard.remove("TRACEVAULT_API_KEY");
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+        _guard.set("TRACEVAULT_PROJECT", "payments");
+
+        let session_id = "vis305-env-name-form";
+        let pid = uuid::Uuid::from_u128(0x5E);
+        crate::session_state::save(
+            session_id,
+            &SessionState {
+                active_project: Some(ProjectBinding {
+                    project_id: pid.to_string(),
+                    project_name: "session-project".into(),
+                    updated_at: "".into(),
+                    forced_until: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let report = status_report(Some(session_id), None, tmp.path(), tmp.path()).await;
+        assert_eq!(
+            report.lines[0], "project: session-project via session (project switch)",
+            "a NAME must not become the effective tier: {:?}",
+            report.lines
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("TRACEVAULT_PROJECT") && w.contains("UUID form")),
+            "the ignored NAME must be explained: {:?}",
+            report.warnings
+        );
+    }
+
+    /// A3, item 3: with credentials unresolved (no client at all — the `Err`
+    /// arm of `resolve_client`), `status` must still honour the UUID form of
+    /// `TRACEVAULT_PROJECT`, which needs no server call. The friendly name
+    /// is simply unavailable, so the id is printed.
+    #[tokio::test]
+    async fn status_reports_env_uuid_even_without_a_client() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
+        _guard.remove("TRACEVAULT_SERVER_URL");
+        _guard.remove("TRACEVAULT_API_KEY");
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
         let uuid = "33333333-3333-4333-8333-333333333333";
         _guard.set("TRACEVAULT_PROJECT", uuid);
 
-        let (b, source) = resolve_status_effective(None, None, tmp.path(), tmp.path())
-            .await
-            .unwrap()
-            .expect("TRACEVAULT_PROJECT (UUID form) must resolve even without a client");
-        assert_eq!(source, ProjectSource::Env);
-        assert_eq!(b.project_id, uuid);
+        let report = status_report(None, None, tmp.path(), tmp.path()).await;
+        assert_eq!(
+            report.lines[0],
+            format!("project: {uuid} via TRACEVAULT_PROJECT (environment)"),
+            "got: {:?}",
+            report.lines
+        );
     }
 
     /// VIS-305 Part C review, small finding 3: `project status` must report
@@ -1414,25 +1920,23 @@ mod tests {
 
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
         _guard.remove("TRACEVAULT_SERVER_URL");
         _guard.remove("TRACEVAULT_API_KEY");
         let uuid = "44444444-4444-4444-8444-444444444444";
         _guard.set("TRACEVAULT_PROJECT", uuid);
         _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
 
-        let (b, _source) = resolve_status_effective(None, None, tmp.path(), tmp.path())
-            .await
-            .unwrap()
-            .expect("TRACEVAULT_PROJECT (UUID form) must resolve even without a client");
+        let report = status_report(None, None, tmp.path(), tmp.path()).await;
         assert_eq!(
-            b.forced_until, None,
-            "the env-derived binding itself carries no persisted force"
-        );
-        assert_eq!(
-            crate::commands::stream::attribution_mode(Some(&b)),
-            "explicit",
+            report.lines,
+            vec![
+                format!("project: {uuid} via TRACEVAULT_PROJECT (environment)"),
+                "attribution mode: explicit (this caller owns attribution; membership is not checked)".to_string(),
+            ],
             "the EFFECTIVE mode must reflect TRACEVAULT_PROJECT_ATTRIBUTION even when \
-             the winning binding has no force of its own"
+             the winning binding has no force of its own, and the lapse line must NOT \
+             appear (there is no persisted force to lapse)"
         );
     }
 }

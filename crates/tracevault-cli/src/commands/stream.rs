@@ -326,46 +326,61 @@ pub(crate) fn attribution_mode(
     }
 }
 
-/// Resolve the capture-time PROJECT BINDING from LOCAL, UUID-bearing bindings
-/// only — no network (the hook fires per event in a short-lived process).
-/// Precedence: subagent worktree override -> `TRACEVAULT_PROJECT` -> session
-/// `active_project` -> user-level default. Repo config `default_project` (a
-/// name) is intentionally excluded: honoring it would need a per-event
-/// `list_projects` call, and `TRACEVAULT_PROJECT` is honoured in its UUID form
-/// only for the same reason. `None` -> fall back to the repo-scoped stream
-/// (server deduces).
+/// The capture-time project BINDING for a stream event: a thin wrapper over
+/// the shared chain [`crate::resolution::capture_project_binding`] (subagent
+/// worktree override -> `TRACEVAULT_PROJECT` -> session `active_project` ->
+/// user-level default; no `--project` flag on the hook path), with a binding
+/// whose stored id is not a UUID dropped exactly as
+/// [`crate::resolution::capture_project_id`] drops it. Local only — no
+/// network (the hook fires per event in a short-lived process), which is why
+/// repo config `default_project` (a name) is not a tier and why
+/// `TRACEVAULT_PROJECT` is honoured in its UUID form only.
+/// `commands::project::status` calls the same shared chain, so it reports
+/// exactly what this returns.
 ///
 /// Returns the full [`crate::session_state::ProjectBinding`], not just its
 /// id: `forced_until` travels with whichever binding actually wins this
 /// precedence chain, so a caller can ask THAT binding — via
 /// [`attribution_mode`] — whether it is currently forced, rather than
 /// consulting some other, unrelated binding (see `attribution_mode`'s doc
-/// comment for why that distinction matters).
-///
-/// `pub(crate)`: also called by `commands::status`, which reuses this
-/// function (plus `resolve_stream_binding`/`attribution_for`) as the
-/// authoritative "will this session record anything" gate, so the status
-/// verdict can never drift from what this hook actually does.
-pub(crate) fn capture_project(
+/// comment for why that distinction matters). Callers that only need the id
+/// use [`capture_project`].
+pub(crate) fn capture_binding(
     session: &crate::session_state::SessionState,
     worktree_path: Option<&str>,
 ) -> Option<crate::session_state::ProjectBinding> {
-    use crate::resolution::{effective_project, ProjectResolveInputs};
-    let local = effective_project(&ProjectResolveInputs {
+    use crate::resolution::{capture_project_binding, capture_project_id, CaptureProjectInputs};
+    let (binding, _) = capture_project_binding(&CaptureProjectInputs {
         project_flag: None,
         env_project: env_project_binding(),
         session,
         worktree_path,
-        config_default: None,
-    })
-    .map(|(b, _)| b)
-    .or_else(crate::user_project_default::load)?;
+        user_default: crate::user_project_default::load(),
+    })?;
     // Defensive: a corrupted/hand-edited binding whose id isn't a real UUID
     // must not be usable for attribution at all (mirrors
     // `binding_repo_id_is_valid` for the repo side) — checked here, once, so
     // every caller gets the same guarantee rather than re-deriving it.
-    local.project_id.parse::<uuid::Uuid>().ok()?;
-    Some(local)
+    capture_project_id(&binding)?;
+    Some(binding)
+}
+
+/// The capture-time project ID for a stream event: [`capture_binding`]
+/// projected down to its id. `None` -> fall back to the repo-scoped stream
+/// (server deduces).
+///
+/// `pub(crate)`: also called by `commands::status`, which reuses this
+/// function (plus `resolve_stream_binding`/`attribution_for`) as the
+/// authoritative "will this session record anything" gate, so the status
+/// verdict can never drift from what this hook actually does. `commands::flush`
+/// and `commands::project::status` call it for the same reason.
+pub(crate) fn capture_project(
+    session: &crate::session_state::SessionState,
+    worktree_path: Option<&str>,
+) -> Option<uuid::Uuid> {
+    capture_binding(session, worktree_path)
+        .as_ref()
+        .and_then(crate::resolution::capture_project_id)
 }
 
 /// The one-line warning printed when a repo-less event is dropped as
@@ -397,34 +412,33 @@ fn undeliverable_warning(pid: uuid::Uuid) -> String {
 /// hence the `"(404 "` marker below matching on the open-paren + code + the
 /// space before the reason phrase). If that error-formatting ever changes,
 /// update this list (and its tests) to match.
-/// Which deterministic client error this is, so the fallback warning can name a
+/// Which deterministic client error this is, so the refusal error can name a
 /// cause that is actually possible instead of assuming one.
 #[derive(Debug, PartialEq, Eq)]
-enum ClientErrorKind {
+pub(crate) enum ClientErrorKind {
     /// 403, which now has TWO plausible causes — see [`send_stream_event`].
     Forbidden,
     /// 400/404/409: a binding/scoping problem, and only that.
     Scoping,
 }
 
-/// The one-line warning printed when a project-scoped send falls back to
-/// repo deduction. Pure, so the wording is asserted directly rather than by
-/// capturing stderr.
+/// The one-line error printed when the server refuses a project-scoped send.
+/// Pure, so the wording is asserted directly rather than by capturing stderr.
 ///
 /// `mode` is the attribution mode this send actually declared — the same
-/// value [`attribution_mode`] put in the header. It matters because the
-/// force gate refuses with a 403: "not Operator on the project", or
+/// value [`attribution_mode`] put in the `x-tracevault-project-attribution`
+/// header, so the message and the wire can never disagree. It matters because
+/// the force gate also refuses with a 403: "not Operator on the project", or
 /// "`explicit` from a `tvk_` key". Without naming it, an operator who asked
-/// for `explicit` got a warning about realm roles, watched their events land
-/// under the repo's DEDUCED project, and was never told the force itself was
-/// what got refused. Failing closed on trust is right; failing closed
-/// silently is the defect.
+/// for `explicit` got an error about membership and realm roles and was never
+/// told the force itself was what got refused. Failing closed on trust is
+/// right; failing closed silently is the defect.
 ///
 /// The extra clause is attached to `Forbidden` ONLY. A `Scoping` 4xx
 /// (400/404/409) means the project id itself does not resolve — the force
 /// gate never ran — so blaming the force there would be a new wrong
 /// explanation of exactly the kind this fixes.
-fn fallback_warning(pid: uuid::Uuid, kind: &ClientErrorKind, mode: &str) -> String {
+pub(crate) fn refused_error(pid: uuid::Uuid, kind: &ClientErrorKind, mode: &str) -> String {
     let base = match kind {
         // Since Keycloak, a 403 has a SECOND and now more common cause: the
         // account has no `tracing` realm role at all, in which case nothing this
@@ -432,37 +446,44 @@ fn fallback_warning(pid: uuid::Uuid, kind: &ClientErrorKind, mode: &str) -> Stri
         // on the code path users hit most. The server's 403 envelope is not
         // distinguishable from here (see `ClientErrorKind`), so name both.
         ClientErrorKind::Forbidden => format!(
-            "tracevault: warning: the server refused to attribute this event to active project \
+            "tracevault: error: the server refused to attribute this event to active project \
              {pid} (403). Either that project does not apply to this repo (not a member, or \
-             missing TracePush) — run `tracevault project switch <name>` — or this account lacks \
-             the `tracing` Keycloak realm role entirely, which an administrator must grant. \
-             Attributing via repo deduction instead."
+             missing TracePush) — run `tracevault project switch <name>` (add `--user` if the \
+             binding is the machine-wide default in `user_project.toml`) — or this account lacks \
+             the `tracing` Keycloak realm role entirely, which an administrator must grant. The \
+             event was NOT re-attributed elsewhere; it has been queued and will be retried once \
+             the binding or the role is fixed."
         ),
         ClientErrorKind::Scoping => format!(
-            "tracevault: warning: active project {pid} does not apply to this repo (not a member, \
-             or missing permission); attributing via repo deduction instead. Run `tracevault \
-             project switch <name>` to update."
+            "tracevault: error: active project {pid} does not apply to this repo (not a member, \
+             missing permission, or the project no longer exists). The event was NOT \
+             re-attributed elsewhere; it has been queued and will be retried once the binding is \
+             fixed. Run `tracevault project switch <name>` (add `--user` if the binding is the \
+             machine-wide default in `user_project.toml`) to update it."
         ),
     };
     if mode == "explicit" && matches!(kind, ClientErrorKind::Forbidden) {
         return format!(
             "{base} This send declared `explicit` attribution, so the refusal may be of the \
              FORCE itself: forcing needs `Operator` on that project AND a Control Plane \
-             identity (a `tvk_` API key can never force). These events are being attributed \
-             by repo deduction instead — not to the project you forced."
+             identity (a `tvk_` API key can never force). Drop the force with `tracevault \
+             project switch <name>` (no `--project-attribution explicit`) if membership \
+             attribution is what you want."
         );
     }
     base
 }
 
-fn deterministic_client_error_kind(e: &dyn std::error::Error) -> Option<ClientErrorKind> {
+pub(crate) fn deterministic_client_error_kind(
+    e: &dyn std::error::Error,
+) -> Option<ClientErrorKind> {
     let s = e.to_string();
     // 401 is deliberately excluded: it's an authentication failure (bad/expired
-    // token), not a project-scoping problem, and the repo-scoped fallback uses
-    // the SAME token — it would also 401, so falling back just wastes a
-    // request before the error propagates to buffer/retry. 403 stays in: it can
-    // mean the token is valid but lacks TracePush on the bound project, and the
-    // repo-scoped fallback (a different authorization check) can help.
+    // token), not a project-scoping problem, and the buffer/retry path already
+    // handles it correctly without a misleading project-scoping message. 403
+    // stays in: it can mean the token is valid but lacks TracePush on the bound
+    // project (or the account lacks the realm role entirely), and the refusal
+    // line can name both possible causes.
     if s.contains("(403 ") {
         return Some(ClientErrorKind::Forbidden);
     }
@@ -494,25 +515,28 @@ fn deterministic_client_error_kind(e: &dyn std::error::Error) -> Option<ClientEr
 /// `Ok(None)` therefore means "deliberately dropped, do not queue": callers
 /// must treat it like a success for offset/queue purposes, not like an error.
 ///
-/// When the attribution carries BOTH a repo and a project and the
-/// project-scoped send fails with a
-/// deterministic client error (the bound project doesn't apply to this repo:
-/// not a member, or the caller lacks `TracePush` on it, or — after a prior
-/// fallback — the repo-scoped 409 multi-project refusal), this falls back to
-/// the repo-scoped endpoint ONCE and lets the server deduce the repo's
-/// project, warning so the miss is visible. A transient error (5xx,
-/// network/transport, timeout) is NOT retried here — it propagates so the
-/// caller's existing buffer/retry logic runs unchanged.
+/// When the attribution carries BOTH a repo and a project, the project was
+/// explicitly declared (by binding or by `project switch`), so the server's
+/// refusal of it is an error, never re-derived elsewhere: a deterministic
+/// client error (the bound project doesn't apply to this repo: not a member,
+/// or the caller lacks `TracePush` on it) prints the refusal line to stderr
+/// and returns `Err(e)` with the original error, unchanged, so the caller's
+/// existing buffer/retry logic queues it in the REPO's pending file
+/// (`pending-<repo_id>.jsonl`, see [`Attribution::pending_file_name`]); the
+/// next drain (the hook's or `tracevault flush`'s) re-applies whatever capture
+/// project is in force at that time (mirrors the server-side rule from VIS-305: a declared project the server
+/// refuses is not silently re-attributed). A transient error (5xx,
+/// network/transport, timeout) also propagates as `Err`, and is handled
+/// identically by that same buffer/retry path.
 ///
 /// `warned` is shared across every call made for a single hook
 /// invocation (both the pending-flush loop and the live send). The
-/// pending-flush loop only `break`s on `Err`, not on a fallback that itself
-/// returns `Ok` — so a stale binding whose repo-scoped fallback keeps
-/// succeeding would otherwise print the warning once per buffered event.
-/// Gating on `*warned` caps it at one warning per invocation while leaving the
-/// fallback behavior itself unchanged. The repo-less drop warning shares the
-/// flag for the same reason: draining a queue of undeliverable events would
-/// otherwise print one line per buffered event.
+/// pending-flush loop only `break`s on `Err`, so without this flag a stale,
+/// refused binding would print the refusal line once per buffered event
+/// before the loop breaks. Gating on `*warned` caps stderr at one line per
+/// invocation. The repo-less drop warning shares the flag for the same
+/// reason: draining a queue of undeliverable events would otherwise print one
+/// line per buffered event.
 async fn send_stream_event(
     client: &crate::api_client::ApiClient,
     attribution: &Attribution,
@@ -572,7 +596,7 @@ async fn send_stream_event(
             };
             match (attempt, kind) {
                 (Ok(r), _) => Ok(Some(r)),
-                (Err(_), Some(kind)) => {
+                (Err(e), Some(kind)) => {
                     if !*warned {
                         // Since Keycloak, a 403 has a SECOND and now more common
                         // cause: the account has no `tracing` realm role at all,
@@ -581,11 +605,15 @@ async fn send_stream_event(
                         // code path users hit most. The server's 403 envelope
                         // isn't distinguishable from here (see
                         // `ClientErrorKind`), so the wording names both.
-                        eprintln!("{}", fallback_warning(pid, &kind, mode));
+                        eprintln!("{}", refused_error(pid, &kind, mode));
                         *warned = true;
                     }
-                    // Repo-scoped fallback: the server deduces the project itself.
-                    client.stream_event(repo_id, req).await.map(Some)
+                    // The caller declared this project; the server refused it.
+                    // Do NOT re-attribute to another project by falling back to
+                    // the repo-scoped endpoint — propagate so the caller queues
+                    // this event for retry under the same (or a corrected)
+                    // binding.
+                    Err(e)
                 }
                 // transient — propagate for buffer/retry
                 (Err(e), None) => Err(e),
@@ -888,10 +916,10 @@ pub async fn run_stream(
     // reads its `forced_until` via `attribution_mode` — this is the binding
     // that actually decided the target project, so it's the only one whose
     // force is allowed to apply (see `attribution_mode`'s doc comment).
-    let capture_binding = capture_project(&session, Some(worktree_top.as_str()));
+    let capture_binding = capture_binding(&session, Some(worktree_top.as_str()));
     let capture_pid = capture_binding
         .as_ref()
-        .and_then(|b| b.project_id.parse::<uuid::Uuid>().ok());
+        .and_then(crate::resolution::capture_project_id);
 
     // Ship if EITHER a repo or a project resolved; no-op only when neither
     // did. (`binding_repo_id_is_valid` guards a corrupted/hand-edited
@@ -913,12 +941,12 @@ pub async fn run_stream(
 
     let mut send_failed = false;
     // Spans the whole invocation (pending-flush loop + live send below) so a
-    // stale binding whose repo-scoped fallback keeps succeeding warns at most
-    // once, not once per buffered event.
+    // refused project binding prints its error at most once per invocation,
+    // not once per buffered event.
     let mut warned = false;
 
     // Send pending events first
-    for pending_json in &pending_events {
+    for (i, pending_json) in pending_events.iter().enumerate() {
         if let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(pending_json) {
             if send_stream_event(
                 &client,
@@ -930,8 +958,13 @@ pub async fn run_stream(
             .await
             .is_err()
             {
-                // Re-queue all remaining pending events
-                for evt in &pending_events {
+                // Re-queue only the failed event and the ones after it that
+                // were never attempted, in order. Events before `i` already
+                // got a server response and must NOT be re-queued here — a
+                // prior iteration already appended them if IT failed, and if
+                // it succeeded, re-adding them would deliver them twice on
+                // the next drain.
+                for evt in &pending_events[i..] {
                     append_pending(&pending_path, evt)?;
                 }
                 send_failed = true;
@@ -1600,60 +1633,52 @@ mod tests {
 
     // ── capture_project: local-only project resolver ──────────────────────────
 
-    /// ENV ISOLATION: `capture_project` READS `TRACEVAULT_PROJECT` (rung 3,
-    /// above `session.active_project`) since the A2 fix, and other tests in
-    /// this same binary SET it. The crate lock only serializes mutators
-    /// against each other, so a non-locking reader still races them — and
-    /// `std::env::set_var` concurrent with `std::env::var` is exactly the UB
-    /// the `unsafe` blocks in `EnvVarGuard` are annotated against. Take the
-    /// lock and pin the var UNSET, so the precedence assertions below
-    /// describe the tiers they name rather than whatever the ambient shell
-    /// (or a concurrent test) happens to export. `XDG_CONFIG_HOME` is
-    /// redirected for the same reason: the "empty session -> None" case
-    /// falls through to `user_project_default::load()`, which would
-    /// otherwise read the developer's real `user_project.toml`.
-    #[test]
-    fn capture_project_precedence_local_only() {
+    /// Holds the env lock and points the config dir (`XDG_CONFIG_HOME` on
+    /// Linux, `HOME` for macOS's `dirs::config_dir()`) at a tempdir: the last
+    /// tier reads `user_project.toml` from there, so without isolation this
+    /// test fails on any machine with a real user default and races tests
+    /// that write one.
+    ///
+    /// `TRACEVAULT_PROJECT` is pinned UNSET for the same reason:
+    /// `capture_project` reads it (rung 3, above `session.active_project`),
+    /// and other tests in this same binary SET it. The crate lock only
+    /// serializes mutators against each other, so a non-locking reader still
+    /// races them — and `std::env::set_var` concurrent with `std::env::var`
+    /// is exactly the UB the `unsafe` blocks in `EnvVarGuard` are annotated
+    /// against. Holding the lock AND declaring the value is what makes the
+    /// precedence assertions below describe the tiers they name rather than
+    /// whatever the ambient shell happens to export.
+    #[tokio::test]
+    async fn capture_project_precedence_local_only() {
         use crate::session_state::{ProjectBinding, SessionState};
-        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
-        let cfg_tmp = tempfile::tempdir().unwrap();
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
         _guard.remove("TRACEVAULT_PROJECT");
-        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+
         let pb = |id: &str| ProjectBinding {
             project_id: id.into(),
             project_name: "n".into(),
             updated_at: "".into(),
             forced_until: None,
         };
-        // `capture_project` now returns the full binding, not just its id —
-        // this helper projects out just the id for the precedence assertions
-        // below, which don't care about `forced_until`.
-        let id_of = |b: Option<ProjectBinding>| b.map(|b| b.project_id);
         let u = uuid::Uuid::from_u128;
         // session active only
         let s = SessionState {
             active_project: Some(pb(&u(2).to_string())),
             ..Default::default()
         };
-        assert_eq!(
-            id_of(capture_project(&s, Some("/wt"))),
-            Some(u(2).to_string())
-        );
+        assert_eq!(capture_project(&s, Some("/wt")), Some(u(2)));
         // subagent worktree beats session
         let mut s = s;
         s.subagent_projects
             .insert("/wt".into(), pb(&u(1).to_string()));
-        assert_eq!(
-            id_of(capture_project(&s, Some("/wt"))),
-            Some(u(1).to_string())
-        );
+        assert_eq!(capture_project(&s, Some("/wt")), Some(u(1)));
         // no worktree match -> session active
-        assert_eq!(
-            id_of(capture_project(&s, Some("/other"))),
-            Some(u(2).to_string())
-        );
-        // empty session -> None (user-default file is not present in this unit test env)
+        assert_eq!(capture_project(&s, Some("/other")), Some(u(2)));
+        // empty session, no user_project.toml in the isolated config dir -> None
         assert_eq!(capture_project(&SessionState::default(), None), None);
         // malformed stored id -> None (defensive)
         let bad = SessionState {
@@ -1661,19 +1686,25 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(capture_project(&bad, None), None);
+        // a valid user_project.toml in the isolated config dir is the last tier
+        let path = crate::user_project_default::default_project_path().unwrap();
+        assert!(path.starts_with(tmp.path()), "not isolated: {path:?}");
+        crate::user_project_default::save(&pb(&u(3).to_string())).unwrap();
+        assert_eq!(capture_project(&SessionState::default(), None), Some(u(3)));
     }
 
-    /// The full binding — not just its id — survives `capture_project`: this
+    /// The full binding — not just its id — survives `capture_binding`: this
     /// is what lets `attribution_mode` see a session-scoped `forced_until`
     /// (Important finding 1 in the VIS-305 Part C review: the old
     /// process-global disk read never saw a force written into SESSION
     /// state, which is where a plain `project switch --project-attribution
     /// explicit` — no `--user` — writes it).
     /// ENV ISOLATION: see `capture_project_precedence_local_only` — this
-    /// test also calls `capture_project`, which reads `TRACEVAULT_PROJECT`
-    /// at a rung ABOVE the session-active binding it is asserting on.
+    /// test also goes through the capture chain, which reads
+    /// `TRACEVAULT_PROJECT` at a rung ABOVE the session-active binding it is
+    /// asserting on.
     #[test]
-    fn capture_project_preserves_forced_until_from_the_winning_tier() {
+    fn capture_binding_preserves_forced_until_from_the_winning_tier() {
         use crate::session_state::{ProjectBinding, SessionState};
         let _env_lock = crate::test_helpers::lock_env_mutation_sync();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
@@ -1689,7 +1720,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let got = capture_project(&s, Some("/wt")).expect("session-active binding resolves");
+        let got = capture_binding(&s, Some("/wt")).expect("session-active binding resolves");
         assert_eq!(got.forced_until, Some(future));
     }
 
@@ -1870,7 +1901,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let capture_binding = capture_project(&session, None);
+        let capture_binding = capture_binding(&session, None);
 
         let resp = ok_stream_response();
         let (base, rx) = spawn_once_capturing_request(Box::leak(resp.into_boxed_str()));
@@ -1934,7 +1965,7 @@ mod tests {
         let project_b = uuid::Uuid::from_u128(2);
         _guard.set("TRACEVAULT_PROJECT", project_b.to_string());
 
-        let capture_binding = capture_project(&SessionState::default(), None);
+        let capture_binding = capture_binding(&SessionState::default(), None);
         assert_eq!(
             capture_binding.as_ref().map(|b| b.project_id.as_str()),
             Some(project_b.to_string()).as_deref(),
@@ -2091,8 +2122,11 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", tmp.path());
         // `capture_project` reads `TRACEVAULT_PROJECT` above the
-        // session-active tier asserted below — pin it unset.
+        // session-active tier asserted below — pin it unset. Ditto
+        // `TRACEVAULT_PROJECT_ATTRIBUTION`, which the `derived` header
+        // assertion at the end of this test depends on.
         _guard.remove("TRACEVAULT_PROJECT");
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
 
         let pid = uuid::Uuid::from_u128(99);
         let session = SessionState {
@@ -2104,10 +2138,10 @@ mod tests {
             }),
             ..Default::default()
         };
-        let capture_binding = capture_project(&session, None);
+        let capture_binding = capture_binding(&session, None);
         let capture_pid = capture_binding
             .as_ref()
-            .and_then(|b| b.project_id.parse::<uuid::Uuid>().ok());
+            .and_then(crate::resolution::capture_project_id);
         assert_eq!(capture_pid, Some(pid));
 
         let resp = ok_stream_response();
@@ -2172,7 +2206,7 @@ mod tests {
         _guard.set("XDG_CONFIG_HOME", tmp.path());
         _guard.remove("TRACEVAULT_PROJECT");
 
-        let capture_binding = capture_project(&SessionState::default(), None);
+        let capture_binding = capture_binding(&SessionState::default(), None);
         assert_eq!(capture_binding, None);
 
         let resp = ok_stream_response();
@@ -2207,7 +2241,7 @@ mod tests {
         );
     }
 
-    // ── I1/I2: deterministic-client-error fallback + transient no-fallback ───
+    // ── I1/I2: refused project-scoped send is an error + transient no-fallback ───
 
     /// Spawn a server that replies to up to `responses.len()` sequential
     /// connections with the given full HTTP responses, in order, capturing
@@ -2265,11 +2299,13 @@ mod tests {
     }
 
     /// I1: a deterministic 400 ("is not a member of project ...") from the
-    /// project-scoped endpoint must fall back to the repo-scoped endpoint —
-    /// which then succeeds — rather than being buffered/retried forever. Both
-    /// endpoints must be hit, project first, then repo.
+    /// project-scoped endpoint must be an error, not a silent second send to
+    /// the repo-scoped endpoint. TWO responses (400 then 200) are staged so
+    /// the "no second request" check is non-vacuous — see the comment in
+    /// `send_stream_event_project_only_drops_on_scoping_4xx` for why a single
+    /// staged response would make that assertion pass vacuously.
     #[tokio::test]
-    async fn send_stream_event_falls_back_to_repo_scoped_on_deterministic_400() {
+    async fn send_stream_event_errors_on_deterministic_400_without_fallback() {
         let body_400 = "repo 11111111-1111-1111-1111-111111111111 is not a member of project 22222222-2222-2222-2222-222222222222";
         let resp_400 = format!(
             "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -2287,7 +2323,7 @@ mod tests {
         let pid = uuid::Uuid::from_u128(42);
 
         let mut warned = false;
-        let got = send_stream_event(
+        let err = send_stream_event(
             &client,
             &Attribution::Repo {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
@@ -2298,10 +2334,14 @@ mod tests {
             &mut warned,
         )
         .await
-        .expect("a deterministic 400 must fall back to repo-scoped and succeed");
-        assert_eq!(
-            got.expect("a successful send returns a response").status,
-            "accepted"
+        .expect_err("a refused declared project must be an error, not a silent fallback");
+        assert!(
+            err.to_string().contains("400"),
+            "propagated error must reflect the status, got: {err}"
+        );
+        assert!(
+            warned,
+            "the refusal must be printed (gated on `warned`) so it is visible"
         );
 
         let first = rx
@@ -2311,26 +2351,129 @@ mod tests {
             first.contains(&format!("/projects/{pid}/stream")),
             "first request must hit the project-scoped endpoint, got: {first}"
         );
-
-        let second = rx
-            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
-            .expect("no second (fallback) request captured");
         assert!(
-            second.starts_with("POST /api/v1/repos/11111111-1111-1111-1111-111111111111/stream "),
-            "second request must fall back to the repo-scoped endpoint, got: {second}"
+            first.contains("repo_id="),
+            "first request must carry repo_id, got: {first}"
+        );
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "no second (repo-scoped fallback) request must be sent"
         );
     }
 
-    /// Finding 5's scenario end to end, on the repo-bound path: a live
-    /// persisted force makes this send declare `explicit`, the force gate
-    /// refuses it with a 403, and the event is silently re-sent to the
-    /// repo-scoped endpoint — where the server DEDUCES a project, which is
-    /// precisely not the one the operator forced. Pins the two facts the
-    /// warning's new clause depends on: that the declared mode really is
-    /// `explicit` (so `fallback_warning` is handed `"explicit"`, the same
-    /// value that went on the wire), and that the fallback happens anyway.
+    /// A 403 from the project-scoped endpoint must likewise be an error, not a
+    /// silent second send to the repo-scoped endpoint.
     #[tokio::test]
-    async fn a_refused_force_still_falls_back_to_repo_scoped_attribution() {
+    async fn send_stream_event_errors_on_403_without_fallback() {
+        let body_403 = "forbidden";
+        let resp_403 = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body_403.len(),
+            body_403
+        );
+        let resp_200 = ok_stream_response();
+
+        let (base, rx) = spawn_n_capturing_requests(vec![
+            Box::leak(resp_403.into_boxed_str()),
+            Box::leak(resp_200.into_boxed_str()),
+        ]);
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let req = sample_stream_event_request();
+        let pid = uuid::Uuid::from_u128(43);
+
+        let mut warned = false;
+        let err = send_stream_event(
+            &client,
+            &Attribution::Repo {
+                repo_id: "11111111-1111-1111-1111-111111111111".into(),
+                project: Some(pid),
+            },
+            None,
+            &req,
+            &mut warned,
+        )
+        .await
+        .expect_err("a refused declared project must be an error, not a silent fallback");
+        assert!(
+            err.to_string().contains("403"),
+            "propagated error must reflect the status, got: {err}"
+        );
+        assert!(
+            warned,
+            "the refusal must be printed (gated on `warned`) so it is visible"
+        );
+
+        let first = rx
+            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
+            .expect("no first request captured");
+        assert!(
+            first.contains(&format!("/projects/{pid}/stream")),
+            "first request must hit the project-scoped endpoint, got: {first}"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "no second (repo-scoped fallback) request must be sent"
+        );
+    }
+
+    /// The refusal error must be printed at most once per hook invocation
+    /// (i.e. per shared `warned` flag), even across multiple calls sharing
+    /// it — mirroring how the pending-flush loop and the live send share one
+    /// `warned` for a single invocation.
+    #[tokio::test]
+    async fn refused_error_is_printed_once_per_invocation() {
+        let body_400 = "not a member";
+        let resp_400 = || {
+            format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body_400.len(),
+                body_400
+            )
+        };
+        let (base, _rx) = spawn_n_capturing_requests(vec![
+            Box::leak(resp_400().into_boxed_str()),
+            Box::leak(resp_400().into_boxed_str()),
+        ]);
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let req = sample_stream_event_request();
+        let pid = uuid::Uuid::from_u128(44);
+        let attribution = Attribution::Repo {
+            repo_id: "11111111-1111-1111-1111-111111111111".into(),
+            project: Some(pid),
+        };
+
+        let mut warned = false;
+        assert!(
+            send_stream_event(&client, &attribution, None, &req, &mut warned)
+                .await
+                .is_err(),
+            "a refused declared project must be an error"
+        );
+        assert!(warned, "the flag must be set after the first refusal");
+
+        assert!(
+            send_stream_event(&client, &attribution, None, &req, &mut warned)
+                .await
+                .is_err(),
+            "a second refusal must also be an error"
+        );
+        assert!(warned, "the flag stays set across the shared invocation");
+    }
+
+    /// Finding 5's scenario end to end, on the repo-bound path, as VIS-316
+    /// leaves it: a live persisted force makes this send declare `explicit`,
+    /// the force gate refuses it with a 403 — and the event is now an ERROR
+    /// queued for retry, never re-sent to the repo-scoped endpoint where the
+    /// server would DEDUCE a project that is precisely not the one the
+    /// operator forced.
+    ///
+    /// Pins the fact the refusal clause depends on: the mode that went on
+    /// the wire really is `explicit`, and it is the same value
+    /// `refused_error` is handed — the message and the wire cannot disagree.
+    /// A spare 200 is staged so "no second request" is non-vacuous.
+    #[tokio::test]
+    async fn a_refused_force_declares_explicit_and_is_an_error_not_a_fallback() {
         let body_403 = "forbidden";
         let resp_403 = format!(
             "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -2357,7 +2500,7 @@ mod tests {
         };
 
         let mut warned = false;
-        let got = send_stream_event(
+        let err = send_stream_event(
             &client,
             &Attribution::Repo {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
@@ -2368,12 +2511,12 @@ mod tests {
             &mut warned,
         )
         .await
-        .expect("a refused force falls back to the repo-scoped endpoint and succeeds");
-        assert_eq!(
-            got.expect("a successful send returns a response").status,
-            "accepted"
+        .expect_err("a refused force must be an error, not a silent fallback");
+        assert!(
+            err.to_string().contains("403"),
+            "propagated error must reflect the status, got: {err}"
         );
-        assert!(warned, "the fallback must warn exactly once");
+        assert!(warned, "the refusal must be printed exactly once");
 
         let first = rx
             .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
@@ -2387,23 +2530,29 @@ mod tests {
                 .to_lowercase()
                 .contains("x-tracevault-project-attribution: explicit"),
             "the refused send must have DECLARED explicit — this is the mode \
-             `fallback_warning` is handed: {first}"
+             `refused_error` is handed: {first}"
         );
 
-        let second = rx
-            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
-            .expect("no second (fallback) request captured");
         assert!(
-            second.starts_with("POST /api/v1/repos/11111111-1111-1111-1111-111111111111/stream "),
-            "a refused force falls back to repo-DERIVED attribution, got: {second}"
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "a refused force must NOT be re-attributed via the repo-scoped endpoint"
         );
     }
 
     /// The repo-less send: a `ProjectOnly` attribution must hit the bare
     /// project endpoint with NO `repo_id` query pair. This is the wire shape
     /// the server documents as "repo-less (0-repo) projects are supported".
+    ///
+    /// Takes the env lock and pins `TRACEVAULT_PROJECT_ATTRIBUTION` unset:
+    /// this test also asserts the `derived` attribution header, and
+    /// `attribution_mode` reads that variable even when the binding passed
+    /// in is `None`.
     #[tokio::test]
     async fn send_stream_event_project_only_omits_repo_id() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
         let resp = ok_stream_response();
         let (base, rx) = spawn_once_capturing_request(Box::leak(resp.into_boxed_str()));
         let client = crate::api_client::ApiClient::new(&base, Some("tok"));
@@ -2631,52 +2780,73 @@ mod tests {
         }
     }
 
-    /// The 403 warning must not tell a user whose account has no `tracing` role
-    /// to switch projects, which cannot possibly help. It names both causes; the
-    /// scoping statuses keep the precise project wording.
+    /// The 403 error must not tell a user whose account has no `tracing` role
+    /// to switch projects, which cannot possibly help. It names both causes,
+    /// and — since the CLI no longer re-attributes to another project — must
+    /// never claim it did.
     #[test]
-    fn the_403_warning_names_the_realm_role_as_well_as_the_project() {
+    fn refused_error_names_both_403_causes_and_never_claims_re_attribution() {
         let pid = uuid::Uuid::from_u128(7);
 
-        let forbidden = fallback_warning(pid, &ClientErrorKind::Forbidden, "derived");
+        let forbidden = refused_error(pid, &ClientErrorKind::Forbidden, "derived");
+        assert!(forbidden.contains("403"), "{forbidden}");
         assert!(
-            forbidden.contains("`tracing` Keycloak realm role"),
+            forbidden.contains("realm role"),
             "must offer the missing-role explanation: {forbidden}"
         );
         assert!(
-            forbidden.contains("project switch"),
+            forbidden.contains("TracePush"),
             "must still offer the project explanation: {forbidden}"
         );
         assert!(
-            forbidden.contains("Either"),
-            "must present them as alternatives, not assert one: {forbidden}"
+            forbidden.starts_with("tracevault: error:"),
+            "a refusal is an error, not a warning: {forbidden}"
         );
         assert!(forbidden.contains(&pid.to_string()));
 
         // A 400/404/409 genuinely IS a binding problem, so that wording stays
         // unhedged — hedging everything would dilute the useful case.
-        let scoping = fallback_warning(pid, &ClientErrorKind::Scoping, "derived");
+        let scoping = refused_error(pid, &ClientErrorKind::Scoping, "derived");
         assert!(scoping.contains("project switch"), "{scoping}");
         assert!(
             !scoping.contains("realm role"),
             "the scoping case must not mention the realm role: {scoping}"
         );
+
+        for s in [&forbidden, &scoping] {
+            // A machine-wide default is rebound with `--user`; without the
+            // hint, `project switch` in a session only shadows it.
+            assert!(s.contains("--user"), "must name the --user fix: {s}");
+            assert!(
+                s.contains("user_project.toml"),
+                "must name the machine-wide default's file: {s}"
+            );
+            assert!(
+                !s.contains("repo deduction"),
+                "must never describe re-attribution to another project: {s}"
+            );
+            assert!(
+                !s.contains("Attributing via"),
+                "must never claim the event was re-attributed: {s}"
+            );
+        }
     }
 
     /// VIS-305 whole-branch review, Important finding 5: a REFUSED FORCE
-    /// fell back silently. The `Attribution::Repo { project: Some(_) }` path
-    /// treats any deterministic 4xx — including the 403 the force gate
-    /// returns for "not Operator on the project" or "`explicit` from a
-    /// `tvk_` key" — as a reason to warn once and re-send to the repo-scoped
-    /// endpoint, which succeeds. The operator asked for `explicit`, got a
-    /// warning about realm roles, and their events landed under the repo's
-    /// DEDUCED project. Failing closed on trust is right; never saying the
-    /// force was refused is the defect.
+    /// said nothing about the force. The 403 the force gate returns for "not
+    /// Operator on the project" or "`explicit` from a `tvk_` key" is
+    /// indistinguishable from here (see `ClientErrorKind`) from a membership
+    /// 403, so an operator who asked for `explicit` got a message about
+    /// membership and realm roles and was never told the force itself was
+    /// what got refused. Failing closed on trust is right; failing closed
+    /// silently is the defect. (VIS-316 made the refusal an error rather
+    /// than a fallback; the missing explanation is orthogonal to that and
+    /// still has to be given.)
     #[test]
-    fn the_403_warning_says_the_force_was_refused_when_the_send_declared_explicit() {
+    fn the_403_error_says_the_force_was_refused_when_the_send_declared_explicit() {
         let pid = uuid::Uuid::from_u128(7);
 
-        let explicit = fallback_warning(pid, &ClientErrorKind::Forbidden, "explicit");
+        let explicit = refused_error(pid, &ClientErrorKind::Forbidden, "explicit");
         assert!(
             explicit.contains("FORCE"),
             "the refusal of the force itself must be named: {explicit}"
@@ -2689,16 +2859,25 @@ mod tests {
             explicit.contains("Control Plane"),
             "must name the identity forcing requires: {explicit}"
         );
+        // `main`'s Forbidden wording is ADDED TO, not replaced: the
+        // membership causes it already names must survive alongside the
+        // force clause.
         assert!(
-            explicit.contains("repo deduction"),
-            "must say where the events actually went: {explicit}"
+            explicit.contains("realm role") && explicit.contains("TracePush"),
+            "the membership causes must still be named: {explicit}"
+        );
+        // The event is queued, not re-attributed — the force clause must not
+        // reintroduce the claim VIS-316 removed.
+        assert!(
+            !explicit.contains("repo deduction") && !explicit.contains("Attributing via"),
+            "must never claim the event was re-attributed: {explicit}"
         );
 
         // Same 403, `derived` mode: no force was asked for, so none was
         // refused and the clause must not appear. This is the discriminating
-        // half — without it the test would pass on a warning that blamed the
+        // half — without it the test would pass on a message that blamed the
         // force unconditionally, which is just a different wrong story.
-        let derived = fallback_warning(pid, &ClientErrorKind::Forbidden, "derived");
+        let derived = refused_error(pid, &ClientErrorKind::Forbidden, "derived");
         assert!(
             !derived.contains("FORCE"),
             "a `derived` send never forced anything: {derived}"
@@ -2712,11 +2891,11 @@ mod tests {
     #[test]
     fn an_explicit_scoping_failure_does_not_blame_the_force() {
         let pid = uuid::Uuid::from_u128(7);
-        let scoping = fallback_warning(pid, &ClientErrorKind::Scoping, "explicit");
+        let scoping = refused_error(pid, &ClientErrorKind::Scoping, "explicit");
         assert!(!scoping.contains("FORCE"), "{scoping}");
         assert_eq!(
             scoping,
-            fallback_warning(pid, &ClientErrorKind::Scoping, "derived"),
+            refused_error(pid, &ClientErrorKind::Scoping, "derived"),
             "the scoping wording does not depend on the mode"
         );
     }

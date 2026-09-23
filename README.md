@@ -84,12 +84,12 @@ export TRACEVAULT_PROJECT_ATTRIBUTION=explicit
 deduction, user default) and below only a `--project` flag and a subagent's per-worktree
 override, so a `.tracevault/config.toml` baked into a pod image cannot outrank the launcher.
 
-> **It accepts a project name or a UUID, but the capture path honours only the UUID form.**
-> Resolving a name needs a `list_projects` round trip, and the capture hook runs per event in
-> a short-lived process, so it never makes one: a name is ignored there and attribution falls
-> through to the next tier. The interactive commands (`tracevault status`,
-> `tracevault project status`) do have a client, so they resolve a name for display — and
-> both say so explicitly rather than reporting a tier the wire ignores. **Export the UUID.**
+> **Only the UUID form is honoured.** Resolving a name needs a `list_projects` round trip,
+> and the capture hook runs per event in a short-lived process, so it never makes one: a
+> name is ignored and attribution falls through to the next tier. `tracevault project status`
+> reports exactly what the capture path does, so it does not resolve a name either — it
+> warns that the value is unused. `tracevault status` does resolve it, for display only, and
+> flags the tier as one the wire ignores. **Export the UUID.**
 
 **`TRACEVAULT_PROJECT_ATTRIBUTION=explicit`** declares that the caller owns the attribution,
 so the server stamps the named project without checking that the repo belongs to it. Any
@@ -110,8 +110,10 @@ again without the flag clears the force immediately. The env-var form has no suc
 
 Forcing is a trust claim and the server enforces it at ingest, not at `switch` time: it
 requires a Control Plane identity with `Operator` on the target project. A long-lived
-`tvk_` API key can never force. A refused force comes back as a `403`, and the event is
-attributed by repo deduction instead — the CLI warns on stderr when that happens.
+`tvk_` API key can never force. A refused force comes back as a `403`; the CLI prints an
+error naming the force as a possible cause and the event is **queued for retry, never
+re-attributed to some other project** — fix the grant (or drop the force) and the next
+drain delivers it.
 
 Use `tracevault project status` to see which tier won and which mode is in effect, and
 `tracevault status` for the same thing as part of the full diagnostic.
