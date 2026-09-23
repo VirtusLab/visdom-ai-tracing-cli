@@ -207,11 +207,22 @@ async fn drain_queue(
     let mut failed = 0u64;
     let mut failed_events: Vec<StreamEventRequest> = Vec::new();
 
+    // Label the progress and warning lines with the session directory the
+    // queue lives in. It is the same id the hook stamped on every event here
+    // (`run_stream` writes the queue under `.tracevault/sessions/<id>/`), but
+    // taken from the path rather than the payload: the label is a directory
+    // name, not data read out of the event.
+    let queue_dir_name = pending_path
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("?");
+
     let mut events = events.into_iter().enumerate();
     while let Some((i, mut event)) = events.next() {
         eprint!(
             "\r  Session {} — event {}/{} ...",
-            short_session_id(&event.session_id),
+            short_session_id(queue_dir_name),
             i + 1,
             event_total
         );
@@ -222,17 +233,13 @@ async fn drain_queue(
                 // Payload too large even after truncation — drop it.
                 eprintln!();
                 eprintln!(
-                    "  Warning: dropped event (session {}) — still too large after truncation",
-                    event.session_id
+                    "  Warning: dropped event (session {queue_dir_name}) — still too large after truncation"
                 );
                 failed += 1;
             }
             QueuedSend::Failed(e) => {
                 eprintln!();
-                eprintln!(
-                    "  Warning: failed to send event (session {}): {e}",
-                    event.session_id
-                );
+                eprintln!("  Warning: failed to send event (session {queue_dir_name}): {e}");
                 failed_events.push(event);
                 failed += 1;
             }
