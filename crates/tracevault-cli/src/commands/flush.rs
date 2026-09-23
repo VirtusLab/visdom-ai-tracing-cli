@@ -132,7 +132,12 @@ fn queue_capture_project(session_dir: &Path, target: &QueueTarget) -> Option<uui
     }
     let session_id = session_dir.file_name()?.to_str()?;
     let session = crate::session_state::load(session_id);
-    let worktree = fs::read_to_string(session_dir.join("origin")).ok();
+    // Trimmed like the other `origin` readers (`check`, `verification_phase`):
+    // the hook writes no trailing newline today, but a hand-edited marker
+    // must not silently miss the subagent worktree override.
+    let worktree = fs::read_to_string(session_dir.join("origin"))
+        .ok()
+        .map(|s| s.trim().to_string());
     crate::commands::stream::capture_project(&session, worktree.as_deref())
 }
 
