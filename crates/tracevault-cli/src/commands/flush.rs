@@ -95,7 +95,7 @@ fn pending_queues_in(
 
 /// The progress line uses a short prefix of the session id for display; guards
 /// against a prior `[..8]` panic on session ids shorter than 8 bytes.
-fn short_session_id(id: &str) -> &str {
+fn display_prefix(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
@@ -222,7 +222,7 @@ async fn drain_queue(
     while let Some((i, mut event)) = events.next() {
         eprint!(
             "\r  Session {} — event {}/{} ...",
-            short_session_id(queue_dir_name),
+            display_prefix(queue_dir_name),
             i + 1,
             event_total
         );
@@ -359,7 +359,7 @@ fn append_pending(
 
 #[cfg(test)]
 mod tests {
-    use super::{pending_queues_in, repo_id_from_pending_filename, short_session_id, QueueTarget};
+    use super::{display_prefix, pending_queues_in, repo_id_from_pending_filename, QueueTarget};
     use crate::paths::resolve_project_root;
     use crate::test_helpers::{add_worktree, init_git_repo};
     use std::fs;
@@ -544,24 +544,24 @@ mod tests {
             .any(|(p, _)| p.ends_with("pending-not-a-uuid.jsonl")));
     }
 
-    // ── short_session_id: display-only truncation, no panic on short ids ─────
+    // ── display_prefix: display-only truncation, no panic on short ids ─────
 
     #[test]
-    fn short_session_id_truncates_long_id() {
+    fn display_prefix_truncates_long_id() {
         assert_eq!(
-            short_session_id("0190a1b2-cccc-dddd-eeee-ffffffffffff"),
+            display_prefix("0190a1b2-cccc-dddd-eeee-ffffffffffff"),
             "0190a1b2"
         );
     }
 
     #[test]
-    fn short_session_id_returns_whole_string_when_shorter_than_8() {
-        assert_eq!(short_session_id("x"), "x");
+    fn display_prefix_returns_whole_string_when_shorter_than_8() {
+        assert_eq!(display_prefix("x"), "x");
     }
 
     #[test]
-    fn short_session_id_handles_empty_string() {
-        assert_eq!(short_session_id(""), "");
+    fn display_prefix_handles_empty_string() {
+        assert_eq!(display_prefix(""), "");
     }
 }
 
