@@ -69,10 +69,6 @@ pub fn clear() -> Result<(), Box<dyn std::error::Error>> {
 /// Default force lifetime: roughly one working day. A persisted force is
 /// strictly worse than a stale project binding, because it also disables the
 /// check that would have caught the binding going stale.
-///
-/// `#[allow(dead_code)]`: wired in by `commands::project`'s `apply_force`
-/// (Task C3) — not yet a caller as of this commit.
-#[allow(dead_code)]
 pub const DEFAULT_FORCE_LIFETIME_HOURS: i64 = 12;
 
 fn load_with_force_from(dir: &Path) -> Option<(ProjectBinding, bool)> {

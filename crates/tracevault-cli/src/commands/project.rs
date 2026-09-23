@@ -29,6 +29,12 @@ pub enum ProjectCmd {
         /// Session to target; defaults to $TRACEVAULT_SESSION_ID.
         #[arg(long)]
         session_id: Option<String>,
+        /// Who owns attribution. `explicit` stamps the named project without
+        /// a membership check and marks the session forced; it requires a
+        /// Control Plane identity and Operator on the project. A persisted
+        /// force lapses after ~one working day.
+        #[arg(long, value_parser = ["derived", "explicit"], default_value = "derived")]
+        project_attribution: String,
     },
     /// Show the project the current session is attributed to.
     Status {
@@ -53,7 +59,18 @@ pub async fn run(
             name,
             user,
             session_id,
-        } => switch(&name, user, session_id.as_deref(), project_root, cwd).await,
+            project_attribution,
+        } => {
+            switch(
+                &name,
+                user,
+                session_id.as_deref(),
+                &project_attribution,
+                project_root,
+                cwd,
+            )
+            .await
+        }
         ProjectCmd::Status {
             session_id,
             project,
@@ -151,10 +168,41 @@ fn switch_destination(user: bool, session_id: Option<String>) -> SwitchDest {
     }
 }
 
+/// Stamp or clear the persisted force on a binding about to be saved.
+///
+/// Clearing on a plain switch is deliberate: without it, a user who forced
+/// once and later switched normally would keep forcing until the clock ran
+/// out, which is exactly the forgotten-force failure the lifetime exists to
+/// bound.
+fn apply_force(mut binding: ProjectBinding, explicit: bool) -> ProjectBinding {
+    binding.forced_until = explicit.then(|| {
+        (chrono::Utc::now()
+            + chrono::Duration::hours(crate::user_project_default::DEFAULT_FORCE_LIFETIME_HOURS))
+        .to_rfc3339()
+    });
+    binding
+}
+
+/// The `project status` line describing attribution ownership.
+fn format_force_line(forced_until: Option<&str>) -> String {
+    match forced_until.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) {
+        Some(until) if until > chrono::Utc::now() => format!(
+            "attribution: forced by this caller (membership not checked); lapses {}",
+            until.to_rfc3339()
+        ),
+        Some(until) => format!(
+            "attribution: derived (a force lapsed {}; membership is checked again)",
+            until.to_rfc3339()
+        ),
+        None => "attribution: derived (TraceVault checks repo/project membership)".to_string(),
+    }
+}
+
 async fn switch(
     name: &str,
     user: bool,
     session_id: Option<&str>,
+    project_attribution: &str,
     project_root: &Path,
     cwd: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -163,6 +211,7 @@ async fn switch(
     let dest = switch_destination(user, session);
     let check_codebase = matches!(dest, SwitchDest::Session(_));
     let binding = resolve_switch_project(name, &client, check_codebase, cwd).await?;
+    let binding = apply_force(binding, project_attribution == "explicit");
 
     match dest {
         SwitchDest::Session(id) => {
@@ -170,6 +219,7 @@ async fn switch(
             state.active_project = Some(binding.clone());
             session_state::save(&id, &state)?;
             println!("bound session {id} to project {}", binding.project_name);
+            println!("{}", format_force_line(binding.forced_until.as_deref()));
         }
         SwitchDest::UserDefault => {
             crate::user_project_default::save(&binding)?;
@@ -177,6 +227,7 @@ async fn switch(
                 "set user-level default project {}; applies to new sessions without their own binding (the current session, if any, is unchanged — omit --user to bind this session)",
                 binding.project_name
             );
+            println!("{}", format_force_line(binding.forced_until.as_deref()));
         }
     }
     Ok(())
@@ -238,6 +289,9 @@ async fn status(
                 "{}",
                 format_status(effective.as_ref().map(|(b, s)| (b, *s)))
             );
+            if let Some((b, _)) = &effective {
+                println!("{}", format_force_line(b.forced_until.as_deref()));
+            }
         }
         // `status` is a read-only inspector: unlike the callers that need an
         // authoritative binding to act on, an unresolvable rung here (notably
@@ -430,6 +484,67 @@ mod tests {
             switch_destination(false, None),
             SwitchDest::UserDefault
         ));
+    }
+
+    #[test]
+    fn switching_with_explicit_stamps_a_lapse_time() {
+        let before = chrono::Utc::now();
+        let binding = apply_force(
+            ProjectBinding {
+                project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+                project_name: "p".into(),
+                updated_at: before.to_rfc3339(),
+                forced_until: None,
+            },
+            true,
+        );
+        let until = chrono::DateTime::parse_from_rfc3339(
+            binding.forced_until.as_deref().expect("force is stamped"),
+        )
+        .unwrap();
+        let expected = before
+            + chrono::Duration::hours(crate::user_project_default::DEFAULT_FORCE_LIFETIME_HOURS);
+        assert!((until.timestamp() - expected.timestamp()).abs() < 5);
+    }
+
+    #[test]
+    fn switching_without_explicit_stamps_no_lapse_time() {
+        let binding = apply_force(
+            ProjectBinding {
+                project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+                project_name: "p".into(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                forced_until: Some("2020-01-01T00:00:00Z".into()),
+            },
+            false,
+        );
+        assert_eq!(
+            binding.forced_until, None,
+            "switching without --project-attribution explicit must CLEAR a stale force"
+        );
+    }
+
+    #[test]
+    fn status_names_the_mode_and_the_lapse() {
+        let future = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
+        let line = format_force_line(Some(&future));
+        assert!(line.contains("forced"), "got: {line}");
+
+        let derived = format_force_line(None);
+        assert!(derived.contains("derived"), "got: {derived}");
+    }
+
+    /// Discriminates the SIGN of the lapse comparison in `format_force_line`:
+    /// a `forced_until` already in the past must report as lapsed (back to
+    /// `derived`), not as still-forced. Complements
+    /// `status_names_the_mode_and_the_lapse`, which only exercises the
+    /// future/none cases.
+    #[test]
+    fn status_names_a_lapsed_force_as_derived_not_forced() {
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let line = format_force_line(Some(&past));
+        assert!(line.contains("derived"), "got: {line}");
+        assert!(!line.contains("forced by"), "got: {line}");
     }
 
     fn pb(name: &str) -> ProjectBinding {
@@ -736,7 +851,7 @@ mod tests {
         _guard.set("TRACEVAULT_SERVER_URL", &base);
         _guard.set("TRACEVAULT_API_KEY", "tok");
 
-        let result = switch("payments", false, None, tmp.path(), tmp.path()).await;
+        let result = switch("payments", false, None, "derived", tmp.path(), tmp.path()).await;
         assert!(
             result.is_ok(),
             "expected a no-session, non-`--user` switch to skip the codebase check: {result:?}"
