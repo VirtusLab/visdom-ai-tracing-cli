@@ -650,19 +650,35 @@ fn project_label(binding: &crate::session_state::ProjectBinding) -> &str {
 }
 
 /// Maps the resolved project-attribution outcome to the "Project" check.
-/// Pure and network-free — the resolution already happened in `run_status`.
+/// Network-free — the resolution already happened in `run_status`. It does
+/// read `TRACEVAULT_PROJECT` (via `env_project_binding`) for the `Env` arm;
+/// see the rule below for why that read is the point.
 /// DISPLAY ONLY: this outcome never feeds [`recording_check`]'s verdict — see
 /// that function's doc comment for why.
 ///
 /// One rule decides `Ok`: the tier must be one `capture_project` itself
-/// honors (flag/subagent/session-active/user-default — NOT `ConfigDefault`
-/// or `Deduced`, which it excludes/never produces), AND the binding's
-/// `project_id` must parse as a UUID, since `capture_project` ends with
-/// `.parse::<uuid::Uuid>().ok()?` and silently drops anything that doesn't.
-/// Either failure renders `Warn`, not `Ok` — showing green for a binding the
-/// capture path will not honor is the exact confusion this command exists to
-/// eliminate (a hand-edited or corrupted `user_project.toml` with a garbage
-/// `project_id` is a real way to hit the id-validity half of this).
+/// honors (flag/subagent/`Env`/session-active/user-default — NOT
+/// `ConfigDefault` or `Deduced`, which it excludes/never produces), AND the
+/// binding must be one `capture_project` would not then drop. It drops a
+/// `project_id` that fails `.parse::<uuid::Uuid>()` (its own last act before
+/// returning the binding), and — at the `Env` rung specifically — it never
+/// forms a binding at all unless the RAW `TRACEVAULT_PROJECT` value is a
+/// UUID, because `env_project_binding` is UUID-only by design (a name would
+/// need a per-event `list_projects` round trip).
+///
+/// That last condition is why the `Env` arm consults
+/// [`crate::commands::stream::env_project_binding`] rather than testing the
+/// RESOLVED binding's id: a NAME in `TRACEVAULT_PROJECT` is resolved here for
+/// display (this command has a client; the hook does not), so its resolved id
+/// IS a valid UUID and would sail through an id-only test — reporting green
+/// for a tier the wire silently ignores. Asking the capture path's own reader
+/// is what makes the two unable to drift.
+///
+/// Any of those failures renders `Warn`, not `Ok` — showing green for a
+/// binding the capture path will not honor is the exact confusion this
+/// command exists to eliminate (a hand-edited or corrupted
+/// `user_project.toml` with a garbage `project_id` is a real way to hit the
+/// id-validity half of this).
 ///
 /// `Err` — the ambiguous "this repo belongs to multiple projects" case, or
 /// any transport/5xx failure of the deduction call (`resolve_effective_project`
@@ -698,8 +714,23 @@ fn project_binding_check(outcome: &ProjectOutcome) -> Check {
                     | ProjectSource::SessionActive
                     | ProjectSource::UserDefault
             );
+            // ...but only for the form the capture path can actually use. A
+            // NAME resolves here (a client is in scope) and nowhere on the
+            // wire, so asking `env_project_binding` — the hook's own reader
+            // of this same var — is the only test that can't go green on a
+            // tier the hook ignores.
+            let env_name_form = *source == ProjectSource::Env
+                && crate::commands::stream::env_project_binding().is_none();
             let label = project_label(binding);
-            if !honored_tier {
+            if env_name_form {
+                Check::warn(
+                    "Project",
+                    format!(
+                        "{label} — {source}, resolved for display only: the capture path honours only the UUID form of TRACEVAULT_PROJECT, so a NAME is ignored there and attribution falls through to the next tier — export TRACEVAULT_PROJECT={} instead, or bind it with `tracevault project switch <name>`",
+                        binding.project_id
+                    ),
+                )
+            } else if !honored_tier {
                 Check::warn(
                     "Project",
                     format!(
@@ -829,10 +860,16 @@ fn recording_attribution(
 /// out analogously to [`offline_project_outcome`] so this branch is
 /// unit-testable without driving all of `run_status`. Returns the outcome
 /// plus the configured `default_project` NAME when it failed to resolve, for
-/// the caller to surface via `unresolved_config_default_check` — an
-/// unresolved `TRACEVAULT_PROJECT` NAME gets no equivalent surfacing; it is
-/// silently dropped, the same treatment `commands::project`'s `status` gives
-/// an unresolved `--project`.
+/// the caller to surface via `unresolved_config_default_check`.
+///
+/// An unresolved `TRACEVAULT_PROJECT` NAME still gets no equivalent surfacing
+/// here; it is silently dropped. That is now a real (if narrow) gap rather
+/// than a matter of parity: `commands::project`'s `status` DOES warn for it
+/// (as it already did for an unresolved `--project` and `default_project`).
+/// It is survivable because the capture path drops a name too, so nothing
+/// this command reports contradicts what the hook does — the operator is
+/// simply not told why their variable had no effect. Closing it means a
+/// `Check` of its own, deliberately left for a follow-up.
 async fn online_project_outcome(
     client: &ApiClient,
     config_default_name: Option<&str>,
@@ -2211,6 +2248,17 @@ mod tests {
         // separately — they must NOT appear here. Uses a well-formed UUID
         // id: an honored tier still needs a parseable `project_id` to read
         // Ok (see the malformed-id tests below).
+        //
+        // `TRACEVAULT_PROJECT` is pinned to that same UUID for the duration:
+        // an `Env`-sourced binding can only ever exist when that var is set,
+        // and the check now asks `env_project_binding()` whether the RAW
+        // value is the UUID form the capture path honours (see
+        // `project_binding_check_env_name_form_is_warn_not_ok`). Leaving the
+        // var unset here would assert on a state that cannot occur.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("TRACEVAULT_PROJECT", "33333333-3333-4333-8333-333333333333");
+
         use crate::resolution::ProjectSource::*;
         for source in [ProjectFlag, Subagent, Env, SessionActive, UserDefault] {
             let outcome: ProjectOutcome = Ok(Some((
@@ -2225,6 +2273,60 @@ mod tests {
                 check.detail
             );
         }
+    }
+
+    /// VIS-305 whole-branch review, Important finding 2: the false green.
+    /// `env_project_binding` is UUID-only, but `project status` and
+    /// `run_status` both resolve a project NAME in `TRACEVAULT_PROJECT` via
+    /// `list_projects` and report the tier as `Env`. The resolved binding's
+    /// id then IS a valid UUID, so an id-only check reads `Ok` — whose
+    /// documented contract is "this tier IS honoured at capture time" —
+    /// while the hook ignores the name entirely and attributes elsewhere.
+    ///
+    /// The condition `capture_project` actually applies is to the RAW env
+    /// value, so this pins that: same well-formed resolved binding, same
+    /// `Env` tier, but `TRACEVAULT_PROJECT` holding a NAME must render
+    /// `Warn`, worded like `unresolved_config_default_check` — resolves for
+    /// display, not honoured on the wire.
+    #[test]
+    fn project_binding_check_env_name_form_is_warn_not_ok() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("TRACEVAULT_PROJECT", "payments");
+
+        // Exactly what `online_project_outcome`/`resolve_status_effective`
+        // hand back for `TRACEVAULT_PROJECT=payments`: the NAME resolved
+        // against `list_projects`, so the id is a perfectly valid UUID.
+        let outcome: ProjectOutcome = Ok(Some((
+            project_binding("33333333-3333-4333-8333-333333333333", "payments"),
+            crate::resolution::ProjectSource::Env,
+        )));
+        let check = project_binding_check(&outcome);
+        assert_eq!(
+            check.level,
+            Level::Warn,
+            "a NAME in TRACEVAULT_PROJECT is ignored by the capture path, so it must never read Ok: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("UUID form"),
+            "the warning must say WHICH form is honoured: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("display only"),
+            "worded like unresolved_config_default_check's precedent: {}",
+            check.detail
+        );
+
+        // Discrimination: the SAME binding under the UUID form still reads
+        // Ok, so this pins the raw-value rule and not merely "Env warns".
+        _guard.set("TRACEVAULT_PROJECT", "33333333-3333-4333-8333-333333333333");
+        let outcome: ProjectOutcome = Ok(Some((
+            project_binding("33333333-3333-4333-8333-333333333333", "payments"),
+            crate::resolution::ProjectSource::Env,
+        )));
+        assert_eq!(project_binding_check(&outcome).level, Level::Ok);
     }
 
     #[test]
