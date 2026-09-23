@@ -2031,17 +2031,53 @@ mod tests {
     /// harness in `tests/stream_event_project_test.rs`.
     const SEND_STREAM_EVENT_RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// Spawn a one-shot server that returns `response` (a full HTTP response)
-    /// to the first request. Captures the HTTP request line (method + path +
-    /// query) FOLLOWED BY its headers (one per line) over the returned
-    /// channel before writing the response. Mirrors the harness in
-    /// `tests/stream_event_project_test.rs` / `tests/resolve_remote_test.rs`.
+    /// Read one request's line and headers off `stream`, hand the pair to
+    /// `tx` as a single string, then write `response` back.
     ///
-    /// Headers are captured (not just the request line) so a test can assert
-    /// on `x-tracevault-project-attribution` — without this, a regression
-    /// that hardcoded `"derived"` at a `stream_event_for_project` call site
-    /// would pass the whole suite, since nothing in-crate ever looked at the
-    /// header actually sent.
+    /// Shared by [`spawn_once_capturing_request`] and
+    /// [`spawn_n_capturing_requests`], which grew this same capture
+    /// independently and disagreed only on `trim()` vs `trim_end()` for the
+    /// blank-line terminator (equivalent, since a bare CRLF trims empty
+    /// either way).
+    ///
+    /// Deliberately NOT `test_helpers::read_request`: that one is private to
+    /// its module and blocks in `accept()`, where these two use
+    /// `set_nonblocking` plus a deadline.
+    ///
+    /// Headers are captured, not just the request line, so a test can assert
+    /// on `x-tracevault-project-attribution` — without them a regression that
+    /// hardcoded `"derived"` at a `stream_event_for_project` call site would
+    /// pass the whole suite, since nothing in-crate ever looked at the header
+    /// actually sent. They are appended AFTER the request line, leaving
+    /// `starts_with`/`contains` assertions on the line itself unaffected.
+    fn capture_request_and_respond(
+        stream: std::net::TcpStream,
+        tx: &mpsc::Sender<String>,
+        response: &str,
+    ) {
+        let mut reader = BufReader::new(stream);
+        let mut captured = String::new();
+        let _ = reader.read_line(&mut captured);
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                break;
+            }
+            if header.trim().is_empty() {
+                break;
+            }
+            captured.push_str(&header);
+        }
+        let _ = tx.send(captured);
+        let mut stream = reader.into_inner();
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    /// Spawn a one-shot server that returns `response` (a full HTTP response)
+    /// to the first request, capturing it via
+    /// [`capture_request_and_respond`]. Mirrors the harness in
+    /// `tests/stream_event_project_test.rs` / `tests/resolve_remote_test.rs`.
     fn spawn_once_capturing_request(response: &'static str) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -2049,23 +2085,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             if let Some(stream) = accept_with_deadline(&listener) {
-                let mut reader = BufReader::new(stream);
-                let mut captured = String::new();
-                let _ = reader.read_line(&mut captured);
-                loop {
-                    let mut header = String::new();
-                    if reader.read_line(&mut header).unwrap_or(0) == 0 {
-                        break;
-                    }
-                    if header.trim().is_empty() {
-                        break;
-                    }
-                    captured.push_str(&header);
-                }
-                let _ = tx.send(captured);
-                let mut stream = reader.into_inner();
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
+                capture_request_and_respond(stream, &tx, response);
             }
         });
         (format!("http://{addr}"), rx)
@@ -2250,11 +2270,12 @@ mod tests {
 
     /// Spawn a server that replies to up to `responses.len()` sequential
     /// connections with the given full HTTP responses, in order, capturing
-    /// each request line over the channel. The listening socket itself is
-    /// dropped (closing it) once all responses have been served, so any
-    /// further connection attempt fails fast (connection refused) rather than
-    /// hanging for the client's request timeout — this lets a test assert
-    /// "no further request was sent" cheaply.
+    /// each request (line + headers, via [`capture_request_and_respond`])
+    /// over the channel. The listening socket itself is dropped (closing it)
+    /// once all responses have been served, so any further connection attempt
+    /// fails fast (connection refused) rather than hanging for the client's
+    /// request timeout — this lets a test assert "no further request was
+    /// sent" cheaply.
     fn spawn_n_capturing_requests(
         responses: Vec<&'static str>,
     ) -> (String, mpsc::Receiver<String>) {
@@ -2271,29 +2292,7 @@ mod tests {
                 let Some(stream) = accept_with_deadline(&listener) else {
                     break;
                 };
-                let mut reader = BufReader::new(stream);
-                let mut captured = String::new();
-                let _ = reader.read_line(&mut captured);
-                // Headers are retained too, appended after the request line
-                // so existing `starts_with`/`contains` assertions on the
-                // line itself are unaffected. Without them a test cannot
-                // assert which attribution mode a request actually DECLARED
-                // — see `a_refused_force_still_falls_back_to_repo_scoped_
-                // attribution`. Mirrors `test_helpers::read_request`.
-                loop {
-                    let mut header = String::new();
-                    if reader.read_line(&mut header).unwrap_or(0) == 0 {
-                        break;
-                    }
-                    if header.trim_end().is_empty() {
-                        break;
-                    }
-                    captured.push_str(&header);
-                }
-                let _ = tx.send(captured);
-                let mut stream = reader.into_inner();
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
+                capture_request_and_respond(stream, &tx, response);
             }
             // `listener` (and `tx`) drop here, closing the socket and the
             // channel — a stray extra request gets ECONNREFUSED immediately
