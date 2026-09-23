@@ -537,15 +537,23 @@ pub(crate) fn deterministic_client_error_kind(
 /// invocation. The repo-less drop warning shares the flag for the same
 /// reason: draining a queue of undeliverable events would otherwise print one
 /// line per buffered event.
+///
+/// `mode` is the invocation's attribution mode — [`attribution_mode`] applied
+/// to the capture binding — sent verbatim as the
+/// `x-tracevault-project-attribution` header on every project-scoped send.
+/// Taken as a parameter rather than derived here because the binding is
+/// invariant across a whole hook invocation while this function runs once per
+/// buffered event, and the mode costs a `user_project.toml` read plus an
+/// RFC3339 parse. `commands::flush` resolves it once per queue for the same
+/// reason.
 async fn send_stream_event(
     client: &crate::api_client::ApiClient,
     attribution: &Attribution,
-    capture_binding: Option<&crate::session_state::ProjectBinding>,
+    mode: &str,
     req: &StreamEventRequest,
     warned: &mut bool,
 ) -> Result<Option<tracevault_protocol::streaming::StreamEventResponse>, Box<dyn std::error::Error>>
 {
-    let mode = attribution_mode(capture_binding);
     let (repo_id, capture_pid) = match attribution {
         // Repo-less: there is no repo-scoped endpoint to fall back TO, so the
         // only choice is buffer-for-retry vs. drop, and that turns on whether
@@ -912,14 +920,19 @@ pub async fn run_stream(
     // already-loaded session + worktree used just above for the repo-binding
     // resolution: a repo-less session is attributable by project alone, so the
     // project must be known before deciding whether this event can be sent.
-    // The full binding (not just its id) is kept around: `send_stream_event`
-    // reads its `forced_until` via `attribution_mode` — this is the binding
-    // that actually decided the target project, so it's the only one whose
-    // force is allowed to apply (see `attribution_mode`'s doc comment).
+    // The full binding (not just its id) is resolved: `attribution_mode`
+    // reads its `forced_until`, and this is the binding that actually decided
+    // the target project, so it's the only one whose force is allowed to
+    // apply (see `attribution_mode`'s doc comment).
     let capture_binding = capture_binding(&session, Some(worktree_top.as_str()));
     let capture_pid = capture_binding
         .as_ref()
         .and_then(crate::resolution::capture_project_id);
+    // Resolved once per invocation, not per event — the binding is invariant
+    // across the pending-flush loop and the live send below, while the mode
+    // read costs a `user_project.toml` read and an RFC3339 parse.
+    // `commands::flush` resolves it once per queue for the same reason.
+    let mode = attribution_mode(capture_binding.as_ref());
 
     // Ship if EITHER a repo or a project resolved; no-op only when neither
     // did. (`binding_repo_id_is_valid` guards a corrupted/hand-edited
@@ -948,15 +961,9 @@ pub async fn run_stream(
     // Send pending events first
     for (i, pending_json) in pending_events.iter().enumerate() {
         if let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(pending_json) {
-            if send_stream_event(
-                &client,
-                &attribution,
-                capture_binding.as_ref(),
-                &pending_req,
-                &mut warned,
-            )
-            .await
-            .is_err()
+            if send_stream_event(&client, &attribution, mode, &pending_req, &mut warned)
+                .await
+                .is_err()
             {
                 // Re-queue only the failed event and the ones after it that
                 // were never attempted, in order. Events before `i` already
@@ -989,15 +996,7 @@ pub async fn run_stream(
             fs::write(&offset_path, new_offset.to_string())?;
         }
     } else {
-        match send_stream_event(
-            &client,
-            &attribution,
-            capture_binding.as_ref(),
-            &req,
-            &mut warned,
-        )
-        .await
-        {
+        match send_stream_event(&client, &attribution, mode, &req, &mut warned).await {
             Ok(_) => {
                 // 10. On success update .stream_offset
                 fs::write(&offset_path, new_offset.to_string())?;
@@ -1912,7 +1911,7 @@ mod tests {
         let got = send_stream_event(
             &client,
             &Attribution::ProjectOnly { project_id: pid },
-            capture_binding.as_ref(),
+            attribution_mode(capture_binding.as_ref()),
             &req,
             &mut warned,
         )
@@ -2156,7 +2155,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: capture_pid,
             },
-            capture_binding.as_ref(),
+            attribution_mode(capture_binding.as_ref()),
             &req,
             &mut warned,
         )
@@ -2221,7 +2220,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: None,
             },
-            capture_binding.as_ref(),
+            attribution_mode(capture_binding.as_ref()),
             &req,
             &mut warned,
         )
@@ -2329,7 +2328,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: Some(pid),
             },
-            None,
+            attribution_mode(None),
             &req,
             &mut warned,
         )
@@ -2389,7 +2388,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: Some(pid),
             },
-            None,
+            attribution_mode(None),
             &req,
             &mut warned,
         )
@@ -2445,17 +2444,29 @@ mod tests {
 
         let mut warned = false;
         assert!(
-            send_stream_event(&client, &attribution, None, &req, &mut warned)
-                .await
-                .is_err(),
+            send_stream_event(
+                &client,
+                &attribution,
+                attribution_mode(None),
+                &req,
+                &mut warned
+            )
+            .await
+            .is_err(),
             "a refused declared project must be an error"
         );
         assert!(warned, "the flag must be set after the first refusal");
 
         assert!(
-            send_stream_event(&client, &attribution, None, &req, &mut warned)
-                .await
-                .is_err(),
+            send_stream_event(
+                &client,
+                &attribution,
+                attribution_mode(None),
+                &req,
+                &mut warned
+            )
+            .await
+            .is_err(),
             "a second refusal must also be an error"
         );
         assert!(warned, "the flag stays set across the shared invocation");
@@ -2506,7 +2517,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: Some(pid),
             },
-            Some(&forced),
+            attribution_mode(Some(&forced)),
             &req,
             &mut warned,
         )
@@ -2563,7 +2574,7 @@ mod tests {
         let got = send_stream_event(
             &client,
             &Attribution::ProjectOnly { project_id: pid },
-            None,
+            attribution_mode(None),
             &req,
             &mut warned,
         )
@@ -2624,7 +2635,7 @@ mod tests {
         let got = send_stream_event(
             &client,
             &Attribution::ProjectOnly { project_id: pid },
-            None,
+            attribution_mode(None),
             &req,
             &mut warned,
         )
@@ -2673,7 +2684,7 @@ mod tests {
             &Attribution::ProjectOnly {
                 project_id: uuid::Uuid::from_u128(13),
             },
-            None,
+            attribution_mode(None),
             &req,
             &mut warned,
         )
@@ -2709,7 +2720,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: Some(pid),
             },
-            None,
+            attribution_mode(None),
             &req,
             &mut warned,
         )
