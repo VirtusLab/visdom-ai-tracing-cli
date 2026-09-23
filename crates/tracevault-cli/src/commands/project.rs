@@ -187,18 +187,28 @@ async fn switch(
 /// Pure — `status` supplies `user_default` from `user_project_default::load()`,
 /// the same file `commands::stream::capture_project` reads, so the two cannot
 /// drift (pinned by `project_status_effective_project_matches_capture_project`).
-fn effective_capture_project(
+///
+/// A binding whose stored id is not a UUID is dropped exactly as ingest drops
+/// it ([`capture_project_id`] → `None`), so the effective project is `None`
+/// and the second element carries the warning naming the tier it came from.
+fn status_effective(
     project_flag: Option<ProjectBinding>,
     session: &SessionState,
     worktree: Option<&str>,
     user_default: Option<ProjectBinding>,
-) -> Option<(ProjectBinding, ProjectSource)> {
-    capture_project_binding(&CaptureProjectInputs {
+) -> (Option<(ProjectBinding, ProjectSource)>, Option<String>) {
+    match capture_project_binding(&CaptureProjectInputs {
         project_flag,
         session,
         worktree_path: worktree,
         user_default,
-    })
+    }) {
+        Some((binding, source)) if capture_project_id(&binding).is_none() => {
+            let warning = invalid_capture_id_warning(&binding, source);
+            (None, Some(warning))
+        }
+        other => (other, None),
+    }
 }
 
 /// Display label for a binding: the friendly name, falling back to the id.
@@ -217,7 +227,7 @@ fn binding_label(b: &ProjectBinding) -> &str {
 fn format_status(effective: Option<(&ProjectBinding, ProjectSource)>) -> String {
     match effective {
         Some((b, source)) => format!("project: {} via {source}", binding_label(b)),
-        None => "no project bound locally; events are sent repo-scoped and the server deduces the project from the repo".to_string(),
+        None => "no project bound locally; if a repo is bound, events are sent repo-scoped and the server deduces the project from the repo".to_string(),
     }
 }
 
@@ -239,6 +249,14 @@ fn invalid_capture_id_warning(binding: &ProjectBinding, source: ProjectSource) -
 fn config_default_warning(name: &str) -> String {
     format!(
         "warning: .tracevault/config.toml default_project '{name}' is not used for attribution at capture time; bind explicitly with `tracevault project switch <name>` or --project"
+    )
+}
+
+/// Warning for `--project <name>` when no credentials resolved: the name
+/// cannot be looked up, so the override is ignored.
+fn offline_project_flag_warning(name: &str) -> String {
+    format!(
+        "warning: --project '{name}' cannot be resolved without server credentials; ignoring the override"
     )
 }
 
@@ -268,7 +286,7 @@ fn format_deduction(
             if effective_is_bound {
                 format!("{PREFIX} {label} (not used: the local binding above wins)")
             } else {
-                format!("{PREFIX} {label} (this is where events will land)")
+                format!("{PREFIX} {label} (events will land here if a repo is bound)")
             }
         }
         Ok(ResolveProjectOutcome::Ambiguous) => {
@@ -345,22 +363,17 @@ async fn status(
             flag
         }
         (Some(name), None) => {
-            eprintln!(
-                "warning: --project '{name}' cannot be resolved without server credentials; ignoring the override"
-            );
+            eprintln!("{}", offline_project_flag_warning(name));
             None
         }
         (None, _) => None,
     };
 
-    let effective =
-        match effective_capture_project(project_flag, &session, Some(&worktree), user_default) {
-            Some((binding, source)) if capture_project_id(&binding).is_none() => {
-                eprintln!("{}", invalid_capture_id_warning(&binding, source));
-                None
-            }
-            other => other,
-        };
+    let (effective, invalid_id_warning) =
+        status_effective(project_flag, &session, Some(&worktree), user_default);
+    if let Some(warning) = invalid_id_warning {
+        eprintln!("{warning}");
+    }
 
     if let Some(name) = config_default_name.as_deref() {
         eprintln!("{}", config_default_warning(name));
@@ -451,7 +464,7 @@ mod tests {
     fn format_status_unbound() {
         assert_eq!(
             format_status(None),
-            "no project bound locally; events are sent repo-scoped and the server deduces the project from the repo"
+            "no project bound locally; if a repo is bound, events are sent repo-scoped and the server deduces the project from the repo"
         );
     }
 
@@ -501,6 +514,53 @@ mod tests {
         );
     }
 
+    /// `status`'s own drop rule: a non-UUID binding is not effective, and the
+    /// warning returned for it names the tier it came from.
+    #[test]
+    fn status_effective_drops_a_non_uuid_binding_with_a_warning_naming_the_tier() {
+        let session = SessionState {
+            active_project: Some(ProjectBinding {
+                project_id: "not-a-uuid".into(),
+                project_name: "payments".into(),
+                updated_at: "".into(),
+            }),
+            ..Default::default()
+        };
+        let (effective, warning) = status_effective(None, &session, None, None);
+        assert!(effective.is_none(), "{effective:?}");
+        let warning = warning.expect("a dropped binding must be explained");
+        assert!(
+            warning.contains("session (project switch)"),
+            "must name the tier: {warning}"
+        );
+        assert!(warning.contains("payments"), "{warning}");
+
+        // A valid binding is effective and carries no warning.
+        let pid = uuid::Uuid::from_u128(5);
+        let valid = SessionState {
+            active_project: Some(ProjectBinding {
+                project_id: pid.to_string(),
+                project_name: "web".into(),
+                updated_at: "".into(),
+            }),
+            ..Default::default()
+        };
+        let (effective, warning) = status_effective(None, &valid, None, None);
+        assert_eq!(
+            effective.map(|(b, s)| (b.project_id, s)),
+            Some((pid.to_string(), ProjectSource::SessionActive))
+        );
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn offline_project_flag_warning_says_the_override_is_ignored() {
+        assert_eq!(
+            offline_project_flag_warning("web"),
+            "warning: --project 'web' cannot be resolved without server credentials; ignoring the override"
+        );
+    }
+
     #[test]
     fn config_default_warning_says_it_is_not_used_at_capture_time() {
         assert_eq!(
@@ -525,7 +585,7 @@ mod tests {
     fn format_deduction_resolved_unbound() {
         assert_eq!(
             format_deduction(false, Ok(ResolveProjectOutcome::Resolved(DEDUCED)), None),
-            format!("server deduction for this repo: {DEDUCED} (this is where events will land)")
+            format!("server deduction for this repo: {DEDUCED} (events will land here if a repo is bound)")
         );
     }
 
@@ -536,7 +596,7 @@ mod tests {
         assert_eq!(name, Some("web"));
         assert_eq!(
             format_deduction(false, Ok(ResolveProjectOutcome::Resolved(DEDUCED)), name),
-            "server deduction for this repo: web (this is where events will land)"
+            "server deduction for this repo: web (events will land here if a repo is bound)"
         );
     }
 
@@ -863,9 +923,8 @@ mod tests {
 
     /// VIS-316 pin: the project `project status` reports as effective is the
     /// project ingest attributes events to. For each configuration, the id
-    /// `status` would treat as effective (its `effective_capture_project`
-    /// binding, dropped when the id is not a UUID — exactly what `status`
-    /// does) must equal `commands::stream::capture_project`. Both sides read
+    /// `status` would treat as effective (`status_effective`, the function
+    /// `status` itself calls, including its non-UUID drop rule) must equal `commands::stream::capture_project`. Both sides read
     /// the user default through `user_project_default::load()`, from a
     /// `user_project.toml` written under a temp config dir (`XDG_CONFIG_HOME`
     /// on Linux, `HOME` for macOS's `dirs::config_dir()`), with the env lock
@@ -944,13 +1003,14 @@ mod tests {
                 Some(id) => crate::user_project_default::save(&bind(id.clone())).unwrap(),
                 None => crate::user_project_default::clear().unwrap(),
             }
-            let status_pid = effective_capture_project(
+            let status_pid = status_effective(
                 None,
                 &session,
                 Some(worktree),
                 crate::user_project_default::load(),
             )
-            .and_then(|(b, _)| b.project_id.parse::<uuid::Uuid>().ok());
+            .0
+            .and_then(|(b, _)| capture_project_id(&b));
             let ingest_pid = crate::commands::stream::capture_project(&session, Some(worktree));
             assert_eq!(
                 status_pid, ingest_pid,
@@ -961,11 +1021,8 @@ mod tests {
         crate::user_project_default::clear().unwrap();
     }
 
-    /// F1: `status` is a read-only inspector — an ambiguous ("this repo
-    /// belongs to multiple projects") deduction is reported on the deduction
-    /// line, not propagated up through `run`/`main` as a fatal exit. Mocks
-    /// the `/projects/resolve` endpoint with a 409, mirroring resolution.rs's
-    /// `ambiguous_deduction_errors_when_no_higher_rung`.
+    /// F1: `status` returns `Ok` when the `/projects/resolve` deduction
+    /// answers 409 (ambiguous) — the deduction is informational, never fatal.
     #[tokio::test]
     async fn status_reports_ambiguous_deduction_as_informational_not_fatal() {
         let _env_lock = crate::test_helpers::lock_env_mutation().await;
@@ -990,22 +1047,15 @@ mod tests {
                 .to_string(),
         );
 
-        // SAFETY: test-scoped env mutation, mirroring the precedent in
-        // `commands::login`'s tests, restored in a guard so a panic in
-        // `status` still cleans up the process env. `_env_lock` (taken
-        // above) serializes this against any other test in the crate that
-        // reads or sets TRACEVAULT_SERVER_URL/TRACEVAULT_API_KEY (e.g.
-        // `switch_without_session_or_user_flag_skips_codebase_check`, whose
-        // credential resolution would otherwise observe these values while
-        // they're set here and get routed at this test's mock server instead
-        // of its own).
+        // Env mutation under `_env_lock`, restored by the guard even if
+        // `status` panics. The config dir (and so any user default) is
+        // isolated to the tempdir, and no ambient session id leaks in.
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("TRACEVAULT_SERVER_URL", &base);
         _guard.set("TRACEVAULT_API_KEY", "tok");
-        // No ambient user default: the effective project is unbound, so the
-        // ambiguous deduction is the one that would decide attribution — the
-        // case most tempting to treat as fatal.
         _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
+        _guard.remove("TRACEVAULT_SESSION_ID");
 
         let result = status(None, None, tmp.path(), tmp.path()).await;
 
