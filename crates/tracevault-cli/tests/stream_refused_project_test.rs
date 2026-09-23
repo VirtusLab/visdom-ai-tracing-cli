@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tracevault_protocol::hooks::HookResponse;
-use tracevault_protocol::streaming::StreamEventRequest;
+use tracevault_protocol::streaming::{StreamEventRequest, StreamEventType};
 
 const REPO_ID: &str = "11111111-1111-1111-1111-111111111111";
 const SESSION_ID: &str = "vis316-refused-session";
@@ -113,6 +113,43 @@ fn refused() -> String {
     )
 }
 
+fn transient_failure() -> String {
+    format!(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "internal error".len(),
+        "internal error"
+    )
+}
+
+/// A minimal, parseable pending-queue line stamped with `event_uuid` so tests
+/// can tell events apart after a drain/re-queue round trip.
+fn sample_pending_event(event_uuid: uuid::Uuid) -> String {
+    let req = StreamEventRequest {
+        protocol_version: 1,
+        tool: Some("claude-code".to_string()),
+        event_type: StreamEventType::ToolUse,
+        session_id: SESSION_ID.to_string(),
+        timestamp: chrono::Utc::now(),
+        hook_event_name: Some("PostToolUse".to_string()),
+        tool_name: None,
+        tool_use_id: None,
+        tool_input: None,
+        tool_response: None,
+        tool_is_error: None,
+        event_index: None,
+        event_uuid: Some(event_uuid),
+        transcript_lines: None,
+        transcript_offset: None,
+        model: None,
+        cwd: None,
+        final_stats: None,
+        flow_id: None,
+        labels: None,
+        params: None,
+    };
+    serde_json::to_string(&req).unwrap()
+}
+
 /// A temp git repo bound to `REPO_ID`, plus isolated home/config/state dirs.
 struct Fixture {
     _tmp: tempfile::TempDir,
@@ -178,6 +215,17 @@ impl Fixture {
             .join("sessions")
             .join(SESSION_ID)
             .join(format!("pending-{REPO_ID}.jsonl"))
+    }
+
+    /// Pre-seed the pending queue file with `lines` (already-serialized
+    /// `StreamEventRequest` JSON), one per line, as if a previous run had
+    /// buffered them.
+    fn seed_queue(&self, lines: &[String]) {
+        let path = self.queue_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut content = lines.join("\n");
+        content.push('\n');
+        std::fs::write(&path, content).unwrap();
     }
 
     /// Run the hook once against `base`: returns (exit code, stdout, stderr).
@@ -310,4 +358,66 @@ fn refused_project_is_queued_in_the_repo_file_and_drains_under_the_fixed_binding
         );
     }
     assert!(queued(&fx.queue_path()).is_empty(), "the queue is drained");
+}
+
+/// VIS-316 (Copilot review, PR 53): when the pending-flush loop hits a
+/// transient failure partway through, only the failed event and the ones
+/// after it must be re-queued. Re-queueing the WHOLE pending batch (the old
+/// bug) would duplicate the already-accepted event(s) on the next drain.
+#[test]
+fn pending_drain_failure_requeues_only_the_unsent_tail() {
+    let fx = Fixture::new();
+    let pid = uuid::Uuid::from_u128(0xC3);
+    fx.bind_session_project(pid);
+
+    let event_a = uuid::Uuid::from_u128(0xA);
+    let event_b = uuid::Uuid::from_u128(0xB);
+    fx.seed_queue(&[sample_pending_event(event_a), sample_pending_event(event_b)]);
+
+    // A is accepted; B fails transiently. A third (spare) 200 is staged but
+    // must never be consumed: the drain stops at B, and the live event C is
+    // queued rather than sent once `send_failed` is set.
+    let (base, rx) = spawn_server(vec![accepted(), transient_failure(), accepted()]);
+    let (code, stdout, stderr) = fx.run_hook(&base);
+    assert_eq!(code, 0, "the hook never fails; stderr:\n{stderr}");
+    assert_eq!(
+        stdout,
+        allow_stdout(),
+        "stdout must be exactly the allow JSON"
+    );
+
+    let requests = captured(&rx);
+    assert_eq!(
+        requests.len(),
+        2,
+        "exactly two requests: A (accepted) and B (transient failure); \
+         the live event C must not be sent once the drain has failed: {requests:?}"
+    );
+
+    let events = queued(&fx.queue_path());
+    assert_eq!(
+        events.len(),
+        2,
+        "the queue holds B (re-queued) and C (the live event); A must not reappear: {events:?}"
+    );
+    assert_eq!(
+        events[0].event_uuid,
+        Some(event_b),
+        "B is re-queued first, preserving order"
+    );
+    assert_ne!(
+        events[0].event_uuid,
+        Some(event_a),
+        "A was already accepted by the server and must NOT be duplicated"
+    );
+    assert_ne!(
+        events[1].event_uuid,
+        Some(event_a),
+        "A must not appear anywhere in the re-queued tail"
+    );
+    assert_ne!(
+        events[1].event_uuid,
+        Some(event_b),
+        "the second entry is the live event C, not a second copy of B"
+    );
 }

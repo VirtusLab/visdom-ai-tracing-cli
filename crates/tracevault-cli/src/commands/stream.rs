@@ -808,14 +808,19 @@ pub async fn run_stream(
     let mut warned = false;
 
     // Send pending events first
-    for pending_json in &pending_events {
+    for (i, pending_json) in pending_events.iter().enumerate() {
         if let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(pending_json) {
             if send_stream_event(&client, &attribution, &pending_req, &mut warned)
                 .await
                 .is_err()
             {
-                // Re-queue all remaining pending events
-                for evt in &pending_events {
+                // Re-queue only the failed event and the ones after it that
+                // were never attempted, in order. Events before `i` already
+                // got a server response and must NOT be re-queued here — a
+                // prior iteration already appended them if IT failed, and if
+                // it succeeded, re-adding them would deliver them twice on
+                // the next drain.
+                for evt in &pending_events[i..] {
                     append_pending(&pending_path, evt)?;
                 }
                 send_failed = true;
