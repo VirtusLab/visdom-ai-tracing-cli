@@ -916,24 +916,6 @@ fn offline_project_outcome(
         .or_else(|| user_default_project.map(|b| (b, ProjectSource::UserDefault))))
 }
 
-/// `TRACEVAULT_PROJECT`, UUID form only — the offline (no client) arm's env
-/// rung. A name would need `list_projects`, which needs a client this arm
-/// doesn't have (same reasoning as `commands::stream::env_project_binding`,
-/// which this deliberately does not share code with — see VIS-305 Part A's
-/// review notes on why the two inline parses stay separate). Pulled out so
-/// this arm's env wiring is unit-testable without driving all of
-/// `run_status`, mirroring [`online_project_outcome`].
-fn offline_env_project() -> Option<crate::session_state::ProjectBinding> {
-    std::env::var("TRACEVAULT_PROJECT")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<uuid::Uuid>().ok())
-        .map(|id| crate::session_state::ProjectBinding {
-            project_id: id.to_string(),
-            project_name: String::new(),
-            updated_at: String::new(),
-        })
-}
-
 // --- Server repo ---
 
 /// How `status` should locate the repo on the server.
@@ -1343,9 +1325,18 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
                 .await
             }
             _ => {
+                // Offline (no client): only the UUID form of
+                // `TRACEVAULT_PROJECT` can be honoured — a name would need
+                // `list_projects`, which needs a client this arm doesn't
+                // have. Reuses `commands::stream`'s capture-time helper
+                // rather than duplicating the same UUID-only parse a third
+                // time (the `project.rs` inline version stays separate: it
+                // must distinguish "not a UUID" from "absent" so it can fall
+                // through to name resolution, which this `Option`-returning
+                // helper can't express).
                 let inputs = ProjectResolveInputs {
                     project_flag: None,
-                    env_project: offline_env_project(),
+                    env_project: crate::commands::stream::env_project_binding(),
                     session: &project_session,
                     worktree_path: Some(&worktree),
                     config_default: None,
@@ -2611,31 +2602,6 @@ mod tests {
             "detail: {}",
             check.detail
         );
-    }
-
-    /// VIS-305 Part A fix: `run_status`'s offline (no-client) arm must
-    /// honour `TRACEVAULT_PROJECT` in its UUID form — a name needs
-    /// `list_projects`, which this arm has no client for.
-    #[test]
-    fn offline_env_project_takes_a_uuid_and_ignores_a_name() {
-        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
-        let mut _guard = crate::test_helpers::EnvVarGuard::new();
-
-        let uuid = "44444444-4444-4444-8444-444444444444";
-        _guard.set("TRACEVAULT_PROJECT", uuid);
-        assert_eq!(
-            offline_env_project().map(|b| b.project_id),
-            Some(uuid.to_string())
-        );
-
-        _guard.set("TRACEVAULT_PROJECT", "a-name");
-        assert!(
-            offline_env_project().is_none(),
-            "a name is ignored on the client-less offline arm"
-        );
-
-        _guard.remove("TRACEVAULT_PROJECT");
-        assert!(offline_env_project().is_none());
     }
 
     /// VIS-305 Part A fix: `run_status`'s client-backed arm must resolve
