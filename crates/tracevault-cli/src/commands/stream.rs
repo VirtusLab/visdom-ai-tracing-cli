@@ -249,33 +249,205 @@ pub(crate) fn resolve_stream_binding(
     .map(|(b, _)| b)
 }
 
-/// The capture-time project id for a stream event: a thin wrapper over the
-/// shared chain [`crate::resolution::capture_project_binding`] (subagent
-/// worktree override -> session `active_project` -> user-level default; no
-/// `--project` flag on the hook path) followed by
-/// [`crate::resolution::capture_project_id`], which drops a non-UUID stored id.
-/// Local only — no network (the hook fires per event in a short-lived
-/// process), which is why repo config `default_project` (a name) is not a
-/// tier. `None` -> fall back to the repo-scoped stream (server deduces).
+/// `TRACEVAULT_PROJECT` as a binding, UUID form only.
+///
+/// A project NAME would require a `list_projects` round trip, and the capture
+/// path fires per event in a short-lived process — the same reason
+/// `capture_project` already ignores the repo config's `default_project`. The
+/// name form is honoured by the interactive commands, which already have a
+/// client in hand.
+pub(crate) fn env_project_binding() -> Option<crate::session_state::ProjectBinding> {
+    let raw = std::env::var("TRACEVAULT_PROJECT").ok()?;
+    let raw = raw.trim();
+    let parsed = raw.parse::<uuid::Uuid>().ok()?;
+    Some(crate::session_state::ProjectBinding {
+        project_id: parsed.to_string(),
+        project_name: String::new(),
+        updated_at: String::new(),
+        forced_until: None,
+    })
+}
+
+/// WHICH of the two force sources put a send into `explicit` attribution —
+/// the reason behind [`attribution_mode`]'s verdict, not a second opinion on
+/// it.
+///
+/// The two sources are not interchangeable and, crucially, are not undone
+/// the same way: the env var is process-wide and cleared by unsetting it,
+/// while a persisted force lives on the binding and is cleared by switching
+/// again without the flag. Any message that tells an operator how to STOP
+/// forcing therefore has to know which one is actually in effect — telling
+/// someone whose force came from `TRACEVAULT_PROJECT_ATTRIBUTION` to drop a
+/// CLI flag is advice that silently changes nothing (Copilot on PR #54).
+///
+/// This carries the reason alongside the verdict instead of letting the
+/// message-building code re-derive it, because re-deriving it would mean a
+/// second copy of the env-var read and the `forced_until` parse — exactly
+/// the two-codepaths-for-one-fact shape whose removal is the whole point of
+/// [`attribution_mode`] taking the winning binding as a parameter.
+///
+/// `Default` is "neither source is forcing", i.e. plain derived attribution
+/// — the ordinary case, and what a test that cares about routing rather
+/// than attribution wants to pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct AttributionForce {
+    /// `TRACEVAULT_PROJECT_ATTRIBUTION=explicit` is set in this process's
+    /// environment. Never expires; only unsetting it stops the forcing.
+    pub(crate) env: bool,
+    /// The winning binding carries a LIVE `forced_until`. Lapses on its own
+    /// (~12h); `project switch` without `--project-attribution explicit`
+    /// clears it immediately.
+    pub(crate) binding: bool,
+}
+
+impl AttributionForce {
+    /// The verdict these sources add up to. Either source alone forces;
+    /// neither does not.
+    pub(crate) fn mode(self) -> crate::api_client::AttributionMode {
+        if self.env || self.binding {
+            crate::api_client::AttributionMode::Explicit
+        } else {
+            crate::api_client::AttributionMode::Derived
+        }
+    }
+}
+
+/// Which attribution mode THIS PARTICULAR winning binding declares.
+///
+/// `explicit` comes either from `TRACEVAULT_PROJECT_ATTRIBUTION` (per-process,
+/// re-asserted at every launch, no expiry — genuinely global, by design) OR
+/// from a LIVE `forced_until` carried by `effective` — the exact
+/// [`crate::session_state::ProjectBinding`] that [`capture_project`] resolved
+/// as the one this event is being attributed to.
+///
+/// `forced_until` is stored PER-BINDING (see that field's own doc comment:
+/// "the FORCE lapses (the binding itself survives)"), so this must read the
+/// force off THAT binding and no other. An earlier version of this function
+/// instead did a process-global disk read
+/// (`user_project_default::load_with_force()`), which had it backwards two
+/// ways at once: a session-scoped force (`project switch` without `--user`,
+/// which is the ordinary case whenever a session id is set) is written into
+/// session state and was never read there at all, so it silently never took
+/// effect while still telling the user membership was not being checked; and
+/// a live force sitting on the user-level default leaked onto ANY
+/// higher-precedence project that happened to resolve instead (subagent
+/// override, `TRACEVAULT_PROJECT`, session active), stamping `explicit` for a
+/// project nobody forced. Taking `effective` as a parameter — the actual
+/// winning binding — makes both mistakes impossible: a force can only apply
+/// when it is attached to the binding actually being used.
+///
+/// Whether that force is live is [`crate::session_state::force_status`]'s
+/// answer, not this function's: `commands::project`'s status line reads the
+/// same field and must never disagree with the header this fills, so there is
+/// exactly one parse and one `Utc::now()` comparison. A lapsed persisted
+/// force reads as `derived` — not sending an `explicit` header IS the
+/// fallback, so ingest never starts failing because a force was forgotten —
+/// and so does an unparseable one, for the same fail-safe reason.
+///
+/// An unrecognised (or absent) `TRACEVAULT_PROJECT_ATTRIBUTION` also reads as
+/// `derived`, deliberately asymmetric with the server, which 400s an unknown
+/// value: that strictness is for callers that bypass the CLI entirely, and
+/// failing a hook over a typo'd env var helps nobody — silently falling back
+/// to the always-checked default is the safe direction to fail in.
+///
+/// This always returns one of the two variants and the caller always sends
+/// it as the header — including the
+/// [`crate::api_client::AttributionMode::Derived`] case. The
+/// server treats an absent header and an explicit `derived` value
+/// identically, but nothing here omits the header; "always emits one of two
+/// values" is simpler to reason about than "sometimes sends a header,
+/// sometimes doesn't."
+///
+/// A verdict only. Callers that must also explain THE REASON — the refusal
+/// remediation, which has to name the force source it is telling the
+/// operator to remove — take [`attribution_force`] instead and call
+/// [`AttributionForce::mode`] on it; both spellings run the one evaluation
+/// below.
+pub(crate) fn attribution_mode(
+    effective: Option<&crate::session_state::ProjectBinding>,
+) -> crate::api_client::AttributionMode {
+    attribution_force(effective).mode()
+}
+
+/// The single evaluation behind [`attribution_mode`]: reads both force
+/// sources ONCE and reports each separately, so the verdict and any
+/// explanation of it are the same fact viewed twice rather than two facts
+/// that can drift. See [`AttributionForce`] for why the distinction is
+/// load-bearing, and [`attribution_mode`]'s doc comment for why each source
+/// is read the way it is.
+pub(crate) fn attribution_force(
+    effective: Option<&crate::session_state::ProjectBinding>,
+) -> AttributionForce {
+    AttributionForce {
+        env: std::env::var("TRACEVAULT_PROJECT_ATTRIBUTION")
+            .map(|v| v.trim().eq_ignore_ascii_case("explicit"))
+            .unwrap_or(false),
+        binding: effective
+            .and_then(|b| b.forced_until.as_deref())
+            .is_some_and(|s| {
+                matches!(
+                    crate::session_state::force_status(s),
+                    crate::session_state::ForceStatus::Live(_)
+                )
+            }),
+    }
+}
+
+/// The capture-time project BINDING for a stream event: a thin wrapper over
+/// the shared chain [`crate::resolution::capture_project_binding`] (subagent
+/// worktree override -> `TRACEVAULT_PROJECT` -> session `active_project` ->
+/// user-level default; no `--project` flag on the hook path), with a binding
+/// whose stored id is not a UUID dropped exactly as
+/// [`crate::resolution::capture_project_id`] drops it. Local only — no
+/// network (the hook fires per event in a short-lived process), which is why
+/// repo config `default_project` (a name) is not a tier and why
+/// `TRACEVAULT_PROJECT` is honoured in its UUID form only.
 /// `commands::project::status` calls the same shared chain, so it reports
 /// exactly what this returns.
 ///
-/// `pub(crate)`: also called by `commands::status`, which reuses this
-/// function (plus `resolve_stream_binding`/`attribution_for`) as the
-/// authoritative "will this session record anything" gate, so the status
-/// verdict can never drift from what this hook actually does.
-pub(crate) fn capture_project(
+/// Returns the full [`crate::session_state::ProjectBinding`], not just its
+/// id: `forced_until` travels with whichever binding actually wins this
+/// precedence chain, so a caller can ask THAT binding — via
+/// [`attribution_mode`] — whether it is currently forced, rather than
+/// consulting some other, unrelated binding (see `attribution_mode`'s doc
+/// comment for why that distinction matters). Callers that only need the id
+/// use [`capture_project`].
+pub(crate) fn capture_binding(
     session: &crate::session_state::SessionState,
     worktree_path: Option<&str>,
-) -> Option<uuid::Uuid> {
+) -> Option<crate::session_state::ProjectBinding> {
     use crate::resolution::{capture_project_binding, capture_project_id, CaptureProjectInputs};
     let (binding, _) = capture_project_binding(&CaptureProjectInputs {
         project_flag: None,
+        env_project: env_project_binding(),
         session,
         worktree_path,
         user_default: crate::user_project_default::load(),
     })?;
-    capture_project_id(&binding)
+    // Defensive: a corrupted/hand-edited binding whose id isn't a real UUID
+    // must not be usable for attribution at all (mirrors
+    // `binding_repo_id_is_valid` for the repo side) — checked here, once, so
+    // every caller gets the same guarantee rather than re-deriving it.
+    capture_project_id(&binding)?;
+    Some(binding)
+}
+
+/// The capture-time project ID for a stream event: [`capture_binding`]
+/// projected down to its id. `None` -> fall back to the repo-scoped stream
+/// (server deduces).
+///
+/// `pub(crate)`: also called by `commands::status`, which reuses this
+/// function (plus `resolve_stream_binding`/`attribution_for`) as the
+/// authoritative "will this session record anything" gate, so the status
+/// verdict can never drift from what this hook actually does. `commands::flush`
+/// and `commands::project::status` call it for the same reason.
+pub(crate) fn capture_project(
+    session: &crate::session_state::SessionState,
+    worktree_path: Option<&str>,
+) -> Option<uuid::Uuid> {
+    capture_binding(session, worktree_path)
+        .as_ref()
+        .and_then(crate::resolution::capture_project_id)
 }
 
 /// The one-line warning printed when a repo-less event is dropped as
@@ -319,8 +491,40 @@ pub(crate) enum ClientErrorKind {
 
 /// The one-line error printed when the server refuses a project-scoped send.
 /// Pure, so the wording is asserted directly rather than by capturing stderr.
-pub(crate) fn refused_error(pid: uuid::Uuid, kind: &ClientErrorKind) -> String {
-    match kind {
+///
+/// `force` is the force situation this send actually declared — the exact
+/// [`AttributionForce`] whose [`AttributionForce::mode`] filled the
+/// `x-tracevault-project-attribution` header, so the message and the wire
+/// can never disagree. It matters because the force gate also refuses with a
+/// 403: "not Operator on the project", or "`explicit` from a `tvk_` key".
+/// Without naming it, an operator who asked for `explicit` got an error about
+/// membership and realm roles and was never told the force itself was what
+/// got refused. Failing closed on trust is right; failing closed silently is
+/// the defect.
+///
+/// The force clause takes the whole `AttributionForce`, not just the mode,
+/// because its remediation has to name the source ACTUALLY in effect. The
+/// two are undone differently and only one of them by a CLI flag: an earlier
+/// wording told everyone to switch again without `--project-attribution
+/// explicit`, which for an env-sourced force clears a persisted
+/// `forced_until` that may not even exist while [`attribution_force`] goes
+/// on reading `TRACEVAULT_PROJECT_ATTRIBUTION` and every subsequent send
+/// keeps declaring `explicit` — advice that silently does nothing, handed
+/// out on the one code path a confused operator reaches (Copilot on PR #54).
+/// [`force_remediation`] derives the fix from the same struct the header
+/// came from, so it cannot name a source that is not set, or miss one that
+/// is.
+///
+/// The extra clause is attached to `Forbidden` ONLY. A `Scoping` 4xx
+/// (400/404/409) means the project id itself does not resolve — the force
+/// gate never ran — so blaming the force there would be a new wrong
+/// explanation of exactly the kind this fixes.
+pub(crate) fn refused_error(
+    pid: uuid::Uuid,
+    kind: &ClientErrorKind,
+    force: AttributionForce,
+) -> String {
+    let base = match kind {
         // Since Keycloak, a 403 has a SECOND and now more common cause: the
         // account has no `tracing` realm role at all, in which case nothing this
         // hook does will work and `project switch` is confidently wrong advice —
@@ -342,6 +546,51 @@ pub(crate) fn refused_error(pid: uuid::Uuid, kind: &ClientErrorKind) -> String {
              fixed. Run `tracevault project switch <name>` (add `--user` if the binding is the \
              machine-wide default in `user_project.toml`) to update it."
         ),
+    };
+    if force.mode() == crate::api_client::AttributionMode::Explicit
+        && matches!(kind, ClientErrorKind::Forbidden)
+    {
+        return format!(
+            "{base} This send declared `explicit` attribution, so the refusal may be of the \
+             FORCE itself: forcing needs `Operator` on that project AND a Control Plane \
+             identity (a `tvk_` API key can never force). If membership attribution is what \
+             you want, {}",
+            force_remediation(force)
+        );
+    }
+    base
+}
+
+/// How to STOP forcing, given which source(s) are doing it.
+///
+/// A sentence fragment completing "If membership attribution is what you
+/// want, ...", so the caller keeps the framing and this keeps the facts.
+///
+/// Only ever reached with at least one source set (see [`refused_error`]'s
+/// guard, which is `force.mode() == Explicit` — i.e. `env || binding`), so
+/// the all-false arm is unreachable in practice. It still has to say
+/// something rather than panic: this runs while printing an error on the
+/// capture path, and a hook that panics mid-diagnostic is strictly worse
+/// than one that prints a slightly vague line. The fallback names both ways,
+/// which is wrong about emphasis but never wrong about the fix.
+///
+/// When BOTH are set the message says so explicitly: removing one alone
+/// leaves the other still forcing, which would look exactly like the fix not
+/// working.
+fn force_remediation(force: AttributionForce) -> String {
+    let env_fix = "unset `TRACEVAULT_PROJECT_ATTRIBUTION` in this environment (it is \
+                   process-wide and never expires, so no switch clears it)";
+    let binding_fix = "run `tracevault project switch <name>` WITHOUT \
+                       `--project-attribution explicit` (add `--user` if the forced binding \
+                       is the machine-wide default in `user_project.toml`)";
+    match (force.env, force.binding) {
+        (true, false) => format!("{env_fix}."),
+        (false, true) => format!("{binding_fix}."),
+        // Both: neither fix is sufficient alone.
+        (true, true) => {
+            format!("BOTH forces are in effect and both must go — {env_fix}, and {binding_fix}.")
+        }
+        (false, false) => format!("{env_fix}, or {binding_fix}."),
     }
 }
 
@@ -408,9 +657,21 @@ pub(crate) fn deterministic_client_error_kind(
 /// invocation. The repo-less drop warning shares the flag for the same
 /// reason: draining a queue of undeliverable events would otherwise print one
 /// line per buffered event.
+///
+/// `force` is the invocation's attribution force — [`attribution_force`]
+/// applied to the capture binding. Its [`AttributionForce::mode`] goes on
+/// every project-scoped send as the `x-tracevault-project-attribution`
+/// header, and the same value is handed to [`refused_error`], which needs
+/// the SOURCES and not only the verdict to tell the operator how to stop
+/// forcing. Taken as a parameter rather than derived here because the
+/// binding is invariant across a whole hook invocation while this function
+/// runs once per buffered event, and the evaluation costs an env read plus
+/// an RFC3339 parse. `commands::flush` resolves it once per queue for the
+/// same reason.
 async fn send_stream_event(
     client: &crate::api_client::ApiClient,
     attribution: &Attribution,
+    force: AttributionForce,
     req: &StreamEventRequest,
     warned: &mut bool,
 ) -> Result<Option<tracevault_protocol::streaming::StreamEventResponse>, Box<dyn std::error::Error>>
@@ -435,7 +696,7 @@ async fn send_stream_event(
         // transient error. Both propagate so the caller queues them.
         Attribution::ProjectOnly { project_id } => {
             let attempt = client
-                .stream_event_for_project(*project_id, None, req)
+                .stream_event_for_project(*project_id, None, force.mode(), req)
                 .await;
             return match attempt {
                 Ok(r) => Ok(Some(r)),
@@ -457,7 +718,7 @@ async fn send_stream_event(
         None => client.stream_event(repo_id, req).await.map(Some),
         Some(pid) => {
             let attempt = client
-                .stream_event_for_project(pid, Some(repo_id), req)
+                .stream_event_for_project(pid, Some(repo_id), force.mode(), req)
                 .await;
             let kind = match &attempt {
                 Ok(_) => None,
@@ -474,7 +735,7 @@ async fn send_stream_event(
                         // code path users hit most. The server's 403 envelope
                         // isn't distinguishable from here (see
                         // `ClientErrorKind`), so the wording names both.
-                        eprintln!("{}", refused_error(pid, &kind));
+                        eprintln!("{}", refused_error(pid, &kind, force));
                         *warned = true;
                     }
                     // The caller declared this project; the server refused it.
@@ -781,7 +1042,21 @@ pub async fn run_stream(
     // already-loaded session + worktree used just above for the repo-binding
     // resolution: a repo-less session is attributable by project alone, so the
     // project must be known before deciding whether this event can be sent.
-    let capture_pid = capture_project(&session, Some(worktree_top.as_str()));
+    // The full binding (not just its id) is resolved: `attribution_mode`
+    // reads its `forced_until`, and this is the binding that actually decided
+    // the target project, so it's the only one whose force is allowed to
+    // apply (see `attribution_mode`'s doc comment).
+    let capture_binding = capture_binding(&session, Some(worktree_top.as_str()));
+    let capture_pid = capture_binding
+        .as_ref()
+        .and_then(crate::resolution::capture_project_id);
+    // Resolved once per invocation, not per event — the binding is invariant
+    // across the pending-flush loop and the live send below, while the
+    // evaluation costs an env read and an RFC3339 parse. `commands::flush`
+    // resolves it once per queue for the same reason. The whole
+    // `AttributionForce` travels, not just its mode: a refusal has to name
+    // the force source it is telling the operator to remove.
+    let force = attribution_force(capture_binding.as_ref());
 
     // Ship if EITHER a repo or a project resolved; no-op only when neither
     // did. (`binding_repo_id_is_valid` guards a corrupted/hand-edited
@@ -810,7 +1085,7 @@ pub async fn run_stream(
     // Send pending events first
     for (i, pending_json) in pending_events.iter().enumerate() {
         if let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(pending_json) {
-            if send_stream_event(&client, &attribution, &pending_req, &mut warned)
+            if send_stream_event(&client, &attribution, force, &pending_req, &mut warned)
                 .await
                 .is_err()
             {
@@ -845,7 +1120,7 @@ pub async fn run_stream(
             fs::write(&offset_path, new_offset.to_string())?;
         }
     } else {
-        match send_stream_event(&client, &attribution, &req, &mut warned).await {
+        match send_stream_event(&client, &attribution, force, &req, &mut warned).await {
             Ok(_) => {
                 // 10. On success update .stream_offset
                 fs::write(&offset_path, new_offset.to_string())?;
@@ -871,6 +1146,7 @@ pub async fn run_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_client::AttributionMode;
     use crate::config::UserContext;
     use crate::context::{Context, EffectiveContext};
     use std::collections::BTreeMap;
@@ -1486,6 +1762,16 @@ mod tests {
     /// tier reads `user_project.toml` from there, so without isolation this
     /// test fails on any machine with a real user default and races tests
     /// that write one.
+    ///
+    /// `TRACEVAULT_PROJECT` is pinned UNSET for the same reason:
+    /// `capture_project` reads it (rung 3, above `session.active_project`),
+    /// and other tests in this same binary SET it. The crate lock only
+    /// serializes mutators against each other, so a non-locking reader still
+    /// races them — and `std::env::set_var` concurrent with `std::env::var`
+    /// is exactly the UB the `unsafe` blocks in `EnvVarGuard` are annotated
+    /// against. Holding the lock AND declaring the value is what makes the
+    /// precedence assertions below describe the tiers they name rather than
+    /// whatever the ambient shell happens to export.
     #[tokio::test]
     async fn capture_project_precedence_local_only() {
         use crate::session_state::{ProjectBinding, SessionState};
@@ -1494,11 +1780,13 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", tmp.path());
         _guard.set("HOME", tmp.path());
+        _guard.remove("TRACEVAULT_PROJECT");
 
         let pb = |id: &str| ProjectBinding {
             project_id: id.into(),
             project_name: "n".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         let u = uuid::Uuid::from_u128;
         // session active only
@@ -1527,6 +1815,293 @@ mod tests {
         assert!(path.starts_with(tmp.path()), "not isolated: {path:?}");
         crate::user_project_default::save(&pb(&u(3).to_string())).unwrap();
         assert_eq!(capture_project(&SessionState::default(), None), Some(u(3)));
+    }
+
+    /// The full binding — not just its id — survives `capture_binding`: this
+    /// is what lets `attribution_mode` see a session-scoped `forced_until`
+    /// (Important finding 1 in the VIS-305 Part C review: the old
+    /// process-global disk read never saw a force written into SESSION
+    /// state, which is where a plain `project switch --project-attribution
+    /// explicit` — no `--user` — writes it).
+    /// ENV ISOLATION: see `capture_project_precedence_local_only` — this
+    /// test also goes through the capture chain, which reads
+    /// `TRACEVAULT_PROJECT` at a rung ABOVE the session-active binding it is
+    /// asserting on.
+    #[test]
+    fn capture_binding_preserves_forced_until_from_the_winning_tier() {
+        use crate::session_state::{ProjectBinding, SessionState};
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.remove("TRACEVAULT_PROJECT");
+        let pid = uuid::Uuid::from_u128(2);
+        let future = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
+        let s = SessionState {
+            active_project: Some(ProjectBinding {
+                project_id: pid.to_string(),
+                project_name: "n".into(),
+                updated_at: "".into(),
+                forced_until: Some(future.clone()),
+            }),
+            ..Default::default()
+        };
+        let got = capture_binding(&s, Some("/wt")).expect("session-active binding resolves");
+        assert_eq!(got.forced_until, Some(future));
+    }
+
+    /// `_env_lock` serializes this against other tests in the crate that
+    /// mutate `TRACEVAULT_PROJECT` (see `test_helpers::lock_env_mutation_sync`),
+    /// including any that call `commands::project::status`, which reads the
+    /// same var.
+    #[test]
+    fn env_project_binding_takes_a_uuid_and_ignores_a_name() {
+        // A name would need a `list_projects` round trip, and this path runs
+        // per-event in a short-lived hook process. Same rule already excludes
+        // `config_default` here.
+        let uuid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+
+        _guard.set("TRACEVAULT_PROJECT", uuid);
+        let got = env_project_binding().expect("uuid form is honoured");
+        assert_eq!(got.project_id, uuid);
+
+        _guard.set("TRACEVAULT_PROJECT", "my-project");
+        assert!(
+            env_project_binding().is_none(),
+            "a name is ignored on the network-free capture path"
+        );
+
+        _guard.remove("TRACEVAULT_PROJECT");
+        assert!(env_project_binding().is_none());
+    }
+
+    // ── attribution_mode ───────────────────────────────────────────────────
+    //
+    // `attribution_mode` no longer touches disk at all: it takes the WINNING
+    // binding (as resolved by `capture_project`) as a parameter, so these
+    // tests only need to isolate `TRACEVAULT_PROJECT_ATTRIBUTION` via the
+    // crate's env-mutation lock/guard, not `XDG_CONFIG_HOME`.
+
+    fn forced_binding(forced_until: Option<&str>) -> crate::session_state::ProjectBinding {
+        crate::session_state::ProjectBinding {
+            project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+            project_name: "p".into(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            forced_until: forced_until.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn env_force_is_explicit_and_needs_no_expiry() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
+
+        assert_eq!(attribution_mode(None), AttributionMode::Explicit);
+    }
+
+    #[test]
+    fn absent_or_unrecognised_env_is_derived() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+        assert_eq!(attribution_mode(None), AttributionMode::Derived);
+
+        // The CLI does not forward a value it does not recognise: the server
+        // would 400 it, and failing a hook over a typo'd env var helps
+        // nobody. The server's strictness is for callers that bypass the
+        // CLI.
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "yes-please");
+        assert_eq!(attribution_mode(None), AttributionMode::Derived);
+    }
+
+    /// The binding-persisted half of `attribution_mode`: a LIVE `forced_until`
+    /// on the WINNING binding (no env var involved) must also read as
+    /// `explicit` — this is what `project switch --project-attribution
+    /// explicit` ultimately drives, whether that binding lives in session
+    /// state or the user-level default.
+    #[test]
+    fn live_binding_force_is_explicit_without_env() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let future = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
+        let binding = forced_binding(Some(&future));
+
+        assert_eq!(attribution_mode(Some(&binding)), AttributionMode::Explicit);
+    }
+
+    /// This is the test that would fail if a lapsed persisted force still
+    /// made it onto the wire: with no env override, a `forced_until` in the
+    /// past on the winning binding must make `attribution_mode` — the exact
+    /// function that supplies the header — report `derived`, not `explicit`.
+    /// Not sending an `explicit` header IS the fallback to derived
+    /// attribution.
+    #[test]
+    fn lapsed_binding_force_is_derived_without_env() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let binding = forced_binding(Some(&past));
+
+        assert_eq!(attribution_mode(Some(&binding)), AttributionMode::Derived);
+    }
+
+    /// A `forced_until` that doesn't even parse as RFC3339 (a hand-edited or
+    /// corrupted `user_project.toml`/session-state file) must fail SAFE —
+    /// read as `derived`, never panic or, worse, read as `explicit`. Pins the
+    /// fail-safe direction against a future refactor to `.expect(...)`.
+    #[test]
+    fn unparseable_forced_until_is_derived() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let binding = forced_binding(Some("not-a-timestamp"));
+
+        assert_eq!(attribution_mode(Some(&binding)), AttributionMode::Derived);
+    }
+
+    /// Env-provided force must be exempt from expiry in fact, not just by
+    /// coincidence of the OR: pairing it with a binding force that has
+    /// ALREADY LAPSED still yields `explicit`. If `attribution_mode` were
+    /// refactored to gate the env branch on any timestamp, this is the test
+    /// that would catch it — `lapsed_binding_force_is_derived_without_env`
+    /// alone couldn't, since it never sets the env var.
+    #[test]
+    fn env_force_is_explicit_even_with_a_lapsed_binding_force() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
+
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let binding = forced_binding(Some(&past));
+
+        assert_eq!(attribution_mode(Some(&binding)), AttributionMode::Explicit);
+    }
+
+    /// VIS-305 Part C review, Important finding 1: a SESSION-scoped force
+    /// (`project switch --project-attribution explicit` WITHOUT `--user`,
+    /// which is the default whenever a session id is set — i.e. the ordinary
+    /// case inside every instrumented agent session) must actually reach the
+    /// wire as `explicit`. The old process-global `attribution_mode` only
+    /// ever consulted the user-level default store and never saw a force
+    /// written into session state at all, so this would have silently sent
+    /// `derived` while `project switch`'s own success message claimed
+    /// membership was not being checked. Exercised end-to-end through
+    /// `send_stream_event` and a real captured request header, not just the
+    /// pure `attribution_mode` function, so a regression anywhere in the
+    /// plumbing between `capture_project` and the wire is caught.
+    #[tokio::test]
+    async fn session_scoped_force_is_honoured_on_the_wire() {
+        use crate::session_state::{ProjectBinding, SessionState};
+
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        // No user-level default at all: the force under test lives ONLY in
+        // session state, so a pass here can't be explained by an ambient or
+        // accidentally-written user_project.toml.
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+        // `capture_project` reads `TRACEVAULT_PROJECT` ABOVE the
+        // session-active tier this test pins the force on; unset it so an
+        // ambient export can't redirect the capture at another project.
+        _guard.remove("TRACEVAULT_PROJECT");
+
+        let pid = uuid::Uuid::from_u128(321);
+        let future = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
+        let session = SessionState {
+            active_project: Some(ProjectBinding {
+                project_id: pid.to_string(),
+                project_name: "proj".into(),
+                updated_at: "".into(),
+                forced_until: Some(future),
+            }),
+            ..Default::default()
+        };
+        let capture_binding = capture_binding(&session, None);
+
+        let resp = ok_stream_response();
+        let (base, rx) = spawn_once_capturing_request(Box::leak(resp.into_boxed_str()));
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let req = sample_stream_event_request();
+        let mut warned = false;
+
+        let got = send_stream_event(
+            &client,
+            &Attribution::ProjectOnly { project_id: pid },
+            attribution_force(capture_binding.as_ref()),
+            &req,
+            &mut warned,
+        )
+        .await
+        .expect("send_stream_event must succeed");
+        assert_eq!(
+            got.expect("a successful send returns a response").status,
+            "accepted"
+        );
+
+        let captured = rx
+            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
+            .expect("no request captured");
+        assert!(
+            captured
+                .to_lowercase()
+                .contains("x-tracevault-project-attribution: explicit"),
+            "a session-scoped (no --user) force must reach the wire as `explicit`, got: {captured}"
+        );
+    }
+
+    /// VIS-305 Part C review, Important finding 2: a LIVE force sitting on
+    /// the machine-global user-level default must NOT leak onto a different,
+    /// higher-precedence project that resolves instead. The old
+    /// process-global `attribution_mode` couldn't tell the two apart — it
+    /// declared `explicit` for ANY project as long as SOME force existed
+    /// anywhere on disk. Here the user-default's force belongs to project A,
+    /// but `TRACEVAULT_PROJECT` (a higher-precedence local tier) points this
+    /// capture at project B, which was never forced.
+    #[test]
+    fn user_default_force_does_not_leak_onto_a_higher_precedence_project() {
+        use crate::session_state::{ProjectBinding, SessionState};
+
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let project_a = uuid::Uuid::from_u128(1);
+        let future = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
+        crate::user_project_default::save(&ProjectBinding {
+            project_id: project_a.to_string(),
+            project_name: "a".into(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            forced_until: Some(future),
+        })
+        .unwrap();
+
+        let project_b = uuid::Uuid::from_u128(2);
+        _guard.set("TRACEVAULT_PROJECT", project_b.to_string());
+
+        let capture_binding = capture_binding(&SessionState::default(), None);
+        assert_eq!(
+            capture_binding.as_ref().map(|b| b.project_id.as_str()),
+            Some(project_b.to_string()).as_deref(),
+            "TRACEVAULT_PROJECT must outrank the user-level default"
+        );
+
+        assert_eq!(
+            attribution_mode(capture_binding.as_ref()),
+            AttributionMode::Derived,
+            "a force on the user-default project must not leak onto a DIFFERENT, \
+             higher-precedence project that never asked to be forced"
+        );
     }
 
     // ── send_stream_event: endpoint routing based on capture_pid ──────────────
@@ -1575,11 +2150,53 @@ mod tests {
     /// harness in `tests/stream_event_project_test.rs`.
     const SEND_STREAM_EVENT_RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
+    /// Read one request's line and headers off `stream`, hand the pair to
+    /// `tx` as a single string, then write `response` back.
+    ///
+    /// Shared by [`spawn_once_capturing_request`] and
+    /// [`spawn_n_capturing_requests`], which grew this same capture
+    /// independently and disagreed only on `trim()` vs `trim_end()` for the
+    /// blank-line terminator (equivalent, since a bare CRLF trims empty
+    /// either way).
+    ///
+    /// Deliberately NOT `test_helpers::read_request`: that one is private to
+    /// its module and blocks in `accept()`, where these two use
+    /// `set_nonblocking` plus a deadline.
+    ///
+    /// Headers are captured, not just the request line, so a test can assert
+    /// on `x-tracevault-project-attribution` — without them a regression that
+    /// hardcoded `"derived"` at a `stream_event_for_project` call site would
+    /// pass the whole suite, since nothing in-crate ever looked at the header
+    /// actually sent. They are appended AFTER the request line, leaving
+    /// `starts_with`/`contains` assertions on the line itself unaffected.
+    fn capture_request_and_respond(
+        stream: std::net::TcpStream,
+        tx: &mpsc::Sender<String>,
+        response: &str,
+    ) {
+        let mut reader = BufReader::new(stream);
+        let mut captured = String::new();
+        let _ = reader.read_line(&mut captured);
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                break;
+            }
+            if header.trim().is_empty() {
+                break;
+            }
+            captured.push_str(&header);
+        }
+        let _ = tx.send(captured);
+        let mut stream = reader.into_inner();
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
     /// Spawn a one-shot server that returns `response` (a full HTTP response)
-    /// to the first request. Captures the HTTP request line (method + path +
-    /// query) over the returned channel before writing the response. Mirrors
-    /// the harness in `tests/stream_event_project_test.rs` /
-    /// `tests/resolve_remote_test.rs`.
+    /// to the first request, capturing it via
+    /// [`capture_request_and_respond`]. Mirrors the harness in
+    /// `tests/stream_event_project_test.rs` / `tests/resolve_remote_test.rs`.
     fn spawn_once_capturing_request(response: &'static str) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1587,13 +2204,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             if let Some(stream) = accept_with_deadline(&listener) {
-                let mut reader = BufReader::new(stream);
-                let mut request_line = String::new();
-                let _ = reader.read_line(&mut request_line);
-                let _ = tx.send(request_line);
-                let mut stream = reader.into_inner();
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
+                capture_request_and_respond(stream, &tx, response);
             }
         });
         (format!("http://{addr}"), rx)
@@ -1654,6 +2265,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", tmp.path());
+        // `capture_project` reads `TRACEVAULT_PROJECT` above the
+        // session-active tier asserted below — pin it unset. Ditto
+        // `TRACEVAULT_PROJECT_ATTRIBUTION`, which the `derived` header
+        // assertion at the end of this test depends on.
+        _guard.remove("TRACEVAULT_PROJECT");
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
 
         let pid = uuid::Uuid::from_u128(99);
         let session = SessionState {
@@ -1661,10 +2278,14 @@ mod tests {
                 project_id: pid.to_string(),
                 project_name: "proj".into(),
                 updated_at: "".into(),
+                forced_until: None,
             }),
             ..Default::default()
         };
-        let capture_pid = capture_project(&session, None);
+        let capture_binding = capture_binding(&session, None);
+        let capture_pid = capture_binding
+            .as_ref()
+            .and_then(crate::resolution::capture_project_id);
         assert_eq!(capture_pid, Some(pid));
 
         let resp = ok_stream_response();
@@ -1679,6 +2300,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: capture_pid,
             },
+            attribution_force(capture_binding.as_ref()),
             &req,
             &mut warned,
         )
@@ -1698,6 +2320,16 @@ mod tests {
             )),
             "an active project binding must route to the project-scoped endpoint, got: {line}"
         );
+        // Covers the `Attribution::Repo { project: Some(_) }` call site of
+        // `stream_event_for_project` (the `ProjectOnly` call site is covered
+        // by `session_scoped_force_is_honoured_on_the_wire` and
+        // `send_stream_event_project_only_omits_repo_id`) — an unforced
+        // binding must still send the header, declaring `derived`.
+        assert!(
+            line.to_lowercase()
+                .contains("x-tracevault-project-attribution: derived"),
+            "got: {line}"
+        );
     }
 
     /// With an empty binding (default `SessionState`, no worktree override)
@@ -1712,11 +2344,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         // No user_project.toml under this isolated config dir, so there is no
-        // ambient user-level default to leak in.
+        // ambient user-level default to leak in — and no `TRACEVAULT_PROJECT`
+        // either, which `capture_project` would otherwise honour and turn
+        // this "nothing resolves" case into a project-scoped send.
         _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.remove("TRACEVAULT_PROJECT");
 
-        let capture_pid = capture_project(&SessionState::default(), None);
-        assert_eq!(capture_pid, None);
+        let capture_binding = capture_binding(&SessionState::default(), None);
+        assert_eq!(capture_binding, None);
 
         let resp = ok_stream_response();
         let (base, rx) = spawn_once_capturing_request(Box::leak(resp.into_boxed_str()));
@@ -1728,8 +2363,9 @@ mod tests {
             &client,
             &Attribution::Repo {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
-                project: capture_pid,
+                project: None,
             },
+            attribution_force(capture_binding.as_ref()),
             &req,
             &mut warned,
         )
@@ -1753,11 +2389,12 @@ mod tests {
 
     /// Spawn a server that replies to up to `responses.len()` sequential
     /// connections with the given full HTTP responses, in order, capturing
-    /// each request line over the channel. The listening socket itself is
-    /// dropped (closing it) once all responses have been served, so any
-    /// further connection attempt fails fast (connection refused) rather than
-    /// hanging for the client's request timeout — this lets a test assert
-    /// "no further request was sent" cheaply.
+    /// each request (line + headers, via [`capture_request_and_respond`])
+    /// over the channel. The listening socket itself is dropped (closing it)
+    /// once all responses have been served, so any further connection attempt
+    /// fails fast (connection refused) rather than hanging for the client's
+    /// request timeout — this lets a test assert "no further request was
+    /// sent" cheaply.
     fn spawn_n_capturing_requests(
         responses: Vec<&'static str>,
     ) -> (String, mpsc::Receiver<String>) {
@@ -1774,13 +2411,7 @@ mod tests {
                 let Some(stream) = accept_with_deadline(&listener) else {
                     break;
                 };
-                let mut reader = BufReader::new(stream);
-                let mut request_line = String::new();
-                let _ = reader.read_line(&mut request_line);
-                let _ = tx.send(request_line);
-                let mut stream = reader.into_inner();
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
+                capture_request_and_respond(stream, &tx, response);
             }
             // `listener` (and `tx`) drop here, closing the socket and the
             // channel — a stray extra request gets ECONNREFUSED immediately
@@ -1821,6 +2452,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: Some(pid),
             },
+            attribution_force(None),
             &req,
             &mut warned,
         )
@@ -1880,6 +2512,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: Some(pid),
             },
+            attribution_force(None),
             &req,
             &mut warned,
         )
@@ -1935,27 +2568,126 @@ mod tests {
 
         let mut warned = false;
         assert!(
-            send_stream_event(&client, &attribution, &req, &mut warned)
-                .await
-                .is_err(),
+            send_stream_event(
+                &client,
+                &attribution,
+                attribution_force(None),
+                &req,
+                &mut warned
+            )
+            .await
+            .is_err(),
             "a refused declared project must be an error"
         );
         assert!(warned, "the flag must be set after the first refusal");
 
         assert!(
-            send_stream_event(&client, &attribution, &req, &mut warned)
-                .await
-                .is_err(),
+            send_stream_event(
+                &client,
+                &attribution,
+                attribution_force(None),
+                &req,
+                &mut warned
+            )
+            .await
+            .is_err(),
             "a second refusal must also be an error"
         );
         assert!(warned, "the flag stays set across the shared invocation");
     }
 
+    /// Finding 5's scenario end to end, on the repo-bound path, as VIS-316
+    /// leaves it: a live persisted force makes this send declare `explicit`,
+    /// the force gate refuses it with a 403 — and the event is now an ERROR
+    /// queued for retry, never re-sent to the repo-scoped endpoint where the
+    /// server would DEDUCE a project that is precisely not the one the
+    /// operator forced.
+    ///
+    /// Pins the fact the refusal clause depends on: the mode that went on
+    /// the wire really is `explicit`, and it is the same value
+    /// `refused_error` is handed — the message and the wire cannot disagree.
+    /// A spare 200 is staged so "no second request" is non-vacuous.
+    #[tokio::test]
+    async fn a_refused_force_declares_explicit_and_is_an_error_not_a_fallback() {
+        let body_403 = "forbidden";
+        let resp_403 = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body_403.len(),
+            body_403
+        );
+        let resp_200 = ok_stream_response();
+
+        let (base, rx) = spawn_n_capturing_requests(vec![
+            Box::leak(resp_403.into_boxed_str()),
+            Box::leak(resp_200.into_boxed_str()),
+        ]);
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let req = sample_stream_event_request();
+        let pid = uuid::Uuid::from_u128(42);
+
+        // A live persisted force on the winning binding — no env var needed,
+        // so this test takes no env lock.
+        let forced = crate::session_state::ProjectBinding {
+            project_id: pid.to_string(),
+            project_name: "forced".into(),
+            updated_at: "".into(),
+            forced_until: Some((chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339()),
+        };
+
+        let mut warned = false;
+        let err = send_stream_event(
+            &client,
+            &Attribution::Repo {
+                repo_id: "11111111-1111-1111-1111-111111111111".into(),
+                project: Some(pid),
+            },
+            attribution_force(Some(&forced)),
+            &req,
+            &mut warned,
+        )
+        .await
+        .expect_err("a refused force must be an error, not a silent fallback");
+        assert!(
+            err.to_string().contains("403"),
+            "propagated error must reflect the status, got: {err}"
+        );
+        assert!(warned, "the refusal must be printed exactly once");
+
+        let first = rx
+            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
+            .expect("no first request captured");
+        assert!(
+            first.contains(&format!("/projects/{pid}/stream")),
+            "first request must hit the project-scoped endpoint, got: {first}"
+        );
+        assert!(
+            first
+                .to_lowercase()
+                .contains("x-tracevault-project-attribution: explicit"),
+            "the refused send must have DECLARED explicit — this is the mode \
+             `refused_error` is handed: {first}"
+        );
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "a refused force must NOT be re-attributed via the repo-scoped endpoint"
+        );
+    }
+
     /// The repo-less send: a `ProjectOnly` attribution must hit the bare
     /// project endpoint with NO `repo_id` query pair. This is the wire shape
     /// the server documents as "repo-less (0-repo) projects are supported".
+    ///
+    /// Takes the env lock and pins `TRACEVAULT_PROJECT_ATTRIBUTION` unset:
+    /// this test also asserts the `derived` attribution header, and
+    /// `attribution_mode` reads that variable even when the binding passed
+    /// in is `None`.
     #[tokio::test]
     async fn send_stream_event_project_only_omits_repo_id() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
         let resp = ok_stream_response();
         let (base, rx) = spawn_once_capturing_request(Box::leak(resp.into_boxed_str()));
         let client = crate::api_client::ApiClient::new(&base, Some("tok"));
@@ -1966,6 +2698,7 @@ mod tests {
         let got = send_stream_event(
             &client,
             &Attribution::ProjectOnly { project_id: pid },
+            attribution_force(None),
             &req,
             &mut warned,
         )
@@ -1982,6 +2715,11 @@ mod tests {
         assert!(
             line.starts_with(&format!("POST /api/v1/projects/{pid}/stream ")),
             "expected a bare project path with no query string, got: {line}"
+        );
+        assert!(
+            line.to_lowercase()
+                .contains("x-tracevault-project-attribution: derived"),
+            "with no forced binding, the header must declare `derived`, got: {line}"
         );
         assert!(
             !warned,
@@ -2021,6 +2759,7 @@ mod tests {
         let got = send_stream_event(
             &client,
             &Attribution::ProjectOnly { project_id: pid },
+            attribution_force(None),
             &req,
             &mut warned,
         )
@@ -2069,6 +2808,7 @@ mod tests {
             &Attribution::ProjectOnly {
                 project_id: uuid::Uuid::from_u128(13),
             },
+            attribution_force(None),
             &req,
             &mut warned,
         )
@@ -2104,6 +2844,7 @@ mod tests {
                 repo_id: "11111111-1111-1111-1111-111111111111".into(),
                 project: Some(pid),
             },
+            attribution_force(None),
             &req,
             &mut warned,
         )
@@ -2182,7 +2923,11 @@ mod tests {
     fn refused_error_names_both_403_causes_and_never_claims_re_attribution() {
         let pid = uuid::Uuid::from_u128(7);
 
-        let forbidden = refused_error(pid, &ClientErrorKind::Forbidden);
+        let forbidden = refused_error(
+            pid,
+            &ClientErrorKind::Forbidden,
+            AttributionForce::default(),
+        );
         assert!(forbidden.contains("403"), "{forbidden}");
         assert!(
             forbidden.contains("realm role"),
@@ -2200,7 +2945,7 @@ mod tests {
 
         // A 400/404/409 genuinely IS a binding problem, so that wording stays
         // unhedged — hedging everything would dilute the useful case.
-        let scoping = refused_error(pid, &ClientErrorKind::Scoping);
+        let scoping = refused_error(pid, &ClientErrorKind::Scoping, AttributionForce::default());
         assert!(scoping.contains("project switch"), "{scoping}");
         assert!(
             !scoping.contains("realm role"),
@@ -2224,5 +2969,200 @@ mod tests {
                 "must never claim the event was re-attributed: {s}"
             );
         }
+    }
+
+    /// VIS-305 whole-branch review, Important finding 5: a REFUSED FORCE
+    /// said nothing about the force. The 403 the force gate returns for "not
+    /// Operator on the project" or "`explicit` from a `tvk_` key" is
+    /// indistinguishable from here (see `ClientErrorKind`) from a membership
+    /// 403, so an operator who asked for `explicit` got a message about
+    /// membership and realm roles and was never told the force itself was
+    /// what got refused. Failing closed on trust is right; failing closed
+    /// silently is the defect. (VIS-316 made the refusal an error rather
+    /// than a fallback; the missing explanation is orthogonal to that and
+    /// still has to be given.)
+    #[test]
+    fn the_403_error_says_the_force_was_refused_when_the_send_declared_explicit() {
+        let pid = uuid::Uuid::from_u128(7);
+
+        let explicit = refused_error(
+            pid,
+            &ClientErrorKind::Forbidden,
+            AttributionForce {
+                env: false,
+                binding: true,
+            },
+        );
+        assert!(
+            explicit.contains("FORCE"),
+            "the refusal of the force itself must be named: {explicit}"
+        );
+        assert!(
+            explicit.contains("Operator"),
+            "must name the grant forcing requires: {explicit}"
+        );
+        assert!(
+            explicit.contains("Control Plane"),
+            "must name the identity forcing requires: {explicit}"
+        );
+        // `main`'s Forbidden wording is ADDED TO, not replaced: the
+        // membership causes it already names must survive alongside the
+        // force clause.
+        assert!(
+            explicit.contains("realm role") && explicit.contains("TracePush"),
+            "the membership causes must still be named: {explicit}"
+        );
+        // The event is queued, not re-attributed — the force clause must not
+        // reintroduce the claim VIS-316 removed.
+        assert!(
+            !explicit.contains("repo deduction") && !explicit.contains("Attributing via"),
+            "must never claim the event was re-attributed: {explicit}"
+        );
+
+        // Same 403, `derived` mode: no force was asked for, so none was
+        // refused and the clause must not appear. This is the discriminating
+        // half — without it the test would pass on a message that blamed the
+        // force unconditionally, which is just a different wrong story.
+        let derived = refused_error(
+            pid,
+            &ClientErrorKind::Forbidden,
+            AttributionForce::default(),
+        );
+        assert!(
+            !derived.contains("FORCE"),
+            "a `derived` send never forced anything: {derived}"
+        );
+    }
+
+    /// The force clause belongs to the 403 the force gate returns, and to
+    /// nothing else: a 400/404/409 means the project id does not resolve, so
+    /// the gate never ran. Blaming the force there would be a new wrong
+    /// explanation of the same family as the one finding 5 reports.
+    #[test]
+    fn an_explicit_scoping_failure_does_not_blame_the_force() {
+        let pid = uuid::Uuid::from_u128(7);
+        let scoping = refused_error(
+            pid,
+            &ClientErrorKind::Scoping,
+            AttributionForce {
+                env: true,
+                binding: true,
+            },
+        );
+        assert!(!scoping.contains("FORCE"), "{scoping}");
+        assert_eq!(
+            scoping,
+            refused_error(pid, &ClientErrorKind::Scoping, AttributionForce::default()),
+            "the scoping wording does not depend on the mode"
+        );
+    }
+
+    /// Copilot on PR #54: the remediation told EVERY forced sender to switch
+    /// again without `--project-attribution explicit`. That clears a
+    /// persisted `forced_until` and nothing else — so when the force came
+    /// from `TRACEVAULT_PROJECT_ATTRIBUTION`, [`attribution_force`] goes on
+    /// reading the environment, every later send still declares `explicit`,
+    /// and the advice silently does nothing. On the one code path a confused
+    /// operator reaches.
+    ///
+    /// Each case is driven through `attribution_force` and a REAL exported
+    /// variable rather than a hand-built struct, so what this pins is the
+    /// whole path: the value that decides the header is the value the
+    /// wording is derived from, and the two cannot describe different
+    /// worlds.
+    ///
+    /// Discriminating in both directions — each case asserts the fix that
+    /// applies AND the absence of the one that doesn't — because a message
+    /// that simply listed both remediations every time would pass a
+    /// one-sided test while being the same "advice that may not apply"
+    /// defect in a longer form.
+    #[test]
+    fn the_403_remediation_names_the_force_source_actually_in_effect() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        let pid = uuid::Uuid::from_u128(7);
+        let live = forced_binding(Some(
+            &(chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339(),
+        ));
+        let never_forced = forced_binding(None);
+
+        // ENV ONLY. The binding carries no force at all, so "switch again
+        // without the flag" would change precisely nothing: the next send
+        // reads the same variable and declares `explicit` again.
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
+        let env_only = refused_error(
+            pid,
+            &ClientErrorKind::Forbidden,
+            attribution_force(Some(&never_forced)),
+        );
+        assert!(
+            env_only.contains("FORCE"),
+            "an env-sourced force is still a force: {env_only}"
+        );
+        assert!(
+            env_only.contains("unset `TRACEVAULT_PROJECT_ATTRIBUTION`"),
+            "must name the variable that is doing the forcing: {env_only}"
+        );
+        assert!(
+            !env_only.contains("--project-attribution"),
+            "must NOT tell the operator to drop a flag that would change \
+             nothing here — this is the bug: {env_only}"
+        );
+
+        // BINDING ONLY. Now the flag advice is the right one, and naming the
+        // env var would send the operator hunting for an export that isn't
+        // set.
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+        let binding_only = refused_error(
+            pid,
+            &ClientErrorKind::Forbidden,
+            attribution_force(Some(&live)),
+        );
+        assert!(
+            binding_only.contains("--project-attribution"),
+            "a persisted force IS cleared by switching without the flag: {binding_only}"
+        );
+        assert!(
+            !binding_only.contains("TRACEVAULT_PROJECT_ATTRIBUTION"),
+            "must not send the operator after an unset variable: {binding_only}"
+        );
+
+        // BOTH. Removing either one alone leaves the other forcing, which
+        // would look exactly like the fix not working — so the message has
+        // to say both must go.
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
+        let both = refused_error(
+            pid,
+            &ClientErrorKind::Forbidden,
+            attribution_force(Some(&live)),
+        );
+        assert!(
+            both.contains("TRACEVAULT_PROJECT_ATTRIBUTION")
+                && both.contains("--project-attribution"),
+            "both sources are in effect and both must be named: {both}"
+        );
+        assert!(
+            both.contains("BOTH"),
+            "must say that removing only one is not enough: {both}"
+        );
+    }
+
+    /// The remediation is built from the same `AttributionForce` the header
+    /// is, so it can never describe a force the send did not declare: with
+    /// no source set there is no force clause at all, whatever the wording
+    /// of the fixes would have been.
+    #[test]
+    fn no_force_means_no_remediation_clause() {
+        let pid = uuid::Uuid::from_u128(7);
+        let none = refused_error(
+            pid,
+            &ClientErrorKind::Forbidden,
+            AttributionForce::default(),
+        );
+        assert!(
+            !none.contains("TRACEVAULT_PROJECT_ATTRIBUTION")
+                && !none.contains("--project-attribution"),
+            "a derived send has no force to remove: {none}"
+        );
     }
 }

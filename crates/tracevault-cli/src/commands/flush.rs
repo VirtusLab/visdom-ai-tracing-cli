@@ -99,6 +99,39 @@ fn display_prefix(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
+/// The attribution force a whole queue declares on the wire, resolved once
+/// per queue (not per event: it reads the environment and parses an RFC3339
+/// timestamp). The whole [`crate::commands::stream::AttributionForce`]
+/// rather than just its mode, for the same reason the live path carries it:
+/// a refusal has to name the force source it tells the operator to remove.
+///
+/// Both queue kinds read it off the capture binding [`queue_capture_binding`]
+/// resolved — the same binding, and therefore the same rule, the live send
+/// path applies in `commands::stream::send_stream_event`.
+///
+/// A repo queue sends under whatever project that binding names, so the
+/// binding speaks for it unconditionally. A repo-less queue is keyed by a
+/// project id of its own (`pending-project-<uuid>.jsonl`), fixed when its
+/// events were buffered, so the binding speaks for it only while it still
+/// resolves to THAT SAME project: `forced_until` is stored PER-BINDING (see
+/// that field's own doc comment), and applying a force resolved for some
+/// other project to this queue would be exactly the leak
+/// `attribution_mode`'s binding-scoping exists to prevent (see
+/// `attribution_mode`'s doc comment for the two-sided bug that motivated
+/// this).
+fn queue_attribution_force(
+    target: &QueueTarget,
+    capture_binding: Option<&crate::session_state::ProjectBinding>,
+) -> crate::commands::stream::AttributionForce {
+    let speaks_for_this_queue = match target {
+        QueueTarget::Repo(_) => capture_binding,
+        QueueTarget::Project(pid) => {
+            capture_binding.filter(|b| crate::resolution::capture_project_id(b) == Some(*pid))
+        }
+    };
+    crate::commands::stream::attribution_force(speaks_for_this_queue)
+}
+
 /// What happened to one queued event on its way back to the server.
 #[derive(Debug)]
 pub(crate) enum QueuedSend {
@@ -117,19 +150,29 @@ pub(crate) enum QueuedSend {
     },
 }
 
-/// The capture project a queue's events are sent under, resolved exactly as
+/// The capture BINDING a queue's events are sent under, resolved exactly as
 /// the stream hook resolves it: the session's state (`session_state::load`,
 /// keyed by the session directory's name) plus the worktree toplevel the hook
-/// recorded in the session dir's `origin` marker (see `run_stream`). Only
-/// repo queues consult it — a repo-less queue is already keyed by its project.
+/// recorded in the session dir's `origin` marker (see `run_stream`).
+///
+/// Resolved the same way for BOTH queue kinds: nothing here needs the target.
+/// The whole chain runs off `session_dir` alone — the session id is its file
+/// name, the worktree override its `origin` marker, and
+/// `commands::stream::capture_binding` takes no repo at all. Which endpoint
+/// the queue then drains to is [`send_queued_event`]'s decision, and what the
+/// binding is allowed to say about a repo-less queue is
+/// [`queue_attribution_force`]'s.
 ///
 /// Without this, `flush` would drain a repo queue to the repo-scoped endpoint
 /// and let the server deduce a project, re-attributing the very events the
 /// hook queued because the server REFUSED the declared project.
-fn queue_capture_project(session_dir: &Path, target: &QueueTarget) -> Option<uuid::Uuid> {
-    if !matches!(target, QueueTarget::Repo(_)) {
-        return None;
-    }
+///
+/// The whole binding, not just its id: its `forced_until` is what
+/// [`queue_attribution_force`] reads, so a flushed event declares the same
+/// attribution mode the live send would have (see
+/// `commands::stream::attribution_mode` for why the force must come from the
+/// binding that actually won, and no other).
+fn queue_capture_binding(session_dir: &Path) -> Option<crate::session_state::ProjectBinding> {
     let session_id = session_dir.file_name()?.to_str()?;
     let session = crate::session_state::load(session_id);
     // Trimmed like the other `origin` readers (`check`, `verification_phase`):
@@ -138,7 +181,7 @@ fn queue_capture_project(session_dir: &Path, target: &QueueTarget) -> Option<uui
     let worktree = fs::read_to_string(session_dir.join("origin"))
         .ok()
         .map(|s| s.trim().to_string());
-    crate::commands::stream::capture_project(&session, worktree.as_deref())
+    crate::commands::stream::capture_binding(&session, worktree.as_deref())
 }
 
 /// Send one queued event to the endpoint its queue and the session's capture
@@ -149,22 +192,30 @@ fn queue_capture_project(session_dir: &Path, target: &QueueTarget) -> Option<uui
 /// repo-scoped endpoint — that would be the silent re-attribution VIS-316
 /// removes. A repo-less queue drains to the project endpoint with no repo id,
 /// the same shape the stream hook buffered it as, and keeps its old rules.
+///
+/// `force` is the queue's attribution force ([`queue_attribution_force`]);
+/// its mode goes on every project-scoped send as the
+/// `x-tracevault-project-attribution` header, so a flushed event declares
+/// exactly what the live send would have.
 pub(crate) async fn send_queued_event(
     client: &ApiClient,
     target: &QueueTarget,
     capture_pid: Option<uuid::Uuid>,
+    force: crate::commands::stream::AttributionForce,
     event: &StreamEventRequest,
 ) -> QueuedSend {
     let (sent, refusable_pid) = match (target, capture_pid) {
         (QueueTarget::Repo(repo_id), None) => (client.stream_event(repo_id, event).await, None),
         (QueueTarget::Repo(repo_id), Some(pid)) => (
             client
-                .stream_event_for_project(pid, Some(repo_id), event)
+                .stream_event_for_project(pid, Some(repo_id), force.mode(), event)
                 .await,
             Some(pid),
         ),
         (QueueTarget::Project(pid), _) => (
-            client.stream_event_for_project(*pid, None, event).await,
+            client
+                .stream_event_for_project(*pid, None, force.mode(), event)
+                .await,
             None,
         ),
     };
@@ -196,6 +247,7 @@ async fn drain_queue(
     pending_path: &Path,
     target: &QueueTarget,
     capture_pid: Option<uuid::Uuid>,
+    force: crate::commands::stream::AttributionForce,
 ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
     let events = drain_pending(pending_path)?;
     if events.is_empty() {
@@ -227,7 +279,7 @@ async fn drain_queue(
             event_total
         );
         event.truncate_large_fields();
-        match send_queued_event(client, target, capture_pid, &event).await {
+        match send_queued_event(client, target, capture_pid, force, &event).await {
             QueuedSend::Sent => sent += 1,
             QueuedSend::TooLarge => {
                 // Payload too large even after truncation — drop it.
@@ -245,7 +297,10 @@ async fn drain_queue(
             }
             QueuedSend::Refused { pid, kind } => {
                 eprintln!();
-                eprintln!("{}", crate::commands::stream::refused_error(pid, &kind));
+                eprintln!(
+                    "{}",
+                    crate::commands::stream::refused_error(pid, &kind, force)
+                );
                 failed_events.push(event);
                 failed_events.extend(events.by_ref().map(|(_, e)| e));
                 // Everything not sent is failed: earlier failures, the refused
@@ -297,9 +352,15 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
         let pending_queues = pending_queues_in(&session_dir, bound_repo_id.as_deref())?;
 
         for (pending_path, target) in pending_queues {
-            // Resolved once per queue, not per event.
-            let capture_pid = queue_capture_project(&session_dir, &target);
-            let (sent, failed) = drain_queue(&client, &pending_path, &target, capture_pid).await?;
+            // Resolved once per queue, not per event — the force read costs
+            // an env read and an RFC3339 parse.
+            let capture_binding = queue_capture_binding(&session_dir);
+            let capture_pid = capture_binding
+                .as_ref()
+                .and_then(crate::resolution::capture_project_id);
+            let force = queue_attribution_force(&target, capture_binding.as_ref());
+            let (sent, failed) =
+                drain_queue(&client, &pending_path, &target, capture_pid, force).await?;
             total_sent += sent;
             total_failed += failed;
         }
@@ -658,7 +719,10 @@ mod queue_target_tests {
 #[cfg(test)]
 mod send_tests {
     use super::*;
+    use crate::api_client::AttributionMode;
+    use crate::commands::stream::AttributionForce;
     use crate::test_helpers::{http_json, lock_env_mutation, spawn_seq, EnvVarGuard, RECV_TIMEOUT};
+    use std::path::PathBuf;
     use std::time::Duration;
     use tracevault_protocol::streaming::StreamEventType;
 
@@ -738,6 +802,7 @@ mod send_tests {
             &client,
             &QueueTarget::Repo(REPO.into()),
             Some(pid),
+            AttributionForce::default(),
             &event(1),
         )
         .await;
@@ -752,13 +817,247 @@ mod send_tests {
         );
     }
 
+    /// VIS-305: a flushed event declares the SAME attribution mode the live
+    /// send would have. `queue_attribution_force` reads it off the capture
+    /// binding that decided the repo queue's project — so a live
+    /// `forced_until` on that binding must reach the wire as `explicit`, and
+    /// an unforced one as `derived`. Without this, a queued event would
+    /// silently downgrade to membership-checked attribution on drain.
+    #[tokio::test]
+    async fn repo_queue_declares_the_capture_bindings_attribution_mode() {
+        let _env_lock = lock_env_mutation().await;
+        let mut guard = EnvVarGuard::new();
+        guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let pid = uuid::Uuid::from_u128(0xF);
+        let forced = crate::session_state::ProjectBinding {
+            project_id: pid.to_string(),
+            project_name: "p".into(),
+            updated_at: String::new(),
+            forced_until: Some((chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339()),
+        };
+        let unforced = crate::session_state::ProjectBinding {
+            forced_until: None,
+            ..forced.clone()
+        };
+        let target = QueueTarget::Repo(REPO.into());
+
+        for (binding, expected) in [
+            (&forced, AttributionMode::Explicit),
+            (&unforced, AttributionMode::Derived),
+        ] {
+            let force = queue_attribution_force(&target, Some(binding));
+            assert_eq!(force.mode(), expected, "mode for {binding:?}");
+
+            let (base, rx) = spawn_seq(vec![ok()]);
+            let client = ApiClient::new(&base, Some("tok"));
+            let got = send_queued_event(&client, &target, Some(pid), force, &event(1)).await;
+            assert!(matches!(got, QueuedSend::Sent), "{got:?}");
+
+            let captured = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
+            assert!(
+                captured
+                    .to_lowercase()
+                    .contains(&format!("x-tracevault-project-attribution: {expected}")),
+                "got: {captured}"
+            );
+        }
+    }
+
+    /// Seed a session whose `active_project` is `pid`, forced until `forced`,
+    /// and hand back the session directory `flush` would resolve it from.
+    /// The directory is deliberately EMPTY apart from its name: that name is
+    /// the session id, and it is the only input `queue_capture_binding` needs.
+    fn seed_forced_session(
+        state_root: &Path,
+        session_id: &str,
+        pid: uuid::Uuid,
+        forced: Option<String>,
+    ) -> PathBuf {
+        crate::session_state::save(
+            session_id,
+            &crate::session_state::SessionState {
+                active_project: Some(crate::session_state::ProjectBinding {
+                    project_id: pid.to_string(),
+                    project_name: "p".into(),
+                    updated_at: String::new(),
+                    forced_until: forced,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let session_dir = state_root.join("sessions").join(session_id);
+        fs::create_dir_all(&session_dir).unwrap();
+        session_dir
+    }
+
+    fn in_four_hours() -> String {
+        (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339()
+    }
+
+    /// VIS-305: a repo-LESS queue resolves the SAME capture binding a repo
+    /// queue does, so a SESSION-scoped force reaches the wire when that queue
+    /// is drained.
+    ///
+    /// `queue_capture_binding` derives everything from the session directory
+    /// — the session id is its name, the worktree override its `origin`
+    /// marker, and `commands::stream::capture_binding` takes no repo at all
+    /// — so nothing about a project queue makes the binding unrecoverable.
+    /// An earlier version early-returned `None` for a non-repo target and
+    /// consulted only the user-level default, which made a session-scoped
+    /// force (the ordinary case whenever a session id is set) invisible: the
+    /// header silently downgraded to `derived` on drain.
+    #[tokio::test]
+    async fn project_queue_honours_a_session_scoped_force() {
+        let _env_lock = lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut guard = EnvVarGuard::new();
+        guard.set("XDG_STATE_HOME", tmp.path().join("state"));
+        guard.set("XDG_CONFIG_HOME", tmp.path().join("config"));
+        guard.set("HOME", tmp.path());
+        // Both are read ABOVE the session binding this test pins (and the
+        // second would decide the header outright).
+        guard.remove("TRACEVAULT_PROJECT");
+        guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let pid = uuid::Uuid::from_u128(0xA1);
+        let session_dir = seed_forced_session(
+            &tmp.path().join("state"),
+            "flush-project-force",
+            pid,
+            Some(in_four_hours()),
+        );
+
+        let binding = queue_capture_binding(&session_dir);
+        let want = pid.to_string();
+        assert_eq!(
+            binding.as_ref().map(|b| b.project_id.as_str()),
+            Some(want.as_str()),
+            "a project queue's binding is recoverable from the session dir alone"
+        );
+
+        let target = QueueTarget::Project(pid);
+        let force = queue_attribution_force(&target, binding.as_ref());
+        assert_eq!(
+            force.mode(),
+            AttributionMode::Explicit,
+            "a live session force must not be dropped"
+        );
+
+        let (base, rx) = spawn_seq(vec![ok()]);
+        let client = ApiClient::new(&base, Some("tok"));
+        let got = send_queued_event(&client, &target, None, force, &event(1)).await;
+        assert!(matches!(got, QueuedSend::Sent), "{got:?}");
+        let captured = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
+        assert!(
+            captured
+                .to_lowercase()
+                .contains("x-tracevault-project-attribution: explicit"),
+            "got: {captured}"
+        );
+    }
+
+    /// The flush-path echo of the "does a force leak onto a different
+    /// project" bug, now over the WHOLE precedence chain rather than the
+    /// user default alone: a live force on the binding that currently
+    /// resolves (project A) must NOT apply to a queue keyed by a DIFFERENT
+    /// project B — e.g. the user switched projects since B's events were
+    /// buffered.
+    #[tokio::test]
+    async fn project_queue_does_not_take_a_force_resolved_for_another_project() {
+        let _env_lock = lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut guard = EnvVarGuard::new();
+        guard.set("XDG_STATE_HOME", tmp.path().join("state"));
+        guard.set("XDG_CONFIG_HOME", tmp.path().join("config"));
+        guard.set("HOME", tmp.path());
+        guard.remove("TRACEVAULT_PROJECT");
+        guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let project_a = uuid::Uuid::from_u128(0xA);
+        let project_b = uuid::Uuid::from_u128(0xB);
+        let session_dir = seed_forced_session(
+            &tmp.path().join("state"),
+            "flush-project-leak",
+            project_a,
+            Some(in_four_hours()),
+        );
+
+        let binding = queue_capture_binding(&session_dir);
+        assert_eq!(
+            queue_attribution_force(&QueueTarget::Project(project_a), binding.as_ref()).mode(),
+            AttributionMode::Explicit,
+            "the queue the force was resolved FOR still gets it"
+        );
+        assert_eq!(
+            queue_attribution_force(&QueueTarget::Project(project_b), binding.as_ref()).mode(),
+            AttributionMode::Derived,
+            "a force resolved for a DIFFERENT project must not leak onto this queue"
+        );
+    }
+
+    /// The user-level default is the lowest tier of that same chain, so a
+    /// force persisted by `project switch --user` still reaches a repo-less
+    /// queue keyed by that project — with no session binding in the way.
+    #[tokio::test]
+    async fn project_queue_honours_a_user_default_force() {
+        let _env_lock = lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut guard = EnvVarGuard::new();
+        guard.set("XDG_STATE_HOME", tmp.path().join("state"));
+        guard.set("XDG_CONFIG_HOME", tmp.path().join("config"));
+        guard.set("HOME", tmp.path());
+        guard.remove("TRACEVAULT_PROJECT");
+        guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let pid = uuid::Uuid::from_u128(0xC);
+        crate::user_project_default::save(&crate::session_state::ProjectBinding {
+            project_id: pid.to_string(),
+            project_name: "p".into(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            forced_until: Some(in_four_hours()),
+        })
+        .unwrap();
+
+        // No session state at all: the directory's name resolves to nothing,
+        // so the user default is what the chain lands on.
+        let session_dir = tmp
+            .path()
+            .join("state")
+            .join("sessions")
+            .join("flush-no-session");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let binding = queue_capture_binding(&session_dir);
+        assert_eq!(
+            queue_attribution_force(&QueueTarget::Project(pid), binding.as_ref()).mode(),
+            AttributionMode::Explicit
+        );
+        assert_eq!(
+            queue_attribution_force(
+                &QueueTarget::Project(uuid::Uuid::from_u128(0xD)),
+                binding.as_ref()
+            )
+            .mode(),
+            AttributionMode::Derived,
+            "and still does not leak onto another project's queue"
+        );
+    }
+
     #[tokio::test]
     async fn repo_queue_without_capture_project_goes_to_the_repo_endpoint() {
         let (base, rx) = spawn_seq(vec![ok()]);
         let client = ApiClient::new(&base, Some("tok"));
 
-        let got =
-            send_queued_event(&client, &QueueTarget::Repo(REPO.into()), None, &event(1)).await;
+        let got = send_queued_event(
+            &client,
+            &QueueTarget::Repo(REPO.into()),
+            None,
+            AttributionForce::default(),
+            &event(1),
+        )
+        .await;
         assert!(matches!(got, QueuedSend::Sent), "{got:?}");
 
         let captured = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
@@ -783,6 +1082,7 @@ mod send_tests {
             &client,
             &QueueTarget::Repo(REPO.into()),
             Some(pid),
+            AttributionForce::default(),
             &event(1),
         )
         .await;
@@ -816,6 +1116,7 @@ mod send_tests {
             &client,
             &QueueTarget::Repo(REPO.into()),
             Some(uuid::Uuid::from_u128(0xC)),
+            AttributionForce::default(),
             &event(1),
         )
         .await;
@@ -835,10 +1136,15 @@ mod send_tests {
         let path = dir.path().join(format!("pending-{REPO}.jsonl"));
         append_pending(&path, &[event(1), event(2), event(3)]).unwrap();
 
-        let (sent, failed) =
-            drain_queue(&client, &path, &QueueTarget::Repo(REPO.into()), Some(pid))
-                .await
-                .unwrap();
+        let (sent, failed) = drain_queue(
+            &client,
+            &path,
+            &QueueTarget::Repo(REPO.into()),
+            Some(pid),
+            AttributionForce::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!((sent, failed), (1, 2));
         assert_eq!(
@@ -870,6 +1176,13 @@ mod send_tests {
         guard.set("XDG_STATE_HOME", tmp.path().join("state"));
         guard.set("XDG_CONFIG_HOME", tmp.path().join("config"));
         guard.set("HOME", tmp.path());
+        // `queue_capture_binding` runs the capture chain, which reads
+        // `TRACEVAULT_PROJECT` ABOVE the session-active binding this test
+        // pins; an ambient export would redirect the drain at another
+        // project. `TRACEVAULT_PROJECT_ATTRIBUTION` would likewise change
+        // the header the assertions below do not expect.
+        guard.remove("TRACEVAULT_PROJECT");
+        guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
 
         let (base, rx) = spawn_seq(vec![bad_request(), ok()]);
         guard.set("TRACEVAULT_SERVER_URL", &base);
@@ -884,6 +1197,7 @@ mod send_tests {
                     project_id: pid.to_string(),
                     project_name: "p".into(),
                     updated_at: String::new(),
+                    forced_until: None,
                 }),
                 ..Default::default()
             },

@@ -27,6 +27,62 @@ pub struct ProjectBinding {
     pub project_id: String,
     pub project_name: String,
     pub updated_at: String,
+    /// RFC3339 instant after which the FORCE lapses (the binding itself
+    /// survives). Only ever set by `project switch --project-attribution
+    /// explicit`, which persists to disk and can therefore be forgotten.
+    /// Environment-provided force is exempt: it is re-asserted at every launch
+    /// by construction, so it cannot go stale and needs no expiry.
+    /// Interpreted by exactly one function, [`force_status`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced_until: Option<String>,
+}
+
+/// What a [`ProjectBinding::forced_until`] currently says about its force.
+///
+/// Lives here, beside the field it interprets, because both readers of that
+/// field are in `commands::` and this module depends on neither — so one
+/// place knows the stored format and both can reach it with no cycle.
+///
+/// There used to be two readers and no shared type:
+/// `commands::stream::attribution_mode` folded the question into a bool while
+/// `commands::project::format_force_line` did its own RFC3339 parse and
+/// `Utc::now()` comparison to choose between its active / lapsed / unreadable
+/// wordings — and a test existed purely to pin that the two independently
+/// written predicates agreed on the unparseable case, which is itself the
+/// evidence they could have drifted. That test now pins one implementation
+/// rather than reconciling two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForceStatus {
+    /// Parsed, and still in the future: the force applies.
+    Live(chrono::DateTime<chrono::Utc>),
+    /// Parsed, but already past — the FORCE lapsed; the binding survives.
+    Lapsed(chrono::DateTime<chrono::Utc>),
+    /// Not RFC3339 at all (a hand-edited or corrupted state file).
+    Unreadable,
+}
+
+/// Classify a stored `forced_until` — see [`ForceStatus`].
+///
+/// [`ForceStatus::Unreadable`] is the fail-SAFE direction, and both callers
+/// depend on it: "can't tell" means NOT in force, never `expect()`-worthy.
+/// Not sending an `explicit` header IS the fallback, so ingest never starts
+/// failing because a force was forgotten or a timestamp got mangled.
+///
+/// A parsed instant is normalised to UTC so both arms can carry one type.
+/// `project switch` only ever writes `Utc::now() + …`, so in practice this
+/// changes nothing that is rendered back to the operator.
+pub fn force_status(forced_until: &str) -> ForceStatus {
+    match chrono::DateTime::parse_from_rfc3339(forced_until) {
+        Ok(until) => {
+            let until = until.with_timezone(&chrono::Utc);
+            if until > chrono::Utc::now() {
+                ForceStatus::Live(until)
+            } else {
+                ForceStatus::Lapsed(until)
+            }
+        }
+        Err(_) => ForceStatus::Unreadable,
+    }
 }
 
 /// Session-level active binding plus per-worktree subagent overrides
@@ -134,6 +190,33 @@ mod tests {
         }
     }
 
+    /// The single parse-and-compare both `commands::stream::attribution_mode`
+    /// and `commands::project::format_force_line` now go through. Each arm is
+    /// asserted here once so a change to the shared rule shows up in one
+    /// place, not only through its two callers.
+    #[test]
+    fn force_status_classifies_live_lapsed_and_unreadable() {
+        let future = chrono::Utc::now() + chrono::Duration::hours(4);
+        assert_eq!(
+            force_status(&future.to_rfc3339()),
+            ForceStatus::Live(future)
+        );
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        assert_eq!(force_status(&past.to_rfc3339()), ForceStatus::Lapsed(past));
+        // Fail-safe: unreadable is NOT in force, and never a panic.
+        assert_eq!(force_status("not-a-timestamp"), ForceStatus::Unreadable);
+        assert_eq!(force_status(""), ForceStatus::Unreadable);
+        // A non-UTC offset is normalised, not rejected.
+        assert_eq!(
+            force_status("2020-01-01T00:00:00+02:00"),
+            ForceStatus::Lapsed(
+                chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00+02:00")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            )
+        );
+    }
+
     #[test]
     fn save_in_then_load_in_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
@@ -219,6 +302,7 @@ mod tests {
             project_id: "11111111-1111-1111-1111-111111111111".into(),
             project_name: "payments".into(),
             updated_at: "t".into(),
+            forced_until: None,
         };
         let mut subagent_projects = HashMap::new();
         subagent_projects.insert("/wt".into(), pb.clone());

@@ -66,6 +66,67 @@ environment always wins on a machine that also has an interactive login. A serve
 without Keycloak supports only this API-key path, and `tracevault login` says exactly that
 instead of starting a flow that cannot complete.
 
+### Project attribution — `TRACEVAULT_PROJECT` and `TRACEVAULT_PROJECT_ATTRIBUTION`
+
+Two environment variables control which project captured events are attributed to, and who
+owns that decision. They are separate on purpose: one says *which* project, the other says
+*who vouches for it*.
+
+```sh
+# WHICH project: a launcher asserting attribution for everything in this process.
+export TRACEVAULT_PROJECT=22222222-2222-4222-8222-222222222222
+
+# WHO owns the decision: this caller does, so do not check repo/project membership.
+export TRACEVAULT_PROJECT_ATTRIBUTION=explicit
+```
+
+**`TRACEVAULT_PROJECT`** sits above every remembered binding (session, repo config,
+deduction, user default) and below only a `--project` flag and a subagent's per-worktree
+override, so a `.tracevault/config.toml` baked into a pod image cannot outrank the launcher.
+
+> **Only the UUID form is honoured.** Resolving a name needs a `list_projects` round trip,
+> and the capture hook runs per event in a short-lived process, so it never makes one: a
+> name is ignored and attribution falls through to the next tier. `tracevault project status`
+> reports exactly what the capture path does, so it does not resolve a name either — it
+> warns that the value is unused. `tracevault status` does resolve it, for display only, and
+> flags the tier as one the wire ignores. **Export the UUID.**
+
+**`TRACEVAULT_PROJECT_ATTRIBUTION=explicit`** declares that the caller owns the attribution,
+so the server stamps the named project without checking that the repo belongs to it. Any
+other value (or none) means `derived`, today's always-checked behaviour. It is process-wide
+and **never expires** — it is re-asserted at every launch, which is the point for a pod
+launcher.
+
+The persisted equivalent is a flag on a switch:
+
+```sh
+tracevault project switch payments --project-attribution explicit
+```
+
+That stamps the force onto the binding it writes, and **it lapses after about one working
+day (~12h)**, after which the CLI quietly stops sending the header and attribution is
+checked again — so a force nobody remembers granting cannot outlive its reason. Switching
+again without the flag clears the force immediately. The env-var form has no such lifetime.
+
+Because the caller owns the decision, a forced switch **also binds a project this checkout
+is not a member of** — a repo deliberately shared by two projects, say — which an ordinary
+switch refuses. It is not silent about it: the switch prints a note saying the project does
+not contain this codebase and that the force is what made that deliberate, so a typo still
+looks like a typo.
+
+Forcing is a trust claim and the server enforces it at ingest, not at `switch` time: it
+requires a Control Plane identity with `Operator` on the target project. A long-lived
+`tvk_` API key can never force. A refused force comes back as a `403`; the CLI prints an
+error naming the force as a possible cause and the event is **queued for retry, never
+re-attributed to some other project** — fix the grant (or drop the force) and the next
+drain delivers it.
+
+Use `tracevault project status` to see which tier won, which mode is in effect, and — when
+the binding carries a persisted force — whether that force is still live. `tracevault
+status` answers a narrower question as part of the full diagnostic: whether the tier that
+won is one the capture path actually honours. It does not report the attribution mode or
+the force.
+
 ### `tracevault init` — set up tracing in a repo
 
 `tracevault init` wires TraceVault into a repository: it installs the AI-agent hooks that

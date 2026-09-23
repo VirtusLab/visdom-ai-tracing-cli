@@ -61,6 +61,58 @@ fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// The value of the `x-tracevault-project-attribution` header: the two
+/// spellings the server accepts, and no others.
+///
+/// A type rather than a `&str` because the wire contract is closed on the
+/// server side and fails LOUDLY: `explicit` and `derived` are the only
+/// accepted values, and anything else — a typo, a future mode this build
+/// does not know about, a hand-passed literal — is a `400`, not a silently
+/// ignored header. Every value is produced today by
+/// `commands::stream::attribution_mode`, so the invariant already holds, but
+/// it holds only by convention: one new call site passing `"Explicit"` or
+/// `"forced"` would turn a working hook into a hard client error. An enum
+/// moves that from "documented" to "unrepresentable", the same move that
+/// makes `ClientErrorKind` and `ForceStatus` types.
+///
+/// The CLI's own tolerance runs the other way, deliberately: an unrecognised
+/// `TRACEVAULT_PROJECT_ATTRIBUTION` reads as `Derived` rather than being
+/// forwarded (see `commands::stream::attribution_mode`), so a typo'd env var
+/// never reaches the server to be rejected. This enum is what keeps that
+/// function the only place a mode is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributionMode {
+    /// TraceVault checks repo→project membership itself. The default, and
+    /// what an absent header also means.
+    Derived,
+    /// The caller owns attribution and the server skips the membership
+    /// check. A trust claim, gated server-side (`Operator` + a Control Plane
+    /// identity).
+    Explicit,
+}
+
+impl AttributionMode {
+    /// The wire spelling. THE one place a mode becomes a string — the header
+    /// write in [`ApiClient::stream_event_for_project`] and the [`fmt::Display`]
+    /// impl below both go through this match, so no surface can invent a
+    /// third spelling or disagree with the wire.
+    pub fn as_header_value(self) -> &'static str {
+        match self {
+            Self::Derived => "derived",
+            Self::Explicit => "explicit",
+        }
+    }
+}
+
+impl fmt::Display for AttributionMode {
+    /// Deliberately the same word the header carries: `project status` prints
+    /// the mode a hook would send, and a separate spelling for human output
+    /// would be a second thing to keep in agreement with the wire.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_header_value())
+    }
+}
+
 #[derive(Serialize)]
 pub struct RegisterRepoRequest {
     pub repo_name: String,
@@ -690,10 +742,23 @@ impl ApiClient {
     /// Called from `commands::stream::send_stream_event` for both the
     /// `Attribution::Repo { project: Some(_) }` and `Attribution::ProjectOnly`
     /// routes.
+    ///
+    /// `mode` is the attribution this send declares — decided by
+    /// `commands::stream::attribution_mode` and rendered into the
+    /// `x-tracevault-project-attribution` header by
+    /// [`AttributionMode::as_header_value`], which is the only place it
+    /// becomes a string.
+    ///
+    /// It is an [`AttributionMode`], not a `&str`, because the server
+    /// accepts exactly two values and rejects everything else with a `400`
+    /// — see that type's doc comment. (An older SERVER simply does not read
+    /// the header, which is the one direction that does degrade quietly, to
+    /// derived attribution.)
     pub async fn stream_event_for_project(
         &self,
         project_id: uuid::Uuid,
         repo_id: Option<&str>,
+        mode: AttributionMode,
         req: &tracevault_protocol::streaming::StreamEventRequest,
     ) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn Error>> {
         let mut url = Url::parse(&format!(
@@ -707,7 +772,11 @@ impl ApiClient {
         if let Some(repo_id) = repo_id {
             url.query_pairs_mut().append_pair("repo_id", repo_id);
         }
-        let builder = self.client.post(url).json(req);
+        let builder = self
+            .client
+            .post(url)
+            .header("x-tracevault-project-attribution", mode.as_header_value())
+            .json(req);
         self.authed_send_json(builder, |status| {
             format!("Project stream failed ({status})")
         })

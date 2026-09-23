@@ -29,6 +29,17 @@ pub enum ProjectCmd {
         /// Session to target; defaults to $TRACEVAULT_SESSION_ID.
         #[arg(long)]
         session_id: Option<String>,
+        /// Who owns attribution. `explicit` stamps the named project
+        /// without a repo/project membership check and marks the session
+        /// forced — so it also binds a project this checkout is not a member
+        /// of, which an ordinary switch refuses; it says so when it does.
+        /// `switch` itself checks nothing: the requirement — a Control Plane
+        /// identity (never a `tvk_` API key) and Operator on the project —
+        /// is enforced at INGEST, which refuses the force with a 403 and
+        /// queues the event rather than re-attributing it. A persisted force
+        /// lapses after ~one working day.
+        #[arg(long, value_parser = ["derived", "explicit"], default_value = "derived")]
+        project_attribution: String,
     },
     /// Show the project the current session is attributed to.
     Status {
@@ -54,7 +65,18 @@ pub async fn run(
             name,
             user,
             session_id,
-        } => switch(&name, user, session_id.as_deref(), project_root, cwd).await,
+            project_attribution,
+        } => {
+            switch(
+                &name,
+                user,
+                session_id.as_deref(),
+                &project_attribution,
+                project_root,
+                cwd,
+            )
+            .await
+        }
         ProjectCmd::Status {
             session_id,
             project,
@@ -77,25 +99,63 @@ fn resolve_project_name<'a>(
     })
 }
 
+/// What a `switch` does about a project that does not contain the current
+/// checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodebaseCheck {
+    /// Not performed at all: the user-level default is session-independent
+    /// and not tied to any checkout, so there is nothing to check it against.
+    Skip,
+    /// An ordinary session switch. Binding a project this checkout is not a
+    /// member of is almost always a typo, so it is an error.
+    Enforce,
+    /// `--project-attribution explicit`. Binding a project this checkout is
+    /// not a member of is the POINT of the flag — a repo deliberately shared
+    /// by two projects, or a launcher attributing work to a project the
+    /// checkout was never registered under. The requirement is a trust claim
+    /// the SERVER enforces at ingest (Operator on the project, and a Control
+    /// Plane identity), not something the client can or should adjudicate at
+    /// switch time; refusing here contradicts both the flag's help text and
+    /// the design. So: report the fact, never block on it.
+    Report,
+}
+
+/// Which [`CodebaseCheck`] a `switch` runs, from where it is persisting and
+/// whether the caller claimed attribution. The one place the rule is written
+/// down, so `switch` and its test cannot disagree about it.
+fn codebase_check_for(dest: &SwitchDest, explicit: bool) -> CodebaseCheck {
+    match (dest, explicit) {
+        // Session-independent: not tied to any checkout, nothing to check.
+        (SwitchDest::UserDefault, _) => CodebaseCheck::Skip,
+        (SwitchDest::Session(_), true) => CodebaseCheck::Report,
+        (SwitchDest::Session(_), false) => CodebaseCheck::Enforce,
+    }
+}
+
 /// Resolve `name` to a registered project (via `list_projects`) and, unless
-/// `check_codebase` is `false`, verify that project contains the current
-/// codebase (resolved from `cwd`'s git origin remote, mirroring
+/// `check` is [`CodebaseCheck::Skip`], test whether that project contains the
+/// current codebase (resolved from `cwd`'s git origin remote, mirroring
 /// `resolve_path_to_binding`). Kept separate from `switch` so the
 /// client-dependent flow is unit-testable with a mock `ApiClient`, mirroring
 /// `commands::repo::resolve_switch_binding`.
+///
+/// Returns the binding plus, for [`CodebaseCheck::Report`] when the check
+/// would have failed, the informational line the caller prints. A failing
+/// check under [`CodebaseCheck::Enforce`] is still an `Err`.
 async fn resolve_switch_project(
     name: &str,
     client: &ApiClient,
-    check_codebase: bool,
+    check: CodebaseCheck,
     cwd: &Path,
-) -> Result<ProjectBinding, Box<dyn std::error::Error>> {
+) -> Result<(ProjectBinding, Option<String>), Box<dyn std::error::Error>> {
     let items = client.list_projects().await?;
     let matched = resolve_project_name(&items, name)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let project_id = matched.id;
     let project_name = matched.name.clone();
+    let mut note = None;
 
-    if check_codebase {
+    if check != CodebaseCheck::Skip {
         if let Some(git_url) = git_remote_url(cwd) {
             if let Some(remote) = client.resolve_remote(&git_url).await? {
                 let codebase_repo_ids: HashSet<uuid::Uuid> = client
@@ -112,9 +172,18 @@ async fn resolve_switch_project(
                     .map(|r| r.id)
                     .collect();
                 if codebase_repo_ids.is_disjoint(&project_repo_ids) {
-                    return Err(
-                        format!("project '{name}' does not contain the current codebase").into(),
-                    );
+                    match check {
+                        CodebaseCheck::Enforce => {
+                            return Err(format!(
+                                "project '{name}' does not contain the current codebase"
+                            )
+                            .into())
+                        }
+                        // Deliberate, but the user should still learn the
+                        // fact — they are just not blocked by it.
+                        CodebaseCheck::Report => note = Some(forced_non_member_note(name)),
+                        CodebaseCheck::Skip => unreachable!("guarded above"),
+                    }
                 }
             }
             // Codebase not registered with the server → nothing to check
@@ -125,11 +194,29 @@ async fn resolve_switch_project(
         // to check against; allow the switch.
     }
 
-    Ok(ProjectBinding {
-        project_id: project_id.to_string(),
-        project_name,
-        updated_at: chrono::Utc::now().to_rfc3339(),
-    })
+    Ok((
+        ProjectBinding {
+            project_id: project_id.to_string(),
+            project_name,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            forced_until: None,
+        },
+        note,
+    ))
+}
+
+/// The line a forced switch prints when the project does not contain this
+/// checkout. Not a warning: with `--project-attribution explicit` this is the
+/// intended case, and the message says so — while still naming the fact, and
+/// where the requirement is actually enforced, so a user who reached it by
+/// typo is not left thinking the switch did what they meant.
+fn forced_non_member_note(name: &str) -> String {
+    format!(
+        "note: project '{name}' does not contain the current codebase — binding it anyway \
+         because --project-attribution explicit says this caller owns attribution. The \
+         server enforces that claim at ingest (Operator on the project, and a Control Plane \
+         identity — never a `tvk_` API key) and refuses it with a 403 otherwise."
+    )
 }
 
 /// Where a `project switch` should persist its binding: a specific session,
@@ -151,55 +238,188 @@ fn switch_destination(user: bool, session_id: Option<String>) -> SwitchDest {
     }
 }
 
+/// Stamp or clear the persisted force on a binding about to be saved.
+///
+/// Clearing on a plain switch is deliberate: without it, a user who forced
+/// once and later switched normally would keep forcing until the clock ran
+/// out, which is exactly the forgotten-force failure the lifetime exists to
+/// bound.
+fn apply_force(mut binding: ProjectBinding, explicit: bool) -> ProjectBinding {
+    binding.forced_until = explicit.then(|| {
+        (chrono::Utc::now()
+            + chrono::Duration::hours(crate::user_project_default::DEFAULT_FORCE_LIFETIME_HOURS))
+        .to_rfc3339()
+    });
+    binding
+}
+
+/// The state of the PERSISTED force stored on a binding — a fact about what
+/// is on disk, never a verdict about what this process will send.
+///
+/// That distinction is the whole point of the wording. The verdict is
+/// [`attribution_report`]'s first line, which is the only thing that can
+/// answer "derived or explicit?", because it is the only one that sees
+/// `TRACEVAULT_PROJECT_ATTRIBUTION` as well as this timestamp. An earlier
+/// version of this function rendered "attribution: derived (a force lapsed
+/// …; membership is checked again)", which read as a second, competing
+/// answer — and in a shell with `TRACEVAULT_PROJECT_ATTRIBUTION=explicit`
+/// and a lapsed persisted force it directly contradicted the true one while
+/// every hook in that shell sent `explicit`. Stating the fact instead makes
+/// the contradiction unrepresentable, whatever the environment says.
+///
+/// Only ever called when `forced_until.is_some()` (see
+/// [`attribution_report`]), so there is no "no force at all" arm: that case
+/// prints no line.
+///
+/// This only WORDS a verdict; it does not reach one.
+/// [`crate::session_state::force_status`] is the single parse-and-compare,
+/// shared with `commands::stream::attribution_mode`, which is the function
+/// that actually decides the header — so the line and the header cannot
+/// disagree about whether a stored force is live, lapsed or unreadable. An
+/// unparseable timestamp (hand-edited or corrupted state file) therefore
+/// fails SAFE here too, and says so.
+fn format_force_line(forced_until: &str) -> String {
+    match crate::session_state::force_status(forced_until) {
+        crate::session_state::ForceStatus::Live(until) => {
+            format!("persisted force: active until {}", until.to_rfc3339())
+        }
+        crate::session_state::ForceStatus::Lapsed(until) => {
+            format!("persisted force: lapsed {}", until.to_rfc3339())
+        }
+        crate::session_state::ForceStatus::Unreadable => format!(
+            "persisted force: unreadable timestamp ('{forced_until}'), treated as not in force"
+        ),
+    }
+}
+
+/// The attribution lines both `project status` and `project switch` print
+/// for the binding they just reported or persisted.
+///
+/// Exactly one line answers "derived or explicit?": the FIRST, the effective
+/// mode, which is the only one that sees both `TRACEVAULT_PROJECT_ATTRIBUTION`
+/// and `b`'s own `forced_until` — i.e. everything
+/// `commands::stream::attribution_mode` sees when it fills the header.
+/// [`format_force_line`] follows only when `b` carries a persisted force, and
+/// states a FACT about that stored force rather than a second verdict, so the
+/// two can never disagree.
+///
+/// Two bugs are closed by that split, both reached the same way — a second
+/// line that answered a question it had no business answering:
+///
+/// * printing the force line unconditionally, so a shell with
+///   `TRACEVAULT_PROJECT_ATTRIBUTION=explicit` and NO persisted force got
+///   "attribution mode: explicit …" followed by "attribution: derived
+///   (TraceVault checks repo/project membership)" (finding 3);
+/// * guarding it on `forced_until.is_some()`, which a LAPSED force still
+///   satisfies, so the same shell with an EXPIRED persisted force got
+///   "attribution mode: explicit …" followed by "attribution: derived (a
+///   force lapsed …; membership is checked again)" (Copilot on PR #54).
+///
+/// In both cases every hook in that shell was in fact sending `explicit`.
+/// The `is_some()` guard is right and stays — a binding that was never
+/// forced has nothing to report — but the guard was never what made the
+/// output honest; the wording is.
+fn attribution_report(b: &ProjectBinding) -> Vec<String> {
+    let mode = crate::commands::stream::attribution_mode(Some(b));
+    // The gloss `format_force_line` used to carry is folded in here rather
+    // than dropped: it is the part that tells a reader what the mode MEANS,
+    // and it applies to every mode, not only to a persisted force.
+    let gloss = match mode {
+        crate::api_client::AttributionMode::Explicit => {
+            "this caller owns attribution; membership is not checked"
+        }
+        crate::api_client::AttributionMode::Derived => "TraceVault checks repo/project membership",
+    };
+    let mut lines = vec![format!("attribution mode: {mode} ({gloss})")];
+    if let Some(forced_until) = b.forced_until.as_deref() {
+        lines.push(format_force_line(forced_until));
+    }
+    lines
+}
+
+/// Everything `switch` prints once the binding is persisted: what was bound
+/// where, then `codebase_note` (see [`forced_non_member_note`]) when a forced
+/// switch bound a project this checkout is not a member of, then
+/// [`attribution_report`]. Pulled out as a pure function so the wording —
+/// including the ABSENCE of a contradictory "attribution: derived" line — is
+/// assertable without capturing stdout.
+///
+/// The note sits between the two because it explains why the force on the
+/// line below it is load-bearing rather than decorative.
+fn switch_report(
+    dest: &SwitchDest,
+    b: &ProjectBinding,
+    codebase_note: Option<&str>,
+) -> Vec<String> {
+    let mut lines = match dest {
+        SwitchDest::Session(id) => {
+            vec![format!("bound session {id} to project {}", b.project_name)]
+        }
+        SwitchDest::UserDefault => vec![format!(
+            "set user-level default project {}; applies to new sessions without their own binding (the current session, if any, is unchanged — omit --user to bind this session)",
+            b.project_name
+        )],
+    };
+    lines.extend(codebase_note.map(str::to_string));
+    lines.extend(attribution_report(b));
+    lines
+}
+
 async fn switch(
     name: &str,
     user: bool,
     session_id: Option<&str>,
+    project_attribution: &str,
     project_root: &Path,
     cwd: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = resolve_client(project_root)?;
     let session = crate::commands::repo::resolve_session_id(session_id).ok();
     let dest = switch_destination(user, session);
-    let check_codebase = matches!(dest, SwitchDest::Session(_));
-    let binding = resolve_switch_project(name, &client, check_codebase, cwd).await?;
+    let explicit = project_attribution == "explicit";
+    let check = codebase_check_for(&dest, explicit);
+    let (binding, codebase_note) = resolve_switch_project(name, &client, check, cwd).await?;
+    let binding = apply_force(binding, explicit);
 
-    match dest {
+    match &dest {
         SwitchDest::Session(id) => {
-            let mut state = session_state::load(&id);
+            let mut state = session_state::load(id);
             state.active_project = Some(binding.clone());
-            session_state::save(&id, &state)?;
-            println!("bound session {id} to project {}", binding.project_name);
+            session_state::save(id, &state)?;
         }
         SwitchDest::UserDefault => {
             crate::user_project_default::save(&binding)?;
-            println!(
-                "set user-level default project {}; applies to new sessions without their own binding (the current session, if any, is unchanged — omit --user to bind this session)",
-                binding.project_name
-            );
         }
+    }
+    for line in switch_report(&dest, &binding, codebase_note.as_deref()) {
+        println!("{line}");
     }
     Ok(())
 }
 
 /// The project `project status` treats as effective: exactly the capture-time
 /// chain ingest uses ([`capture_project_binding`]: `--project` flag →
-/// subagent worktree override → session `active_project` → user default).
-/// Pure — `status` supplies `user_default` from `user_project_default::load()`,
-/// the same file `commands::stream::capture_project` reads, so the two cannot
-/// drift (pinned by `project_status_effective_project_matches_capture_project`).
+/// subagent worktree override → `TRACEVAULT_PROJECT` → session
+/// `active_project` → user default).
+/// Pure — `status` supplies `user_default` from `user_project_default::load()`
+/// and `env_project` from `commands::stream::env_project_binding()`, the same
+/// file and the same reader `commands::stream::capture_project` uses, so the
+/// two cannot drift (pinned by
+/// `project_status_effective_project_matches_capture_project`).
 ///
 /// A binding whose stored id is not a UUID is dropped exactly as ingest drops
 /// it ([`capture_project_id`] → `None`), so the effective project is `None`
 /// and the second element carries the warning naming the tier it came from.
 fn status_effective(
     project_flag: Option<ProjectBinding>,
+    env_project: Option<ProjectBinding>,
     session: &SessionState,
     worktree: Option<&str>,
     user_default: Option<ProjectBinding>,
 ) -> (Option<(ProjectBinding, ProjectSource)>, Option<String>) {
     match capture_project_binding(&CaptureProjectInputs {
         project_flag,
+        env_project,
         session,
         worktree_path: worktree,
         user_default,
@@ -210,6 +430,50 @@ fn status_effective(
         }
         other => (other, None),
     }
+}
+
+/// Fill in a binding's friendly `project_name` from an already-fetched
+/// projects list, when the binding has none.
+///
+/// The UUID form of `TRACEVAULT_PROJECT` arrives nameless: it is parsed
+/// locally by `commands::stream::env_project_binding` and never looked up, so
+/// without this `status` prints a bare UUID for a tier it just named. Gating
+/// on the EMPTY NAME rather than on a particular [`ProjectSource`] keeps this
+/// to the condition actually being repaired; a binding that already has a
+/// name is untouched.
+///
+/// Cosmetic only, and it never changes WHICH project is effective — the id is
+/// not touched — so it cannot make `status` disagree with ingest.
+fn enrich_project_name(
+    effective: Option<(ProjectBinding, ProjectSource)>,
+    items: Option<&[ProjectListItem]>,
+) -> Option<(ProjectBinding, ProjectSource)> {
+    effective.map(|(mut binding, source)| {
+        if binding.project_name.is_empty() {
+            if let Some(items) = items {
+                if let Ok(id) = binding.project_id.parse::<uuid::Uuid>() {
+                    if let Some(matched) = items.iter().find(|p| p.id == id) {
+                        binding.project_name = matched.name.clone();
+                    }
+                }
+            }
+        }
+        (binding, source)
+    })
+}
+
+/// Warning for a `TRACEVAULT_PROJECT` that holds a NAME rather than a UUID.
+///
+/// Same rule, and the same shape of warning, as [`config_default_warning`]:
+/// resolving a name needs a `list_projects` round trip, the per-event capture
+/// path never makes one, so the variable decides nothing and attribution
+/// falls through to the next tier. `status` therefore does NOT resolve it
+/// either — reporting a name-resolved project as effective would be exactly
+/// the status/ingest disagreement this command exists to remove.
+fn env_name_form_warning(raw: &str) -> String {
+    format!(
+        "warning: TRACEVAULT_PROJECT '{raw}' is a NAME; only the UUID form is used for attribution at capture time, so this value is ignored — export the project's id instead, or bind it with `tracevault project switch <name>`"
+    )
 }
 
 /// Display label for a binding: the friendly name, falling back to the id.
@@ -363,7 +627,23 @@ async fn status_report(
     let user_default = crate::user_project_default::load();
     let git_url = git_remote_url(cwd);
 
-    // The server is needed only to resolve a `--project` NAME and to show the
+    // `TRACEVAULT_PROJECT` enters the chain through the capture path's OWN
+    // reader, which is UUID-only: `status` must not resolve a NAME into the
+    // chain, or it would report a project ingest never attributes to. The
+    // name form gets a warning instead.
+    let env_project = crate::commands::stream::env_project_binding();
+    let env_raw = std::env::var("TRACEVAULT_PROJECT")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty());
+    if env_project.is_none() {
+        if let Some(raw) = env_raw.as_deref() {
+            report.warnings.push(env_name_form_warning(raw));
+        }
+    }
+
+    // The server is needed only to resolve a `--project` NAME, to put a
+    // friendly name on the env binding's bare UUID, and to show the
     // deduction line; the effective project itself is computed locally.
     let client = match resolve_client(project_root) {
         Ok(client) => Some(client),
@@ -386,6 +666,7 @@ async fn status_report(
                     project_id: matched.id.to_string(),
                     project_name: matched.name.clone(),
                     updated_at: chrono::Utc::now().to_rfc3339(),
+                    forced_until: None,
                 });
             if flag.is_none() {
                 report.warnings.push(format!(
@@ -401,9 +682,25 @@ async fn status_report(
         (None, _) => None,
     };
 
-    let (effective, invalid_id_warning) =
-        status_effective(project_flag, &session, Some(&worktree), user_default);
+    // The UUID form of `TRACEVAULT_PROJECT` resolves to a NAMELESS binding
+    // (no lookup on the capture path), so fetch the list once here purely to
+    // print a friendly name for it. Cosmetic: the id, and therefore which
+    // project is effective, is unaffected either way.
+    if items.is_none() && env_project.is_some() {
+        if let Some(client) = client.as_ref() {
+            items = client.list_projects().await.ok();
+        }
+    }
+
+    let (effective, invalid_id_warning) = status_effective(
+        project_flag,
+        env_project,
+        &session,
+        Some(&worktree),
+        user_default,
+    );
     report.warnings.extend(invalid_id_warning);
+    let effective = enrich_project_name(effective, items.as_deref());
 
     if let Some(name) = config_default_name.as_deref() {
         report.warnings.push(config_default_warning(name));
@@ -412,6 +709,12 @@ async fn status_report(
     report
         .lines
         .push(format_status(effective.as_ref().map(|(b, s)| (b, *s))));
+    // The attribution mode of the binding that actually won, read off THAT
+    // binding (plus `TRACEVAULT_PROJECT_ATTRIBUTION`) — the same value
+    // `commands::stream::send_stream_event` puts in the header.
+    if let Some((b, _)) = effective.as_ref() {
+        report.lines.extend(attribution_report(b));
+    }
 
     if let (Some(client), Some(url)) = (client.as_ref(), git_url.as_deref()) {
         // Best-effort and informational: an ambiguous or failed deduction is
@@ -483,11 +786,340 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn switching_with_explicit_stamps_a_lapse_time() {
+        let before = chrono::Utc::now();
+        let binding = apply_force(
+            ProjectBinding {
+                project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+                project_name: "p".into(),
+                updated_at: before.to_rfc3339(),
+                forced_until: None,
+            },
+            true,
+        );
+        let until = chrono::DateTime::parse_from_rfc3339(
+            binding.forced_until.as_deref().expect("force is stamped"),
+        )
+        .unwrap();
+        let expected = before
+            + chrono::Duration::hours(crate::user_project_default::DEFAULT_FORCE_LIFETIME_HOURS);
+        assert!((until.timestamp() - expected.timestamp()).abs() < 5);
+    }
+
+    #[test]
+    fn switching_without_explicit_stamps_no_lapse_time() {
+        let binding = apply_force(
+            ProjectBinding {
+                project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+                project_name: "p".into(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                forced_until: Some("2020-01-01T00:00:00Z".into()),
+            },
+            false,
+        );
+        assert_eq!(
+            binding.forced_until, None,
+            "switching without --project-attribution explicit must CLEAR a stale force"
+        );
+    }
+
+    /// `format_force_line` reports the STATE of the stored force and never a
+    /// verdict, so no output of it may contain the words the mode line owns.
+    /// A live force says when it runs out; a lapsed one says when it did.
+    #[test]
+    fn format_force_line_distinguishes_a_live_force_from_a_lapsed_one() {
+        let future = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
+        let live = format_force_line(&future);
+        assert!(live.contains("active until"), "got: {live}");
+        assert!(live.contains(&future), "got: {live}");
+
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let lapsed = format_force_line(&past);
+        assert!(lapsed.contains("lapsed"), "got: {lapsed}");
+        assert!(lapsed.contains(&past), "got: {lapsed}");
+
+        // Neither may render a mode: that is `attribution_report`'s first
+        // line, and a second answer here is what produced both contradiction
+        // bugs (see `attribution_report`'s doc comment).
+        for line in [&live, &lapsed] {
+            assert!(!line.contains("derived"), "got: {line}");
+            assert!(!line.contains("explicit"), "got: {line}");
+            assert!(!line.contains("membership"), "got: {line}");
+        }
+    }
+
+    /// Discriminates the SIGN of the lapse comparison in `format_force_line`:
+    /// a `forced_until` already in the past must report as lapsed, not as
+    /// still active.
+    #[test]
+    fn status_names_a_lapsed_force_as_lapsed_not_active() {
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let line = format_force_line(&past);
+        assert!(line.contains("lapsed"), "got: {line}");
+        assert!(!line.contains("active until"), "got: {line}");
+    }
+
+    /// A `forced_until` that doesn't even parse as RFC3339 (a hand-edited or
+    /// corrupted `user_project.toml`/session-state file) must fail SAFE —
+    /// reported as not in force, never as active, and never a panic. Pins
+    /// the fail-safe direction against a future refactor to `.expect(...)`.
+    ///
+    /// The second half — that the printed state agrees with
+    /// `commands::stream::attribution_mode`, the one that fills the header —
+    /// used to reconcile two independently written predicates. Both now go
+    /// through `session_state::force_status`, so it pins that neither reader
+    /// has quietly grown a second opinion around the shared one.
+    #[test]
+    fn status_names_unparseable_forced_until_as_not_in_force() {
+        let line = format_force_line("not-a-timestamp");
+        assert!(line.contains("not in force"), "got: {line}");
+        assert!(!line.contains("active until"), "got: {line}");
+
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+        let b = ProjectBinding {
+            project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+            project_name: "payments".into(),
+            updated_at: "".into(),
+            forced_until: Some("not-a-timestamp".into()),
+        };
+        assert_eq!(
+            crate::commands::stream::attribution_mode(Some(&b)),
+            crate::api_client::AttributionMode::Derived,
+            "the reported state and the header must agree on an unreadable force"
+        );
+    }
+
+    /// VIS-305 whole-branch review, Important finding 3: `project status`
+    /// printed the effective mode and THEN printed `format_force_line`
+    /// unconditionally, so a shell with
+    /// `TRACEVAULT_PROJECT_ATTRIBUTION=explicit` and no persisted force got
+    /// two lines that contradicted each other — "attribution mode: explicit"
+    /// immediately followed by "attribution: derived (TraceVault checks
+    /// repo/project membership)" — while every hook in that shell sent
+    /// `explicit`. The lapse detail describes a PERSISTED force, so it may
+    /// only be printed when one exists.
+    #[test]
+    fn attribution_report_omits_the_lapse_line_when_there_is_no_persisted_force() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
+
+        let b = ProjectBinding {
+            project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+            project_name: "payments".into(),
+            updated_at: "".into(),
+            forced_until: None,
+        };
+        let lines = attribution_report(&b);
+        assert_eq!(
+            lines.len(),
+            1,
+            "an env-only force has no lapse to report, and must not be \
+             contradicted by a `derived` line: {lines:?}"
+        );
+        assert!(
+            lines[0].starts_with("attribution mode: explicit"),
+            "got: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("derived")),
+            "got: {lines:?}"
+        );
+    }
+
+    /// The other half of the same rule: a binding that DOES carry a
+    /// persisted force still gets its lapse time, so finding 3's fix is
+    /// "print it only when it applies", not "stop printing it".
+    #[test]
+    fn attribution_report_keeps_the_lapse_line_for_a_persisted_force() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let until = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
+        let b = ProjectBinding {
+            project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+            project_name: "payments".into(),
+            updated_at: "".into(),
+            forced_until: Some(until.clone()),
+        };
+        let lines = attribution_report(&b);
+        assert_eq!(lines.len(), 2, "got: {lines:?}");
+        assert!(
+            lines[0].starts_with("attribution mode: explicit"),
+            "got: {}",
+            lines[0]
+        );
+        assert!(lines[1].contains("active until"), "got: {}", lines[1]);
+        assert!(lines[1].contains(&until), "got: {}", lines[1]);
+    }
+
+    /// A LAPSED persisted force still gets its detail line — the binding
+    /// really does carry a force, it has simply run out, and saying when is
+    /// the useful part. With no env override the mode line correctly reads
+    /// `derived`; the detail line states the lapse as a fact, and the two
+    /// agree without the detail line having to render a verdict of its own.
+    #[test]
+    fn attribution_report_reports_a_lapsed_persisted_force_as_derived() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let b = ProjectBinding {
+            project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+            project_name: "payments".into(),
+            updated_at: "".into(),
+            forced_until: Some((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339()),
+        };
+        let lines = attribution_report(&b);
+        assert_eq!(lines.len(), 2, "got: {lines:?}");
+        assert!(
+            lines[0].starts_with("attribution mode: derived"),
+            "got: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("persisted force: lapsed"),
+            "got: {}",
+            lines[1]
+        );
+    }
+
+    /// Copilot on PR #54: the `is_some()` guard is the wrong test, because a
+    /// LAPSED force is still `is_some()`. With
+    /// `TRACEVAULT_PROJECT_ATTRIBUTION=explicit` and a binding whose
+    /// persisted force has expired, the report used to read
+    ///
+    /// ```text
+    /// attribution mode: explicit (this caller owns attribution; ...)
+    /// attribution: derived (a force lapsed ...; membership is checked again)
+    /// ```
+    ///
+    /// — the exact contradiction `attribution_report` exists to remove, just
+    /// reached by a different route than finding 3's. The fix is not a
+    /// narrower guard (the lapse time is still worth printing) but wording:
+    /// the second line states a FACT about the persisted binding, so it is
+    /// detail under the verdict rather than a competing verdict. The
+    /// unparseable case is the same shape and is covered too.
+    #[test]
+    fn a_lapsed_persisted_force_never_contradicts_an_env_force() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
+
+        let lapsed = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        for forced_until in [lapsed.as_str(), "not-a-timestamp"] {
+            let b = ProjectBinding {
+                project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+                project_name: "payments".into(),
+                updated_at: "".into(),
+                forced_until: Some(forced_until.to_string()),
+            };
+            let lines = attribution_report(&b);
+            assert_eq!(lines.len(), 2, "{forced_until}: got {lines:?}");
+            assert!(
+                lines[0].starts_with("attribution mode: explicit"),
+                "{forced_until}: the env force decides the mode: {lines:?}"
+            );
+            // The detail line may say the PERSISTED force has lapsed — that
+            // is a true fact about the stored binding — but it must not
+            // answer the question the mode line already answered.
+            assert!(
+                !lines[1].contains("derived"),
+                "{forced_until}: the detail line must not render a competing \
+                 verdict while the env force makes this send explicit: {lines:?}"
+            );
+            assert!(
+                !lines[1].contains("membership is checked"),
+                "{forced_until}: membership is NOT being checked here: {lines:?}"
+            );
+        }
+    }
+
+    /// VIS-305 whole-branch review, Important finding 4: Part C fixed
+    /// `status` and left `switch` printing the same lie with no mode line to
+    /// offset it. In a shell with `TRACEVAULT_PROJECT_ATTRIBUTION=explicit`,
+    /// `tracevault project switch foo` reported "attribution: derived" while
+    /// every hook in that shell sent `explicit`. Asserts the whole rendered
+    /// output, including the ABSENCE of the contradictory line, for both
+    /// destinations.
+    #[test]
+    fn switch_report_names_the_env_force_and_never_claims_derived() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
+
+        let b = ProjectBinding {
+            project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+            project_name: "payments".into(),
+            updated_at: "".into(),
+            forced_until: None,
+        };
+
+        for dest in [
+            SwitchDest::Session("sess-1".to_string()),
+            SwitchDest::UserDefault,
+        ] {
+            let lines = switch_report(&dest, &b, None);
+            assert!(
+                lines[0].contains("payments"),
+                "the first line still says what was bound: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("attribution mode: explicit")),
+                "a `switch` in an explicit shell must say so: {lines:?}"
+            );
+            assert!(
+                !lines.iter().any(|l| l.contains("derived")),
+                "{dest:?}: `switch` must not claim membership is checked while \
+                 every hook in this shell sends `explicit`: {lines:?}"
+            );
+        }
+    }
+
+    /// `switch --project-attribution explicit` still reports the lapse it
+    /// just stamped — the fix to finding 4 must not swallow the one piece of
+    /// information a forced switch owes the caller.
+    #[test]
+    fn switch_report_names_the_lapse_it_just_stamped() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let b = apply_force(
+            ProjectBinding {
+                project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+                project_name: "payments".into(),
+                updated_at: "".into(),
+                forced_until: None,
+            },
+            true,
+        );
+        let lines = switch_report(&SwitchDest::Session("sess-1".to_string()), &b, None);
+        assert_eq!(lines.len(), 3, "got: {lines:?}");
+        assert!(
+            lines[1].starts_with("attribution mode: explicit"),
+            "got: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].starts_with("persisted force: active until"),
+            "got: {}",
+            lines[2]
+        );
+    }
+
     fn pb(name: &str) -> ProjectBinding {
         ProjectBinding {
             project_id: format!("id-{name}"),
             project_name: name.into(),
             updated_at: "t".into(),
+            forced_until: None,
         }
     }
 
@@ -525,10 +1157,20 @@ mod tests {
             project_id: "some-id".into(),
             project_name: String::new(),
             updated_at: "".into(),
+            forced_until: None,
         };
         assert_eq!(
             format_status(Some((&b, ProjectSource::UserDefault))),
             "project: some-id via user default (project switch --user)"
+        );
+    }
+
+    #[test]
+    fn format_status_env() {
+        let b = pb("payments");
+        assert_eq!(
+            format_status(Some((&b, ProjectSource::Env))),
+            "project: payments via TRACEVAULT_PROJECT (environment)"
         );
     }
 
@@ -538,6 +1180,7 @@ mod tests {
             project_id: "not-a-uuid".into(),
             project_name: "payments".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         assert_eq!(
             invalid_capture_id_warning(&b, ProjectSource::UserDefault),
@@ -554,10 +1197,11 @@ mod tests {
                 project_id: "not-a-uuid".into(),
                 project_name: "payments".into(),
                 updated_at: "".into(),
+                forced_until: None,
             }),
             ..Default::default()
         };
-        let (effective, warning) = status_effective(None, &session, None, None);
+        let (effective, warning) = status_effective(None, None, &session, None, None);
         assert!(effective.is_none(), "{effective:?}");
         let warning = warning.expect("a dropped binding must be explained");
         assert!(
@@ -573,10 +1217,11 @@ mod tests {
                 project_id: pid.to_string(),
                 project_name: "web".into(),
                 updated_at: "".into(),
+                forced_until: None,
             }),
             ..Default::default()
         };
-        let (effective, warning) = status_effective(None, &valid, None, None);
+        let (effective, warning) = status_effective(None, None, &valid, None, None);
         assert_eq!(
             effective.map(|(b, s)| (b.project_id, s)),
             Some((pid.to_string(), ProjectSource::SessionActive))
@@ -584,11 +1229,70 @@ mod tests {
         assert_eq!(warning, None);
     }
 
+    /// `TRACEVAULT_PROJECT` is the `Env` rung of the SAME chain ingest runs,
+    /// so `status_effective` must place it above session-active and the user
+    /// default, and below `--project`. Pure: the binding is passed in, as
+    /// `status_report` passes what `stream::env_project_binding` returned.
+    #[test]
+    fn status_effective_places_env_at_rung_three() {
+        let u = uuid::Uuid::from_u128;
+        let bind = |id: uuid::Uuid, name: &str| ProjectBinding {
+            project_id: id.to_string(),
+            project_name: name.into(),
+            updated_at: "".into(),
+            forced_until: None,
+        };
+        let session = SessionState {
+            active_project: Some(bind(u(2), "session")),
+            ..Default::default()
+        };
+
+        // env beats session active and the user default
+        let (effective, _) = status_effective(
+            None,
+            Some(bind(u(9), "env")),
+            &session,
+            None,
+            Some(bind(u(3), "user")),
+        );
+        assert_eq!(
+            effective.map(|(b, s)| (b.project_id, s)),
+            Some((u(9).to_string(), ProjectSource::Env))
+        );
+
+        // --project still beats env
+        let (effective, _) = status_effective(
+            Some(bind(u(1), "flag")),
+            Some(bind(u(9), "env")),
+            &session,
+            None,
+            Some(bind(u(3), "user")),
+        );
+        assert_eq!(
+            effective.map(|(b, s)| (b.project_id, s)),
+            Some((u(1).to_string(), ProjectSource::ProjectFlag))
+        );
+    }
+
     #[test]
     fn offline_project_flag_warning_says_the_override_is_ignored() {
         assert_eq!(
             offline_project_flag_warning("web"),
             "warning: --project 'web' cannot be resolved without server credentials; ignoring the override"
+        );
+    }
+
+    /// The NAME form of `TRACEVAULT_PROJECT` is not resolved into the chain
+    /// (that would need a per-event `list_projects` the hook never makes), so
+    /// `status` warns instead of reporting a tier ingest ignores.
+    #[test]
+    fn env_name_form_warning_says_only_the_uuid_form_is_used() {
+        let warning = env_name_form_warning("payments");
+        assert!(warning.contains("payments"), "{warning}");
+        assert!(warning.contains("UUID form"), "{warning}");
+        assert!(
+            warning.contains("not used") || warning.contains("ignored"),
+            "{warning}"
         );
     }
 
@@ -762,11 +1466,13 @@ mod tests {
         let base = spawn_once(http_200(list));
         let client = ApiClient::new(&base, Some("tok"));
 
-        let binding = resolve_switch_project("web", &client, true, tmp.path())
-            .await
-            .expect("expected Ok binding");
+        let (binding, note) =
+            resolve_switch_project("web", &client, CodebaseCheck::Enforce, tmp.path())
+                .await
+                .expect("expected Ok binding");
         assert_eq!(binding.project_id, "22222222-2222-4222-8222-222222222222");
         assert_eq!(binding.project_name, "web");
+        assert_eq!(note, None, "no remote to check against, so nothing to note");
 
         let session_id = format!("project-switch-test-{}", uuid::Uuid::new_v4());
         let mut state = session_state::load(&session_id);
@@ -785,9 +1491,14 @@ mod tests {
         let base = spawn_once(http_200(list));
         let client = ApiClient::new(&base, Some("tok"));
 
-        let err = resolve_switch_project("web", &client, false, Path::new("/nonexistent"))
-            .await
-            .expect_err("expected Err for an unknown project name");
+        let err = resolve_switch_project(
+            "web",
+            &client,
+            CodebaseCheck::Skip,
+            Path::new("/nonexistent"),
+        )
+        .await
+        .expect_err("expected Err for an unknown project name");
         let msg = err.to_string();
         assert!(msg.contains("not found"), "got: {msg}");
         assert!(msg.contains("payments"), "got: {msg}");
@@ -830,13 +1541,121 @@ mod tests {
         ]);
         let client = ApiClient::new(&base, Some("tok"));
 
-        let err = resolve_switch_project("payments", &client, true, tmp.path())
+        let err = resolve_switch_project("payments", &client, CodebaseCheck::Enforce, tmp.path())
             .await
             .expect_err("expected Err: project doesn't contain the current codebase");
         assert!(
             err.to_string()
                 .contains("does not contain the current codebase"),
             "got: {err}"
+        );
+    }
+
+    /// Copilot on PR #54: `--project-attribution explicit` was refused for
+    /// exactly the projects it exists to bind. `check_codebase` was derived
+    /// from the destination alone, so inside any instrumented session (the
+    /// default whenever `TRACEVAULT_SESSION_ID` is set) `resolve_switch_project`
+    /// errored on a project that does not contain this checkout — a repo
+    /// deliberately shared by two projects, say. That contradicts the flag's
+    /// own help text and the design, which puts the requirement on the
+    /// SERVER at ingest.
+    ///
+    /// Same mock traffic as
+    /// `project_switch_errors_when_project_does_not_contain_codebase` — the
+    /// check genuinely runs and genuinely fails — but under
+    /// `CodebaseCheck::Report` it must bind anyway AND say so, so a user who
+    /// got here by typo still learns the fact.
+    #[tokio::test]
+    async fn explicit_attribution_binds_a_non_member_project_and_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        let ok = std::process::Command::new("git")
+            .args([
+                "-C",
+                &tmp.path().to_string_lossy(),
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:org/repo.git",
+            ])
+            .status()
+            .expect("git remote add failed")
+            .success();
+        assert!(ok, "git remote add must succeed");
+
+        let list =
+            r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"payments"}]"#.to_string();
+        let remote_id = "44000761-8d22-4256-bd2c-27a0ba278c6f";
+        let remote = format!(
+            r#"{{"remote_id":"{remote_id}","name":"repo","normalized_url":"github.com/org/repo","clone_status":"ready"}}"#
+        );
+        let codebase_repo_id = "55555555-5555-4555-8555-555555555555";
+        let detail = format!(
+            r#"{{"id":"{remote_id}","name":"repo","normalized_url":"github.com/org/repo","clone_url":"https://github.com/org/repo.git","clone_status":"ready","clone_error":null,"last_fetched_at":null,"repo_count":1,"created_at":"2026-01-01T00:00:00Z","repos":[{{"id":"{codebase_repo_id}","name":"repo"}}]}}"#
+        );
+        let project_detail = r#"{"repos":[{"id":"66666666-6666-4666-8666-666666666666"}]}"#;
+        let base = spawn_n(vec![
+            http_200(&list),
+            http_200(&remote),
+            http_200(&detail),
+            http_200(project_detail),
+        ]);
+        let client = ApiClient::new(&base, Some("tok"));
+
+        let (binding, note) =
+            resolve_switch_project("payments", &client, CodebaseCheck::Report, tmp.path())
+                .await
+                .expect("a forced switch must not be blocked by the containment check");
+        assert_eq!(binding.project_id, "11111111-1111-4111-8111-111111111111");
+
+        let note = note.expect("the user must still be told the project is not a member");
+        assert!(
+            note.contains("does not contain the current codebase"),
+            "the fact must be stated: {note}"
+        );
+        assert!(
+            note.contains("--project-attribution explicit"),
+            "must say what made it deliberate: {note}"
+        );
+        assert!(
+            note.contains("Operator") && note.contains("ingest"),
+            "must say where the requirement is actually enforced: {note}"
+        );
+
+        // It reads as a note, not a refusal: the switch succeeded.
+        assert!(
+            !note.starts_with("error"),
+            "this is informational, not a failure: {note}"
+        );
+    }
+
+    /// The other direction, and the reason `Report` is opt-in: without the
+    /// flag an ordinary session switch still `Enforce`s, so a typo'd project
+    /// name that happens to exist is caught exactly as before (the erroring
+    /// half is `project_switch_errors_when_project_does_not_contain_codebase`).
+    /// Calls the same [`codebase_check_for`] `switch` calls, so the mapping
+    /// cannot drift away from this test.
+    #[test]
+    fn only_an_explicit_session_switch_downgrades_the_containment_check() {
+        let session = SwitchDest::Session("s".into());
+        assert_eq!(
+            codebase_check_for(&session, true),
+            CodebaseCheck::Report,
+            "--project-attribution explicit must not be blocked"
+        );
+        assert_eq!(
+            codebase_check_for(&session, false),
+            CodebaseCheck::Enforce,
+            "an ordinary session switch keeps erroring"
+        );
+        // The user-level default is not tied to a checkout either way.
+        assert_eq!(
+            codebase_check_for(&SwitchDest::UserDefault, true),
+            CodebaseCheck::Skip
+        );
+        assert_eq!(
+            codebase_check_for(&SwitchDest::UserDefault, false),
+            CodebaseCheck::Skip
         );
     }
 
@@ -924,7 +1743,7 @@ mod tests {
         _guard.set("TRACEVAULT_SERVER_URL", &base);
         _guard.set("TRACEVAULT_API_KEY", "tok");
 
-        let result = switch("payments", false, None, tmp.path(), tmp.path()).await;
+        let result = switch("payments", false, None, "derived", tmp.path(), tmp.path()).await;
         assert!(
             result.is_ok(),
             "expected a no-session, non-`--user` switch to skip the codebase check: {result:?}"
@@ -951,6 +1770,65 @@ mod tests {
         ]
     }
 
+    /// A nameless binding at a given tier. The UUID form of
+    /// `TRACEVAULT_PROJECT` is the one such tier that can be EFFECTIVE (the
+    /// capture path parses the id locally and never looks the name up);
+    /// `Deduced` is nameless too, but only ever reaches the separate
+    /// deduction line, which has [`deduced_project_name`] of its own.
+    fn nameless(id: uuid::Uuid, source: ProjectSource) -> (ProjectBinding, ProjectSource) {
+        (
+            ProjectBinding {
+                project_id: id.to_string(),
+                project_name: String::new(),
+                updated_at: "".into(),
+                forced_until: None,
+            },
+            source,
+        )
+    }
+
+    /// Small finding 8: the UUID form of `TRACEVAULT_PROJECT` never goes
+    /// through a name lookup, so its binding arrives nameless and the
+    /// operator would see a bare UUID on the effective line.
+    #[test]
+    fn enrich_project_name_fills_in_name_when_id_found_in_list() {
+        let effective = Some(nameless(uuid::Uuid::from_u128(2), ProjectSource::Env));
+        let (b, source) = enrich_project_name(effective, Some(&items())).unwrap();
+        assert_eq!(b.project_name, "web");
+        assert_eq!(source, ProjectSource::Env);
+    }
+
+    #[test]
+    fn enrich_project_name_leaves_empty_when_no_list_available() {
+        let effective = Some(nameless(uuid::Uuid::from_u128(2), ProjectSource::Env));
+        let (b, _source) = enrich_project_name(effective, None).unwrap();
+        assert_eq!(b.project_name, "");
+    }
+
+    #[test]
+    fn enrich_project_name_leaves_empty_when_id_not_in_list() {
+        let effective = Some(nameless(uuid::Uuid::from_u128(999), ProjectSource::Env));
+        let (b, _source) = enrich_project_name(effective, Some(&items())).unwrap();
+        assert_eq!(b.project_name, "");
+    }
+
+    #[test]
+    fn enrich_project_name_leaves_a_populated_name_untouched() {
+        // A binding that already has a friendly name must pass through
+        // unchanged, whatever its tier — enrichment repairs an EMPTY name
+        // and nothing else.
+        let b = pb("payments");
+        let effective = Some((b.clone(), ProjectSource::SessionActive));
+        let (out, source) = enrich_project_name(effective, Some(&items())).unwrap();
+        assert_eq!(out, b);
+        assert_eq!(source, ProjectSource::SessionActive);
+    }
+
+    #[test]
+    fn enrich_project_name_passes_through_none() {
+        assert!(enrich_project_name(None, Some(&items())).is_none());
+    }
+
     /// VIS-316 pin: the project `project status` reports as effective is the
     /// project ingest attributes events to. For each configuration, the id
     /// `status` would treat as effective (`status_effective`, the function
@@ -973,6 +1851,7 @@ mod tests {
             project_id: id,
             project_name: "n".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         let worktree = "/wt";
         let subagent_session = {
@@ -993,31 +1872,43 @@ mod tests {
             ..Default::default()
         };
 
-        // (label, session, user default written to user_project.toml, expected id)
-        let cases: Vec<(&str, SessionState, Option<String>, Option<uuid::Uuid>)> = vec![
+        // (label, session, user default written to user_project.toml,
+        //  TRACEVAULT_PROJECT, expected id)
+        type Case = (
+            &'static str,
+            SessionState,
+            Option<String>,
+            Option<String>,
+            Option<uuid::Uuid>,
+        );
+        let cases: Vec<Case> = vec![
             (
                 "(a) subagent override + session active + user default",
                 subagent_session,
                 Some(u(3).to_string()),
+                None,
                 Some(u(1)),
             ),
             (
                 "(b) session active + user default",
-                active_session,
+                active_session.clone(),
                 Some(u(3).to_string()),
+                None,
                 Some(u(2)),
             ),
             (
                 "(c) user default only",
                 SessionState::default(),
                 Some(u(3).to_string()),
+                None,
                 Some(u(3)),
             ),
-            ("(d) nothing", SessionState::default(), None, None),
+            ("(d) nothing", SessionState::default(), None, None, None),
             (
                 "(e) user default with a non-UUID project_id",
                 SessionState::default(),
                 Some("not-a-uuid".into()),
+                None,
                 None,
             ),
             (
@@ -1025,16 +1916,40 @@ mod tests {
                 bad_active_session,
                 Some(u(3).to_string()),
                 None,
+                None,
+            ),
+            // The `Env` rung is part of the SAME shared chain, so it has to
+            // be covered here too or `status` and ingest could drift on it.
+            (
+                "(g) TRACEVAULT_PROJECT (UUID) outranks session active and the user default",
+                active_session.clone(),
+                Some(u(3).to_string()),
+                Some(u(4).to_string()),
+                Some(u(4)),
+            ),
+            // A NAME in TRACEVAULT_PROJECT is not a tier on either side:
+            // both must fall through to the session's active binding.
+            (
+                "(h) TRACEVAULT_PROJECT (NAME) is ignored by both",
+                active_session,
+                Some(u(3).to_string()),
+                Some("payments".into()),
+                Some(u(2)),
             ),
         ];
 
-        for (label, session, user_default, expected) in cases {
+        for (label, session, user_default, env_project, expected) in cases {
             match &user_default {
                 Some(id) => crate::user_project_default::save(&bind(id.clone())).unwrap(),
                 None => crate::user_project_default::clear().unwrap(),
             }
+            match &env_project {
+                Some(v) => _guard.set("TRACEVAULT_PROJECT", v),
+                None => _guard.remove("TRACEVAULT_PROJECT"),
+            }
             let status_pid = status_effective(
                 None,
+                crate::commands::stream::env_project_binding(),
                 &session,
                 Some(worktree),
                 crate::user_project_default::load(),
@@ -1085,6 +2000,13 @@ mod tests {
         _guard.set("XDG_CONFIG_HOME", tmp.path());
         _guard.set("HOME", tmp.path());
         _guard.remove("TRACEVAULT_SESSION_ID");
+        // `status_effective` takes `TRACEVAULT_PROJECT` at a rung ABOVE the
+        // "nothing is bound" state this test asserts, and an env-sourced
+        // binding also triggers an extra `list_projects` call this mock does
+        // not stage — an ambient export would make the test fail, or pass,
+        // for the wrong reason.
+        _guard.remove("TRACEVAULT_PROJECT");
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
 
         let result = status(None, None, tmp.path(), tmp.path()).await;
         assert!(
@@ -1139,11 +2061,17 @@ mod tests {
         _guard.set("HOME", tmp.path());
         _guard.set("XDG_STATE_HOME", tmp.path().join("state"));
         _guard.remove("TRACEVAULT_SESSION_ID");
+        // Both would change which project is effective / which mode is
+        // reported, and the env binding would also trigger a `list_projects`
+        // call this one-shot mock does not stage.
+        _guard.remove("TRACEVAULT_PROJECT");
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
 
         let default_b = ProjectBinding {
             project_id: uuid::Uuid::from_u128(0xB).to_string(),
             project_name: "project-b".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         crate::user_project_default::save(&default_b).unwrap();
 
@@ -1153,10 +2081,167 @@ mod tests {
             report.lines,
             vec![
                 "project: project-b via user default (project switch --user)".to_string(),
+                "attribution mode: derived (TraceVault checks repo/project membership)"
+                    .to_string(),
                 format!(
                     "server deduction for this repo: {deduced_a} (not used: the local binding above wins)"
                 ),
             ]
+        );
+    }
+
+    /// A3, UUID form, through the whole report: `TRACEVAULT_PROJECT` set to
+    /// a UUID resolves at the `Env` rung, and the one `list_projects` call
+    /// the env binding triggers is used to put its friendly name on the line
+    /// (small finding 8 — otherwise a bare UUID is printed). `spawn_once`'s
+    /// listener only ever answers one request, so a regression that fell
+    /// through to the `/projects/resolve` deduction would fail on the
+    /// missing listener as well as on the line itself.
+    #[tokio::test]
+    async fn status_reports_env_uuid_as_the_effective_tier_with_its_name() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let list = format!(r#"[{{"id":"{uuid}","name":"payments"}}]"#);
+        let base = spawn_once(http_200(&list));
+
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
+        _guard.set("TRACEVAULT_SERVER_URL", &base);
+        _guard.set("TRACEVAULT_API_KEY", "tok");
+        _guard.set("TRACEVAULT_PROJECT", uuid);
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+        _guard.remove("TRACEVAULT_SESSION_ID");
+
+        let report = status_report(None, None, tmp.path(), tmp.path()).await;
+        assert_eq!(
+            report.lines[0], "project: payments via TRACEVAULT_PROJECT (environment)",
+            "got: {:?}",
+            report.lines
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|w| !w.contains("TRACEVAULT_PROJECT")),
+            "the UUID form is honoured at capture time and needs no caveat: {:?}",
+            report.warnings
+        );
+    }
+
+    /// A3, name form: unlike our earlier design, `status` does NOT resolve a
+    /// NAME in `TRACEVAULT_PROJECT` into the chain. VIS-316's rule is that
+    /// `project status` reports what ingest does, and the capture path is
+    /// UUID-only (a name would need a per-event `list_projects`), so a
+    /// resolved name would be a project no event is attributed to. The value
+    /// is reported as an ignored tier instead, and the session's own binding
+    /// stays effective.
+    #[tokio::test]
+    async fn status_warns_that_an_env_name_is_not_used_and_falls_through() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
+        _guard.set("XDG_STATE_HOME", tmp.path().join("state"));
+        _guard.remove("TRACEVAULT_SERVER_URL");
+        _guard.remove("TRACEVAULT_API_KEY");
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+        _guard.set("TRACEVAULT_PROJECT", "payments");
+
+        let session_id = "vis305-env-name-form";
+        let pid = uuid::Uuid::from_u128(0x5E);
+        crate::session_state::save(
+            session_id,
+            &SessionState {
+                active_project: Some(ProjectBinding {
+                    project_id: pid.to_string(),
+                    project_name: "session-project".into(),
+                    updated_at: "".into(),
+                    forced_until: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let report = status_report(Some(session_id), None, tmp.path(), tmp.path()).await;
+        assert_eq!(
+            report.lines[0], "project: session-project via session (project switch)",
+            "a NAME must not become the effective tier: {:?}",
+            report.lines
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("TRACEVAULT_PROJECT") && w.contains("UUID form")),
+            "the ignored NAME must be explained: {:?}",
+            report.warnings
+        );
+    }
+
+    /// A3, item 3: with credentials unresolved (no client at all — the `Err`
+    /// arm of `resolve_client`), `status` must still honour the UUID form of
+    /// `TRACEVAULT_PROJECT`, which needs no server call. The friendly name
+    /// is simply unavailable, so the id is printed.
+    #[tokio::test]
+    async fn status_reports_env_uuid_even_without_a_client() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
+        _guard.remove("TRACEVAULT_SERVER_URL");
+        _guard.remove("TRACEVAULT_API_KEY");
+        _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+        let uuid = "33333333-3333-4333-8333-333333333333";
+        _guard.set("TRACEVAULT_PROJECT", uuid);
+
+        let report = status_report(None, None, tmp.path(), tmp.path()).await;
+        assert_eq!(
+            report.lines[0],
+            format!("project: {uuid} via TRACEVAULT_PROJECT (environment)"),
+            "got: {:?}",
+            report.lines
+        );
+    }
+
+    /// VIS-305 Part C review, small finding 3: `project status` must report
+    /// the EFFECTIVE attribution mode, not just the winning binding's own
+    /// `forced_until`. `TRACEVAULT_PROJECT_ATTRIBUTION=explicit` drives
+    /// `explicit` on its own, with no persisted force anywhere — a status
+    /// line built from `format_force_line` alone would show "derived" here,
+    /// which is exactly the lie item 3 flags: every hook in this shell is
+    /// actually sending `explicit`.
+    #[tokio::test]
+    async fn status_reports_explicit_via_env_even_when_the_binding_itself_is_not_forced() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
+        _guard.remove("TRACEVAULT_SERVER_URL");
+        _guard.remove("TRACEVAULT_API_KEY");
+        let uuid = "44444444-4444-4444-8444-444444444444";
+        _guard.set("TRACEVAULT_PROJECT", uuid);
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
+
+        let report = status_report(None, None, tmp.path(), tmp.path()).await;
+        assert_eq!(
+            report.lines,
+            vec![
+                format!("project: {uuid} via TRACEVAULT_PROJECT (environment)"),
+                "attribution mode: explicit (this caller owns attribution; membership is not checked)".to_string(),
+            ],
+            "the EFFECTIVE mode must reflect TRACEVAULT_PROJECT_ATTRIBUTION even when \
+             the winning binding has no force of its own, and the lapse line must NOT \
+             appear (there is no persisted force to lapse)"
         );
     }
 }

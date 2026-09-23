@@ -246,6 +246,14 @@ impl Fixture {
             .env("TRACEVAULT_SERVER_URL", base)
             .env("TRACEVAULT_API_KEY", "tvk_test")
             .env_remove("TRACEVAULT_SESSION_ID")
+            // The capture chain reads `TRACEVAULT_PROJECT` ABOVE the session
+            // binding this harness writes, so a developer's ambient export
+            // would redirect the hook at another project and fail these
+            // assertions for an unrelated reason.
+            // `TRACEVAULT_PROJECT_ATTRIBUTION` would likewise change the
+            // attribution header the hook sends.
+            .env_remove("TRACEVAULT_PROJECT")
+            .env_remove("TRACEVAULT_PROJECT_ATTRIBUTION")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

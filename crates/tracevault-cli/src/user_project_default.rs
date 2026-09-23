@@ -66,6 +66,11 @@ pub fn clear() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Default force lifetime: roughly one working day. A persisted force is
+/// strictly worse than a stale project binding, because it also disables the
+/// check that would have caught the binding going stale.
+pub const DEFAULT_FORCE_LIFETIME_HOURS: i64 = 12;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,6 +82,7 @@ mod tests {
             project_id: "id".into(),
             project_name: "p".into(),
             updated_at: "t".into(),
+            forced_until: None,
         };
         save_in(tmp.path(), &pb).unwrap();
         assert_eq!(load_from(tmp.path()), Some(pb));
@@ -111,8 +117,30 @@ mod tests {
             project_id: "id".into(),
             project_name: "p".into(),
             updated_at: "t".into(),
+            forced_until: None,
         };
         save(&pb).unwrap();
         assert_eq!(load(), Some(pb));
+    }
+
+    /// `forced_until` round-trips through the real `save`/`load` on-disk
+    /// format. The LIVENESS check itself (is a given `forced_until` still in
+    /// the future?) lives entirely in
+    /// `commands::stream::attribution_mode` now — this store only persists
+    /// the binding, it doesn't interpret it (see that function's doc comment
+    /// for why: a force is scoped to the binding that carries it, and this
+    /// module has no notion of "the binding that won").
+    #[test]
+    fn forced_until_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let until = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
+        let binding = ProjectBinding {
+            project_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
+            project_name: "p".into(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            forced_until: Some(until),
+        };
+        save_in(dir.path(), &binding).unwrap();
+        assert_eq!(load_from(dir.path()), Some(binding));
     }
 }

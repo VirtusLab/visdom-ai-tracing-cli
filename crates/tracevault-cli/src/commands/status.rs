@@ -650,19 +650,35 @@ fn project_label(binding: &crate::session_state::ProjectBinding) -> &str {
 }
 
 /// Maps the resolved project-attribution outcome to the "Project" check.
-/// Pure and network-free — the resolution already happened in `run_status`.
+/// Network-free — the resolution already happened in `run_status`. It does
+/// read `TRACEVAULT_PROJECT` (via `env_project_binding`) for the `Env` arm;
+/// see the rule below for why that read is the point.
 /// DISPLAY ONLY: this outcome never feeds [`recording_check`]'s verdict — see
 /// that function's doc comment for why.
 ///
 /// One rule decides `Ok`: the tier must be one `capture_project` itself
-/// honors (flag/subagent/session-active/user-default — NOT `ConfigDefault`
-/// or `Deduced`, which it excludes/never produces), AND the binding's
-/// `project_id` must parse as a UUID, since `capture_project` ends with
-/// `.parse::<uuid::Uuid>().ok()?` and silently drops anything that doesn't.
-/// Either failure renders `Warn`, not `Ok` — showing green for a binding the
-/// capture path will not honor is the exact confusion this command exists to
-/// eliminate (a hand-edited or corrupted `user_project.toml` with a garbage
-/// `project_id` is a real way to hit the id-validity half of this).
+/// honors (flag/subagent/`Env`/session-active/user-default — NOT
+/// `ConfigDefault` or `Deduced`, which it excludes/never produces), AND the
+/// binding must be one `capture_project` would not then drop. It drops a
+/// `project_id` that fails `.parse::<uuid::Uuid>()` (its own last act before
+/// returning the binding), and — at the `Env` rung specifically — it never
+/// forms a binding at all unless the RAW `TRACEVAULT_PROJECT` value is a
+/// UUID, because `env_project_binding` is UUID-only by design (a name would
+/// need a per-event `list_projects` round trip).
+///
+/// That last condition is why the `Env` arm consults
+/// [`crate::commands::stream::env_project_binding`] rather than testing the
+/// RESOLVED binding's id: a NAME in `TRACEVAULT_PROJECT` is resolved here for
+/// display (this command has a client; the hook does not), so its resolved id
+/// IS a valid UUID and would sail through an id-only test — reporting green
+/// for a tier the wire silently ignores. Asking the capture path's own reader
+/// is what makes the two unable to drift.
+///
+/// Any of those failures renders `Warn`, not `Ok` — showing green for a
+/// binding the capture path will not honor is the exact confusion this
+/// command exists to eliminate (a hand-edited or corrupted
+/// `user_project.toml` with a garbage `project_id` is a real way to hit the
+/// id-validity half of this).
 ///
 /// `Err` — the ambiguous "this repo belongs to multiple projects" case, or
 /// any transport/5xx failure of the deduction call (`resolve_effective_project`
@@ -675,6 +691,21 @@ fn project_label(binding: &crate::session_state::ProjectBinding) -> &str {
 /// `None` (nothing bound on this axis) is a `Skip` — severity for "nothing
 /// will be recorded" is [`recording_check`]'s job, since only it consults the
 /// actual recording gate.
+///
+/// DELIBERATE GAP — this reports WHICH project and WHICH tier, and whether
+/// ingest honours that tier. It does not report the attribution MODE
+/// (`derived`/`explicit`) or any persisted-force detail, and it is not meant
+/// to: `commands::project`'s `status` owns that, via the one function that
+/// decides the header (`commands::stream::attribution_mode`) plus
+/// `format_force_line`. Reproducing either here would mean a second surface
+/// that has to keep agreeing with the wire, and the whole shape of VIS-305's
+/// attribution reporting is that exactly one place answers "derived or
+/// explicit?" — the bugs this branch fixed were all second answers drifting
+/// from the first. The README says the same split rather than promising
+/// parity, the way `online_project_outcome`'s unresolvable-name case is
+/// documented as a gap instead of claimed as coverage. If the mode ever does
+/// belong in the full diagnostic, it must arrive by CALLING
+/// `attribution_mode` — never by re-deriving the verdict here.
 fn project_binding_check(outcome: &ProjectOutcome) -> Check {
     match outcome {
         Err(e) => Check::warn("Project", e.to_string()),
@@ -683,15 +714,38 @@ fn project_binding_check(outcome: &ProjectOutcome) -> Check {
             "not bound — run `tracevault project switch --user \"<name>\"`, or `tracevault repo switch <path>` inside a checkout",
         ),
         Ok(Some((binding, source))) => {
+            // `Env` (`TRACEVAULT_PROJECT`) joined this list once
+            // `commands::stream::capture_project` started passing
+            // `env_project_binding()` into `effective_project` — it is now
+            // one of the tiers capture time actually resolves, same as
+            // Subagent/SessionActive/UserDefault, so it must read Ok here
+            // too or this Check would warn "not used for attribution at
+            // capture time" about a tier that is, in fact, used.
             let honored_tier = matches!(
                 source,
                 ProjectSource::ProjectFlag
                     | ProjectSource::Subagent
+                    | ProjectSource::Env
                     | ProjectSource::SessionActive
                     | ProjectSource::UserDefault
             );
+            // ...but only for the form the capture path can actually use. A
+            // NAME resolves here (a client is in scope) and nowhere on the
+            // wire, so asking `env_project_binding` — the hook's own reader
+            // of this same var — is the only test that can't go green on a
+            // tier the hook ignores.
+            let env_name_form = *source == ProjectSource::Env
+                && crate::commands::stream::env_project_binding().is_none();
             let label = project_label(binding);
-            if !honored_tier {
+            if env_name_form {
+                Check::warn(
+                    "Project",
+                    format!(
+                        "{label} — {source}, resolved for display only: the capture path honours only the UUID form of TRACEVAULT_PROJECT, so a NAME is ignored there and attribution falls through to the next tier — export TRACEVAULT_PROJECT={} instead, or bind it with `tracevault project switch <name>`",
+                        binding.project_id
+                    ),
+                )
+            } else if !honored_tier {
                 Check::warn(
                     "Project",
                     format!(
@@ -811,6 +865,96 @@ fn recording_attribution(
     let attribution =
         crate::commands::stream::attribution_for(stream_binding.as_ref(), capture_pid);
     (attribution, worktree)
+}
+
+/// The project axis's client-backed resolution: a configured `default_project`
+/// NAME and `TRACEVAULT_PROJECT` (UUID or NAME, mirroring `commands::project`'s
+/// `status`) both get to consult `list_projects` here, then the full
+/// server-aware precedence chain (`resolve_effective_project`) runs. Pulled
+/// out analogously to [`offline_project_outcome`] so this branch is
+/// unit-testable without driving all of `run_status`. Returns the outcome
+/// plus the configured `default_project` NAME when it failed to resolve, for
+/// the caller to surface via `unresolved_config_default_check`.
+///
+/// An unresolved `TRACEVAULT_PROJECT` NAME still gets no equivalent surfacing
+/// here; it is silently dropped. That is now a real (if narrow) gap rather
+/// than a matter of parity: `commands::project`'s `status` DOES warn for it
+/// (as it already did for an unresolved `--project` and `default_project`).
+/// It is survivable because the capture path drops a name too, so nothing
+/// this command reports contradicts what the hook does — the operator is
+/// simply not told why their variable had no effect. Closing it means a
+/// `Check` of its own, deliberately left for a follow-up.
+/// One project NAME looked up in the server's project list, as a binding.
+///
+/// The configured `default_project` and the NAME form of `TRACEVAULT_PROJECT`
+/// resolve identically — a client is in scope here, unlike on the capture
+/// path — so [`online_project_outcome`] runs both through this instead of
+/// writing the same `list_projects` fold twice.
+async fn resolve_name_via_client(
+    client: &ApiClient,
+    name: &str,
+) -> Option<crate::session_state::ProjectBinding> {
+    client.list_projects().await.ok().and_then(|items| {
+        items
+            .into_iter()
+            .find(|p| p.name == name)
+            .map(|p| crate::session_state::ProjectBinding {
+                project_id: p.id.to_string(),
+                project_name: p.name,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                forced_until: None,
+            })
+    })
+}
+
+async fn online_project_outcome(
+    client: &ApiClient,
+    config_default_name: Option<&str>,
+    project_session: &crate::session_state::SessionState,
+    worktree: &str,
+    user_default_project: Option<crate::session_state::ProjectBinding>,
+    project_git_url: Option<&str>,
+) -> (ProjectOutcome, Option<String>) {
+    // A configured default_project is a NAME; resolving it into a binding
+    // needs the project list, same as project.rs's status.
+    let mut config_default_unresolved = None;
+    let config_default = match config_default_name {
+        Some(name) => {
+            let resolved = resolve_name_via_client(client, name).await;
+            if resolved.is_none() {
+                config_default_unresolved = Some(name.to_string());
+            }
+            resolved
+        }
+        None => None,
+    };
+    // `TRACEVAULT_PROJECT`: a UUID or a NAME — a client is in scope here, so
+    // both forms are honoured (unlike the capture path, which is UUID-only).
+    //
+    // The UUID form is whatever the HOOK reads, so it comes from
+    // `env_project_binding` — the hook's own reader — rather than a fourth
+    // hand-rolled copy of the same parse (the reason `offline_project_outcome`
+    // already calls it). A non-empty value it declines is a name, which only
+    // this command can resolve.
+    let env_project = match crate::commands::stream::env_project_binding() {
+        Some(binding) => Some(binding),
+        None => match std::env::var("TRACEVAULT_PROJECT").ok() {
+            Some(raw) if !raw.trim().is_empty() => {
+                resolve_name_via_client(client, raw.trim()).await
+            }
+            _ => None,
+        },
+    };
+    let inputs = ProjectResolveInputs {
+        project_flag: None,
+        env_project,
+        session: project_session,
+        worktree_path: Some(worktree),
+        config_default,
+    };
+    let outcome =
+        resolve_effective_project(&inputs, user_default_project, project_git_url, client).await;
+    (outcome, config_default_unresolved)
 }
 
 /// The project axis's offline/no-client display fallback: the pure local
@@ -1224,56 +1368,40 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
     // attempts resolution at all (no client to call `list_projects` with),
     // which is a different, already-visible gap (no credential -> an Error
     // from the Authentication section).
-    let mut config_default_unresolved: Option<String> = None;
-
-    let project_outcome: ProjectOutcome = match (auth.credential.clone(), auth.server_url.as_ref())
-    {
-        (Some(credential), Some(server_url)) => {
-            let client = ApiClient::with_credential(server_url, Some(credential));
-            // A configured default_project is a NAME; resolving it into a
-            // binding needs the project list.
-            let config_default = match config_default_name.as_deref() {
-                Some(name) => {
-                    let resolved = client.list_projects().await.ok().and_then(|items| {
-                        items.into_iter().find(|p| p.name == name).map(|p| {
-                            crate::session_state::ProjectBinding {
-                                project_id: p.id.to_string(),
-                                project_name: p.name,
-                                updated_at: chrono::Utc::now().to_rfc3339(),
-                            }
-                        })
-                    });
-                    if resolved.is_none() {
-                        config_default_unresolved = Some(name.to_string());
-                    }
-                    resolved
-                }
-                None => None,
-            };
-            let inputs = ProjectResolveInputs {
-                project_flag: None,
-                session: &project_session,
-                worktree_path: Some(&worktree),
-                config_default,
-            };
-            resolve_effective_project(
-                &inputs,
-                user_default_project,
-                project_git_url.as_deref(),
-                &client,
-            )
-            .await
-        }
-        _ => {
-            let inputs = ProjectResolveInputs {
-                project_flag: None,
-                session: &project_session,
-                worktree_path: Some(&worktree),
-                config_default: None,
-            };
-            offline_project_outcome(&inputs, user_default_project)
-        }
-    };
+    let (project_outcome, config_default_unresolved): (ProjectOutcome, Option<String>) =
+        match (auth.credential.clone(), auth.server_url.as_ref()) {
+            (Some(credential), Some(server_url)) => {
+                let client = ApiClient::with_credential(server_url, Some(credential));
+                online_project_outcome(
+                    &client,
+                    config_default_name.as_deref(),
+                    &project_session,
+                    &worktree,
+                    user_default_project,
+                    project_git_url.as_deref(),
+                )
+                .await
+            }
+            _ => {
+                // Offline (no client): only the UUID form of
+                // `TRACEVAULT_PROJECT` can be honoured — a name would need
+                // `list_projects`, which needs a client this arm doesn't
+                // have. Reuses `commands::stream`'s capture-time helper
+                // rather than duplicating the same UUID-only parse a third
+                // time (the `project.rs` inline version stays separate: it
+                // must distinguish "not a UUID" from "absent" so it can fall
+                // through to name resolution, which this `Option`-returning
+                // helper can't express).
+                let inputs = ProjectResolveInputs {
+                    project_flag: None,
+                    env_project: crate::commands::stream::env_project_binding(),
+                    session: &project_session,
+                    worktree_path: Some(&worktree),
+                    config_default: None,
+                };
+                (offline_project_outcome(&inputs, user_default_project), None)
+            }
+        };
 
     let mut attribution_v = Vec::new();
     if let Some(c) = recording_check(session_id, attribution.as_ref()) {
@@ -2059,6 +2187,7 @@ mod tests {
             project_id: id.into(),
             project_name: name.into(),
             updated_at: "t".into(),
+            forced_until: None,
         }
     }
 
@@ -2130,12 +2259,25 @@ mod tests {
     fn project_binding_check_tiers_capture_project_honors_are_ok() {
         // Only the tiers `capture_project` itself resolves at capture time
         // read Ok: a `--project`-equivalent flag, the subagent/session-active
-        // overrides, and the user-level default. `ConfigDefault` and
-        // `Deduced` are covered separately — they must NOT appear here. Uses
-        // a well-formed UUID id: an honored tier still needs a parseable
-        // `project_id` to read Ok (see the malformed-id tests below).
+        // overrides, `TRACEVAULT_PROJECT` (`Env`, since A2 wired
+        // `env_project_binding()` into `capture_project`'s inputs), and the
+        // user-level default. `ConfigDefault` and `Deduced` are covered
+        // separately — they must NOT appear here. Uses a well-formed UUID
+        // id: an honored tier still needs a parseable `project_id` to read
+        // Ok (see the malformed-id tests below).
+        //
+        // `TRACEVAULT_PROJECT` is pinned to that same UUID for the duration:
+        // an `Env`-sourced binding can only ever exist when that var is set,
+        // and the check now asks `env_project_binding()` whether the RAW
+        // value is the UUID form the capture path honours (see
+        // `project_binding_check_env_name_form_is_warn_not_ok`). Leaving the
+        // var unset here would assert on a state that cannot occur.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("TRACEVAULT_PROJECT", "33333333-3333-4333-8333-333333333333");
+
         use crate::resolution::ProjectSource::*;
-        for source in [ProjectFlag, Subagent, SessionActive, UserDefault] {
+        for source in [ProjectFlag, Subagent, Env, SessionActive, UserDefault] {
             let outcome: ProjectOutcome = Ok(Some((
                 project_binding("33333333-3333-4333-8333-333333333333", "My Project"),
                 source,
@@ -2148,6 +2290,60 @@ mod tests {
                 check.detail
             );
         }
+    }
+
+    /// VIS-305 whole-branch review, Important finding 2: the false green.
+    /// `env_project_binding` is UUID-only, but `project status` and
+    /// `run_status` both resolve a project NAME in `TRACEVAULT_PROJECT` via
+    /// `list_projects` and report the tier as `Env`. The resolved binding's
+    /// id then IS a valid UUID, so an id-only check reads `Ok` — whose
+    /// documented contract is "this tier IS honoured at capture time" —
+    /// while the hook ignores the name entirely and attributes elsewhere.
+    ///
+    /// The condition `capture_project` actually applies is to the RAW env
+    /// value, so this pins that: same well-formed resolved binding, same
+    /// `Env` tier, but `TRACEVAULT_PROJECT` holding a NAME must render
+    /// `Warn`, worded like `unresolved_config_default_check` — resolves for
+    /// display, not honoured on the wire.
+    #[test]
+    fn project_binding_check_env_name_form_is_warn_not_ok() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("TRACEVAULT_PROJECT", "payments");
+
+        // Exactly what `online_project_outcome`/`resolve_status_effective`
+        // hand back for `TRACEVAULT_PROJECT=payments`: the NAME resolved
+        // against `list_projects`, so the id is a perfectly valid UUID.
+        let outcome: ProjectOutcome = Ok(Some((
+            project_binding("33333333-3333-4333-8333-333333333333", "payments"),
+            crate::resolution::ProjectSource::Env,
+        )));
+        let check = project_binding_check(&outcome);
+        assert_eq!(
+            check.level,
+            Level::Warn,
+            "a NAME in TRACEVAULT_PROJECT is ignored by the capture path, so it must never read Ok: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("UUID form"),
+            "the warning must say WHICH form is honoured: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("display only"),
+            "worded like unresolved_config_default_check's precedent: {}",
+            check.detail
+        );
+
+        // Discrimination: the SAME binding under the UUID form still reads
+        // Ok, so this pins the raw-value rule and not merely "Env warns".
+        _guard.set("TRACEVAULT_PROJECT", "33333333-3333-4333-8333-333333333333");
+        let outcome: ProjectOutcome = Ok(Some((
+            project_binding("33333333-3333-4333-8333-333333333333", "payments"),
+            crate::resolution::ProjectSource::Env,
+        )));
+        assert_eq!(project_binding_check(&outcome).level, Level::Ok);
     }
 
     #[test]
@@ -2258,6 +2454,14 @@ mod tests {
     // these tests call the public `save()` (not just `load()`), so getting
     // this isolation wrong doesn't just make a test flaky — it overwrites
     // that developer's real config file.
+    //
+    // Every test below ALSO pins `TRACEVAULT_PROJECT` unset. Since the A2
+    // fix, `capture_project` reads it at a rung ABOVE `session.active_
+    // project`, so a developer who has exported it in their shell — or a
+    // concurrently-running test in this same binary that sets it — would
+    // otherwise silently change which project these verdicts resolve. The
+    // crate lock serializes mutators against each other, but only holding
+    // the lock AND declaring the var's value makes a reader safe.
 
     // ---- resolve_auth: `.tracevault/config.toml` is the lowest credential
     // ---- rung in `resolve_credentials`, so the inspector must know it too.
@@ -2356,6 +2560,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         crate::user_default::save(&repo_binding_for_attribution(
             "11111111-1111-4111-8111-111111111111",
@@ -2384,11 +2589,13 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let pb = crate::session_state::ProjectBinding {
             project_id: uuid::Uuid::from_u128(7).to_string(),
             project_name: "p".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         crate::user_project_default::save(&pb).unwrap();
 
@@ -2412,6 +2619,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let config = crate::config::TracevaultConfig::default();
         assert!(
@@ -2434,6 +2642,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let cwd = tempfile::tempdir().unwrap();
         let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), None);
@@ -2458,6 +2667,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let cwd = tempfile::tempdir().unwrap();
         let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), None);
@@ -2482,6 +2692,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let config = crate::config::TracevaultConfig {
             repo_id: Some("22222222-2222-4222-8222-222222222222".into()),
@@ -2509,12 +2720,14 @@ mod tests {
             project_id: uuid::Uuid::from_u128(9).to_string(),
             project_name: "My Project".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         crate::user_project_default::save(&pb).unwrap();
 
         let session = crate::session_state::SessionState::default();
         let inputs = ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &session,
             worktree_path: None,
             config_default: None,
@@ -2531,6 +2744,65 @@ mod tests {
         );
     }
 
+    /// VIS-305 Part A fix: `run_status`'s client-backed arm must resolve
+    /// `TRACEVAULT_PROJECT`'s UUID form at the `Env` rung, and the resulting
+    /// `Check` must read Ok (not the "not used for attribution at capture
+    /// time" Warn) — `capture_project` genuinely honours this tier as of the
+    /// A2 fix, so the diagnostic disagreeing with real behaviour would be
+    /// exactly the bug this batch closes.
+    #[tokio::test]
+    async fn online_project_outcome_resolves_env_uuid_and_reads_ok() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        let uuid = "55555555-5555-4555-8555-555555555555";
+        _guard.set("TRACEVAULT_PROJECT", uuid);
+
+        // No `list_projects` mock: the UUID form must resolve without one.
+        let client = ApiClient::new("http://127.0.0.1:0", Some("tok"));
+        let session = crate::session_state::SessionState::default();
+        let (outcome, unresolved) =
+            online_project_outcome(&client, None, &session, "/wt", None, None).await;
+        assert!(unresolved.is_none());
+        let (b, source) = outcome
+            .unwrap()
+            .expect("TRACEVAULT_PROJECT must resolve to a binding");
+        assert_eq!(source, ProjectSource::Env);
+        assert_eq!(b.project_id, uuid);
+
+        let check = project_binding_check(&Ok(Some((b, source))));
+        assert_eq!(
+            check.level,
+            Level::Ok,
+            "an Env-sourced binding is honoured by capture_project and must read Ok: {}",
+            check.detail
+        );
+    }
+
+    /// VIS-305 Part A fix, name form: with a client in scope,
+    /// `TRACEVAULT_PROJECT` set to a NAME must resolve via `list_projects`,
+    /// mirroring `commands::project`'s `status`.
+    #[tokio::test]
+    async fn online_project_outcome_resolves_env_name_via_the_client() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("TRACEVAULT_PROJECT", "payments");
+
+        let list =
+            r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"payments"}]"#.to_string();
+        let (base, _rx) =
+            crate::test_helpers::spawn_seq(vec![crate::test_helpers::http_json("200 OK", &list)]);
+        let client = ApiClient::new(&base, Some("tok"));
+        let session = crate::session_state::SessionState::default();
+        let (outcome, _unresolved) =
+            online_project_outcome(&client, None, &session, "/wt", None, None).await;
+        let (b, source) = outcome
+            .unwrap()
+            .expect("a name should resolve via list_projects");
+        assert_eq!(source, ProjectSource::Env);
+        assert_eq!(b.project_name, "payments");
+        assert_eq!(b.project_id, "11111111-1111-4111-8111-111111111111");
+    }
+
     #[test]
     fn recording_attribution_finds_subagent_override_via_linked_worktree_cwd() {
         // The subagent override is keyed by the LINKED worktree's own
@@ -2541,6 +2813,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let base = tempfile::tempdir().unwrap();
         let repo_dir = base.path().join("repo");
@@ -2558,6 +2831,7 @@ mod tests {
                 project_id: project_id.to_string(),
                 project_name: "linked".into(),
                 updated_at: "t".into(),
+                forced_until: None,
             },
         );
         let state = crate::session_state::SessionState {
@@ -2604,6 +2878,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let state = crate::session_state::SessionState {
             active_project: Some(project_binding("not-a-uuid", "My Project")),
@@ -2643,6 +2918,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
         _guard.set("HOME", cfg_tmp.path()); // see isolation note above
+        _guard.remove("TRACEVAULT_PROJECT"); // see isolation note above
 
         let state = crate::session_state::SessionState {
             active: Some(crate::session_state::RepoBinding {

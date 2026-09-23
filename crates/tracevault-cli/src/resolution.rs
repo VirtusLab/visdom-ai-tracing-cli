@@ -175,6 +175,9 @@ pub struct ResolveInputs<'a> {
 /// come from the per-session state.
 pub struct ProjectResolveInputs<'a> {
     pub project_flag: Option<ProjectBinding>,
+    /// Parsed from `TRACEVAULT_PROJECT` by the caller, so this module stays
+    /// free of environment reads and remains a pure function of its inputs.
+    pub env_project: Option<ProjectBinding>,
     pub session: &'a SessionState,
     pub worktree_path: Option<&'a str>,
     pub config_default: Option<ProjectBinding>,
@@ -215,6 +218,12 @@ pub enum ProjectSource {
     ProjectFlag,
     /// A subagent's per-worktree override.
     Subagent,
+    /// The `TRACEVAULT_PROJECT` environment variable — a per-process
+    /// assertion, re-asserted at every launch and never written to disk.
+    /// Outranks every remembered tier so a stale `user_project.toml` or a
+    /// `.tracevault/config.toml` baked into a pod image cannot outrank the
+    /// launcher that started the process.
+    Env,
     /// The session's project-level active binding.
     SessionActive,
     /// A pinned `.tracevault/config.toml` default_project (bound mode).
@@ -234,6 +243,7 @@ impl std::fmt::Display for ProjectSource {
         let label = match self {
             ProjectSource::ProjectFlag => "--project override",
             ProjectSource::Subagent => "subagent worktree override",
+            ProjectSource::Env => "TRACEVAULT_PROJECT (environment)",
             ProjectSource::SessionActive => "session (project switch)",
             ProjectSource::ConfigDefault => "bound .tracevault/config.toml default_project",
             ProjectSource::Deduced => "repo deduction",
@@ -265,9 +275,13 @@ pub fn effective_binding(inputs: ResolveInputs) -> Option<(RepoBinding, BindingS
 }
 
 /// The project that applies, and which tier produced it: `--project` flag →
-/// subagent worktree override → session active → config default → none.
-/// Pure; covers only the local tiers (flag → subagent → session.active_project
-/// → config_default). The user-level default (and, in the display chain only,
+/// subagent worktree override → `TRACEVAULT_PROJECT` → session active →
+/// config default → none.
+/// Pure; covers only the local tiers (flag → subagent → env_project →
+/// session.active_project → config_default). `env_project` is supplied BY THE
+/// CALLER — this module never reads the environment — and the capture path
+/// fills it from `commands::stream::env_project_binding`, which honours the
+/// UUID form only. The user-level default (and, in the display chain only,
 /// server-side deduction) are applied afterward by [`capture_project_binding`]
 /// / [`resolve_effective_project`], which call this function first and only
 /// fall through to those tiers when it returns `None`.
@@ -279,6 +293,9 @@ pub fn effective_project(inputs: &ProjectResolveInputs) -> Option<(ProjectBindin
         if let Some(b) = inputs.session.subagent_projects.get(wt) {
             return Some((b.clone(), ProjectSource::Subagent));
         }
+    }
+    if let Some(b) = &inputs.env_project {
+        return Some((b.clone(), ProjectSource::Env));
     }
     if let Some(b) = &inputs.session.active_project {
         return Some((b.clone(), ProjectSource::SessionActive));
@@ -296,6 +313,13 @@ pub fn effective_project(inputs: &ProjectResolveInputs) -> Option<(ProjectBindin
 pub struct CaptureProjectInputs<'a> {
     /// `--project` override (only `project status` supplies it; the hook passes `None`).
     pub project_flag: Option<ProjectBinding>,
+    /// `TRACEVAULT_PROJECT`, UUID form ONLY — parsed by the caller (via
+    /// `commands::stream::env_project_binding`) so this module stays free of
+    /// environment reads. The NAME form is deliberately not a tier here: it
+    /// would need a `list_projects` round trip, and this is the network-free
+    /// chain the per-event hook runs. Both callers fill this field from that
+    /// same reader, so `project status` cannot report a tier ingest ignores.
+    pub env_project: Option<ProjectBinding>,
     pub session: &'a SessionState,
     pub worktree_path: Option<&'a str>,
     /// `user_project_default::load()` — passed in so the function stays pure.
@@ -303,14 +327,15 @@ pub struct CaptureProjectInputs<'a> {
 }
 
 /// THE capture-time project chain: `--project` flag → subagent worktree
-/// override → session `active_project` → user default → none. Pure, no
-/// network. `commands::stream::capture_project` (ingest) and
+/// override → `TRACEVAULT_PROJECT` → session `active_project` → user default
+/// → none. Pure, no network. `commands::stream::capture_project` (ingest) and
 /// `commands::project::status` both call this, so they cannot drift.
 pub fn capture_project_binding(
     inputs: &CaptureProjectInputs<'_>,
 ) -> Option<(ProjectBinding, ProjectSource)> {
     effective_project(&ProjectResolveInputs {
         project_flag: inputs.project_flag.clone(),
+        env_project: inputs.env_project.clone(),
         session: inputs.session,
         worktree_path: inputs.worktree_path,
         config_default: None,
@@ -332,9 +357,9 @@ pub fn capture_project_id(binding: &ProjectBinding) -> Option<uuid::Uuid> {
 }
 
 /// DISPLAY chain for `commands::status`'s "Project" line: `--project` flag →
-/// subagent override → session active → config default (all pure, via
-/// [`effective_project`]; no network call) → user-level default → server-side
-/// deduction from the repo's git remote.
+/// subagent override → `TRACEVAULT_PROJECT` → session active → config default
+/// (all pure, via [`effective_project`]; no network call) → user-level default
+/// → server-side deduction from the repo's git remote.
 ///
 /// The user-level default outranks deduction because that is what ingest
 /// does: the capture chain ([`capture_project_binding`]) applies the user
@@ -355,7 +380,8 @@ pub async fn resolve_effective_project(
     git_url: Option<&str>,
     client: &ApiClient,
 ) -> Result<Option<(ProjectBinding, ProjectSource)>, Box<dyn std::error::Error>> {
-    // Local tiers: flag → subagent → session active → config default.
+    // Local tiers: flag → subagent → TRACEVAULT_PROJECT → session active →
+    // config default.
     if let Some(hit) = effective_project(inputs) {
         return Ok(Some(hit));
     }
@@ -372,6 +398,7 @@ pub async fn resolve_effective_project(
                         project_id: pid.to_string(),
                         project_name: String::new(), // enriched for display by the caller if needed
                         updated_at: String::new(),
+                        forced_until: None,
                     },
                     ProjectSource::Deduced,
                 )));
@@ -501,9 +528,11 @@ mod tests {
             project_id: "user".into(),
             project_name: "u".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         let inputs = ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: None,
@@ -525,6 +554,7 @@ mod tests {
         let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
         let inputs = ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: None,
@@ -543,6 +573,7 @@ mod tests {
         let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
         let inputs = ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: None,
@@ -564,6 +595,7 @@ mod tests {
         let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
         let inputs = ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: None,
@@ -584,6 +616,7 @@ mod tests {
         let client = ApiClient::new(&format!("http://{addr}"), Some("k"));
         let inputs = ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: None,
@@ -602,9 +635,11 @@ mod tests {
             project_id: "cfg".into(),
             project_name: "c".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         let inputs = ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: Some(cfg),
@@ -733,6 +768,7 @@ mod tests {
             project_id: n.into(),
             project_name: n.into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         let mut subagent_projects = HashMap::new();
         subagent_projects.insert("/wt".into(), pb("subagent"));
@@ -745,6 +781,7 @@ mod tests {
         // rung 1: flag wins over everything
         let got = effective_project(&ProjectResolveInputs {
             project_flag: Some(pb("flag")),
+            env_project: None,
             session: &session,
             worktree_path: Some("/wt"),
             config_default: Some(pb("cfg")),
@@ -756,6 +793,7 @@ mod tests {
         // rung 2: subagent (worktree) beats session.active
         let got = effective_project(&ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &session,
             worktree_path: Some("/wt"),
             config_default: Some(pb("cfg")),
@@ -767,6 +805,7 @@ mod tests {
         // rung 3: session.active when no subagent match
         let got = effective_project(&ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &session,
             worktree_path: Some("/other"),
             config_default: Some(pb("cfg")),
@@ -777,6 +816,7 @@ mod tests {
         // rung 3b: config_default when session empty
         let got = effective_project(&ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: Some(pb("cfg")),
@@ -787,6 +827,7 @@ mod tests {
         // none: nothing local
         assert!(effective_project(&ProjectResolveInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             config_default: None,
@@ -808,6 +849,7 @@ mod tests {
             project_id: n.into(),
             project_name: n.into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         let mut subagent_projects = HashMap::new();
         subagent_projects.insert("/wt".into(), pb("subagent"));
@@ -820,6 +862,7 @@ mod tests {
         // tier 1: flag wins over everything
         let got = capture_project_binding(&CaptureProjectInputs {
             project_flag: Some(pb("flag")),
+            env_project: Some(pb("env")),
             session: &session,
             worktree_path: Some("/wt"),
             user_default: Some(pb("user")),
@@ -830,9 +873,10 @@ mod tests {
             ("flag", ProjectSource::ProjectFlag)
         );
 
-        // tier 2: subagent worktree override beats session active
+        // tier 2: subagent worktree override beats env and session active
         let got = capture_project_binding(&CaptureProjectInputs {
             project_flag: None,
+            env_project: Some(pb("env")),
             session: &session,
             worktree_path: Some("/wt"),
             user_default: Some(pb("user")),
@@ -843,9 +887,24 @@ mod tests {
             ("subagent", ProjectSource::Subagent)
         );
 
-        // tier 3: session active when the worktree has no override
+        // tier 3: TRACEVAULT_PROJECT beats session active and the user default
         let got = capture_project_binding(&CaptureProjectInputs {
             project_flag: None,
+            env_project: Some(pb("env")),
+            session: &session,
+            worktree_path: Some("/other"),
+            user_default: Some(pb("user")),
+        })
+        .unwrap();
+        assert_eq!(
+            (got.0.project_id.as_str(), got.1),
+            ("env", ProjectSource::Env)
+        );
+
+        // tier 4: session active when the worktree has no override and no env
+        let got = capture_project_binding(&CaptureProjectInputs {
+            project_flag: None,
+            env_project: None,
             session: &session,
             worktree_path: Some("/other"),
             user_default: Some(pb("user")),
@@ -856,9 +915,10 @@ mod tests {
             ("session", ProjectSource::SessionActive)
         );
 
-        // tier 4: user default when the session has nothing
+        // tier 5: user default when the session has nothing
         let got = capture_project_binding(&CaptureProjectInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: Some("/wt"),
             user_default: Some(pb("user")),
@@ -872,6 +932,7 @@ mod tests {
         // none: nothing anywhere
         assert!(capture_project_binding(&CaptureProjectInputs {
             project_flag: None,
+            env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
             user_default: None,
@@ -885,11 +946,59 @@ mod tests {
             project_id: id.into(),
             project_name: "n".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         let u = uuid::Uuid::from_u128(7);
         assert_eq!(capture_project_id(&pb(&u.to_string())), Some(u));
         assert_eq!(capture_project_id(&pb("not-a-uuid")), None);
         assert_eq!(capture_project_id(&pb("")), None);
+    }
+
+    #[test]
+    fn env_outranks_remembered_state_but_not_flag_or_subagent() {
+        let pb = |n: &str| ProjectBinding {
+            project_id: n.into(),
+            project_name: n.into(),
+            updated_at: "".into(),
+            forced_until: None,
+        };
+        let mut subagent_projects = HashMap::new();
+        subagent_projects.insert("/wt".to_string(), pb("subagent"));
+        let session = SessionState {
+            active_project: Some(pb("session")),
+            subagent_projects,
+            ..Default::default()
+        };
+
+        // env beats session active and config default
+        let got = effective_project(&ProjectResolveInputs {
+            project_flag: None,
+            env_project: Some(pb("env")),
+            session: &session,
+            worktree_path: None,
+            config_default: Some(pb("config")),
+        });
+        assert_eq!(got.unwrap().1, ProjectSource::Env);
+
+        // the subagent worktree override still beats env
+        let got = effective_project(&ProjectResolveInputs {
+            project_flag: None,
+            env_project: Some(pb("env")),
+            session: &session,
+            worktree_path: Some("/wt"),
+            config_default: None,
+        });
+        assert_eq!(got.unwrap().1, ProjectSource::Subagent);
+
+        // --project still beats env
+        let got = effective_project(&ProjectResolveInputs {
+            project_flag: Some(pb("flag")),
+            env_project: Some(pb("env")),
+            session: &session,
+            worktree_path: None,
+            config_default: None,
+        });
+        assert_eq!(got.unwrap().1, ProjectSource::ProjectFlag);
     }
 
     #[test]
