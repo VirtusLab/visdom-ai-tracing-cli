@@ -869,6 +869,29 @@ fn recording_attribution(
 /// this command reports contradicts what the hook does — the operator is
 /// simply not told why their variable had no effect. Closing it means a
 /// `Check` of its own, deliberately left for a follow-up.
+/// One project NAME looked up in the server's project list, as a binding.
+///
+/// The configured `default_project` and the NAME form of `TRACEVAULT_PROJECT`
+/// resolve identically — a client is in scope here, unlike on the capture
+/// path — so [`online_project_outcome`] runs both through this instead of
+/// writing the same `list_projects` fold twice.
+async fn resolve_name_via_client(
+    client: &ApiClient,
+    name: &str,
+) -> Option<crate::session_state::ProjectBinding> {
+    client.list_projects().await.ok().and_then(|items| {
+        items
+            .into_iter()
+            .find(|p| p.name == name)
+            .map(|p| crate::session_state::ProjectBinding {
+                project_id: p.id.to_string(),
+                project_name: p.name,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                forced_until: None,
+            })
+    })
+}
+
 async fn online_project_outcome(
     client: &ApiClient,
     config_default_name: Option<&str>,
@@ -882,16 +905,7 @@ async fn online_project_outcome(
     let mut config_default_unresolved = None;
     let config_default = match config_default_name {
         Some(name) => {
-            let resolved = client.list_projects().await.ok().and_then(|items| {
-                items.into_iter().find(|p| p.name == name).map(|p| {
-                    crate::session_state::ProjectBinding {
-                        project_id: p.id.to_string(),
-                        project_name: p.name,
-                        updated_at: chrono::Utc::now().to_rfc3339(),
-                        forced_until: None,
-                    }
-                })
-            });
+            let resolved = resolve_name_via_client(client, name).await;
             if resolved.is_none() {
                 config_default_unresolved = Some(name.to_string());
             }
@@ -901,30 +915,20 @@ async fn online_project_outcome(
     };
     // `TRACEVAULT_PROJECT`: a UUID or a NAME — a client is in scope here, so
     // both forms are honoured (unlike the capture path, which is UUID-only).
-    let env_project = match std::env::var("TRACEVAULT_PROJECT").ok() {
-        Some(raw) if !raw.trim().is_empty() => {
-            let raw = raw.trim().to_string();
-            match raw.parse::<uuid::Uuid>() {
-                Ok(id) => Some(crate::session_state::ProjectBinding {
-                    project_id: id.to_string(),
-                    project_name: String::new(),
-                    updated_at: String::new(),
-                    forced_until: None,
-                }),
-                // A name: resolvable here because a client is in scope.
-                Err(_) => client.list_projects().await.ok().and_then(|items| {
-                    items.into_iter().find(|p| p.name == raw).map(|p| {
-                        crate::session_state::ProjectBinding {
-                            project_id: p.id.to_string(),
-                            project_name: p.name,
-                            updated_at: chrono::Utc::now().to_rfc3339(),
-                            forced_until: None,
-                        }
-                    })
-                }),
+    //
+    // The UUID form is whatever the HOOK reads, so it comes from
+    // `env_project_binding` — the hook's own reader — rather than a fourth
+    // hand-rolled copy of the same parse (the reason `offline_project_outcome`
+    // already calls it). A non-empty value it declines is a name, which only
+    // this command can resolve.
+    let env_project = match crate::commands::stream::env_project_binding() {
+        Some(binding) => Some(binding),
+        None => match std::env::var("TRACEVAULT_PROJECT").ok() {
+            Some(raw) if !raw.trim().is_empty() => {
+                resolve_name_via_client(client, raw.trim()).await
             }
-        }
-        _ => None,
+            _ => None,
+        },
     };
     let inputs = ProjectResolveInputs {
         project_flag: None,
