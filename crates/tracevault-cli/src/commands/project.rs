@@ -256,7 +256,10 @@ async fn status(
     // unresolved) rather than failing the whole inspector.
     let effective = match resolve_client(project_root) {
         Ok(client) => {
-            let items = if project_flag_name.is_some() || config_default_name.is_some() {
+            let items = if project_flag_name.is_some()
+                || config_default_name.is_some()
+                || std::env::var("TRACEVAULT_PROJECT").is_ok()
+            {
                 client.list_projects().await.ok()
             } else {
                 None
@@ -289,9 +292,25 @@ async fn status(
                 }
             }
 
+            let env_project = match std::env::var("TRACEVAULT_PROJECT").ok() {
+                Some(raw) if !raw.trim().is_empty() => {
+                    let raw = raw.trim().to_string();
+                    match raw.parse::<uuid::Uuid>() {
+                        Ok(id) => Some(ProjectBinding {
+                            project_id: id.to_string(),
+                            project_name: String::new(),
+                            updated_at: String::new(),
+                        }),
+                        // A name: resolvable here because `status` already has a client.
+                        Err(_) => to_binding(&raw),
+                    }
+                }
+                _ => None,
+            };
+
             let inputs = ProjectResolveInputs {
                 project_flag,
-                env_project: None,
+                env_project,
                 session: &session,
                 worktree_path: Some(&worktree),
                 config_default,
@@ -429,6 +448,15 @@ mod tests {
         assert_eq!(
             format_status(Some((&b, ProjectSource::Deduced))),
             "project: deduced-id via repo deduction"
+        );
+    }
+
+    #[test]
+    fn format_status_env() {
+        let b = pb("payments");
+        assert_eq!(
+            format_status(Some((&b, ProjectSource::Env))),
+            "project: payments via TRACEVAULT_PROJECT (environment)"
         );
     }
 
