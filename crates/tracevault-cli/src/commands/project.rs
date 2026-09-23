@@ -5,9 +5,9 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::api_client::{resolve_client, ApiClient, ProjectListItem};
+use crate::api_client::{resolve_client, ApiClient, ProjectListItem, ResolveProjectOutcome};
 use crate::resolution::{
-    effective_project, git_remote_url, resolve_effective_project, ProjectResolveInputs,
+    capture_project_binding, capture_project_id, git_remote_url, CaptureProjectInputs,
     ProjectSource,
 };
 use crate::session_state::{self, ProjectBinding, SessionState};
@@ -36,7 +36,7 @@ pub enum ProjectCmd {
         #[arg(long)]
         session_id: Option<String>,
         /// One-off: resolve this project name and feed it in at the
-        /// `--project` precedence tier instead of the session/config
+        /// `--project` precedence tier, above the session and user-default
         /// bindings.
         #[arg(long)]
         project: Option<String>,
@@ -181,50 +181,116 @@ async fn switch(
     Ok(())
 }
 
-/// If `effective`'s source is `Deduced`, its binding carries an empty
-/// `project_name` (`resolve_effective_project` doesn't enrich it — see the
-/// comment there). When a projects list is already available in this scope
-/// (fetched for the `--project`/config-default lookups), use it to fill in
-/// the friendly name for display; otherwise leave it empty and
-/// `format_status` falls back to printing the id. Kept simple: this never
-/// triggers an extra API call just for cosmetic enrichment.
-fn enrich_deduced_name(
-    effective: Option<(ProjectBinding, ProjectSource)>,
-    items: Option<&[ProjectListItem]>,
+/// The project `project status` treats as effective: exactly the capture-time
+/// chain ingest uses ([`capture_project_binding`]: `--project` flag →
+/// subagent worktree override → session `active_project` → user default).
+/// Pure — `status` supplies `user_default` from `user_project_default::load()`,
+/// the same file `commands::stream::capture_project` reads, so the two cannot
+/// drift (pinned by `project_status_effective_project_matches_capture_project`).
+fn effective_capture_project(
+    project_flag: Option<ProjectBinding>,
+    session: &SessionState,
+    worktree: Option<&str>,
+    user_default: Option<ProjectBinding>,
 ) -> Option<(ProjectBinding, ProjectSource)> {
-    effective.map(|(mut binding, source)| {
-        if source == ProjectSource::Deduced && binding.project_name.is_empty() {
-            if let Some(items) = items {
-                if let Ok(id) = binding.project_id.parse::<uuid::Uuid>() {
-                    if let Some(matched) = items.iter().find(|p| p.id == id) {
-                        binding.project_name = matched.name.clone();
-                    }
-                }
-            }
-        }
-        (binding, source)
+    capture_project_binding(&CaptureProjectInputs {
+        project_flag,
+        session,
+        worktree_path: worktree,
+        user_default,
     })
 }
 
-/// Pure formatter for `project status`'s output: which project is
-/// attributed, and via which precedence tier. Mirrors
-/// `commands::repo::format_status`. A `Deduced` binding carries an empty
-/// `project_name` (resolution.rs doesn't enrich it), so this falls back to
-/// the id for display.
-fn format_status(effective: Option<(&ProjectBinding, ProjectSource)>) -> String {
-    match effective {
-        Some((b, source)) => {
-            let label = if b.project_name.is_empty() {
-                &b.project_id
-            } else {
-                &b.project_name
-            };
-            format!("project: {label} via {source}")
-        }
-        None => "no project bound".to_string(),
+/// Display label for a binding: the friendly name, falling back to the id.
+fn binding_label(b: &ProjectBinding) -> &str {
+    if b.project_name.is_empty() {
+        &b.project_id
+    } else {
+        &b.project_name
     }
 }
 
+/// Pure formatter for `project status`'s effective-project line: the project
+/// ingest attributes events to, and via which precedence tier. Mirrors
+/// `commands::repo::format_status`. `None` means ingest sends events
+/// repo-scoped and leaves attribution to the server.
+fn format_status(effective: Option<(&ProjectBinding, ProjectSource)>) -> String {
+    match effective {
+        Some((b, source)) => format!("project: {} via {source}", binding_label(b)),
+        None => "no project bound locally; events are sent repo-scoped and the server deduces the project from the repo".to_string(),
+    }
+}
+
+/// Warning for a capture binding whose stored `project_id` is not a UUID:
+/// ingest drops it (`capture_project_id` → `None`), so `status` reports the
+/// session as unbound. Same rule and wording as `commands::status`'s
+/// `project_binding_check`.
+fn invalid_capture_id_warning(binding: &ProjectBinding, source: ProjectSource) -> String {
+    format!(
+        "warning: project {} — {source}, but the saved project_id is not a valid id and is dropped at capture time; run `tracevault project switch <name>` to rewrite it",
+        binding_label(binding)
+    )
+}
+
+/// Warning for a `.tracevault/config.toml` `default_project`: it is a name,
+/// ingest never resolves it (that would be a per-event network call), so it
+/// never decides attribution. `status` neither resolves it nor feeds it into
+/// the chain.
+fn config_default_warning(name: &str) -> String {
+    format!(
+        "warning: .tracevault/config.toml default_project '{name}' is not used for attribution at capture time; bind explicitly with `tracevault project switch <name>` or --project"
+    )
+}
+
+/// The name of a deduced project id, if the projects list is already in
+/// scope (fetched for `--project`). Never triggers an API call of its own:
+/// the name is cosmetic, and the id is printed when it is unknown.
+fn deduced_project_name(pid: uuid::Uuid, items: Option<&[ProjectListItem]>) -> Option<&str> {
+    items?.iter().find(|p| p.id == pid).map(|p| p.name.as_str())
+}
+
+/// Pure formatter for the server-deduction line: what the server would deduce
+/// from this repo's git remote if no local binding were set. Shown separately
+/// from the effective project because ingest never deduces client-side — it
+/// only matters when nothing is bound locally. `resolved_name` is the name of
+/// a `Resolved` project when already known (see [`deduced_project_name`]);
+/// otherwise the id is printed.
+fn format_deduction(
+    effective_is_bound: bool,
+    outcome: Result<ResolveProjectOutcome, String>,
+    resolved_name: Option<&str>,
+) -> String {
+    const PREFIX: &str = "server deduction for this repo:";
+    match outcome {
+        Ok(ResolveProjectOutcome::Resolved(pid)) => {
+            let pid = pid.to_string();
+            let label = resolved_name.unwrap_or(&pid);
+            if effective_is_bound {
+                format!("{PREFIX} {label} (not used: the local binding above wins)")
+            } else {
+                format!("{PREFIX} {label} (this is where events will land)")
+            }
+        }
+        Ok(ResolveProjectOutcome::Ambiguous) => {
+            if effective_is_bound {
+                format!(
+                    "{PREFIX} ambiguous (multiple projects) — not used, the local binding above wins"
+                )
+            } else {
+                format!(
+                    "{PREFIX} ambiguous (multiple projects) — events will be refused until you run `tracevault project switch <name>` or pass --project"
+                )
+            }
+        }
+        Ok(ResolveProjectOutcome::None) => format!("{PREFIX} none"),
+        Err(msg) => format!("{PREFIX} unavailable ({msg})"),
+    }
+}
+
+/// `tracevault project status`: a read-only inspector that always returns
+/// `Ok(())`. The effective project is the capture-time chain (local, no
+/// network); the server's deduction from the git remote is shown on its own
+/// line, best-effort, as what would apply if nothing were bound locally.
 async fn status(
     session_id: Option<&str>,
     project_flag_name: Option<&str>,
@@ -249,87 +315,74 @@ async fn status(
     let user_default = crate::user_project_default::load();
     let git_url = git_remote_url(cwd);
 
-    // Resolving a project *name* (--project override, or the config-file
-    // default_project) into a binding needs the server; running the full
-    // rung 4/5 chain (deduction, user default) needs it too. Best-effort: no
-    // client degrades to the pure local rungs (flag/config_default stay
-    // unresolved) rather than failing the whole inspector.
-    let effective = match resolve_client(project_root) {
-        Ok(client) => {
-            let items = if project_flag_name.is_some() || config_default_name.is_some() {
-                client.list_projects().await.ok()
-            } else {
-                None
-            };
-            let to_binding = |name: &str| -> Option<ProjectBinding> {
-                let matched = items
-                    .as_ref()
-                    .and_then(|items| resolve_project_name(items, name).ok())?;
-                Some(ProjectBinding {
+    // The server is needed only to resolve a `--project` NAME and to show the
+    // deduction line; the effective project itself is computed locally.
+    let client = match resolve_client(project_root) {
+        Ok(client) => Some(client),
+        Err(e) => {
+            eprintln!("warning: could not resolve credentials ({e}); server deduction not shown");
+            None
+        }
+    };
+
+    let mut items: Option<Vec<ProjectListItem>> = None;
+    let project_flag = match (project_flag_name, client.as_ref()) {
+        (Some(name), Some(client)) => {
+            items = client.list_projects().await.ok();
+            let flag = items
+                .as_deref()
+                .and_then(|items| resolve_project_name(items, name).ok())
+                .map(|matched| ProjectBinding {
                     project_id: matched.id.to_string(),
                     project_name: matched.name.clone(),
                     updated_at: chrono::Utc::now().to_rfc3339(),
-                })
-            };
-
-            let project_flag = project_flag_name.and_then(to_binding);
-            if let Some(name) = project_flag_name {
-                if project_flag.is_none() {
-                    eprintln!(
-                        "warning: --project '{name}' could not be resolved; ignoring the override"
-                    );
-                }
+                });
+            if flag.is_none() {
+                eprintln!(
+                    "warning: --project '{name}' could not be resolved; ignoring the override"
+                );
             }
-            let config_default = config_default_name.as_deref().and_then(to_binding);
-            if let Some(name) = config_default_name.as_deref() {
-                if config_default.is_none() {
-                    eprintln!(
-                        "warning: configured default_project '{name}' could not be resolved; ignoring it"
-                    );
-                }
-            }
-
-            let inputs = ProjectResolveInputs {
-                project_flag,
-                session: &session,
-                worktree_path: Some(&worktree),
-                config_default,
-            };
-            // `status` is a read-only inspector: unlike the callers that need
-            // an authoritative binding to act on, an unresolvable rung here
-            // (notably the ambiguous/409 "belongs to multiple projects" case)
-            // is informational, not fatal — report it and exit 0 rather than
-            // propagating the error up through `run`/`main` as a hard
-            // failure. `resolve_effective_project` itself keeps returning
-            // `Err` unchanged; only this call site swallows it.
-            let resolved =
-                match resolve_effective_project(&inputs, user_default, git_url.as_deref(), &client)
-                    .await
-                {
-                    Ok(effective) => effective,
-                    Err(e) => {
-                        println!("project: unresolved — {e}");
-                        return Ok(());
-                    }
-                };
-            enrich_deduced_name(resolved, items.as_deref())
+            flag
         }
-        Err(e) => {
-            eprintln!("warning: could not resolve credentials ({e}); showing local status only");
-            let inputs = ProjectResolveInputs {
-                project_flag: None,
-                session: &session,
-                worktree_path: Some(&worktree),
-                config_default: None,
-            };
-            effective_project(&inputs)
+        (Some(name), None) => {
+            eprintln!(
+                "warning: --project '{name}' cannot be resolved without server credentials; ignoring the override"
+            );
+            None
         }
+        (None, _) => None,
     };
+
+    let effective =
+        match effective_capture_project(project_flag, &session, Some(&worktree), user_default) {
+            Some((binding, source)) if capture_project_id(&binding).is_none() => {
+                eprintln!("{}", invalid_capture_id_warning(&binding, source));
+                None
+            }
+            other => other,
+        };
+
+    if let Some(name) = config_default_name.as_deref() {
+        eprintln!("{}", config_default_warning(name));
+    }
 
     println!(
         "{}",
         format_status(effective.as_ref().map(|(b, s)| (b, *s)))
     );
+
+    if let (Some(client), Some(url)) = (client.as_ref(), git_url.as_deref()) {
+        // Best-effort and informational: an ambiguous or failed deduction is
+        // reported, never propagated — `status` exits 0 regardless.
+        let outcome = client.resolve_project(url).await.map_err(|e| e.to_string());
+        let name = match &outcome {
+            Ok(ResolveProjectOutcome::Resolved(pid)) => {
+                deduced_project_name(*pid, items.as_deref())
+            }
+            _ => None,
+        };
+        println!("{}", format_deduction(effective.is_some(), outcome, name));
+    }
     Ok(())
 }
 
@@ -395,8 +448,11 @@ mod tests {
     }
 
     #[test]
-    fn format_status_none() {
-        assert_eq!(format_status(None), "no project bound");
+    fn format_status_unbound() {
+        assert_eq!(
+            format_status(None),
+            "no project bound locally; events are sent repo-scoped and the server deduces the project from the repo"
+        );
     }
 
     #[test]
@@ -418,16 +474,115 @@ mod tests {
     }
 
     #[test]
-    fn format_status_deduced_falls_back_to_id_when_name_empty() {
+    fn format_status_falls_back_to_id_when_name_empty() {
+        // `Deduced` can no longer be the effective tier (the capture chain
+        // never deduces); a bound tier with an empty name still prints the id.
         let b = ProjectBinding {
-            project_id: "deduced-id".into(),
+            project_id: "some-id".into(),
             project_name: String::new(),
             updated_at: "".into(),
         };
         assert_eq!(
-            format_status(Some((&b, ProjectSource::Deduced))),
-            "project: deduced-id via repo deduction"
+            format_status(Some((&b, ProjectSource::UserDefault))),
+            "project: some-id via user default (project switch --user)"
         );
+    }
+
+    #[test]
+    fn invalid_capture_id_warning_names_tier_and_rewrite_command() {
+        let b = ProjectBinding {
+            project_id: "not-a-uuid".into(),
+            project_name: "payments".into(),
+            updated_at: "".into(),
+        };
+        assert_eq!(
+            invalid_capture_id_warning(&b, ProjectSource::UserDefault),
+            "warning: project payments — user default (project switch --user), but the saved project_id is not a valid id and is dropped at capture time; run `tracevault project switch <name>` to rewrite it"
+        );
+    }
+
+    #[test]
+    fn config_default_warning_says_it_is_not_used_at_capture_time() {
+        assert_eq!(
+            config_default_warning("web"),
+            "warning: .tracevault/config.toml default_project 'web' is not used for attribution at capture time; bind explicitly with `tracevault project switch <name>` or --project"
+        );
+    }
+
+    const DEDUCED: uuid::Uuid = uuid::Uuid::from_u128(2);
+
+    #[test]
+    fn format_deduction_resolved_bound() {
+        assert_eq!(
+            format_deduction(true, Ok(ResolveProjectOutcome::Resolved(DEDUCED)), None),
+            format!(
+                "server deduction for this repo: {DEDUCED} (not used: the local binding above wins)"
+            )
+        );
+    }
+
+    #[test]
+    fn format_deduction_resolved_unbound() {
+        assert_eq!(
+            format_deduction(false, Ok(ResolveProjectOutcome::Resolved(DEDUCED)), None),
+            format!("server deduction for this repo: {DEDUCED} (this is where events will land)")
+        );
+    }
+
+    #[test]
+    fn format_deduction_resolved_uses_name_when_known() {
+        let items = items();
+        let name = deduced_project_name(DEDUCED, Some(&items));
+        assert_eq!(name, Some("web"));
+        assert_eq!(
+            format_deduction(false, Ok(ResolveProjectOutcome::Resolved(DEDUCED)), name),
+            "server deduction for this repo: web (this is where events will land)"
+        );
+    }
+
+    #[test]
+    fn deduced_project_name_none_without_list_or_match() {
+        assert_eq!(deduced_project_name(DEDUCED, None), None);
+        assert_eq!(
+            deduced_project_name(uuid::Uuid::from_u128(999), Some(&items())),
+            None
+        );
+    }
+
+    #[test]
+    fn format_deduction_ambiguous_bound() {
+        assert_eq!(
+            format_deduction(true, Ok(ResolveProjectOutcome::Ambiguous), None),
+            "server deduction for this repo: ambiguous (multiple projects) — not used, the local binding above wins"
+        );
+    }
+
+    #[test]
+    fn format_deduction_ambiguous_unbound() {
+        assert_eq!(
+            format_deduction(false, Ok(ResolveProjectOutcome::Ambiguous), None),
+            "server deduction for this repo: ambiguous (multiple projects) — events will be refused until you run `tracevault project switch <name>` or pass --project"
+        );
+    }
+
+    #[test]
+    fn format_deduction_none() {
+        for bound in [true, false] {
+            assert_eq!(
+                format_deduction(bound, Ok(ResolveProjectOutcome::None), None),
+                "server deduction for this repo: none"
+            );
+        }
+    }
+
+    #[test]
+    fn format_deduction_err() {
+        for bound in [true, false] {
+            assert_eq!(
+                format_deduction(bound, Err("connection refused".into()), None),
+                "server deduction for this repo: unavailable (connection refused)"
+            );
+        }
     }
 
     #[test]
@@ -706,61 +861,110 @@ mod tests {
         ]
     }
 
-    fn deduced(id: uuid::Uuid) -> (ProjectBinding, ProjectSource) {
-        (
-            ProjectBinding {
-                project_id: id.to_string(),
-                project_name: String::new(),
-                updated_at: "".into(),
-            },
-            ProjectSource::Deduced,
-        )
+    /// VIS-316 pin: the project `project status` reports as effective is the
+    /// project ingest attributes events to. For each configuration, the id
+    /// `status` would treat as effective (its `effective_capture_project`
+    /// binding, dropped when the id is not a UUID — exactly what `status`
+    /// does) must equal `commands::stream::capture_project`. Both sides read
+    /// the user default through `user_project_default::load()`, from a
+    /// `user_project.toml` written under a temp config dir (`XDG_CONFIG_HOME`
+    /// on Linux, `HOME` for macOS's `dirs::config_dir()`), with the env lock
+    /// held for the whole test. Each case also asserts the expected id, so
+    /// the equality can't pass vacuously with both sides `None`.
+    #[tokio::test]
+    async fn project_status_effective_project_matches_capture_project() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
+
+        let u = uuid::Uuid::from_u128;
+        let bind = |id: String| ProjectBinding {
+            project_id: id,
+            project_name: "n".into(),
+            updated_at: "".into(),
+        };
+        let worktree = "/wt";
+        let subagent_session = {
+            let mut s = SessionState {
+                active_project: Some(bind(u(2).to_string())),
+                ..Default::default()
+            };
+            s.subagent_projects
+                .insert(worktree.into(), bind(u(1).to_string()));
+            s
+        };
+        let active_session = SessionState {
+            active_project: Some(bind(u(2).to_string())),
+            ..Default::default()
+        };
+        let bad_active_session = SessionState {
+            active_project: Some(bind("not-a-uuid".into())),
+            ..Default::default()
+        };
+
+        // (label, session, user default written to user_project.toml, expected id)
+        let cases: Vec<(&str, SessionState, Option<String>, Option<uuid::Uuid>)> = vec![
+            (
+                "(a) subagent override + session active + user default",
+                subagent_session,
+                Some(u(3).to_string()),
+                Some(u(1)),
+            ),
+            (
+                "(b) session active + user default",
+                active_session,
+                Some(u(3).to_string()),
+                Some(u(2)),
+            ),
+            (
+                "(c) user default only",
+                SessionState::default(),
+                Some(u(3).to_string()),
+                Some(u(3)),
+            ),
+            ("(d) nothing", SessionState::default(), None, None),
+            (
+                "(e) user default with a non-UUID project_id",
+                SessionState::default(),
+                Some("not-a-uuid".into()),
+                None,
+            ),
+            (
+                "(f) non-UUID session active shadows a valid user default",
+                bad_active_session,
+                Some(u(3).to_string()),
+                None,
+            ),
+        ];
+
+        for (label, session, user_default, expected) in cases {
+            match &user_default {
+                Some(id) => crate::user_project_default::save(&bind(id.clone())).unwrap(),
+                None => crate::user_project_default::clear().unwrap(),
+            }
+            let status_pid = effective_capture_project(
+                None,
+                &session,
+                Some(worktree),
+                crate::user_project_default::load(),
+            )
+            .and_then(|(b, _)| b.project_id.parse::<uuid::Uuid>().ok());
+            let ingest_pid = crate::commands::stream::capture_project(&session, Some(worktree));
+            assert_eq!(
+                status_pid, ingest_pid,
+                "{label}: status and ingest disagree"
+            );
+            assert_eq!(status_pid, expected, "{label}");
+        }
+        crate::user_project_default::clear().unwrap();
     }
 
-    #[test]
-    fn enrich_deduced_name_fills_in_name_when_id_found_in_list() {
-        let effective = Some(deduced(uuid::Uuid::from_u128(2)));
-        let (b, source) = enrich_deduced_name(effective, Some(&items())).unwrap();
-        assert_eq!(b.project_name, "web");
-        assert_eq!(source, ProjectSource::Deduced);
-    }
-
-    #[test]
-    fn enrich_deduced_name_leaves_empty_when_no_list_available() {
-        let effective = Some(deduced(uuid::Uuid::from_u128(2)));
-        let (b, _source) = enrich_deduced_name(effective, None).unwrap();
-        assert_eq!(b.project_name, "");
-    }
-
-    #[test]
-    fn enrich_deduced_name_leaves_empty_when_id_not_in_list() {
-        let effective = Some(deduced(uuid::Uuid::from_u128(999)));
-        let (b, _source) = enrich_deduced_name(effective, Some(&items())).unwrap();
-        assert_eq!(b.project_name, "");
-    }
-
-    #[test]
-    fn enrich_deduced_name_leaves_non_deduced_sources_untouched() {
-        // Only the Deduced source carries an empty name by design; other
-        // sources must pass through unchanged even if a list is available.
-        let b = pb("payments");
-        let effective = Some((b.clone(), ProjectSource::SessionActive));
-        let (out, source) = enrich_deduced_name(effective, Some(&items())).unwrap();
-        assert_eq!(out, b);
-        assert_eq!(source, ProjectSource::SessionActive);
-    }
-
-    #[test]
-    fn enrich_deduced_name_passes_through_none() {
-        assert!(enrich_deduced_name(None, Some(&items())).is_none());
-    }
-
-    /// F1: an ambiguous ("this repo belongs to multiple projects") deduction
-    /// result is a hard `Err` from `resolve_effective_project` — but `status`
-    /// is a read-only inspector, so it must swallow that into an
-    /// informational line and still exit `Ok`, not propagate the error up
-    /// through `run`/`main` as a fatal exit. Mocks the `/projects/resolve`
-    /// endpoint with a 409, mirroring resolution.rs's
+    /// F1: `status` is a read-only inspector — an ambiguous ("this repo
+    /// belongs to multiple projects") deduction is reported on the deduction
+    /// line, not propagated up through `run`/`main` as a fatal exit. Mocks
+    /// the `/projects/resolve` endpoint with a 409, mirroring resolution.rs's
     /// `ambiguous_deduction_errors_when_no_higher_rung`.
     #[tokio::test]
     async fn status_reports_ambiguous_deduction_as_informational_not_fatal() {
@@ -798,6 +1002,10 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("TRACEVAULT_SERVER_URL", &base);
         _guard.set("TRACEVAULT_API_KEY", "tok");
+        // No ambient user default: the effective project is unbound, so the
+        // ambiguous deduction is the one that would decide attribution — the
+        // case most tempting to treat as fatal.
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
 
         let result = status(None, None, tmp.path(), tmp.path()).await;
 

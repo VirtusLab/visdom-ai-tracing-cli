@@ -715,9 +715,9 @@ fn project_binding_check(outcome: &ProjectOutcome) -> Check {
 /// Surfaces a `.tracevault/config.toml` `default_project` NAME that failed
 /// to resolve to a real project (network failure, no matching name, or a
 /// case mismatch — names are matched case-sensitively). Without this, the
-/// tier is silently dropped: `commands::project`'s `status` warns for the
-/// same gap (project.rs:284-289) via a plain `eprintln!`, but `status` has
-/// no equivalent, so a stale/misspelled `default_project` is invisible here.
+/// tier is silently dropped and a stale/misspelled `default_project` is
+/// invisible here. (`commands::project`'s `status` never resolves the name at
+/// all; it warns that the tier is not used at capture time.)
 ///
 /// Always a `Warn`, and the wording says so explicitly: even a `default_project`
 /// that DOES resolve is a `ConfigDefault` tier `capture_project` excludes (see
@@ -1220,8 +1220,7 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
     let project_git_url = git_remote_url(cwd);
     // Set when a configured `default_project` NAME fails to resolve (network
     // error, or no matching/case-matching project) — surfaced below rather
-    // than silently dropped, mirroring `commands::project`'s `status`
-    // (project.rs:284-289). `None` in EITHER arm: the offline arm never
+    // than silently dropped. `None` in EITHER arm: the offline arm never
     // attempts resolution at all (no client to call `list_projects` with),
     // which is a different, already-visible gap (no credential -> an Error
     // from the Authentication section).
@@ -1232,7 +1231,7 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
         (Some(credential), Some(server_url)) => {
             let client = ApiClient::with_credential(server_url, Some(credential));
             // A configured default_project is a NAME; resolving it into a
-            // binding needs the project list, same as project.rs's status.
+            // binding needs the project list.
             let config_default = match config_default_name.as_deref() {
                 Some(name) => {
                     let resolved = client.list_projects().await.ok().and_then(|items| {
