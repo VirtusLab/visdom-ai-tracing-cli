@@ -290,6 +290,20 @@ async fn status(
                 format_status(effective.as_ref().map(|(b, s)| (b, *s)))
             );
             if let Some((b, _)) = &effective {
+                // The EFFECTIVE mode — the thing that actually decides the
+                // header — incorporates `TRACEVAULT_PROJECT_ATTRIBUTION` as
+                // well as `b`'s own `forced_until`. Reporting `format_force_
+                // line` alone would be silently wrong whenever the env var is
+                // set: it only looks at `b.forced_until`, so a session with
+                // `TRACEVAULT_PROJECT_ATTRIBUTION=explicit` set would show
+                // "attribution: derived" here while every hook in that shell
+                // actually sends `explicit`. Shown on its own line; the
+                // lapse detail (when there IS a persisted force on `b`)
+                // follows separately.
+                println!(
+                    "attribution mode: {}",
+                    crate::commands::stream::attribution_mode(Some(b))
+                );
                 println!("{}", format_force_line(b.forced_until.as_deref()));
             }
         }
@@ -545,6 +559,18 @@ mod tests {
         let line = format_force_line(Some(&past));
         assert!(line.contains("derived"), "got: {line}");
         assert!(!line.contains("forced by"), "got: {line}");
+    }
+
+    /// A `forced_until` that doesn't even parse as RFC3339 (a hand-edited or
+    /// corrupted `user_project.toml`/session-state file) must fail SAFE —
+    /// reported exactly like `None`, never as forced, and never a panic.
+    /// Pins the fail-safe direction against a future refactor to
+    /// `.expect(...)`; complements `commands::stream::attribution_mode`'s
+    /// equivalent test, since both are readers of this same field.
+    #[test]
+    fn status_names_unparseable_forced_until_as_derived() {
+        let line = format_force_line(Some("not-a-timestamp"));
+        assert_eq!(line, format_force_line(None));
     }
 
     fn pb(name: &str) -> ProjectBinding {
@@ -1065,5 +1091,41 @@ mod tests {
             .expect("TRACEVAULT_PROJECT (UUID form) must resolve even without a client");
         assert_eq!(source, ProjectSource::Env);
         assert_eq!(b.project_id, uuid);
+    }
+
+    /// VIS-305 Part C review, small finding 3: `project status` must report
+    /// the EFFECTIVE attribution mode, not just the winning binding's own
+    /// `forced_until`. `TRACEVAULT_PROJECT_ATTRIBUTION=explicit` drives
+    /// `explicit` on its own, with no persisted force anywhere — a status
+    /// line built from `format_force_line` alone would show "derived" here,
+    /// which is exactly the lie item 3 flags: every hook in this shell is
+    /// actually sending `explicit`.
+    #[tokio::test]
+    async fn status_reports_explicit_via_env_even_when_the_binding_itself_is_not_forced() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.remove("TRACEVAULT_SERVER_URL");
+        _guard.remove("TRACEVAULT_API_KEY");
+        let uuid = "44444444-4444-4444-8444-444444444444";
+        _guard.set("TRACEVAULT_PROJECT", uuid);
+        _guard.set("TRACEVAULT_PROJECT_ATTRIBUTION", "explicit");
+
+        let (b, _source) = resolve_status_effective(None, None, tmp.path(), tmp.path())
+            .await
+            .unwrap()
+            .expect("TRACEVAULT_PROJECT (UUID form) must resolve even without a client");
+        assert_eq!(
+            b.forced_until, None,
+            "the env-derived binding itself carries no persisted force"
+        );
+        assert_eq!(
+            crate::commands::stream::attribution_mode(Some(&b)),
+            "explicit",
+            "the EFFECTIVE mode must reflect TRACEVAULT_PROJECT_ATTRIBUTION even when \
+             the winning binding has no force of its own"
+        );
     }
 }
