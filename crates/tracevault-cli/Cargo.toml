@@ -36,6 +36,5 @@ dirs = "6"
 toml = "0.8"
 
 [dev-dependencies]
-temp-env = "0.3.6"
 tempfile = "3"
 tokio.workspace = true

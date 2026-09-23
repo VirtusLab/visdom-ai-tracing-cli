@@ -1515,6 +1515,10 @@ mod tests {
         assert_eq!(capture_project(&bad, None), None);
     }
 
+    /// `_env_lock` serializes this against other tests in the crate that
+    /// mutate `TRACEVAULT_PROJECT` (see `test_helpers::lock_env_mutation_sync`),
+    /// including any that call `commands::project::status`, which reads the
+    /// same var.
     #[test]
     fn env_project_binding_takes_a_uuid_and_ignores_a_name() {
         // A name would need a `list_projects` round trip, and this path runs
@@ -1522,21 +1526,21 @@ mod tests {
         // `config_default` here.
         let uuid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
 
-        temp_env::with_var("TRACEVAULT_PROJECT", Some(uuid), || {
-            let got = env_project_binding().expect("uuid form is honoured");
-            assert_eq!(got.project_id, uuid);
-        });
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
 
-        temp_env::with_var("TRACEVAULT_PROJECT", Some("my-project"), || {
-            assert!(
-                env_project_binding().is_none(),
-                "a name is ignored on the network-free capture path"
-            );
-        });
+        _guard.set("TRACEVAULT_PROJECT", uuid);
+        let got = env_project_binding().expect("uuid form is honoured");
+        assert_eq!(got.project_id, uuid);
 
-        temp_env::with_var("TRACEVAULT_PROJECT", None::<&str>, || {
-            assert!(env_project_binding().is_none());
-        });
+        _guard.set("TRACEVAULT_PROJECT", "my-project");
+        assert!(
+            env_project_binding().is_none(),
+            "a name is ignored on the network-free capture path"
+        );
+
+        _guard.remove("TRACEVAULT_PROJECT");
+        assert!(env_project_binding().is_none());
     }
 
     // ── send_stream_event: endpoint routing based on capture_pid ──────────────
