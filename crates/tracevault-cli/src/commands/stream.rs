@@ -264,6 +264,7 @@ pub(crate) fn env_project_binding() -> Option<crate::session_state::ProjectBindi
         project_id: parsed.to_string(),
         project_name: String::new(),
         updated_at: String::new(),
+        forced_until: None,
     })
 }
 
@@ -1490,6 +1491,7 @@ mod tests {
             project_id: id.into(),
             project_name: "n".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         let u = uuid::Uuid::from_u128;
         // session active only
@@ -1675,6 +1677,7 @@ mod tests {
                 project_id: pid.to_string(),
                 project_name: "proj".into(),
                 updated_at: "".into(),
+                forced_until: None,
             }),
             ..Default::default()
         };

@@ -334,6 +334,7 @@ pub async fn resolve_effective_project(
                         project_id: pid.to_string(),
                         project_name: String::new(), // enriched for display by the caller if needed
                         updated_at: String::new(),
+                        forced_until: None,
                     },
                     ProjectSource::Deduced,
                 )));
@@ -465,6 +466,7 @@ mod tests {
             project_id: "user".into(),
             project_name: "u".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         let inputs = ProjectResolveInputs {
             project_flag: None,
@@ -509,6 +511,7 @@ mod tests {
             project_id: "user".into(),
             project_name: "u".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         let inputs = ProjectResolveInputs {
             project_flag: None,
@@ -536,6 +539,7 @@ mod tests {
             project_id: "user".into(),
             project_name: "u".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         let inputs = ProjectResolveInputs {
             project_flag: None,
@@ -558,6 +562,7 @@ mod tests {
             project_id: "cfg".into(),
             project_name: "c".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         let inputs = ProjectResolveInputs {
             project_flag: None,
@@ -690,6 +695,7 @@ mod tests {
             project_id: n.into(),
             project_name: n.into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         let mut subagent_projects = HashMap::new();
         subagent_projects.insert("/wt".into(), pb("subagent"));
@@ -762,6 +768,7 @@ mod tests {
             project_id: n.into(),
             project_name: n.into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         let mut subagent_projects = HashMap::new();
         subagent_projects.insert("/wt".to_string(), pb("subagent"));

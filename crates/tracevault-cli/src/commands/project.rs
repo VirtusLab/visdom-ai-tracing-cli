@@ -128,6 +128,7 @@ async fn resolve_switch_project(
         project_id: project_id.to_string(),
         project_name,
         updated_at: chrono::Utc::now().to_rfc3339(),
+        forced_until: None,
     })
 }
 
@@ -300,6 +301,7 @@ async fn resolve_status_effective(
                     project_id: matched.id.to_string(),
                     project_name: matched.name.clone(),
                     updated_at: chrono::Utc::now().to_rfc3339(),
+                    forced_until: None,
                 })
             };
 
@@ -328,6 +330,7 @@ async fn resolve_status_effective(
                             project_id: id.to_string(),
                             project_name: String::new(),
                             updated_at: String::new(),
+                            forced_until: None,
                         }),
                         // A name: resolvable here because `status` already has a client.
                         Err(_) => to_binding(&raw),
@@ -360,6 +363,7 @@ async fn resolve_status_effective(
                     project_id: id.to_string(),
                     project_name: String::new(),
                     updated_at: String::new(),
+                    forced_until: None,
                 });
             let inputs = ProjectResolveInputs {
                 project_flag: None,
@@ -433,6 +437,7 @@ mod tests {
             project_id: format!("id-{name}"),
             project_name: name.into(),
             updated_at: "t".into(),
+            forced_until: None,
         }
     }
 
@@ -465,6 +470,7 @@ mod tests {
             project_id: "deduced-id".into(),
             project_name: String::new(),
             updated_at: "".into(),
+            forced_until: None,
         };
         assert_eq!(
             format_status(Some((&b, ProjectSource::Deduced))),
@@ -763,6 +769,7 @@ mod tests {
                 project_id: id.to_string(),
                 project_name: String::new(),
                 updated_at: "".into(),
+                forced_until: None,
             },
             ProjectSource::Deduced,
         )

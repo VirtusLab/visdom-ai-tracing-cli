@@ -27,6 +27,13 @@ pub struct ProjectBinding {
     pub project_id: String,
     pub project_name: String,
     pub updated_at: String,
+    /// RFC3339 instant after which the FORCE lapses (the binding itself
+    /// survives). Only ever set by `project switch --project-attribution
+    /// explicit`, which persists to disk and can therefore be forgotten.
+    /// Environment-provided force is exempt: it is re-asserted at every launch
+    /// by construction, so it cannot go stale and needs no expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced_until: Option<String>,
 }
 
 /// Session-level active binding plus per-worktree subagent overrides
@@ -219,6 +226,7 @@ mod tests {
             project_id: "11111111-1111-1111-1111-111111111111".into(),
             project_name: "payments".into(),
             updated_at: "t".into(),
+            forced_until: None,
         };
         let mut subagent_projects = HashMap::new();
         subagent_projects.insert("/wt".into(), pb.clone());

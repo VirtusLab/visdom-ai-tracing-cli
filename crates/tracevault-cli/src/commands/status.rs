@@ -851,6 +851,7 @@ async fn online_project_outcome(
                         project_id: p.id.to_string(),
                         project_name: p.name,
                         updated_at: chrono::Utc::now().to_rfc3339(),
+                        forced_until: None,
                     }
                 })
             });
@@ -871,6 +872,7 @@ async fn online_project_outcome(
                     project_id: id.to_string(),
                     project_name: String::new(),
                     updated_at: String::new(),
+                    forced_until: None,
                 }),
                 // A name: resolvable here because a client is in scope.
                 Err(_) => client.list_projects().await.ok().and_then(|items| {
@@ -879,6 +881,7 @@ async fn online_project_outcome(
                             project_id: p.id.to_string(),
                             project_name: p.name,
                             updated_at: chrono::Utc::now().to_rfc3339(),
+                            forced_until: None,
                         }
                     })
                 }),
@@ -2129,6 +2132,7 @@ mod tests {
             project_id: id.into(),
             project_name: name.into(),
             updated_at: "t".into(),
+            forced_until: None,
         }
     }
 
@@ -2461,6 +2465,7 @@ mod tests {
             project_id: uuid::Uuid::from_u128(7).to_string(),
             project_name: "p".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         crate::user_project_default::save(&pb).unwrap();
 
@@ -2581,6 +2586,7 @@ mod tests {
             project_id: uuid::Uuid::from_u128(9).to_string(),
             project_name: "My Project".into(),
             updated_at: "".into(),
+            forced_until: None,
         };
         crate::user_project_default::save(&pb).unwrap();
 
@@ -2690,6 +2696,7 @@ mod tests {
                 project_id: project_id.to_string(),
                 project_name: "linked".into(),
                 updated_at: "t".into(),
+                forced_until: None,
             },
         );
         let state = crate::session_state::SessionState {
