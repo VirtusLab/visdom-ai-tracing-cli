@@ -1476,9 +1476,20 @@ mod tests {
 
     // ── capture_project: local-only project resolver ──────────────────────────
 
-    #[test]
-    fn capture_project_precedence_local_only() {
+    /// Holds the env lock and points the config dir (`XDG_CONFIG_HOME` on
+    /// Linux, `HOME` for macOS's `dirs::config_dir()`) at a tempdir: the last
+    /// tier reads `user_project.toml` from there, so without isolation this
+    /// test fails on any machine with a real user default and races tests
+    /// that write one.
+    #[tokio::test]
+    async fn capture_project_precedence_local_only() {
         use crate::session_state::{ProjectBinding, SessionState};
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.set("HOME", tmp.path());
+
         let pb = |id: &str| ProjectBinding {
             project_id: id.into(),
             project_name: "n".into(),
@@ -1498,7 +1509,7 @@ mod tests {
         assert_eq!(capture_project(&s, Some("/wt")), Some(u(1)));
         // no worktree match -> session active
         assert_eq!(capture_project(&s, Some("/other")), Some(u(2)));
-        // empty session -> None (user-default file is not present in this unit test env)
+        // empty session, no user_project.toml in the isolated config dir -> None
         assert_eq!(capture_project(&SessionState::default(), None), None);
         // malformed stored id -> None (defensive)
         let bad = SessionState {
@@ -1506,6 +1517,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(capture_project(&bad, None), None);
+        // a valid user_project.toml in the isolated config dir is the last tier
+        let path = crate::user_project_default::default_project_path().unwrap();
+        assert!(path.starts_with(tmp.path()), "not isolated: {path:?}");
+        crate::user_project_default::save(&pb(&u(3).to_string())).unwrap();
+        assert_eq!(capture_project(&SessionState::default(), None), Some(u(3)));
     }
 
     // ── send_stream_event: endpoint routing based on capture_pid ──────────────
