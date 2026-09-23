@@ -691,6 +691,21 @@ fn project_label(binding: &crate::session_state::ProjectBinding) -> &str {
 /// `None` (nothing bound on this axis) is a `Skip` — severity for "nothing
 /// will be recorded" is [`recording_check`]'s job, since only it consults the
 /// actual recording gate.
+///
+/// DELIBERATE GAP — this reports WHICH project and WHICH tier, and whether
+/// ingest honours that tier. It does not report the attribution MODE
+/// (`derived`/`explicit`) or any persisted-force detail, and it is not meant
+/// to: `commands::project`'s `status` owns that, via the one function that
+/// decides the header (`commands::stream::attribution_mode`) plus
+/// `format_force_line`. Reproducing either here would mean a second surface
+/// that has to keep agreeing with the wire, and the whole shape of VIS-305's
+/// attribution reporting is that exactly one place answers "derived or
+/// explicit?" — the bugs this branch fixed were all second answers drifting
+/// from the first. The README says the same split rather than promising
+/// parity, the way `online_project_outcome`'s unresolvable-name case is
+/// documented as a gap instead of claimed as coverage. If the mode ever does
+/// belong in the full diagnostic, it must arrive by CALLING
+/// `attribution_mode` — never by re-deriving the verdict here.
 fn project_binding_check(outcome: &ProjectOutcome) -> Check {
     match outcome {
         Err(e) => Check::warn("Project", e.to_string()),

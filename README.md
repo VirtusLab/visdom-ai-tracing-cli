@@ -121,8 +121,11 @@ error naming the force as a possible cause and the event is **queued for retry, 
 re-attributed to some other project** — fix the grant (or drop the force) and the next
 drain delivers it.
 
-Use `tracevault project status` to see which tier won and which mode is in effect, and
-`tracevault status` for the same thing as part of the full diagnostic.
+Use `tracevault project status` to see which tier won, which mode is in effect, and — when
+the binding carries a persisted force — whether that force is still live. `tracevault
+status` answers a narrower question as part of the full diagnostic: whether the tier that
+won is one the capture path actually honours. It does not report the attribution mode or
+the force.
 
 ### `tracevault init` — set up tracing in a repo
 
