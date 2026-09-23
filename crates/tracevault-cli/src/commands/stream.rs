@@ -410,8 +410,22 @@ enum ClientErrorKind {
 /// The one-line warning printed when a project-scoped send falls back to
 /// repo deduction. Pure, so the wording is asserted directly rather than by
 /// capturing stderr.
-fn fallback_warning(pid: uuid::Uuid, kind: &ClientErrorKind) -> String {
-    match kind {
+///
+/// `mode` is the attribution mode this send actually declared — the same
+/// value [`attribution_mode`] put in the header. It matters because the
+/// force gate refuses with a 403: "not Operator on the project", or
+/// "`explicit` from a `tvk_` key". Without naming it, an operator who asked
+/// for `explicit` got a warning about realm roles, watched their events land
+/// under the repo's DEDUCED project, and was never told the force itself was
+/// what got refused. Failing closed on trust is right; failing closed
+/// silently is the defect.
+///
+/// The extra clause is attached to `Forbidden` ONLY. A `Scoping` 4xx
+/// (400/404/409) means the project id itself does not resolve — the force
+/// gate never ran — so blaming the force there would be a new wrong
+/// explanation of exactly the kind this fixes.
+fn fallback_warning(pid: uuid::Uuid, kind: &ClientErrorKind, mode: &str) -> String {
+    let base = match kind {
         // Since Keycloak, a 403 has a SECOND and now more common cause: the
         // account has no `tracing` realm role at all, in which case nothing this
         // hook does will work and `project switch` is confidently wrong advice —
@@ -429,7 +443,16 @@ fn fallback_warning(pid: uuid::Uuid, kind: &ClientErrorKind) -> String {
              or missing permission); attributing via repo deduction instead. Run `tracevault \
              project switch <name>` to update."
         ),
+    };
+    if mode == "explicit" && matches!(kind, ClientErrorKind::Forbidden) {
+        return format!(
+            "{base} This send declared `explicit` attribution, so the refusal may be of the \
+             FORCE itself: forcing needs `Operator` on that project AND a Control Plane \
+             identity (a `tvk_` API key can never force). These events are being attributed \
+             by repo deduction instead — not to the project you forced."
+        );
     }
+    base
 }
 
 fn deterministic_client_error_kind(e: &dyn std::error::Error) -> Option<ClientErrorKind> {
@@ -558,7 +581,7 @@ async fn send_stream_event(
                         // code path users hit most. The server's 403 envelope
                         // isn't distinguishable from here (see
                         // `ClientErrorKind`), so the wording names both.
-                        eprintln!("{}", fallback_warning(pid, &kind));
+                        eprintln!("{}", fallback_warning(pid, &kind, mode));
                         *warned = true;
                     }
                     // Repo-scoped fallback: the server deduces the project itself.
@@ -2210,9 +2233,25 @@ mod tests {
                     break;
                 };
                 let mut reader = BufReader::new(stream);
-                let mut request_line = String::new();
-                let _ = reader.read_line(&mut request_line);
-                let _ = tx.send(request_line);
+                let mut captured = String::new();
+                let _ = reader.read_line(&mut captured);
+                // Headers are retained too, appended after the request line
+                // so existing `starts_with`/`contains` assertions on the
+                // line itself are unaffected. Without them a test cannot
+                // assert which attribution mode a request actually DECLARED
+                // — see `a_refused_force_still_falls_back_to_repo_scoped_
+                // attribution`. Mirrors `test_helpers::read_request`.
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if header.trim_end().is_empty() {
+                        break;
+                    }
+                    captured.push_str(&header);
+                }
+                let _ = tx.send(captured);
                 let mut stream = reader.into_inner();
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
@@ -2279,6 +2318,84 @@ mod tests {
         assert!(
             second.starts_with("POST /api/v1/repos/11111111-1111-1111-1111-111111111111/stream "),
             "second request must fall back to the repo-scoped endpoint, got: {second}"
+        );
+    }
+
+    /// Finding 5's scenario end to end, on the repo-bound path: a live
+    /// persisted force makes this send declare `explicit`, the force gate
+    /// refuses it with a 403, and the event is silently re-sent to the
+    /// repo-scoped endpoint — where the server DEDUCES a project, which is
+    /// precisely not the one the operator forced. Pins the two facts the
+    /// warning's new clause depends on: that the declared mode really is
+    /// `explicit` (so `fallback_warning` is handed `"explicit"`, the same
+    /// value that went on the wire), and that the fallback happens anyway.
+    #[tokio::test]
+    async fn a_refused_force_still_falls_back_to_repo_scoped_attribution() {
+        let body_403 = "forbidden";
+        let resp_403 = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body_403.len(),
+            body_403
+        );
+        let resp_200 = ok_stream_response();
+
+        let (base, rx) = spawn_n_capturing_requests(vec![
+            Box::leak(resp_403.into_boxed_str()),
+            Box::leak(resp_200.into_boxed_str()),
+        ]);
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let req = sample_stream_event_request();
+        let pid = uuid::Uuid::from_u128(42);
+
+        // A live persisted force on the winning binding — no env var needed,
+        // so this test takes no env lock.
+        let forced = crate::session_state::ProjectBinding {
+            project_id: pid.to_string(),
+            project_name: "forced".into(),
+            updated_at: "".into(),
+            forced_until: Some((chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339()),
+        };
+
+        let mut warned = false;
+        let got = send_stream_event(
+            &client,
+            &Attribution::Repo {
+                repo_id: "11111111-1111-1111-1111-111111111111".into(),
+                project: Some(pid),
+            },
+            Some(&forced),
+            &req,
+            &mut warned,
+        )
+        .await
+        .expect("a refused force falls back to the repo-scoped endpoint and succeeds");
+        assert_eq!(
+            got.expect("a successful send returns a response").status,
+            "accepted"
+        );
+        assert!(warned, "the fallback must warn exactly once");
+
+        let first = rx
+            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
+            .expect("no first request captured");
+        assert!(
+            first.contains(&format!("/projects/{pid}/stream")),
+            "first request must hit the project-scoped endpoint, got: {first}"
+        );
+        assert!(
+            first
+                .to_lowercase()
+                .contains("x-tracevault-project-attribution: explicit"),
+            "the refused send must have DECLARED explicit — this is the mode \
+             `fallback_warning` is handed: {first}"
+        );
+
+        let second = rx
+            .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
+            .expect("no second (fallback) request captured");
+        assert!(
+            second.starts_with("POST /api/v1/repos/11111111-1111-1111-1111-111111111111/stream "),
+            "a refused force falls back to repo-DERIVED attribution, got: {second}"
         );
     }
 
@@ -2521,7 +2638,7 @@ mod tests {
     fn the_403_warning_names_the_realm_role_as_well_as_the_project() {
         let pid = uuid::Uuid::from_u128(7);
 
-        let forbidden = fallback_warning(pid, &ClientErrorKind::Forbidden);
+        let forbidden = fallback_warning(pid, &ClientErrorKind::Forbidden, "derived");
         assert!(
             forbidden.contains("`tracing` Keycloak realm role"),
             "must offer the missing-role explanation: {forbidden}"
@@ -2538,11 +2655,69 @@ mod tests {
 
         // A 400/404/409 genuinely IS a binding problem, so that wording stays
         // unhedged — hedging everything would dilute the useful case.
-        let scoping = fallback_warning(pid, &ClientErrorKind::Scoping);
+        let scoping = fallback_warning(pid, &ClientErrorKind::Scoping, "derived");
         assert!(scoping.contains("project switch"), "{scoping}");
         assert!(
             !scoping.contains("realm role"),
             "the scoping case must not mention the realm role: {scoping}"
+        );
+    }
+
+    /// VIS-305 whole-branch review, Important finding 5: a REFUSED FORCE
+    /// fell back silently. The `Attribution::Repo { project: Some(_) }` path
+    /// treats any deterministic 4xx — including the 403 the force gate
+    /// returns for "not Operator on the project" or "`explicit` from a
+    /// `tvk_` key" — as a reason to warn once and re-send to the repo-scoped
+    /// endpoint, which succeeds. The operator asked for `explicit`, got a
+    /// warning about realm roles, and their events landed under the repo's
+    /// DEDUCED project. Failing closed on trust is right; never saying the
+    /// force was refused is the defect.
+    #[test]
+    fn the_403_warning_says_the_force_was_refused_when_the_send_declared_explicit() {
+        let pid = uuid::Uuid::from_u128(7);
+
+        let explicit = fallback_warning(pid, &ClientErrorKind::Forbidden, "explicit");
+        assert!(
+            explicit.contains("FORCE"),
+            "the refusal of the force itself must be named: {explicit}"
+        );
+        assert!(
+            explicit.contains("Operator"),
+            "must name the grant forcing requires: {explicit}"
+        );
+        assert!(
+            explicit.contains("Control Plane"),
+            "must name the identity forcing requires: {explicit}"
+        );
+        assert!(
+            explicit.contains("repo deduction"),
+            "must say where the events actually went: {explicit}"
+        );
+
+        // Same 403, `derived` mode: no force was asked for, so none was
+        // refused and the clause must not appear. This is the discriminating
+        // half — without it the test would pass on a warning that blamed the
+        // force unconditionally, which is just a different wrong story.
+        let derived = fallback_warning(pid, &ClientErrorKind::Forbidden, "derived");
+        assert!(
+            !derived.contains("FORCE"),
+            "a `derived` send never forced anything: {derived}"
+        );
+    }
+
+    /// The force clause belongs to the 403 the force gate returns, and to
+    /// nothing else: a 400/404/409 means the project id does not resolve, so
+    /// the gate never ran. Blaming the force there would be a new wrong
+    /// explanation of the same family as the one finding 5 reports.
+    #[test]
+    fn an_explicit_scoping_failure_does_not_blame_the_force() {
+        let pid = uuid::Uuid::from_u128(7);
+        let scoping = fallback_warning(pid, &ClientErrorKind::Scoping, "explicit");
+        assert!(!scoping.contains("FORCE"), "{scoping}");
+        assert_eq!(
+            scoping,
+            fallback_warning(pid, &ClientErrorKind::Scoping, "derived"),
+            "the scoping wording does not depend on the mode"
         );
     }
 }
