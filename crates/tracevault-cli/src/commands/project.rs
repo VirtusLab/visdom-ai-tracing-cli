@@ -35,9 +35,10 @@ pub enum ProjectCmd {
         /// Session to target; defaults to $TRACEVAULT_SESSION_ID.
         #[arg(long)]
         session_id: Option<String>,
-        /// One-off: resolve this project name and feed it in at the
-        /// `--project` precedence tier, above the session and user-default
-        /// bindings.
+        /// What-if, display only: resolve this project name and feed it in at
+        /// the top of the precedence chain, above the session and user-default
+        /// bindings, to preview what `status` would report. It binds nothing;
+        /// use `project switch` to change what events are attributed to.
         #[arg(long)]
         project: Option<String>,
     },
@@ -248,7 +249,7 @@ fn invalid_capture_id_warning(binding: &ProjectBinding, source: ProjectSource) -
 /// the chain.
 fn config_default_warning(name: &str) -> String {
     format!(
-        "warning: .tracevault/config.toml default_project '{name}' is not used for attribution at capture time; bind explicitly with `tracevault project switch <name>` or --project"
+        "warning: .tracevault/config.toml default_project '{name}' is not used for attribution at capture time; bind explicitly with `tracevault project switch <name>`"
     )
 }
 
@@ -296,7 +297,7 @@ fn format_deduction(
                 )
             } else {
                 format!(
-                    "{PREFIX} ambiguous (multiple projects) — events will be refused until you run `tracevault project switch <name>` or pass --project"
+                    "{PREFIX} ambiguous (multiple projects) — if a repo is bound, events will be refused until you run `tracevault project switch <name>`"
                 )
             }
         }
@@ -595,7 +596,7 @@ mod tests {
     fn config_default_warning_says_it_is_not_used_at_capture_time() {
         assert_eq!(
             config_default_warning("web"),
-            "warning: .tracevault/config.toml default_project 'web' is not used for attribution at capture time; bind explicitly with `tracevault project switch <name>` or --project"
+            "warning: .tracevault/config.toml default_project 'web' is not used for attribution at capture time; bind explicitly with `tracevault project switch <name>`"
         );
     }
 
@@ -651,7 +652,7 @@ mod tests {
     fn format_deduction_ambiguous_unbound() {
         assert_eq!(
             format_deduction(false, Ok(ResolveProjectOutcome::Ambiguous), None),
-            "server deduction for this repo: ambiguous (multiple projects) — events will be refused until you run `tracevault project switch <name>` or pass --project"
+            "server deduction for this repo: ambiguous (multiple projects) — if a repo is bound, events will be refused until you run `tracevault project switch <name>`"
         );
     }
 
