@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.3](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.28.2...v0.28.3) - 2026-09-23
+
+### Added
+
+- *(project)* declared project attribution, client side (VIS-305) ([#54](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/54))
+
+### Fixed
+
+- *(cli)* project status matches ingest, and a refused project-scoped send is an error (VIS-316) ([#53](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/53))
+- *(cli)* warn when a repo-pinned server_url disagrees with the saved login ([#51](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/51))
+- *(init)* warn that Codex hooks do not fire until hook trust is granted ([#49](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/49))
+
 ## [0.28.2](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.28.1...v0.28.2) - 2026-08-20
 
 ### Fixed
