@@ -159,7 +159,7 @@ fn resolve_auth(config_server_url: Option<&str>, config_api_key: Option<&str>) -
             source,
             // An empty email means a login saved credentials before
             // `/auth/me` could resolve the identity (e.g. the account lacks
-            // the `tracing` role); there is nothing to compare against.
+            // a `tracevault` grant); there is nothing to compare against.
             email_from_creds: Some(c.email).filter(|e| !e.is_empty()),
             url_override_mismatch: url_override_mismatch.map(|env| (c.server_url, env)),
         };
@@ -278,8 +278,8 @@ async fn auth_checks(auth: &AuthContext, config_server_url: Option<&str>) -> Vec
         Err(GetMeError::Forbidden(_)) => {
             out.push(Check::err(
                 "Account authorized",
-                "the token is valid but this account lacks the `tracing` Keycloak realm role — \
-                 ask an administrator to grant `tracing` (or `tracing-admin`).",
+                "the token is valid but this account has no `tracevault` grant in Control Plane — \
+                 ask an administrator to grant it (or the `ai-tracing-admin` realm role).",
             ));
         }
         Err(GetMeError::Network(msg)) => {

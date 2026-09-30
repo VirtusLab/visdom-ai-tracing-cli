@@ -526,18 +526,18 @@ pub(crate) fn refused_error(
 ) -> String {
     let base = match kind {
         // Since Keycloak, a 403 has a SECOND and now more common cause: the
-        // account has no `tracing` realm role at all, in which case nothing this
+        // account has no `tracevault` grant in Control Plane, in which case nothing this
         // hook does will work and `project switch` is confidently wrong advice —
         // on the code path users hit most. The server's 403 envelope is not
         // distinguishable from here (see `ClientErrorKind`), so name both.
         ClientErrorKind::Forbidden => format!(
             "tracevault: error: the server refused to attribute this event to active project \
              {pid} (403). Either that project does not apply to this repo (not a member, or \
-             missing TracePush) — run `tracevault project switch <name>` (add `--user` if the \
-             binding is the machine-wide default in `user_project.toml`) — or this account lacks \
-             the `tracing` Keycloak realm role entirely, which an administrator must grant. The \
-             event was NOT re-attributed elsewhere; it has been queued and will be retried once \
-             the binding or the role is fixed."
+             no `Operator` role on it) — run `tracevault project switch <name>` (add `--user` if the \
+             binding is the machine-wide default in `user_project.toml`) — or this account has \
+             no `tracevault` grant in Control Plane at all, which an administrator must grant. \
+             The event was NOT re-attributed elsewhere; it has been queued and will be retried \
+             once the binding or the grant is fixed."
         ),
         ClientErrorKind::Scoping => format!(
             "tracevault: error: active project {pid} does not apply to this repo (not a member, \
@@ -601,8 +601,8 @@ pub(crate) fn deterministic_client_error_kind(
     // 401 is deliberately excluded: it's an authentication failure (bad/expired
     // token), not a project-scoping problem, and the buffer/retry path already
     // handles it correctly without a misleading project-scoping message. 403
-    // stays in: it can mean the token is valid but lacks TracePush on the bound
-    // project (or the account lacks the realm role entirely), and the refusal
+    // stays in: it can mean the token is valid but lacks `Operator` on the bound
+    // project (or the account has no `tracevault` grant at all), and the refusal
     // line can name both possible causes.
     if s.contains("(403 ") {
         return Some(ClientErrorKind::Forbidden);
@@ -639,7 +639,7 @@ pub(crate) fn deterministic_client_error_kind(
 /// explicitly declared (by binding or by `project switch`), so the server's
 /// refusal of it is an error, never re-derived elsewhere: a deterministic
 /// client error (the bound project doesn't apply to this repo: not a member,
-/// or the caller lacks `TracePush` on it) prints the refusal line to stderr
+/// or the caller lacks `Operator` on it) prints the refusal line to stderr
 /// and returns `Err(e)` with the original error, unchanged, so the caller's
 /// existing buffer/retry logic queues it in the REPO's pending file
 /// (`pending-<repo_id>.jsonl`, see [`Attribution::pending_file_name`]); the
@@ -691,7 +691,7 @@ async fn send_stream_event(
         // and a growing queue only hides it.
         //
         // `Forbidden` (403) is deliberately NOT dropped. It can mean the
-        // account lacks the realm role entirely, which an administrator can
+        // account has no `tracevault` grant at all, which an administrator can
         // grant — after which the buffered events do deliver. Same for any
         // transient error. Both propagate so the caller queues them.
         Attribution::ProjectOnly { project_id } => {
@@ -729,7 +729,7 @@ async fn send_stream_event(
                 (Err(e), Some(kind)) => {
                     if !*warned {
                         // Since Keycloak, a 403 has a SECOND and now more common
-                        // cause: the account has no `tracing` realm role at all,
+                        // cause: the account has no `tracevault` grant at all,
                         // in which case nothing this hook does will work and
                         // `project switch` is confidently wrong advice — on the
                         // code path users hit most. The server's 403 envelope
@@ -2787,7 +2787,7 @@ mod tests {
         );
     }
 
-    /// A 403 is NOT dropped. It can mean the account lacks the realm role,
+    /// A 403 is NOT dropped. It can mean the account has no `tracevault` grant,
     /// which an administrator can grant — after which the buffered events do
     /// deliver. It must propagate so the caller queues them.
     #[tokio::test]
@@ -2880,7 +2880,7 @@ mod tests {
     }
 
     /// A 403 must be classified apart from the binding/scoping statuses: since
-    /// Keycloak it has a second, now more common cause (no `tracing` realm role
+    /// Keycloak it has a second, now more common cause (no `tracevault` grant
     /// at all) whose advice is completely different.
     #[test]
     fn a_403_is_classified_apart_from_the_scoping_statuses() {
@@ -2915,7 +2915,7 @@ mod tests {
         }
     }
 
-    /// The 403 error must not tell a user whose account has no `tracing` role
+    /// The 403 error must not tell a user whose account has no `tracevault` grant
     /// to switch projects, which cannot possibly help. It names both causes,
     /// and — since the CLI no longer re-attributes to another project — must
     /// never claim it did.
@@ -2930,11 +2930,11 @@ mod tests {
         );
         assert!(forbidden.contains("403"), "{forbidden}");
         assert!(
-            forbidden.contains("realm role"),
+            forbidden.contains("no `tracevault` grant in Control Plane"),
             "must offer the missing-role explanation: {forbidden}"
         );
         assert!(
-            forbidden.contains("TracePush"),
+            forbidden.contains("no `Operator` role on it"),
             "must still offer the project explanation: {forbidden}"
         );
         assert!(
@@ -2948,8 +2948,8 @@ mod tests {
         let scoping = refused_error(pid, &ClientErrorKind::Scoping, AttributionForce::default());
         assert!(scoping.contains("project switch"), "{scoping}");
         assert!(
-            !scoping.contains("realm role"),
-            "the scoping case must not mention the realm role: {scoping}"
+            !scoping.contains("`tracevault` grant"),
+            "the scoping case must not mention the `tracevault` grant: {scoping}"
         );
 
         for s in [&forbidden, &scoping] {
@@ -3009,7 +3009,8 @@ mod tests {
         // membership causes it already names must survive alongside the
         // force clause.
         assert!(
-            explicit.contains("realm role") && explicit.contains("TracePush"),
+            explicit.contains("`tracevault` grant")
+                && explicit.contains("no `Operator` role on it"),
             "the membership causes must still be named: {explicit}"
         );
         // The event is queued, not re-attributed — the force clause must not

@@ -210,8 +210,8 @@ pub struct MeResponse {
     pub user_id: uuid::Uuid,
     pub email: String,
     pub name: Option<String>,
-    /// The role the server derived for this caller (from the `tracing` /
-    /// `tracing-admin` realm roles for a Keycloak bearer). Optional so this
+    /// The role the server derived for this caller (from Keycloak realm
+    /// roles or Control Plane grants for a Keycloak bearer). Optional so this
     /// CLI keeps parsing a server that predates the field.
     #[serde(default)]
     pub role: Option<String>,
@@ -222,7 +222,7 @@ pub enum GetMeError {
     /// 401 — token is missing or invalid.
     Unauthorized,
     /// 403 — the token is valid but the account is not authorized (for a
-    /// Keycloak bearer: it lacks the `tracing` realm role). Distinct from
+    /// Keycloak bearer: it has no `tracevault` grant in Control Plane). Distinct from
     /// `Unauthorized` because the fix is "an admin grants a role", not
     /// "log in again".
     Forbidden(String),
