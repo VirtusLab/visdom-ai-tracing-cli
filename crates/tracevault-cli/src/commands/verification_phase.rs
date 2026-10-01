@@ -101,9 +101,9 @@ pub async fn open_verification_phase(
                 ));
             }
             _ => {
-                let session_dir = find_latest_session(&sessions_dir).ok_or(
-                    "No active session found. Start a session by running an AI coding agent \
-                     first, or pass --session-id to target a specific session.",
+                let session_dir = find_latest_session(&sessions_dir, &worktree_top).ok_or(
+                    "No active session found for this worktree. Start a session by running an \
+                     AI coding agent here first, or pass --session-id to target a specific session.",
                 )?;
                 let chosen = session_dir
                     .file_name()
@@ -227,11 +227,16 @@ fn invoking_session(
 }
 
 /// Return the most recently modified session directory under `sessions_dir`.
-fn find_latest_session(sessions_dir: &Path) -> Option<PathBuf> {
+///
+/// Sessions whose `origin` marker names another worktree are skipped: this is
+/// the fallback for legacy, unmarked sessions, and picking another worktree's
+/// session would open the window under that worktree's repo binding.
+fn find_latest_session(sessions_dir: &Path, worktree_top: &str) -> Option<PathBuf> {
     let entries = fs::read_dir(sessions_dir).ok()?;
     entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
+        .filter(|e| origin_match(&e.path(), worktree_top) != OriginMatch::Mismatch)
         .max_by_key(|e| {
             e.metadata()
                 .and_then(|m| m.modified())
@@ -433,8 +438,28 @@ mod tests {
         assert!(matched.is_empty(), "no markers means no matches");
 
         // Fallback must still find a session.
-        let latest = find_latest_session(&sessions);
+        let latest = find_latest_session(&sessions, "/any/worktree");
         assert!(latest.is_some(), "fallback must find a session");
+    }
+
+    /// The fallback is for legacy, unmarked sessions only: it must never pick
+    /// a session marked as another worktree's — e.g. the invoking session that
+    /// `invoking_session` just rejected for that reason — because its repo
+    /// binding (and subagent override) belong to that other worktree.
+    #[test]
+    fn fallback_never_picks_another_worktrees_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        make_session_dir(&sessions, "sess-legacy", None);
+        // Created last, so it is the most recently modified.
+        make_session_dir(&sessions, "sess-elsewhere", Some("/wt/b"));
+
+        let latest = find_latest_session(&sessions, "/wt/a").unwrap();
+        assert!(latest.ends_with("sess-legacy"), "{}", latest.display());
+
+        let only_elsewhere = tmp.path().join("only-elsewhere");
+        make_session_dir(&only_elsewhere, "sess-elsewhere", Some("/wt/b"));
+        assert_eq!(find_latest_session(&only_elsewhere, "/wt/a"), None);
     }
 
     /// Verify that `paths::worktree_toplevel(sibling_wt)` returns the sibling

@@ -445,8 +445,11 @@ async fn resolve_pushed_repo(
 /// The session is still checked under the pushed repo — enforcement fails
 /// closed — but the server looks verification-phase data up by exact repo
 /// id, so that session's window and tool stats will not be found there.
+///
+/// Names the repos, not the session: the session id is not needed to act on
+/// it (the fix is a `repo switch` in whichever session is bound elsewhere),
+/// and CodeQL treats session ids as sensitive in log output.
 fn streamed_elsewhere_warning(
-    session_id: &str,
     streamed_to: Option<&crate::session_state::RepoBinding>,
     pushed: &PushedRepo,
 ) -> Option<String> {
@@ -460,7 +463,7 @@ fn streamed_elsewhere_warning(
         _ => "a different repo",
     };
     Some(format!(
-        "Warning: session {session_id} streamed its events to {scope} ({}), not to the repo \
+        "Warning: an unpushed session streamed its events to {scope} ({}), not to the repo \
          this push is checked under ({}). Its verification-phase data will not be found; \
          run `tracevault repo switch <this checkout>` in that session.",
         b.repo_id, pushed.id
@@ -559,9 +562,7 @@ pub async fn check_policies(
                 bound.clone(),
                 user_default.clone(),
             );
-            if let Some(w) =
-                streamed_elsewhere_warning(&data.session_id, streamed_to.as_ref(), &repo)
-            {
+            if let Some(w) = streamed_elsewhere_warning(streamed_to.as_ref(), &repo) {
                 eprintln!("{w}");
             }
             sessions.push(data);
@@ -1346,10 +1347,10 @@ mod pushed_repo_tests {
             remote_id: Some(CODEBASE),
         };
         assert_eq!(
-            streamed_elsewhere_warning("s", Some(&binding(PUSHED, None)), &pushed),
+            streamed_elsewhere_warning(Some(&binding(PUSHED, None)), &pushed),
             None
         );
-        assert_eq!(streamed_elsewhere_warning("s", None, &pushed), None);
+        assert_eq!(streamed_elsewhere_warning(None, &pushed), None);
     }
 
     #[test]
@@ -1358,16 +1359,14 @@ mod pushed_repo_tests {
             id: PUSHED,
             remote_id: Some(CODEBASE),
         };
-        let same = streamed_elsewhere_warning("s1", Some(&binding(OTHER, Some(CODEBASE))), &pushed)
-            .unwrap();
+        let same =
+            streamed_elsewhere_warning(Some(&binding(OTHER, Some(CODEBASE))), &pushed).unwrap();
         assert!(same.contains("another repo of this codebase"), "{same}");
         assert!(same.contains(&OTHER.to_string()) && same.contains(&PUSHED.to_string()));
-        let far =
-            streamed_elsewhere_warning("s1", Some(&binding(OTHER, Some(OTHER_CODEBASE))), &pushed)
-                .unwrap();
+        let far = streamed_elsewhere_warning(Some(&binding(OTHER, Some(OTHER_CODEBASE))), &pushed)
+            .unwrap();
         assert!(far.contains("a different codebase"), "{far}");
-        let unknown =
-            streamed_elsewhere_warning("s1", Some(&binding(OTHER, None)), &pushed).unwrap();
+        let unknown = streamed_elsewhere_warning(Some(&binding(OTHER, None)), &pushed).unwrap();
         assert!(unknown.contains("a different repo"), "{unknown}");
     }
 
