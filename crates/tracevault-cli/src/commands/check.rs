@@ -361,13 +361,96 @@ pub fn select_worktree_sessions(
     }
 }
 
+/// The server repo a push is checked under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PushedRepo {
+    id: uuid::Uuid,
+    /// The codebase it belongs to, when resolved through the origin remote.
+    remote_id: Option<uuid::Uuid>,
+}
+
+/// Resolve the repo being pushed — the policy authority for this push.
+///
+/// First through the checkout's origin remote, exactly as
+/// `tracevault repo switch <path>` binds a session (VIS-601): a session bound
+/// to this checkout then streams to the very repo it is checked under, so the
+/// server finds its verification window and tool stats. Then, for a checkout
+/// whose remote the server does not know (or that has none), by the primary
+/// checkout's directory name — the only resolution `check` had before.
+///
+/// Never the sessions' own bindings: a `repo switch` to another repo, or a
+/// machine-wide user default, must not decide which repo's policies a push
+/// to THIS checkout is held to.
+async fn resolve_pushed_repo(
+    client: &ApiClient,
+    project_root: &Path,
+) -> Result<PushedRepo, Box<dyn std::error::Error>> {
+    match crate::resolution::resolve_path_to_binding(project_root, client).await {
+        Ok(Some(b)) => {
+            if let Ok(id) = b.repo_id.parse() {
+                return Ok(PushedRepo {
+                    id,
+                    remote_id: b.remote_id,
+                });
+            }
+        }
+        Ok(None) => {}
+        Err(e) => return Err(connectivity_message(&e.to_string()).into()),
+    }
+    match resolve_repo_by_name(client, project_root).await {
+        Ok(r) => Ok(PushedRepo {
+            id: r.id,
+            remote_id: None,
+        }),
+        Err(ResolveRepoByNameError::ListFailed(e)) => {
+            Err(connectivity_message(&e.to_string()).into())
+        }
+        Err(ResolveRepoByNameError::NotFound { repo_name }) => Err(format!(
+            "Repo '{repo_name}' not found on server. Run `tracevault sync` first."
+        )
+        .into()),
+    }
+}
+
+/// A warning for a session whose events went to a different repo than the
+/// one this push is checked under, or `None` when they agree (or the session
+/// has no repo binding at all).
+///
+/// The session is still checked under the pushed repo — enforcement fails
+/// closed — but the server looks verification-phase data up by exact repo
+/// id, so that session's window and tool stats will not be found there.
+///
+/// Names the repos, not the session: the session id is not needed to act on
+/// it (the fix is a `repo switch` in whichever session is bound elsewhere),
+/// and CodeQL treats session ids as sensitive in log output.
+fn streamed_elsewhere_warning(
+    streamed_to: Option<&crate::session_state::RepoBinding>,
+    pushed: &PushedRepo,
+) -> Option<String> {
+    let b = streamed_to?;
+    if b.repo_id == pushed.id.to_string() {
+        return None;
+    }
+    let scope = match (b.remote_id, pushed.remote_id) {
+        (Some(a), Some(p)) if a == p => "another repo of this codebase",
+        (Some(_), Some(_)) => "a different codebase",
+        _ => "a different repo",
+    };
+    Some(format!(
+        "Warning: an unpushed session streamed its events to {scope} ({}), not to the repo \
+         this push is checked under ({}). Its verification-phase data will not be found; \
+         run `tracevault repo switch <this checkout>` in that session.",
+        b.repo_id, pushed.id
+    ))
+}
+
 /// Check unpushed sessions against server policies.
 ///
 /// `project_root` — the git-resolved PRIMARY worktree root (from
 ///   `paths::resolve_project_root`). Used to load config/credentials, locate
-///   `.tracevault/sessions/`, and resolve the server-registered repo name
-///   (the primary checkout's basename; a sibling worktree's own directory
-///   basename would not match the registered repo).
+///   `.tracevault/sessions/`, and resolve the server-registered repo (by its
+///   origin remote, else by the primary checkout's basename; a sibling
+///   worktree's own directory basename would not match the registered repo).
 /// `cwd` — the ACTUAL working directory where the CLI was invoked. Used for
 ///   git *state* (`HEAD`) so the reported `commit_sha` is the commit being
 ///   pushed from the invoking worktree, not the primary's unrelated HEAD.
@@ -389,7 +472,7 @@ pub async fn check_policies(
 
     let client = ApiClient::with_credential(&server_url, credential);
 
-    // Resolve repo_id by name.
+    // Resolve the pushed repo.
     //
     // Connectivity errors here (auth expired, server down, network
     // unreachable) propagate so the pre-push hook exits non-zero — if a
@@ -398,18 +481,7 @@ pub async fn check_policies(
     // point of enforcement. We attach an actionable next step to each
     // error so the user (or agent) knows the recovery command without
     // guessing — see `connectivity_message` below.
-    let repo = match resolve_repo_by_name(&client, project_root).await {
-        Ok(r) => r,
-        Err(ResolveRepoByNameError::ListFailed(e)) => {
-            return Err(connectivity_message(&e.to_string()).into());
-        }
-        Err(ResolveRepoByNameError::NotFound { repo_name }) => {
-            return Err(format!(
-                "Repo '{repo_name}' not found on server. Run `tracevault sync` first."
-            )
-            .into());
-        }
-    };
+    let repo = resolve_pushed_repo(&client, project_root).await?;
 
     // Collect unpushed session dirs from the shared primary .tracevault/.
     let sessions_dir = project_root.join(".tracevault").join("sessions");
@@ -439,9 +511,34 @@ pub async fn check_policies(
         );
     }
 
+    // Where each session's events actually went, resolved as the stream hook
+    // resolves it — only to warn when that is not the pushed repo. A
+    // malformed config.toml costs the bound tier here, nothing more: the
+    // check never needed the config before.
+    let bound = match crate::config::TracevaultConfig::try_load(project_root) {
+        Ok(cfg) => cfg
+            .as_ref()
+            .and_then(crate::resolution::binding_from_config),
+        Err(e) => {
+            eprintln!("Warning: ignoring malformed .tracevault/config.toml: {e}");
+            None
+        }
+    };
+    let user_default = crate::user_default::load();
+
     let mut sessions = Vec::new();
     for session_dir in &selected_dirs {
         if let Some(data) = collect_session_data(session_dir) {
+            let state = crate::session_state::load(&data.session_id);
+            let streamed_to = crate::resolution::recorded_session_binding(
+                session_dir,
+                &state,
+                bound.clone(),
+                user_default.clone(),
+            );
+            if let Some(w) = streamed_elsewhere_warning(streamed_to.as_ref(), &repo) {
+                eprintln!("{w}");
+            }
             sessions.push(data);
         }
     }
@@ -1290,5 +1387,282 @@ mod read_with_timeout_tests {
             "must return promptly on timeout, not block on the stalled closure; took {:?}",
             start.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod pushed_repo_tests {
+    use super::{streamed_elsewhere_warning, PushedRepo};
+    use crate::session_state::RepoBinding;
+
+    /// The repo the checkout's origin remote resolves to.
+    const PUSHED: uuid::Uuid = uuid::uuid!("44000761-0000-4000-8000-000000000001");
+    /// The repo registered under the checkout's directory name.
+    const BY_NAME: uuid::Uuid = uuid::uuid!("7995d35d-0000-4000-8000-000000000002");
+    /// Some other repo a session could be bound to.
+    const OTHER: uuid::Uuid = uuid::uuid!("aaaaaaaa-0000-4000-8000-000000000003");
+    const CODEBASE: uuid::Uuid = uuid::uuid!("cccccccc-0000-4000-8000-000000000004");
+    const OTHER_CODEBASE: uuid::Uuid = uuid::uuid!("dddddddd-0000-4000-8000-000000000005");
+    const PASS: &str = r#"{"passed":true,"results":[],"blocked":false}"#;
+
+    fn binding(repo: uuid::Uuid, remote: Option<uuid::Uuid>) -> RepoBinding {
+        RepoBinding {
+            repo_id: repo.to_string(),
+            git_url: None,
+            remote_id: remote,
+            codebase_name: None,
+            updated_at: "t".into(),
+        }
+    }
+
+    // ── streamed_elsewhere_warning ───────────────────────────────────────────
+
+    #[test]
+    fn no_warning_when_the_session_streamed_to_the_pushed_repo_or_is_unbound() {
+        let pushed = PushedRepo {
+            id: PUSHED,
+            remote_id: Some(CODEBASE),
+        };
+        assert_eq!(
+            streamed_elsewhere_warning(Some(&binding(PUSHED, None)), &pushed),
+            None
+        );
+        assert_eq!(streamed_elsewhere_warning(None, &pushed), None);
+    }
+
+    #[test]
+    fn warning_names_both_repos_and_how_far_apart_they_are() {
+        let pushed = PushedRepo {
+            id: PUSHED,
+            remote_id: Some(CODEBASE),
+        };
+        let same =
+            streamed_elsewhere_warning(Some(&binding(OTHER, Some(CODEBASE))), &pushed).unwrap();
+        assert!(same.contains("another repo of this codebase"), "{same}");
+        assert!(same.contains(&OTHER.to_string()) && same.contains(&PUSHED.to_string()));
+        let far = streamed_elsewhere_warning(Some(&binding(OTHER, Some(OTHER_CODEBASE))), &pushed)
+            .unwrap();
+        assert!(far.contains("a different codebase"), "{far}");
+        let unknown = streamed_elsewhere_warning(Some(&binding(OTHER, None)), &pushed).unwrap();
+        assert!(unknown.contains("a different repo"), "{unknown}");
+    }
+
+    // ── check_policies end to end against a one-shot server ──────────────────
+
+    /// Isolated config/state homes and a saved login for a server answering
+    /// `responses` in order; a primary checkout named `tracing` (with an
+    /// origin remote when `remote` is set) holding the given sessions, all
+    /// marked as this worktree's.
+    struct Fixture {
+        _guard: crate::test_helpers::EnvVarGuard,
+        _home: tempfile::TempDir,
+        _tmp: tempfile::TempDir,
+        repo: std::path::PathBuf,
+        rx: std::sync::mpsc::Receiver<String>,
+    }
+
+    fn fixture(remote: bool, sessions: &[&str], responses: Vec<String>) -> Fixture {
+        let home = tempfile::tempdir().unwrap();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("XDG_CONFIG_HOME", home.path());
+        guard.set("XDG_STATE_HOME", home.path());
+        guard.remove("TRACEVAULT_API_KEY");
+        guard.remove("TRACEVAULT_SERVER_URL");
+        let (server, rx) = crate::test_helpers::spawn_seq(responses);
+        let creds_dir = home.path().join("tracevault");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(
+            creds_dir.join("credentials.json"),
+            format!(
+                r#"{{"server_url":"{server}","email":"a@b.com","auth":{{
+                "issuer":"https://idp.example.com/realms/v","client_id":"tracing-cli",
+                "refresh_token":"rt","access_token":"at","access_expires_at":9999999999}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("tracing");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::test_helpers::init_git_repo(&repo);
+        if remote {
+            let ok = std::process::Command::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/example/visdom-tracing.git",
+                ])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git remote add failed");
+        }
+        let top = crate::paths::worktree_toplevel(&repo);
+        for id in sessions {
+            let dir = repo.join(".tracevault").join("sessions").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("origin"), &top).unwrap();
+        }
+        Fixture {
+            _guard: guard,
+            _home: home,
+            _tmp: tmp,
+            repo,
+            rx,
+        }
+    }
+
+    fn bind_with_repo_switch(session_id: &str, repo_id: uuid::Uuid) {
+        let state = crate::session_state::SessionState {
+            active: Some(binding(repo_id, None)),
+            ..Default::default()
+        };
+        crate::session_state::save(session_id, &state).unwrap();
+    }
+
+    /// The origin remote resolves to codebase `CODEBASE`, whose only repo is
+    /// `PUSHED` — what `repo switch <checkout>` binds a session to.
+    fn remote_resolves_to_pushed() -> Vec<String> {
+        vec![
+            crate::test_helpers::http_json(
+                "200 OK",
+                &format!(
+                    r#"{{"remote_id":"{CODEBASE}","name":"visdom-tracing","normalized_url":"github.com/example/visdom-tracing","clone_status":"ready"}}"#
+                ),
+            ),
+            crate::test_helpers::http_json(
+                "200 OK",
+                &format!(
+                    r#"{{"name":"visdom-tracing","normalized_url":"github.com/example/visdom-tracing","clone_status":"ready","repos":[{{"id":"{PUSHED}","name":"visdom-tracing"}}]}}"#
+                ),
+            ),
+        ]
+    }
+
+    fn repos_listing() -> String {
+        crate::test_helpers::http_json(
+            "200 OK",
+            &format!(r#"[{{"id":"{BY_NAME}","name":"tracing"}}]"#),
+        )
+    }
+
+    fn pass() -> String {
+        crate::test_helpers::http_json("200 OK", PASS)
+    }
+
+    fn recv(f: &Fixture) -> String {
+        f.rx.recv_timeout(crate::test_helpers::RECV_TIMEOUT)
+            .expect("expected another request")
+    }
+
+    fn assert_checked_under(request: &str, repo: uuid::Uuid) {
+        assert!(
+            request.starts_with(&format!("POST /api/v1/repos/{repo}/policies/check")),
+            "expected the check under {repo}: {request}"
+        );
+    }
+
+    /// VIS-601 (first hit on VIS-536's PR): a session bound with
+    /// `repo switch <checkout>` streamed to the repo the checkout's remote
+    /// resolves to, but was checked under the repo found by directory name.
+    /// The push is now checked under the remote-resolved repo, where that
+    /// session's data lives.
+    #[tokio::test]
+    async fn a_push_is_checked_under_the_repo_its_remote_resolves_to() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let mut responses = remote_resolves_to_pushed();
+        responses.push(pass());
+        let f = fixture(true, &["sess-bound"], responses);
+        bind_with_repo_switch("sess-bound", PUSHED);
+
+        super::check_policies(&f.repo, &f.repo).await.unwrap();
+
+        assert!(recv(&f).starts_with("GET /api/v1/remotes/resolve?git_url="));
+        assert!(recv(&f).starts_with(&format!("GET /api/v1/remotes/{CODEBASE} ")));
+        let check = recv(&f);
+        assert_checked_under(&check, PUSHED);
+        assert!(check.contains("sess-bound"), "{check}");
+    }
+
+    /// The pushed repo is the policy authority: a session bound elsewhere —
+    /// by `repo switch` or by a machine-wide user default — must not move the
+    /// push to that repo's (possibly laxer) policies.
+    #[tokio::test]
+    async fn a_session_bound_elsewhere_does_not_change_which_repo_the_push_is_checked_under() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let mut responses = remote_resolves_to_pushed();
+        responses.push(pass());
+        let f = fixture(true, &["sess-switched", "sess-default"], responses);
+        bind_with_repo_switch("sess-switched", OTHER);
+        crate::user_default::save(&binding(OTHER, None)).unwrap();
+        assert_eq!(
+            crate::user_default::load().map(|b| b.repo_id),
+            Some(OTHER.to_string()),
+            "fixture must actually set a user default"
+        );
+
+        super::check_policies(&f.repo, &f.repo).await.unwrap();
+
+        recv(&f);
+        recv(&f);
+        let check = recv(&f);
+        assert_checked_under(&check, PUSHED);
+        assert!(
+            check.contains("sess-switched") && check.contains("sess-default"),
+            "every session is still evaluated (fail closed): {check}"
+        );
+    }
+
+    /// No origin remote: the directory-name lookup, exactly as before VIS-601.
+    #[tokio::test]
+    async fn without_a_remote_the_push_is_checked_under_the_name_resolved_repo() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let f = fixture(false, &["sess-free"], vec![repos_listing(), pass()]);
+
+        super::check_policies(&f.repo, &f.repo).await.unwrap();
+
+        assert!(recv(&f).starts_with("GET /api/v1/repos "));
+        let check = recv(&f);
+        assert_checked_under(&check, BY_NAME);
+        assert!(check.contains("sess-free"), "{check}");
+    }
+
+    /// A remote the server does not know falls back to the name lookup too.
+    #[tokio::test]
+    async fn an_unknown_remote_falls_back_to_the_name_resolved_repo() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let f = fixture(
+            true,
+            &["sess-free"],
+            vec![
+                crate::test_helpers::http_json("404 Not Found", r#"{"error":"remote not found"}"#),
+                repos_listing(),
+                pass(),
+            ],
+        );
+
+        super::check_policies(&f.repo, &f.repo).await.unwrap();
+
+        assert!(recv(&f).starts_with("GET /api/v1/remotes/resolve?git_url="));
+        assert!(recv(&f).starts_with("GET /api/v1/repos "));
+        assert_checked_under(&recv(&f), BY_NAME);
+    }
+
+    /// An unregistered repo still fails the push, even with nothing to check.
+    #[tokio::test]
+    async fn an_unregistered_repo_fails_the_push_even_without_sessions() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let f = fixture(
+            false,
+            &[],
+            vec![crate::test_helpers::http_json("200 OK", "[]")],
+        );
+
+        let err = super::check_policies(&f.repo, &f.repo)
+            .await
+            .expect_err("an unregistered repo must fail the push");
+        assert!(err.to_string().contains("'tracing' not found"), "{err}");
     }
 }
