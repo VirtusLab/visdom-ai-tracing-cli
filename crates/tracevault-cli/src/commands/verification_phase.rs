@@ -174,8 +174,10 @@ pub async fn open_verification_phase(
     let client = crate::api_client::resolve_client(project_root).map_err(|e| e.to_string())?;
 
     // The repo the session's tool events went to: the same chain as the hook
-    // (subagent override → `repo switch` → bound config → user default), then
-    // the repo registered under the primary checkout's name, as `check` does.
+    // (subagent override → `repo switch` → bound config → user default), and
+    // nothing else. The hook has no by-name fallback — with no repo binding
+    // it sends project-only or not at all — so guessing a repo here would
+    // open a window no tool event of this session ever reaches.
     let state = crate::session_state::load(&session_id);
     let binding = crate::resolution::recorded_session_binding(
         &sessions_dir.join(&session_id),
@@ -185,23 +187,16 @@ pub async fn open_verification_phase(
             .and_then(crate::resolution::binding_from_config),
         crate::user_default::load(),
     );
-    let repo_id = match binding {
-        Some(b) => b.repo_id,
-        None => crate::resolution::resolve_repo_by_name(&client, project_root)
-            .await
-            .map(|r| r.id.to_string())
-            .map_err(|e| match e {
-                crate::resolution::ResolveRepoByNameError::ListFailed(e) => {
-                    format!("Failed to resolve the repo for session {session_id}: {e}")
-                }
-                crate::resolution::ResolveRepoByNameError::NotFound { repo_name } => format!(
-                    "No repo resolved for session {session_id}: it is not bound \
-                     (`tracevault repo switch`), no repo_id is configured, and no repo named \
-                     '{repo_name}' is registered. Run `tracevault repo switch <path>` or \
-                     `tracevault init`."
-                ),
-            })?,
-    };
+    let repo_id = binding
+        .ok_or_else(|| {
+            format!(
+                "No repo resolved for session {session_id}: it is not bound with \
+                 `tracevault repo switch` and no repo_id is configured, so its tool events \
+                 are not sent to any repo. Run `tracevault repo switch <path>` or \
+                 `tracevault init`."
+            )
+        })?
+        .repo_id;
 
     client
         .stream_event(&repo_id, &event)
@@ -718,6 +713,31 @@ mod tests {
         assert!(
             request.contains(r#""session_id":"sess-me""#),
             "must open the window for the invoking session: {request}"
+        );
+    }
+
+    /// With no repo binding the hook sends nothing to any repo, so there is no
+    /// repo to open the window under: refuse instead of guessing one by name.
+    #[tokio::test]
+    async fn an_unbound_session_without_config_is_refused_without_sending() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let (_guard, _home, rx) = login_to_one_shot_server();
+        let repo = tempfile::tempdir().unwrap();
+        let top = crate::paths::worktree_toplevel(repo.path());
+        make_session_dir(
+            &repo.path().join(".tracevault").join("sessions"),
+            "sess-1",
+            Some(&top),
+        );
+
+        let err = open_verification_phase(repo.path(), repo.path(), Some("sess-1"), None)
+            .await
+            .expect_err("no repo resolves for this session");
+        assert!(err.contains("No repo resolved for session sess-1"), "{err}");
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "nothing may be sent"
         );
     }
 
