@@ -18,24 +18,38 @@ use crate::config::TracevaultConfig;
 ///   sibling linked worktree `cwd` differs from `project_root`, so both are
 ///   needed.
 /// `explicit_session_id` — when Some, targets that session directly.
-///   When None, the most recently modified session directory is used (suitable
-///   for single-agent setups; pass `--session-id` in multi-agent setups).
+/// `env_session_id` — `$TRACEVAULT_SESSION_ID`, the session that invoked this
+///   command (exported by the SessionStart hook). Used when no flag is given
+///   and that session has recorded events in this worktree, so an agent never
+///   needs `--session-id` just because other sessions share the worktree.
+///   Otherwise the session is auto-detected by `origin` marker, falling back
+///   to the most recently modified session directory.
+///
+/// The event goes to the repo the session's tool events were streamed to,
+/// resolved as the stream hook resolves it (VIS-601) — otherwise the window
+/// and the events it should cover never meet on the server.
 pub async fn open_verification_phase(
     project_root: &Path,
     cwd: &Path,
     explicit_session_id: Option<&str>,
+    env_session_id: Option<&str>,
 ) -> Result<(), String> {
-    let config = TracevaultConfig::load(project_root)
-        .ok_or("TraceVault not initialized. Run `tracevault init` first.")?;
-
-    let repo_id = config
-        .repo_id
-        .as_deref()
-        .ok_or("No repo_id configured. Run `tracevault init`.")?;
+    // Optional, like on the hook path: a session bound with `repo switch`
+    // resolves without a `.tracevault/config.toml`. A malformed one is still
+    // an error — the hook refuses to send under it too.
+    let config = TracevaultConfig::try_load(project_root)
+        .map_err(|e| format!("malformed .tracevault/config.toml: {e}"))?;
 
     let sessions_dir = project_root.join(".tracevault").join("sessions");
+    let worktree_top = crate::paths::worktree_toplevel(cwd);
+    let invoking = explicit_session_id
+        .is_none()
+        .then(|| invoking_session(&sessions_dir, &worktree_top, env_session_id))
+        .flatten();
 
-    let session_id = if let Some(id) = explicit_session_id {
+    let session_id = if let Some(id) = invoking {
+        id
+    } else if let Some(id) = explicit_session_id {
         // Verify the session directory exists when an explicit ID is given.
         let dir = sessions_dir.join(id);
         if !dir.is_dir() {
@@ -44,7 +58,6 @@ pub async fn open_verification_phase(
                 dir.display()
             ));
         }
-        let worktree_top = crate::paths::worktree_toplevel(cwd);
         if origin_match(&dir, &worktree_top) == OriginMatch::Mismatch {
             return Err(format!(
                 "Session {id} belongs to a different worktree (origin != {worktree_top}). \
@@ -67,7 +80,6 @@ pub async fn open_verification_phase(
         // Use `cwd` (the actual invocation directory), not `project_root`
         // (the primary root), so that in a sibling worktree we correctly
         // compare against the sibling's toplevel, not the primary's.
-        let worktree_top = crate::paths::worktree_toplevel(cwd);
         let matching = find_sessions_by_origin(&sessions_dir, &worktree_top);
 
         match matching.len() {
@@ -83,14 +95,15 @@ pub async fn open_verification_phase(
                     .collect();
                 return Err(format!(
                     "Multiple sessions belong to this worktree ({worktree_top}): {}. \
-                     Pass --session-id to select one.",
+                     Pass --session-id to select one, or run verify-start from the agent \
+                     session itself (it reads $TRACEVAULT_SESSION_ID).",
                     ids.join(", ")
                 ));
             }
             _ => {
-                let session_dir = find_latest_session(&sessions_dir).ok_or(
-                    "No active session found. Start a session by running an AI coding agent \
-                     first, or pass --session-id to target a specific session.",
+                let session_dir = find_latest_session(&sessions_dir, &worktree_top).ok_or(
+                    "No active session found for this worktree. Start a session by running an \
+                     AI coding agent here first, or pass --session-id to target a specific session.",
                 )?;
                 let chosen = session_dir
                     .file_name()
@@ -160,8 +173,33 @@ pub async fn open_verification_phase(
     // softwaremill host this project has since migrated away from).
     let client = crate::api_client::resolve_client(project_root).map_err(|e| e.to_string())?;
 
+    // The repo the session's tool events went to: the same chain as the hook
+    // (subagent override → `repo switch` → bound config → user default), and
+    // nothing else. The hook has no by-name fallback — with no repo binding
+    // it sends project-only or not at all — so guessing a repo here would
+    // open a window no tool event of this session ever reaches.
+    let state = crate::session_state::load(&session_id);
+    let binding = crate::resolution::recorded_session_binding(
+        &sessions_dir.join(&session_id),
+        &state,
+        config
+            .as_ref()
+            .and_then(crate::resolution::binding_from_config),
+        crate::user_default::load(),
+    );
+    let repo_id = binding
+        .ok_or_else(|| {
+            format!(
+                "No repo resolved for session {session_id}: it is not bound with \
+                 `tracevault repo switch` and no repo_id is configured, so its tool events \
+                 are not sent to any repo. Run `tracevault repo switch <path>` or \
+                 `tracevault init`."
+            )
+        })?
+        .repo_id;
+
     client
-        .stream_event(repo_id, &event)
+        .stream_event(&repo_id, &event)
         .await
         .map_err(|e| format!("Failed to send verification phase event: {e}"))?;
 
@@ -172,12 +210,33 @@ pub async fn open_verification_phase(
     Ok(())
 }
 
+/// The invoking session (`$TRACEVAULT_SESSION_ID`), if it has a session
+/// directory here whose `origin` marker does not name another worktree. `None`
+/// sends the caller to the usual auto-detection — e.g. when the session has
+/// not streamed an event in this repo yet, or last streamed from a sibling
+/// worktree, where the explicit-flag path would refuse it.
+fn invoking_session(
+    sessions_dir: &Path,
+    worktree_top: &str,
+    env_session_id: Option<&str>,
+) -> Option<String> {
+    let id = env_session_id.filter(|s| crate::session_state::is_safe_session_id(s))?;
+    let dir = sessions_dir.join(id);
+    (dir.is_dir() && origin_match(&dir, worktree_top) != OriginMatch::Mismatch)
+        .then(|| id.to_string())
+}
+
 /// Return the most recently modified session directory under `sessions_dir`.
-fn find_latest_session(sessions_dir: &Path) -> Option<PathBuf> {
+///
+/// Sessions whose `origin` marker names another worktree are skipped: this is
+/// the fallback for legacy, unmarked sessions, and picking another worktree's
+/// session would open the window under that worktree's repo binding.
+fn find_latest_session(sessions_dir: &Path, worktree_top: &str) -> Option<PathBuf> {
     let entries = fs::read_dir(sessions_dir).ok()?;
     entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
+        .filter(|e| origin_match(&e.path(), worktree_top) != OriginMatch::Mismatch)
         .max_by_key(|e| {
             e.metadata()
                 .and_then(|m| m.modified())
@@ -379,8 +438,28 @@ mod tests {
         assert!(matched.is_empty(), "no markers means no matches");
 
         // Fallback must still find a session.
-        let latest = find_latest_session(&sessions);
+        let latest = find_latest_session(&sessions, "/any/worktree");
         assert!(latest.is_some(), "fallback must find a session");
+    }
+
+    /// The fallback is for legacy, unmarked sessions only: it must never pick
+    /// a session marked as another worktree's — e.g. the invoking session that
+    /// `invoking_session` just rejected for that reason — because its repo
+    /// binding (and subagent override) belong to that other worktree.
+    #[test]
+    fn fallback_never_picks_another_worktrees_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        make_session_dir(&sessions, "sess-legacy", None);
+        // Created last, so it is the most recently modified.
+        make_session_dir(&sessions, "sess-elsewhere", Some("/wt/b"));
+
+        let latest = find_latest_session(&sessions, "/wt/a").unwrap();
+        assert!(latest.ends_with("sess-legacy"), "{}", latest.display());
+
+        let only_elsewhere = tmp.path().join("only-elsewhere");
+        make_session_dir(&only_elsewhere, "sess-elsewhere", Some("/wt/b"));
+        assert_eq!(find_latest_session(&only_elsewhere, "/wt/a"), None);
     }
 
     /// Verify that `paths::worktree_toplevel(sibling_wt)` returns the sibling
@@ -454,6 +533,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut guard = crate::test_helpers::EnvVarGuard::new();
         guard.set("XDG_CONFIG_HOME", home.path());
+        guard.set("XDG_STATE_HOME", home.path());
         guard.remove("TRACEVAULT_API_KEY");
         guard.remove("TRACEVAULT_SERVER_URL");
 
@@ -488,7 +568,7 @@ mod tests {
         )
         .unwrap();
 
-        open_verification_phase(repo.path(), repo.path(), Some("sess-1"))
+        open_verification_phase(repo.path(), repo.path(), Some("sess-1"), None)
             .await
             .expect("the event must go to the login's server");
 
@@ -514,6 +594,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut guard = crate::test_helpers::EnvVarGuard::new();
         guard.set("XDG_CONFIG_HOME", home.path());
+        guard.set("XDG_STATE_HOME", home.path());
         guard.remove("TRACEVAULT_API_KEY");
         guard.set("TRACEVAULT_SERVER_URL", "https://instance-a.example.com");
 
@@ -536,7 +617,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = open_verification_phase(repo.path(), repo.path(), Some("sess-1"))
+        let err = open_verification_phase(repo.path(), repo.path(), Some("sess-1"), None)
             .await
             .expect_err("a mismatched server URL must be refused");
         assert!(
@@ -547,5 +628,166 @@ mod tests {
             err.contains("refusing to use the saved credentials"),
             "must be the credential-scoping refusal, not a connection error: {err}"
         );
+    }
+
+    // ── VIS-601: same session, same repo as the stream hook ──────────────────
+
+    const CONFIG_REPO: &str = "11111111-1111-4111-8111-111111111111";
+    const SWITCHED_REPO: &str = "44444444-4444-4444-8444-444444444444";
+
+    /// Isolated config/state homes with a saved login pointing at a one-shot
+    /// server that accepts one stream event. Returns the guard (keep it alive),
+    /// the home dir and the request receiver.
+    fn login_to_one_shot_server() -> (
+        crate::test_helpers::EnvVarGuard,
+        tempfile::TempDir,
+        std::sync::mpsc::Receiver<String>,
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("XDG_CONFIG_HOME", home.path());
+        guard.set("XDG_STATE_HOME", home.path());
+        guard.remove("TRACEVAULT_API_KEY");
+        guard.remove("TRACEVAULT_SERVER_URL");
+        let (server, rx) = crate::test_helpers::spawn_seq(vec![crate::test_helpers::http_json(
+            "200 OK",
+            r#"{"session_db_id":"22222222-2222-4222-8222-222222222222","event_db_id":null,"status":"ok"}"#,
+        )]);
+        let creds_dir = home.path().join("tracevault");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(
+            creds_dir.join("credentials.json"),
+            format!(
+                r#"{{"server_url":"{server}","email":"a@b.com","auth":{{
+                "issuer":"https://idp.example.com/realms/v","client_id":"tracing-cli",
+                "refresh_token":"rt","access_token":"at","access_expires_at":9999999999}}}}"#
+            ),
+        )
+        .unwrap();
+        (guard, home, rx)
+    }
+
+    /// A checkout with a pinned config repo and the given sessions, all of
+    /// them recorded (by `origin` marker) as belonging to this worktree.
+    fn checkout_with_sessions(ids: &[&str]) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        let tv = repo.path().join(".tracevault");
+        let top = crate::paths::worktree_toplevel(repo.path());
+        for id in ids {
+            make_session_dir(&tv.join("sessions"), id, Some(&top));
+        }
+        std::fs::write(
+            tv.join("config.toml"),
+            format!("repo_id = \"{CONFIG_REPO}\"\n"),
+        )
+        .unwrap();
+        repo
+    }
+
+    fn bind_with_repo_switch(session_id: &str, repo_id: &str) {
+        let state = crate::session_state::SessionState {
+            active: Some(crate::session_state::RepoBinding {
+                repo_id: repo_id.into(),
+                git_url: None,
+                remote_id: None,
+                codebase_name: None,
+                updated_at: "t".into(),
+            }),
+            ..Default::default()
+        };
+        crate::session_state::save(session_id, &state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_bound_with_repo_switch_opens_its_window_under_the_bound_repo() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let (_guard, _home, rx) = login_to_one_shot_server();
+        let repo = checkout_with_sessions(&["sess-1"]);
+        bind_with_repo_switch("sess-1", SWITCHED_REPO);
+
+        open_verification_phase(repo.path(), repo.path(), Some("sess-1"), None)
+            .await
+            .unwrap();
+
+        let request = rx.recv_timeout(crate::test_helpers::RECV_TIMEOUT).unwrap();
+        assert!(
+            request.contains(&format!("/api/v1/repos/{SWITCHED_REPO}/stream")),
+            "the window must go where the session's tool events go, not to config.repo_id: \
+             {request}"
+        );
+    }
+
+    /// Several sessions in one worktree is the normal state (`.pushed` is never
+    /// written), so the invoking session must not need `--session-id`.
+    #[tokio::test]
+    async fn the_invoking_session_is_used_when_several_share_the_worktree() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let (_guard, _home, rx) = login_to_one_shot_server();
+        let repo = checkout_with_sessions(&["sess-other", "sess-me"]);
+        bind_with_repo_switch("sess-me", SWITCHED_REPO);
+
+        open_verification_phase(repo.path(), repo.path(), None, Some("sess-me"))
+            .await
+            .expect("must not ask for --session-id");
+
+        let request = rx.recv_timeout(crate::test_helpers::RECV_TIMEOUT).unwrap();
+        assert!(
+            request.contains(&format!("/api/v1/repos/{SWITCHED_REPO}/stream")),
+            "{request}"
+        );
+        assert!(
+            request.contains(r#""session_id":"sess-me""#),
+            "must open the window for the invoking session: {request}"
+        );
+    }
+
+    /// With no repo binding the hook sends nothing to any repo, so there is no
+    /// repo to open the window under: refuse instead of guessing one by name.
+    #[tokio::test]
+    async fn an_unbound_session_without_config_is_refused_without_sending() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let (_guard, _home, rx) = login_to_one_shot_server();
+        let repo = tempfile::tempdir().unwrap();
+        let top = crate::paths::worktree_toplevel(repo.path());
+        make_session_dir(
+            &repo.path().join(".tracevault").join("sessions"),
+            "sess-1",
+            Some(&top),
+        );
+
+        let err = open_verification_phase(repo.path(), repo.path(), Some("sess-1"), None)
+            .await
+            .expect_err("no repo resolves for this session");
+        assert!(err.contains("No repo resolved for session sess-1"), "{err}");
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "nothing may be sent"
+        );
+    }
+
+    #[test]
+    fn invoking_session_needs_a_session_dir_in_this_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        make_session_dir(&sessions, "here", Some("/wt/a"));
+        make_session_dir(&sessions, "legacy", None);
+        make_session_dir(&sessions, "elsewhere", Some("/wt/b"));
+
+        assert_eq!(
+            invoking_session(&sessions, "/wt/a", Some("here")).as_deref(),
+            Some("here")
+        );
+        assert_eq!(
+            invoking_session(&sessions, "/wt/a", Some("legacy")).as_deref(),
+            Some("legacy")
+        );
+        assert_eq!(
+            invoking_session(&sessions, "/wt/a", Some("elsewhere")),
+            None
+        );
+        assert_eq!(invoking_session(&sessions, "/wt/a", Some("missing")), None);
+        assert_eq!(invoking_session(&sessions, "/wt/a", Some("../here")), None);
+        assert_eq!(invoking_session(&sessions, "/wt/a", None), None);
     }
 }

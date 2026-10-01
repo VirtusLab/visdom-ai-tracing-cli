@@ -14,6 +14,7 @@ mod resolution;
 mod session_state;
 #[cfg(test)]
 mod test_helpers;
+mod transcript;
 mod user_default;
 mod user_project_default;
 
@@ -139,8 +140,9 @@ enum Cli {
     /// In multi-agent setups, pass --session-id to target the correct session.
     #[command(name = "verify-start")]
     VerifyStart {
-        /// Explicit session ID to open the window for. When omitted, the most
-        /// recently active session under .tracevault/sessions/ is used.
+        /// Explicit session ID to open the window for. When omitted, the
+        /// invoking session ($TRACEVAULT_SESSION_ID) is used if it has events in
+        /// this worktree, else the session is detected by worktree.
         #[arg(long)]
         session_id: Option<String>,
     },
@@ -585,10 +587,12 @@ async fn main() {
         Cli::VerifyStart { session_id } => {
             let cwd = env::current_dir().expect("Cannot determine current directory");
             let project_root = crate::paths::resolve_project_root(&cwd).root;
+            let env_session_id = std::env::var("TRACEVAULT_SESSION_ID").ok();
             if let Err(e) = commands::verification_phase::open_verification_phase(
                 &project_root,
                 &cwd,
                 session_id.as_deref(),
+                env_session_id.as_deref(),
             )
             .await
             {
