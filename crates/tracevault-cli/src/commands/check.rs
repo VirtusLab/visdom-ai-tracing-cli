@@ -1432,9 +1432,10 @@ mod repo_grouping_tests {
             .expect("expected another request")
     }
 
-    /// The VIS-536 failure: a session bound with `repo switch` streamed to its
-    /// bound repo but was checked under the name-resolved one. It must be
-    /// checked under the bound repo, and the name lookup is not even needed.
+    /// VIS-601 (first hit on VIS-536's PR): a session bound with `repo switch`
+    /// streamed to its bound repo but was checked under the name-resolved one.
+    /// It must be checked under the bound repo, and the name lookup is not
+    /// even needed.
     #[tokio::test]
     async fn a_bound_session_is_checked_under_the_repo_it_streamed_to() {
         let _env_lock = crate::test_helpers::lock_env_mutation().await;
