@@ -92,6 +92,34 @@ pub fn read_new_transcript_lines(
     Ok((lines, offset, bytes_read))
 }
 
+/// Store `transcript_path` in the session's `metadata.json`, which is where
+/// `tracevault check` looks for the transcript it counts tool calls from.
+/// Without it every session reports no tool calls, and a "must call X" policy
+/// can never pass. Other keys in the file are kept. An empty path (Codex
+/// before its first record) writes nothing, and an unchanged path skips the
+/// write. The file is replaced atomically: parallel tool hooks of one session
+/// run concurrently, and `check` must never read a half-written file.
+pub fn record_transcript_path(session_dir: &Path, transcript_path: &str) -> Result<(), io::Error> {
+    if transcript_path.is_empty() {
+        return Ok(());
+    }
+    let meta_path = session_dir.join("metadata.json");
+    let mut meta = fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    if meta.get("transcript_path").and_then(|v| v.as_str()) == Some(transcript_path) {
+        return Ok(());
+    }
+    meta["transcript_path"] = serde_json::Value::String(transcript_path.to_string());
+    let tmp = session_dir.join(format!(".metadata.json.{}", uuid::Uuid::now_v7()));
+    fs::write(&tmp, meta.to_string())?;
+    fs::rename(&tmp, &meta_path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
 pub fn append_pending(pending_path: &Path, json: &str) -> Result<(), io::Error> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -865,6 +893,11 @@ pub async fn run_stream(
     let worktree_top = crate::paths::worktree_toplevel(hook_cwd);
     let _ = fs::write(session_dir.join("origin"), &worktree_top);
 
+    // Record where the transcript lives: `tracevault check` counts the
+    // session's tool calls from it, and finds it only through metadata.json.
+    // Best-effort, like the origin marker.
+    let _ = record_transcript_path(&session_dir, &hook_event.transcript_path);
+
     // 3. Mint a time-ordered event id. UUIDv7 is stamped at hook-fire time, so
     //    it both orders events and is a stable idempotency key — no shared
     //    `.event_counter` file (which raced between concurrent parallel-tool
@@ -1404,6 +1437,48 @@ mod tests {
             expected.as_str(),
             "origin marker must contain the canonicalized worktree toplevel"
         );
+    }
+
+    fn metadata(session_dir: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(session_dir.join("metadata.json")).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn record_transcript_path_writes_metadata_for_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        record_transcript_path(tmp.path(), "/t/a.jsonl").unwrap();
+        assert_eq!(metadata(tmp.path())["transcript_path"], "/t/a.jsonl");
+    }
+
+    #[test]
+    fn record_transcript_path_keeps_other_keys_and_follows_a_new_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("metadata.json"),
+            r#"{"transcript_path":"/t/old.jsonl","model":"m"}"#,
+        )
+        .unwrap();
+        record_transcript_path(tmp.path(), "/t/new.jsonl").unwrap();
+        let m = metadata(tmp.path());
+        assert_eq!(m["transcript_path"], "/t/new.jsonl");
+        assert_eq!(m["model"], "m");
+        let leftovers = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name() != "metadata.json")
+            .count();
+        assert_eq!(leftovers, 0, "the temp file is renamed into place");
+    }
+
+    #[test]
+    fn record_transcript_path_ignores_an_empty_path_and_replaces_garbage() {
+        let tmp = tempfile::tempdir().unwrap();
+        record_transcript_path(tmp.path(), "").unwrap();
+        assert!(!tmp.path().join("metadata.json").exists());
+
+        std::fs::write(tmp.path().join("metadata.json"), "not json").unwrap();
+        record_transcript_path(tmp.path(), "/t/a.jsonl").unwrap();
+        assert_eq!(metadata(tmp.path())["transcript_path"], "/t/a.jsonl");
     }
 
     // ── resolve_stream_binding: workspace-mode precedence for the stream hook ──

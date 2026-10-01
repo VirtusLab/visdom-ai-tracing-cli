@@ -678,7 +678,45 @@ mod worktree_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::connectivity_message;
+    use super::{collect_session_data, connectivity_message};
+
+    /// The stream hook's `metadata.json` is what lets `check` see a streaming
+    /// session's tool calls; without it every session sent `tool_calls: None`
+    /// and a "must call X" policy could never pass.
+    #[test]
+    fn counts_tool_calls_from_the_transcript_the_stream_hook_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__cargo__cargo_check"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"},{"type":"tool_use","name":"mcp__cargo__cargo_check"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let session_dir = tmp.path().join("sess-1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let before = collect_session_data(&session_dir).unwrap();
+        assert!(
+            before.tool_calls.is_none(),
+            "no metadata.json, no tool calls"
+        );
+
+        crate::commands::stream::record_transcript_path(&session_dir, transcript.to_str().unwrap())
+            .unwrap();
+        let after = collect_session_data(&session_dir).unwrap();
+
+        assert_eq!(after.session_id, "sess-1");
+        assert_eq!(after.total_tool_calls, Some(3));
+        assert_eq!(
+            after.tool_calls,
+            Some(serde_json::json!({"mcp__cargo__cargo_check": 2, "Bash": 1}))
+        );
+    }
 
     #[test]
     fn connectivity_message_suggests_login_on_401() {
