@@ -133,7 +133,7 @@ pub struct Credentials {
     pub token: Option<String>,
     /// The signed-in identity, for display. Empty when a login saved
     /// credentials before `/auth/me` could resolve it (e.g. the account
-    /// lacks the `tracing` realm role).
+    /// has no `tracevault` grant in Control Plane).
     #[serde(default)]
     pub email: String,
     /// The Keycloak session, when this file holds one.

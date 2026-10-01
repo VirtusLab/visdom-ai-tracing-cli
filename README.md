@@ -48,10 +48,10 @@ prompt. Nothing has to be re-run periodically.
 `tracevault logout` revokes the refresh token at Keycloak (best-effort — the local file is
 removed either way) and deletes the credentials file.
 
-If sign-in succeeds but the server answers "not authorized", the Keycloak account is missing
-the `tracing` realm role. The credentials are still saved; an administrator has to grant
-`tracing` (or `tracing-admin`), after which any TraceVault command works — no new login
-needed.
+If sign-in succeeds but the server answers "not authorized", the account has no `tracevault`
+grant in Control Plane. The credentials are still saved; an administrator has to grant
+`tracevault` plus the project roles you need (`tracevault.viewer` / `tracevault.operator`) in
+Control Plane, or the `ai-tracing-admin` Keycloak realm role. No new login is needed afterwards.
 
 **CI and automation do not use `tracevault login`.** They keep using a long-lived API key,
 which never expires and needs no browser:

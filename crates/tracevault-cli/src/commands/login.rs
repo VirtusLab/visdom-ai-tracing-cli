@@ -217,7 +217,7 @@ where
     creds.save()?;
 
     // 6. Confirm with TraceVault who this token resolves to. This is also
-    // where a missing realm role surfaces.
+    // where a missing `tracevault` grant surfaces.
     let client = ApiClient::with_credential(server_url, Some(Credential::Keycloak(session)));
     match client.get_me().await {
         Ok(me) => {
@@ -244,9 +244,10 @@ where
                 "Signed in successfully, but this account is NOT authorized to use Visdom Trace."
             );
             eprintln!(
-                "It lacks the `tracing` Keycloak realm role. An administrator must grant your \
-                 account the `tracing` realm role (or `tracing-admin` for admin access) in \
-                 Keycloak; after that, re-run any TraceVault command — no new login is needed."
+                "It has no `tracevault` grant in Control Plane. An administrator must grant your \
+                 account `tracevault` plus the project roles you need (`tracevault.viewer` / \
+                 `tracevault.operator`) in Control Plane, or the `ai-tracing-admin` Keycloak realm \
+                 role for admin access. No new login is needed afterwards."
             );
             // A second, less common cause of the same 403: the realm's client
             // has no audience mapper, so the token is not FOR this server at
@@ -259,7 +260,7 @@ where
                         eprintln!();
                         eprintln!(
                             "Note: the issued token's audience is [{}], but this server expects \
-                             '{expected}'. If granting the role does not help, the realm's \
+                             '{expected}'. If granting access does not help, the realm's \
                              `{}` client is missing its audience mapper for '{expected}'.",
                             found.join(", "),
                             config.cli_client_id
@@ -267,7 +268,7 @@ where
                     }
                 }
             }
-            Err("account lacks the `tracing` Keycloak realm role".into())
+            Err("account has no `tracevault` grant in Control Plane".into())
         }
         Err(GetMeError::Unauthorized) => {
             println!();
@@ -352,7 +353,7 @@ mod tests {
         let _env_lock = crate::test_helpers::lock_env_mutation().await;
         let (result, saved) = run_login(http_json(
             "200 OK",
-            r#"{"user_id":"11111111-1111-4111-8111-111111111111","email":"alice@example.com","name":"Alice","role":"tracing-admin"}"#,
+            r#"{"user_id":"11111111-1111-4111-8111-111111111111","email":"alice@example.com","name":"Alice","role":"ai-tracing-admin"}"#,
         ))
         .await;
 
@@ -379,10 +380,7 @@ mod tests {
         .await;
 
         let err = result.expect_err("a 403 must not report success");
-        assert!(
-            err.contains("tracing") && err.contains("role"),
-            "the error must name the missing realm role: {err}"
-        );
+        assert_eq!(err, "account has no `tracevault` grant in Control Plane");
         let saved = saved.expect("a 403 must NOT throw the credentials away");
         assert!(saved.auth.is_some(), "the session must still be saved");
         assert_eq!(
