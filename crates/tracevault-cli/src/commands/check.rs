@@ -295,37 +295,11 @@ fn collect_session_data(session_dir: &Path) -> Option<SessionCheckData> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let mut tool_calls_map: std::collections::HashMap<String, i32> =
-        std::collections::HashMap::new();
-    let mut total_tool_calls: i32 = 0;
-
-    if let Some(path) = &transcript_path {
-        if let Ok(content) = fs::read_to_string(path) {
-            for line in content.lines() {
-                let entry: serde_json::Value = match serde_json::from_str(line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                if entry.get("type").and_then(|v| v.as_str()) == Some("assistant") {
-                    if let Some(content_arr) = entry
-                        .get("message")
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_array())
-                    {
-                        for block in content_arr {
-                            if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                                if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
-                                    *tool_calls_map.entry(name.to_string()).or_insert(0) += 1;
-                                    total_tool_calls += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let tool_calls_map = transcript_path
+        .as_deref()
+        .map(|p| crate::transcript::count_tool_calls(Path::new(p)))
+        .unwrap_or_default();
+    let total_tool_calls: i32 = tool_calls_map.values().sum();
 
     let tool_calls = if tool_calls_map.is_empty() {
         None
@@ -678,7 +652,110 @@ mod worktree_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::connectivity_message;
+    use super::{collect_session_data, connectivity_message};
+
+    /// The stream hook's `metadata.json` is what lets `check` see a streaming
+    /// session's tool calls; without it every session sent `tool_calls: None`
+    /// and a "must call X" policy could never pass.
+    #[test]
+    fn counts_tool_calls_from_the_transcript_the_stream_hook_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__cargo__cargo_check"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"},{"type":"tool_use","name":"mcp__cargo__cargo_check"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let session_dir = tmp.path().join("sess-1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let before = collect_session_data(&session_dir).unwrap();
+        assert!(
+            before.tool_calls.is_none(),
+            "no metadata.json, no tool calls"
+        );
+
+        crate::commands::stream::record_transcript_path(&session_dir, transcript.to_str().unwrap())
+            .unwrap();
+        let after = collect_session_data(&session_dir).unwrap();
+
+        assert_eq!(after.session_id, "sess-1");
+        assert_eq!(after.total_tool_calls, Some(3));
+        assert_eq!(
+            after.tool_calls,
+            Some(serde_json::json!({"mcp__cargo__cargo_check": 2, "Bash": 1}))
+        );
+    }
+
+    /// Write `lines` as a transcript, record it the way the stream hook does,
+    /// and return the tool calls `check` counts from it.
+    fn tool_calls_from_transcript(lines: &[&str]) -> Option<serde_json::Value> {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("t.jsonl");
+        std::fs::write(&transcript, lines.join("\n")).unwrap();
+        let session_dir = tmp.path().join("sess");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        crate::commands::stream::record_transcript_path(&session_dir, transcript.to_str().unwrap())
+            .unwrap();
+        collect_session_data(&session_dir).unwrap().tool_calls
+    }
+
+    #[test]
+    fn counts_tool_calls_from_a_codex_rollout() {
+        let calls = tool_calls_from_transcript(&[
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix it"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** End Patch\n"}}"#,
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"mcp__cargo__cargo_check","arguments":"{}"}}"#,
+            r#"{"type":"response_item","payload":{"type":"local_shell_call","command":"ls"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count"}}"#,
+        ]);
+        assert_eq!(
+            calls,
+            Some(serde_json::json!({"apply_patch": 1, "mcp__cargo__cargo_check": 1, "Bash": 1}))
+        );
+    }
+
+    #[test]
+    fn counts_tool_calls_from_a_gsd_session() {
+        let calls = tool_calls_from_transcript(&[
+            r#"{"type":"model_change","provider":"anthropic","modelId":"claude-opus-4-7"}"#,
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"toolCall","id":"t1","name":"write","arguments":{}},{"type":"toolCall","id":"t2","name":"bash","arguments":{}}]}}"#,
+            r#"{"type":"message","message":{"role":"toolResult","toolName":"write","content":[]}}"#,
+        ]);
+        assert_eq!(calls, Some(serde_json::json!({"write": 1, "bash": 1})));
+    }
+
+    /// OpenCode sends no transcript path, only inline records; the stream hook
+    /// keeps their tool calls in a local log that `check` then counts.
+    #[test]
+    fn counts_tool_calls_from_opencode_inline_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool_event = [
+            serde_json::json!({"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","name":"bash","arguments":{"command":"ls"}}]}}),
+            serde_json::json!({"type":"message","message":{"role":"toolResult","toolName":"bash","isError":false,"content":[{"type":"text","text":"a.rs"}]}}),
+        ];
+        let assistant_turn = [
+            serde_json::json!({"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}),
+        ];
+
+        crate::commands::stream::record_transcript_path(tmp.path(), "").unwrap();
+        crate::commands::stream::record_inline_tool_calls(tmp.path(), &assistant_turn).unwrap();
+        assert!(collect_session_data(tmp.path())
+            .unwrap()
+            .tool_calls
+            .is_none());
+
+        crate::commands::stream::record_inline_tool_calls(tmp.path(), &tool_event).unwrap();
+        crate::commands::stream::record_inline_tool_calls(tmp.path(), &tool_event).unwrap();
+        let data = collect_session_data(tmp.path()).unwrap();
+        assert_eq!(data.tool_calls, Some(serde_json::json!({"bash": 2})));
+        assert_eq!(data.total_tool_calls, Some(2));
+    }
 
     #[test]
     fn connectivity_message_suggests_login_on_401() {
