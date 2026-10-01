@@ -387,6 +387,27 @@ pub fn select_worktree_sessions(
     }
 }
 
+/// Group sessions by the repo each is evaluated under, keeping the order in
+/// which repos first appear. A session with no resolved repo goes under
+/// `fallback`, the name-resolved repo; the caller looks that up whenever such
+/// a session exists, so an unbound session is never dropped in practice.
+fn group_sessions_by_repo(
+    sessions: Vec<(Option<uuid::Uuid>, SessionCheckData)>,
+    fallback: Option<uuid::Uuid>,
+) -> Vec<(uuid::Uuid, Vec<SessionCheckData>)> {
+    let mut groups: Vec<(uuid::Uuid, Vec<SessionCheckData>)> = Vec::new();
+    for (repo_id, data) in sessions {
+        let Some(repo_id) = repo_id.or(fallback) else {
+            continue;
+        };
+        match groups.iter_mut().find(|(r, _)| *r == repo_id) {
+            Some((_, group)) => group.push(data),
+            None => groups.push((repo_id, vec![data])),
+        }
+    }
+    groups
+}
+
 /// Check unpushed sessions against server policies.
 ///
 /// `project_root` — the git-resolved PRIMARY worktree root (from
@@ -414,28 +435,6 @@ pub async fn check_policies(
     }
 
     let client = ApiClient::with_credential(&server_url, credential);
-
-    // Resolve repo_id by name.
-    //
-    // Connectivity errors here (auth expired, server down, network
-    // unreachable) propagate so the pre-push hook exits non-zero — if a
-    // repo is opted into TraceVault, every push must be evaluated, full
-    // stop. Letting pushes slip when TV is unreachable would defeat the
-    // point of enforcement. We attach an actionable next step to each
-    // error so the user (or agent) knows the recovery command without
-    // guessing — see `connectivity_message` below.
-    let repo = match resolve_repo_by_name(&client, project_root).await {
-        Ok(r) => r,
-        Err(ResolveRepoByNameError::ListFailed(e)) => {
-            return Err(connectivity_message(&e.to_string()).into());
-        }
-        Err(ResolveRepoByNameError::NotFound { repo_name }) => {
-            return Err(format!(
-                "Repo '{repo_name}' not found on server. Run `tracevault sync` first."
-            )
-            .into());
-        }
-    };
 
     // Collect unpushed session dirs from the shared primary .tracevault/.
     let sessions_dir = project_root.join(".tracevault").join("sessions");
@@ -465,12 +464,69 @@ pub async fn check_policies(
         );
     }
 
+    // Each session is evaluated under the repo its events were streamed to,
+    // resolved exactly as the stream hook resolves it (VIS-601): a session
+    // bound with `repo switch` streams to its bound repo, and the server only
+    // finds its verification window and tool stats under that repo id. The
+    // lower tiers are the ones the hook consults too. A malformed
+    // config.toml makes the hook refuse to send at all; here it only costs
+    // the bound tier, so a push is never blocked by a config the check did
+    // not need before.
+    let bound = match crate::config::TracevaultConfig::try_load(project_root) {
+        Ok(cfg) => cfg
+            .as_ref()
+            .and_then(crate::resolution::binding_from_config),
+        Err(e) => {
+            eprintln!("Warning: ignoring malformed .tracevault/config.toml: {e}");
+            None
+        }
+    };
+    let user_default = crate::user_default::load();
+
     let mut sessions = Vec::new();
     for session_dir in &selected_dirs {
         if let Some(data) = collect_session_data(session_dir) {
-            sessions.push(data);
+            let state = crate::session_state::load(&data.session_id);
+            let binding = crate::resolution::recorded_session_binding(
+                session_dir,
+                &state,
+                bound.clone(),
+                user_default.clone(),
+            );
+            sessions.push((binding.and_then(|b| b.repo_id.parse().ok()), data));
         }
     }
+
+    // Sessions no tier binds fall back to the repo registered under the
+    // primary checkout's directory name — the only resolution `check` had
+    // before VIS-601, so an unbound session behaves exactly as it did. It is
+    // also resolved when there are no sessions at all, which keeps the old
+    // contract that an unreachable server or an unregistered repo fails the
+    // push even when there is nothing to evaluate.
+    //
+    // Connectivity errors here (auth expired, server down, network
+    // unreachable) propagate so the pre-push hook exits non-zero — if a
+    // repo is opted into TraceVault, every push must be evaluated, full
+    // stop. Letting pushes slip when TV is unreachable would defeat the
+    // point of enforcement. We attach an actionable next step to each
+    // error so the user (or agent) knows the recovery command without
+    // guessing — see `connectivity_message` below.
+    let fallback_repo_id = if sessions.is_empty() || sessions.iter().any(|(r, _)| r.is_none()) {
+        match resolve_repo_by_name(&client, project_root).await {
+            Ok(r) => Some(r.id),
+            Err(ResolveRepoByNameError::ListFailed(e)) => {
+                return Err(connectivity_message(&e.to_string()).into());
+            }
+            Err(ResolveRepoByNameError::NotFound { repo_name }) => {
+                return Err(format!(
+                    "Repo '{repo_name}' not found on server. Run `tracevault sync` first."
+                )
+                .into());
+            }
+        }
+    } else {
+        None
+    };
 
     if sessions.is_empty() {
         println!("No unpushed sessions to check.");
@@ -483,36 +539,51 @@ pub async fn check_policies(
     // the commit being pushed lives on the current worktree's branch.
     let commit_sha = git_head_sha(cwd);
     let changed_paths = resolve_changed_paths(cwd);
-    let result = client
-        .check_policies(
-            &repo.id,
-            CheckPoliciesRequest {
-                sessions,
-                commit_sha,
-                changed_paths,
-            },
-        )
-        .await
-        .map_err(|e| connectivity_message(&e.to_string()))?;
-
-    // Print results
-    for r in &result.results {
-        let icon = match r.result.as_str() {
-            "pass" => "\x1b[32m✓\x1b[0m",                             // green
-            "fail" if r.action == "block_push" => "\x1b[31m✗\x1b[0m", // red
-            "fail" => "\x1b[33m!\x1b[0m",                             // yellow
-            _ => " ",
-        };
-        println!(
-            "  {} [{}] {} — {}",
-            icon, r.severity, r.rule_name, r.details
-        );
+    let groups = group_sessions_by_repo(sessions, fallback_repo_id);
+    let multi_repo = groups.len() > 1;
+    let mut results = Vec::new();
+    let mut blocked = false;
+    let mut passed = true;
+    for (repo_id, sessions) in groups {
+        let r = client
+            .check_policies(
+                &repo_id,
+                CheckPoliciesRequest {
+                    sessions,
+                    commit_sha: commit_sha.clone(),
+                    changed_paths: changed_paths.clone(),
+                },
+            )
+            .await
+            .map_err(|e| connectivity_message(&e.to_string()))?;
+        blocked |= r.blocked;
+        passed &= r.passed;
+        results.push((repo_id, r.results));
     }
 
-    if result.blocked {
+    // Print results
+    for (repo_id, items) in &results {
+        if multi_repo {
+            println!("  repo {repo_id}:");
+        }
+        for r in items {
+            let icon = match r.result.as_str() {
+                "pass" => "\x1b[32m✓\x1b[0m",                             // green
+                "fail" if r.action == "block_push" => "\x1b[31m✗\x1b[0m", // red
+                "fail" => "\x1b[33m!\x1b[0m",                             // yellow
+                _ => " ",
+            };
+            println!(
+                "  {} [{}] {} — {}",
+                icon, r.severity, r.rule_name, r.details
+            );
+        }
+    }
+
+    if blocked {
         eprintln!("\n\x1b[31mPolicy check failed: push blocked.\x1b[0m");
         std::process::exit(1);
-    } else if result.passed {
+    } else if passed {
         println!("\n\x1b[32mAll policy checks passed.\x1b[0m");
     } else {
         println!("\n\x1b[33mPolicy warnings found (push not blocked).\x1b[0m");
@@ -1213,5 +1284,225 @@ mod read_with_timeout_tests {
             "must return promptly on timeout, not block on the stalled closure; took {:?}",
             start.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod repo_grouping_tests {
+    use super::group_sessions_by_repo;
+    use crate::api_client::SessionCheckData;
+
+    const BOUND: uuid::Uuid = uuid::uuid!("44000761-0000-4000-8000-000000000001");
+    const BY_NAME: uuid::Uuid = uuid::uuid!("7995d35d-0000-4000-8000-000000000002");
+
+    fn data(id: &str) -> SessionCheckData {
+        SessionCheckData {
+            session_id: id.into(),
+            tool_calls: None,
+            files_modified: None,
+            total_tool_calls: None,
+        }
+    }
+
+    fn ids(group: &[SessionCheckData]) -> Vec<&str> {
+        group.iter().map(|d| d.session_id.as_str()).collect()
+    }
+
+    #[test]
+    fn bound_session_is_checked_under_its_bound_repo_not_the_name_resolved_one() {
+        let groups = group_sessions_by_repo(vec![(Some(BOUND), data("s1"))], Some(BY_NAME));
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, BOUND);
+    }
+
+    #[test]
+    fn unbound_sessions_fall_back_to_the_name_resolved_repo() {
+        let groups =
+            group_sessions_by_repo(vec![(None, data("s1")), (None, data("s2"))], Some(BY_NAME));
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, BY_NAME);
+        assert_eq!(ids(&groups[0].1), ["s1", "s2"]);
+    }
+
+    #[test]
+    fn mixed_sessions_split_into_one_group_per_repo_in_first_seen_order() {
+        let groups = group_sessions_by_repo(
+            vec![
+                (None, data("unbound-1")),
+                (Some(BOUND), data("bound-1")),
+                (None, data("unbound-2")),
+                (Some(BOUND), data("bound-2")),
+            ],
+            Some(BY_NAME),
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, BY_NAME);
+        assert_eq!(ids(&groups[0].1), ["unbound-1", "unbound-2"]);
+        assert_eq!(groups[1].0, BOUND);
+        assert_eq!(ids(&groups[1].1), ["bound-1", "bound-2"]);
+    }
+
+    #[test]
+    fn a_session_bound_to_the_name_resolved_repo_shares_its_group() {
+        let groups = group_sessions_by_repo(
+            vec![(Some(BY_NAME), data("s1")), (None, data("s2"))],
+            Some(BY_NAME),
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(ids(&groups[0].1), ["s1", "s2"]);
+    }
+
+    // ── check_policies end to end against a one-shot server ──────────────────
+
+    const PASS: &str = r#"{"passed":true,"results":[],"blocked":false}"#;
+
+    /// Isolated config/state homes and a saved login for a server answering
+    /// `responses` in order; a primary checkout named `tracing` holding the
+    /// given sessions, all marked as this worktree's.
+    struct Fixture {
+        _guard: crate::test_helpers::EnvVarGuard,
+        _home: tempfile::TempDir,
+        _tmp: tempfile::TempDir,
+        repo: std::path::PathBuf,
+        rx: std::sync::mpsc::Receiver<String>,
+    }
+
+    fn fixture(sessions: &[&str], responses: Vec<String>) -> Fixture {
+        let home = tempfile::tempdir().unwrap();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("XDG_CONFIG_HOME", home.path());
+        guard.set("XDG_STATE_HOME", home.path());
+        guard.remove("TRACEVAULT_API_KEY");
+        guard.remove("TRACEVAULT_SERVER_URL");
+        let (server, rx) = crate::test_helpers::spawn_seq(responses);
+        let creds_dir = home.path().join("tracevault");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(
+            creds_dir.join("credentials.json"),
+            format!(
+                r#"{{"server_url":"{server}","email":"a@b.com","auth":{{
+                "issuer":"https://idp.example.com/realms/v","client_id":"tracing-cli",
+                "refresh_token":"rt","access_token":"at","access_expires_at":9999999999}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("tracing");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::test_helpers::init_git_repo(&repo);
+        let top = crate::paths::worktree_toplevel(&repo);
+        for id in sessions {
+            let dir = repo.join(".tracevault").join("sessions").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("origin"), &top).unwrap();
+        }
+        Fixture {
+            _guard: guard,
+            _home: home,
+            _tmp: tmp,
+            repo,
+            rx,
+        }
+    }
+
+    fn bind_with_repo_switch(session_id: &str, repo_id: uuid::Uuid) {
+        let state = crate::session_state::SessionState {
+            active: Some(crate::session_state::RepoBinding {
+                repo_id: repo_id.to_string(),
+                git_url: None,
+                remote_id: None,
+                codebase_name: None,
+                updated_at: "t".into(),
+            }),
+            ..Default::default()
+        };
+        crate::session_state::save(session_id, &state).unwrap();
+    }
+
+    fn repos_listing() -> String {
+        crate::test_helpers::http_json(
+            "200 OK",
+            &format!(r#"[{{"id":"{BY_NAME}","name":"tracing"}}]"#),
+        )
+    }
+
+    fn recv(f: &Fixture) -> String {
+        f.rx.recv_timeout(crate::test_helpers::RECV_TIMEOUT)
+            .expect("expected another request")
+    }
+
+    /// The VIS-536 failure: a session bound with `repo switch` streamed to its
+    /// bound repo but was checked under the name-resolved one. It must be
+    /// checked under the bound repo, and the name lookup is not even needed.
+    #[tokio::test]
+    async fn a_bound_session_is_checked_under_the_repo_it_streamed_to() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let f = fixture(
+            &["sess-bound"],
+            vec![crate::test_helpers::http_json("200 OK", PASS)],
+        );
+        bind_with_repo_switch("sess-bound", BOUND);
+
+        super::check_policies(&f.repo, &f.repo).await.unwrap();
+
+        let request = recv(&f);
+        assert!(
+            request.starts_with(&format!("POST /api/v1/repos/{BOUND}/policies/check")),
+            "{request}"
+        );
+        assert!(request.contains("sess-bound"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn an_unbound_session_is_still_checked_under_the_name_resolved_repo() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let f = fixture(
+            &["sess-free"],
+            vec![
+                repos_listing(),
+                crate::test_helpers::http_json("200 OK", PASS),
+            ],
+        );
+
+        super::check_policies(&f.repo, &f.repo).await.unwrap();
+
+        assert!(recv(&f).starts_with("GET /api/v1/repos "));
+        let check = recv(&f);
+        assert!(
+            check.starts_with(&format!("POST /api/v1/repos/{BY_NAME}/policies/check")),
+            "{check}"
+        );
+        assert!(check.contains("sess-free"), "{check}");
+    }
+
+    #[tokio::test]
+    async fn bound_and_unbound_sessions_are_each_checked_under_their_own_repo() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let f = fixture(
+            &["sess-bound", "sess-free"],
+            vec![
+                repos_listing(),
+                crate::test_helpers::http_json("200 OK", PASS),
+                crate::test_helpers::http_json("200 OK", PASS),
+            ],
+        );
+        bind_with_repo_switch("sess-bound", BOUND);
+
+        super::check_policies(&f.repo, &f.repo).await.unwrap();
+
+        assert!(recv(&f).starts_with("GET /api/v1/repos "));
+        // Group order follows directory iteration order, which is unspecified.
+        let checks = [recv(&f), recv(&f)];
+        let under = |repo: uuid::Uuid| {
+            checks
+                .iter()
+                .find(|r| r.starts_with(&format!("POST /api/v1/repos/{repo}/policies/check")))
+                .unwrap_or_else(|| panic!("no check under {repo}: {checks:?}"))
+        };
+        let bound = under(BOUND);
+        assert!(bound.contains("sess-bound") && !bound.contains("sess-free"));
+        let by_name = under(BY_NAME);
+        assert!(by_name.contains("sess-free") && !by_name.contains("sess-bound"));
     }
 }

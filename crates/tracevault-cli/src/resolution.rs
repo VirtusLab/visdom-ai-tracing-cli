@@ -416,6 +416,38 @@ pub async fn resolve_effective_project(
     Ok(None)
 }
 
+/// The repo binding a recorded session's events were streamed under, resolved
+/// exactly as the stream hook resolves it — so `check` and `verify-start` work
+/// under the same repo id the session's events went to (VIS-601).
+///
+/// The whole chain runs off `session_dir`, like `flush`'s
+/// `queue_capture_binding`: the session id is its file name (the caller loads
+/// `state` from it), and the subagent worktree override is keyed by the
+/// worktree toplevel the hook recorded in its `origin` marker. `bound` and
+/// `user_default` are the lower tiers the hook also consults.
+///
+/// A binding whose `repo_id` is not a UUID resolves to `None`, as it does for
+/// the hook (`stream::attribution_for` never sends to it).
+pub(crate) fn recorded_session_binding(
+    session_dir: &Path,
+    state: &SessionState,
+    bound: Option<RepoBinding>,
+    user_default: Option<RepoBinding>,
+) -> Option<RepoBinding> {
+    let worktree = std::fs::read_to_string(session_dir.join("origin"))
+        .ok()
+        .map(|s| s.trim().to_string());
+    effective_binding(ResolveInputs {
+        repo_flag: None,
+        session: state,
+        worktree_path: worktree.as_deref(),
+        bound,
+        user_default,
+    })
+    .map(|(b, _)| b)
+    .filter(|b| crate::commands::stream::binding_repo_id_is_valid(&b.repo_id))
+}
+
 /// A RepoBinding from a pinned `.tracevault/config.toml` (bound mode), if it has
 /// a repo_id. Pure — caller supplies the already-loaded config.
 /// Carries through the `remote_id`/`codebase_name` `init` persisted (best-effort,
@@ -658,6 +690,99 @@ mod tests {
             remote_id: None,
             codebase_name: None,
             updated_at: "t".into(),
+        }
+    }
+
+    const REPO_A: &str = "11111111-1111-1111-1111-111111111111";
+    const REPO_B: &str = "22222222-2222-2222-2222-222222222222";
+    const REPO_C: &str = "33333333-3333-3333-3333-333333333333";
+
+    fn session_dir_with_origin(origin: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(o) = origin {
+            std::fs::write(dir.path().join("origin"), o).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn recorded_session_binding_prefers_repo_switch_over_config() {
+        let dir = session_dir_with_origin(Some("/wt/a"));
+        let state = SessionState {
+            active: Some(binding(REPO_A)),
+            ..Default::default()
+        };
+        let got =
+            recorded_session_binding(dir.path(), &state, Some(binding(REPO_B)), None).unwrap();
+        assert_eq!(got.repo_id, REPO_A);
+    }
+
+    #[test]
+    fn recorded_session_binding_honours_subagent_override_via_origin_marker() {
+        // The hook writes no trailing newline today; a hand-edited marker with
+        // one must still key the override.
+        let dir = session_dir_with_origin(Some("/wt/sub\n"));
+        let mut state = SessionState {
+            active: Some(binding(REPO_A)),
+            ..Default::default()
+        };
+        state.subagents.insert("/wt/sub".into(), binding(REPO_C));
+        let got = recorded_session_binding(dir.path(), &state, None, None).unwrap();
+        assert_eq!(got.repo_id, REPO_C);
+    }
+
+    #[test]
+    fn recorded_session_binding_unbound_falls_to_config_then_user_default() {
+        let dir = session_dir_with_origin(None);
+        let state = SessionState::default();
+        let got = recorded_session_binding(
+            dir.path(),
+            &state,
+            Some(binding(REPO_B)),
+            Some(binding(REPO_C)),
+        )
+        .unwrap();
+        assert_eq!(got.repo_id, REPO_B);
+        let got =
+            recorded_session_binding(dir.path(), &state, None, Some(binding(REPO_C))).unwrap();
+        assert_eq!(got.repo_id, REPO_C);
+        assert!(recorded_session_binding(dir.path(), &state, None, None).is_none());
+    }
+
+    #[test]
+    fn recorded_session_binding_rejects_non_uuid_repo_id() {
+        let dir = session_dir_with_origin(Some("/wt/a"));
+        let state = SessionState {
+            active: Some(binding("../escape")),
+            ..Default::default()
+        };
+        assert!(recorded_session_binding(dir.path(), &state, None, None).is_none());
+    }
+
+    /// The same session must resolve to the same repo on the hook side and on
+    /// the `check`/`verify-start` side — the whole point of VIS-601.
+    #[test]
+    fn recorded_session_binding_agrees_with_stream_hook() {
+        let mut state = SessionState {
+            active: Some(binding(REPO_A)),
+            ..Default::default()
+        };
+        state.subagents.insert("/wt/sub".into(), binding(REPO_C));
+        for wt in ["/wt/main", "/wt/sub"] {
+            let dir = session_dir_with_origin(Some(wt));
+            let hook = crate::commands::stream::resolve_stream_binding(
+                &state,
+                wt,
+                Some(binding(REPO_B)),
+                None,
+            );
+            let recorded =
+                recorded_session_binding(dir.path(), &state, Some(binding(REPO_B)), None);
+            assert_eq!(
+                hook.map(|b| b.repo_id),
+                recorded.map(|b| b.repo_id),
+                "worktree {wt}"
+            );
         }
     }
 
