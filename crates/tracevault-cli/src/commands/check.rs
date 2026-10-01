@@ -253,51 +253,6 @@ fn resolve_changed_paths(project_root: &Path) -> Option<Vec<String>> {
     }
 }
 
-/// Names of the tools called in one transcript record, in every transcript
-/// schema a supported agent writes:
-/// - Claude Code: `type: "assistant"`, `message.content[]` blocks of `type: "tool_use"`
-/// - pi (GSD) and OpenCode: `type: "message"`, an assistant `message.content[]`
-///   with blocks of `type: "toolCall"`
-/// - Codex: `type: "response_item"` whose `payload` is a `custom_tool_call` or
-///   `function_call` (named) or a `local_shell_call` (counted as `Bash`, the
-///   name the server gives it)
-pub(crate) fn tool_call_names(entry: &serde_json::Value) -> Vec<&str> {
-    fn str_at<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-        v.get(key).and_then(|v| v.as_str())
-    }
-    let blocks_of_type = |block_type: &'static str| {
-        entry
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_array())
-            .into_iter()
-            .flatten()
-            .filter(move |b| str_at(b, "type") == Some(block_type))
-            .filter_map(|b| str_at(b, "name"))
-    };
-    match str_at(entry, "type") {
-        Some("assistant") => blocks_of_type("tool_use").collect(),
-        Some("message")
-            if entry.get("message").and_then(|m| str_at(m, "role")) == Some("assistant") =>
-        {
-            blocks_of_type("toolCall").collect()
-        }
-        Some("response_item") => {
-            let Some(payload) = entry.get("payload") else {
-                return Vec::new();
-            };
-            match str_at(payload, "type") {
-                Some("custom_tool_call" | "function_call") => {
-                    str_at(payload, "name").into_iter().collect()
-                }
-                Some("local_shell_call") => vec!["Bash"],
-                _ => Vec::new(),
-            }
-        }
-        _ => Vec::new(),
-    }
-}
-
 fn collect_session_data(session_dir: &Path) -> Option<SessionCheckData> {
     let session_id = session_dir.file_name()?.to_string_lossy().to_string();
 
@@ -340,25 +295,11 @@ fn collect_session_data(session_dir: &Path) -> Option<SessionCheckData> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let mut tool_calls_map: std::collections::HashMap<String, i32> =
-        std::collections::HashMap::new();
-    let mut total_tool_calls: i32 = 0;
-
-    if let Some(path) = &transcript_path {
-        if let Ok(content) = fs::read_to_string(path) {
-            for line in content.lines() {
-                let entry: serde_json::Value = match serde_json::from_str(line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                for name in tool_call_names(&entry) {
-                    *tool_calls_map.entry(name.to_string()).or_insert(0) += 1;
-                    total_tool_calls += 1;
-                }
-            }
-        }
-    }
+    let tool_calls_map = transcript_path
+        .as_deref()
+        .map(|p| crate::transcript::count_tool_calls(Path::new(p)))
+        .unwrap_or_default();
+    let total_tool_calls: i32 = tool_calls_map.values().sum();
 
     let tool_calls = if tool_calls_map.is_empty() {
         None

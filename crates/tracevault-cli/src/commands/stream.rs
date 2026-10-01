@@ -132,7 +132,7 @@ pub fn record_inline_tool_calls(
 ) -> Result<(), io::Error> {
     let lines: String = records
         .iter()
-        .flat_map(crate::commands::check::tool_call_names)
+        .flat_map(crate::transcript::tool_call_names)
         .map(|name| {
             let record = serde_json::json!({
                 "type": "message",
@@ -930,6 +930,13 @@ pub async fn run_stream(
     // session's tool calls from it, and finds it only through metadata.json.
     // Best-effort, like the origin marker.
     let _ = record_transcript_path(&session_dir, &hook_event.transcript_path);
+    // Inline records (OpenCode) reach no transcript file `check` could read,
+    // so keep their tool calls locally for it. Done here, before the
+    // `.stream_offset` read below can fail the hook, so a corrupt offset file
+    // never costs `check` a tool call.
+    if let Some(records) = &hook_event.transcript_records {
+        let _ = record_inline_tool_calls(&session_dir, records);
+    }
 
     // 3. Mint a time-ordered event id. UUIDv7 is stamped at hook-fire time, so
     //    it both orders events and is a stable idempotency key — no shared
@@ -991,13 +998,6 @@ pub async fn run_stream(
     } else {
         (transcript_lines, start_offset, new_offset)
     };
-
-    // Inline records reach no transcript file `tracevault check` could read,
-    // so keep their tool calls locally for it. Best-effort, like the origin
-    // marker.
-    if is_inline {
-        let _ = record_inline_tool_calls(&session_dir, &transcript_lines);
-    }
 
     // 5. Build StreamEventRequest
     let stream_event_type = match event_type {
