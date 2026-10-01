@@ -120,6 +120,39 @@ pub fn record_transcript_path(session_dir: &Path, transcript_path: &str) -> Resu
     })
 }
 
+/// Fileless agents (OpenCode) have no transcript for `tracevault check` to
+/// count tool calls from: their records ride inline on each hook event. Append
+/// one slim `toolCall` record per tool called in `records` to the session's
+/// `tool_calls.jsonl` and record that file as the session's transcript. Only
+/// the tool name is kept — arguments and outputs (file contents, bash stdout)
+/// would grow the file for nothing. Records with no tool call write nothing.
+pub fn record_inline_tool_calls(
+    session_dir: &Path,
+    records: &[serde_json::Value],
+) -> Result<(), io::Error> {
+    let lines: String = records
+        .iter()
+        .flat_map(crate::commands::check::tool_call_names)
+        .map(|name| {
+            let record = serde_json::json!({
+                "type": "message",
+                "message": {"role": "assistant", "content": [{"type": "toolCall", "name": name}]},
+            });
+            format!("{record}\n")
+        })
+        .collect();
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let log_path = session_dir.join("tool_calls.jsonl");
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?
+        .write_all(lines.as_bytes())?;
+    record_transcript_path(session_dir, &log_path.to_string_lossy())
+}
+
 pub fn append_pending(pending_path: &Path, json: &str) -> Result<(), io::Error> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -958,6 +991,13 @@ pub async fn run_stream(
     } else {
         (transcript_lines, start_offset, new_offset)
     };
+
+    // Inline records reach no transcript file `tracevault check` could read,
+    // so keep their tool calls locally for it. Best-effort, like the origin
+    // marker.
+    if is_inline {
+        let _ = record_inline_tool_calls(&session_dir, &transcript_lines);
+    }
 
     // 5. Build StreamEventRequest
     let stream_event_type = match event_type {
