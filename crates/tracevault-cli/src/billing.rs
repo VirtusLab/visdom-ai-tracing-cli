@@ -126,10 +126,12 @@ fn claude_code(p: &Probe) -> BillingMode {
     if p.var("ANTHROPIC_AUTH_TOKEN").is_some() {
         return gateway_or_key();
     }
-    let api_key_in_use = p
-        .var("ANTHROPIC_API_KEY")
-        .is_some_and(|key| !claude_api_key_declined(p, config_dir.as_deref(), &key));
-    if api_key_in_use {
+    if let Some(key) = p.var("ANTHROPIC_API_KEY") {
+        if claude_api_key_declined(p, config_dir.as_deref(), &key) {
+            // Interactive sessions skip a declined key and use the login, but
+            // `-p` always uses the key, and the hook cannot tell the two apart.
+            return BillingMode::Unknown;
+        }
         return gateway_or_key();
     }
     if claude_api_key_helper_configured(p, config_dir.as_deref()) {
@@ -165,9 +167,9 @@ fn claude_global_state(p: &Probe, config_dir: Option<&Path>) -> Option<serde_jso
 /// In interactive mode Claude Code asks once whether to use ANTHROPIC_API_KEY
 /// and falls back to the subscription when the user declines. The answer is
 /// kept in `customApiKeyResponses.rejected` as the key's last 20 characters.
-/// That storage is observed, not documented, so it is only used to step past
-/// a key the user has explicitly declined; anything else counts the key as in
-/// use (which is also what non-interactive `-p` mode always does).
+/// That storage is observed, not documented, so it is only used to downgrade
+/// an explicitly declined key to "can't tell"; anything else counts the key as
+/// in use (which is also what non-interactive `-p` mode always does).
 fn claude_api_key_declined(p: &Probe, config_dir: Option<&Path>, key: &str) -> bool {
     let Some(state) = claude_global_state(p, config_dir) else {
         return false;
@@ -268,50 +270,63 @@ fn codex(p: &Probe) -> BillingMode {
         .as_ref()
         .and_then(|h| read_json(&h.join("auth.json")));
     let auth = auth_json.as_ref().map(codex_auth_mode);
+    let bedrock_auth = auth_json.as_ref().is_some_and(codex_auth_is_bedrock);
+    let access_token = p.var("CODEX_ACCESS_TOKEN").is_some();
 
-    // Bedrock credentials bill per token on the AWS account, whatever
-    // provider id they are paired with.
-    if auth_json.as_ref().is_some_and(codex_auth_is_bedrock) {
-        return BillingMode::ApiKey;
-    }
-
-    // Project config layers on top of the user's, so look at it first.
-    let configs: Vec<toml::Table> = [
-        Some(p.project_dir.join(".codex").join("config.toml")),
-        codex_home.as_ref().map(|h| h.join("config.toml")),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(|path| std::fs::read_to_string(path).ok()?.parse().ok())
-    .collect();
-    let config_str = |key: &str| {
-        configs
-            .iter()
-            .find_map(|c| c.get(key).and_then(|v| v.as_str()).map(str::to_string))
+    // Only the user's config: routing keys in a project `.codex/config.toml`
+    // are not honoured by Codex, and the rollout records the provider anyway.
+    let config: Option<toml::Table> = codex_home
+        .as_ref()
+        .and_then(|h| std::fs::read_to_string(h.join("config.toml")).ok())
+        .and_then(|s| s.parse().ok());
+    let config_str = |path: &[&str]| {
+        let (last, parents) = path.split_last()?;
+        let mut table = config.as_ref()?;
+        for key in parents {
+            table = table.get(*key)?.as_table()?;
+        }
+        table
+            .get(*last)?
+            .as_str()
             .filter(|v| !v.trim().is_empty())
+            .map(str::to_string)
     };
 
     let provider = p
         .transcript_path
         .as_deref()
         .and_then(codex_rollout_provider)
-        .or_else(|| config_str("model_provider"))
+        .or_else(|| config_str(&["model_provider"]))
         .unwrap_or_else(|| "openai".to_string());
     if provider != "openai" {
-        return if CODEX_LOCAL_PROVIDERS.contains(&provider.as_str()) {
-            BillingMode::Unknown
-        } else {
-            BillingMode::Gateway
+        if CODEX_LOCAL_PROVIDERS.contains(&provider.as_str()) {
+            return BillingMode::Unknown;
+        }
+        if bedrock_auth {
+            // Bedrock credentials bill per token on the AWS account, unless
+            // the access-token override replaces them.
+            return if access_token {
+                BillingMode::Unknown
+            } else {
+                BillingMode::ApiKey
+            };
+        }
+        // A custom provider bills through whatever its base URL points at.
+        return match config_str(&["model_providers", &provider, "base_url"]) {
+            Some(url) if is_direct_provider_api(&url) => BillingMode::ApiKey,
+            Some(_) => BillingMode::Gateway,
+            None => BillingMode::Unknown,
         };
     }
-    let redirected = config_str("openai_base_url")
+    let redirected = config_str(&["openai_base_url"])
         .is_some_and(|u| !host_is(&u, "api.openai.com") && !host_is(&u, "chatgpt.com"));
     if redirected {
         return BillingMode::Gateway;
     }
 
-    if p.var("CODEX_ACCESS_TOKEN").is_some() {
-        // A personal access token or an agent-identity JWT: can't tell which.
+    if access_token {
+        // Overrides auth.json, and is a personal access token or an
+        // agent-identity JWT: can't tell which.
         return BillingMode::Unknown;
     }
     match auth {
@@ -348,6 +363,31 @@ fn codex_auth_is_bedrock(auth: &serde_json::Value) -> bool {
             .iter()
             .any(|k| auth.get(k).is_some_and(|v| !v.is_null())),
     }
+}
+
+/// Hosts of model vendors' own pay-per-token APIs. A custom Codex provider
+/// pointing at one of these is billed directly, not through a gateway; any
+/// other endpoint (LiteLLM, an internal proxy, localhost) counts as a gateway.
+fn is_direct_provider_api(url: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "api.openai.com",
+        "api.anthropic.com",
+        "api.mistral.ai",
+        "generativelanguage.googleapis.com",
+        "api.deepseek.com",
+        "api.x.ai",
+        "api.groq.com",
+        "aiplatform.googleapis.com",
+    ];
+    const SUFFIXES: &[&str] = &[
+        ".openai.azure.com",
+        ".services.ai.azure.com",
+        ".cognitiveservices.azure.com",
+        ".amazonaws.com",
+        "-aiplatform.googleapis.com",
+    ];
+    url_host(url)
+        .is_some_and(|h| EXACT.contains(&h.as_str()) || SUFFIXES.iter().any(|s| h.ends_with(s)))
 }
 
 /// `model_provider` from the rollout's leading `session_meta` line.
@@ -551,7 +591,9 @@ mod tests {
     }
 
     #[test]
-    fn claude_declined_api_key_falls_back_to_the_subscription() {
+    fn claude_declined_api_key_is_unknown() {
+        // Interactive sessions would fall back to the login, `-p` would use
+        // the key; the hook can't tell which, so it must not claim either.
         let key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
         let last20 = &key[key.len() - 20..];
         let f = Fixture::new()
@@ -562,7 +604,7 @@ mod tests {
                     .to_string(),
             )
             .env("ANTHROPIC_API_KEY", key);
-        assert_eq!(f.detect(Agent::ClaudeCode), BillingMode::Subscription);
+        assert_eq!(f.detect(Agent::ClaudeCode), BillingMode::Unknown);
     }
 
     #[test]
@@ -752,8 +794,37 @@ mod tests {
     fn codex_custom_provider_in_the_rollout_is_gateway() {
         let f = Fixture::new()
             .home_file(".codex/auth.json", r#"{"auth_mode":"chatgpt"}"#)
+            .home_file(
+                ".codex/config.toml",
+                "[model_providers.litellm]\nbase_url = \"http://localhost:4000/v1\"\n",
+            )
             .rollout(session_meta("litellm"));
         assert_eq!(f.detect(Agent::Codex), BillingMode::Gateway);
+    }
+
+    #[test]
+    fn codex_custom_provider_at_a_vendor_api_is_billed_directly() {
+        for url in [
+            "https://my-res.openai.azure.com/openai/v1",
+            "https://api.mistral.ai/v1",
+            "https://us-central1-aiplatform.googleapis.com/v1",
+        ] {
+            let f = Fixture::new()
+                .home_file(
+                    ".codex/config.toml",
+                    &format!("[model_providers.direct]\nbase_url = \"{url}\"\n"),
+                )
+                .rollout(session_meta("direct"));
+            assert_eq!(f.detect(Agent::Codex), BillingMode::ApiKey, "{url}");
+        }
+    }
+
+    #[test]
+    fn codex_custom_provider_without_a_resolvable_endpoint_is_unknown() {
+        let f = Fixture::new()
+            .home_file(".codex/auth.json", r#"{"auth_mode":"chatgpt"}"#)
+            .rollout(session_meta("defined-elsewhere"));
+        assert_eq!(f.detect(Agent::Codex), BillingMode::Unknown);
     }
 
     #[test]
@@ -792,7 +863,7 @@ mod tests {
                 ".codex/auth.json",
                 r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk"}"#,
             )
-            .project_file(
+            .home_file(
                 ".codex/config.toml",
                 "openai_base_url = \"https://gw.example.com/v1\"\n",
             )
@@ -813,6 +884,18 @@ mod tests {
     }
 
     #[test]
+    fn codex_ignores_project_routing_config() {
+        let f = Fixture::new()
+            .home_file(".codex/auth.json", r#"{"auth_mode":"chatgpt"}"#)
+            .project_file(
+                ".codex/config.toml",
+                "model_provider = \"litellm\"\nopenai_base_url = \"https://gw.example.com/v1\"\n",
+            )
+            .rollout(session_meta("openai"));
+        assert_eq!(f.detect(Agent::Codex), BillingMode::Subscription);
+    }
+
+    #[test]
     fn codex_ignores_openai_base_url_env() {
         // Codex 0.160 no longer reads OPENAI_BASE_URL for the openai provider.
         let f = Fixture::new()
@@ -827,6 +910,48 @@ mod tests {
             .home_file(".codex/auth.json", r#"{"auth_mode":"bedrockApiKey"}"#)
             .rollout(session_meta("amazon-bedrock"));
         assert_eq!(f.detect(Agent::Codex), BillingMode::ApiKey);
+    }
+
+    #[test]
+    fn codex_access_token_overrides_stored_bedrock_credentials() {
+        for provider in ["amazon-bedrock", "openai"] {
+            let f = Fixture::new()
+                .home_file(".codex/auth.json", r#"{"auth_mode":"bedrockApiKey"}"#)
+                .env("CODEX_ACCESS_TOKEN", "t")
+                .rollout(session_meta(provider));
+            assert_eq!(f.detect(Agent::Codex), BillingMode::Unknown, "{provider}");
+        }
+    }
+
+    /// The production entry point reads the real process environment and the
+    /// hook's transcript path (what `run_stream` stamps on every event).
+    #[test]
+    fn detect_current_reads_the_process_environment_and_transcript() {
+        use crate::test_helpers::{lock_env_mutation_sync, EnvVarGuard};
+        let _lock = lock_env_mutation_sync();
+        let f = Fixture::new()
+            .home_file(".codex/auth.json", r#"{"auth_mode":"chatgpt"}"#)
+            .home_file(
+                ".codex/config.toml",
+                "[model_providers.litellm]\nbase_url = \"https://litellm.example.com\"\n",
+            )
+            .rollout(session_meta("litellm"));
+        let mut env = EnvVarGuard::new();
+        env.set("CODEX_HOME", f.home.path().join(".codex"));
+        env.remove("CODEX_ACCESS_TOKEN");
+        env.remove("CODEX_API_KEY");
+        let transcript = f.transcript.clone().unwrap();
+        let transcript = transcript.to_str().unwrap();
+
+        assert_eq!(
+            detect_current(Agent::Codex, f.project.path(), transcript),
+            BillingMode::Gateway
+        );
+        // No transcript: falls back to auth.json.
+        assert_eq!(
+            detect_current(Agent::Codex, f.project.path(), ""),
+            BillingMode::Subscription
+        );
     }
 
     #[test]

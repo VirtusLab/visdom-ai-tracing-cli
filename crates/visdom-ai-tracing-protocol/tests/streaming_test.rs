@@ -179,7 +179,7 @@ fn pending_flush_round_trip_preserves_context_stamp() {
         flow_id: Some("flow-round-trip".to_string()),
         labels: Some(vec!["backend".to_string(), "payments".to_string()]),
         params: Some(params.clone()),
-        billing_mode: None,
+        billing_mode: Some(BillingMode::Gateway),
     };
 
     let json_str = serde_json::to_string(&req).expect("serialization must succeed");
@@ -206,6 +206,11 @@ fn pending_flush_round_trip_preserves_context_stamp() {
         round_tripped_params.get("region").map(String::as_str),
         Some("us-east-1"),
         "params[region] must survive the JSON round-trip"
+    );
+    assert_eq!(
+        parsed.billing_mode,
+        Some(BillingMode::Gateway),
+        "billing_mode must survive the JSON round-trip"
     );
 }
 
