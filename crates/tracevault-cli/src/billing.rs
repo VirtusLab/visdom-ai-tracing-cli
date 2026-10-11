@@ -281,6 +281,12 @@ fn codex(p: &Probe) -> BillingMode {
         // A configured provider bills through whatever its base URL points at
         // (it carries its own credentials, so stored auth doesn't matter).
         return match config_str(&["model_providers", &provider, "base_url"]) {
+            // ChatGPT's own backend only takes the stored ChatGPT login
+            // (`requires_openai_auth`), i.e. the subscription.
+            Some(url) if host_is(&url, "chatgpt.com") => match auth {
+                Some(BillingMode::Subscription) if !access_token => BillingMode::Subscription,
+                _ => BillingMode::Unknown,
+            },
             Some(url) if is_direct_provider_api(&url) => BillingMode::ApiKey,
             Some(_) => BillingMode::Gateway,
             // A built-in provider not in the config (Bedrock): stored Bedrock
@@ -423,7 +429,8 @@ fn is_direct_provider_api(url: &str) -> bool {
             // Bedrock's own endpoints, including FIPS and VPC (PrivateLink)
             // ones, but not other AWS-hosted hosts such as API Gateway, which
             // can front a customer's gateway.
-            || (h.ends_with(".amazonaws.com")
+            // (`bedrock-mantle.<region>.api.aws` is Codex's default).
+            || ((h.ends_with(".amazonaws.com") || h.ends_with(".api.aws"))
                 && h.split('.').any(|label| label.starts_with("bedrock")))
     })
 }
@@ -1078,6 +1085,7 @@ mod tests {
             "https://bedrock-runtime.eu-west-1.amazonaws.com",
             "https://bedrock-runtime-fips.us-east-1.amazonaws.com",
             "https://vpce-0abc.bedrock-runtime.us-east-1.vpce.amazonaws.com",
+            "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
         ] {
             assert!(is_direct_provider_api(direct), "{direct}");
         }
@@ -1181,6 +1189,32 @@ mod tests {
             )
             .rollout(session_meta("litellm"));
         assert_eq!(f.detect(Agent::Codex), BillingMode::Gateway);
+    }
+
+    #[test]
+    fn codex_custom_provider_on_the_chatgpt_backend_uses_the_login() {
+        let config = "[model_providers.chatgpt-alt]\nbase_url = \"https://chatgpt.com/backend-api/codex\"\nrequires_openai_auth = true\n";
+        let f = Fixture::new()
+            .home_file(".codex/auth.json", r#"{"auth_mode":"chatgpt"}"#)
+            .home_file(".codex/config.toml", config)
+            .rollout(session_meta("chatgpt-alt"));
+        assert_eq!(f.detect(Agent::Codex), BillingMode::Subscription);
+
+        let f = Fixture::new()
+            .home_file(".codex/config.toml", config)
+            .rollout(session_meta("chatgpt-alt"));
+        assert_eq!(f.detect(Agent::Codex), BillingMode::Unknown);
+    }
+
+    #[test]
+    fn codex_bedrock_default_endpoint_is_billed_directly() {
+        let f = Fixture::new()
+            .home_file(
+                ".codex/config.toml",
+                "[model_providers.amazon-bedrock]\nbase_url = \"https://bedrock-mantle.us-east-1.api.aws/openai/v1\"\n",
+            )
+            .rollout(session_meta("amazon-bedrock"));
+        assert_eq!(f.detect(Agent::Codex), BillingMode::ApiKey);
     }
 
     #[test]
