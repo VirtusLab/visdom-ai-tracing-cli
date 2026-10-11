@@ -26,6 +26,10 @@ pub struct Probe<'a> {
     pub managed_claude_settings: Vec<PathBuf>,
     /// The session transcript (Codex: the rollout), if the hook named one.
     pub transcript_path: Option<PathBuf>,
+    /// Codex's machine-wide config layers outside `$CODEX_HOME`, in Codex's
+    /// precedence: `system` sits below the user config, `managed` above it.
+    pub codex_system_config: Vec<PathBuf>,
+    pub codex_managed_config: Vec<PathBuf>,
 }
 
 impl Probe<'_> {
@@ -56,6 +60,8 @@ pub fn detect_current(agent: Agent, hook_cwd: &Path, transcript_path: &str) -> B
         project_dir,
         managed_claude_settings: managed_claude_settings_paths(),
         transcript_path: (!transcript_path.is_empty()).then(|| PathBuf::from(transcript_path)),
+        codex_system_config: codex_system_config_paths(),
+        codex_managed_config: codex_managed_config_paths(),
     };
     detect(agent, &probe)
 }
@@ -81,27 +87,13 @@ pub fn detect(agent: Agent, probe: &Probe) -> BillingMode {
 // URL only turns a gateway credential (token / key / helper) into `Gateway`.
 
 fn claude_code(p: &Probe) -> BillingMode {
-    for (flag, base_url, native_host_suffix) in [
-        (
-            "CLAUDE_CODE_USE_BEDROCK",
-            "ANTHROPIC_BEDROCK_BASE_URL",
-            ".amazonaws.com",
-        ),
-        (
-            "CLAUDE_CODE_USE_VERTEX",
-            "ANTHROPIC_VERTEX_BASE_URL",
-            ".googleapis.com",
-        ),
-        (
-            "CLAUDE_CODE_USE_FOUNDRY",
-            "ANTHROPIC_FOUNDRY_BASE_URL",
-            ".azure.com",
-        ),
+    for (flag, base_url) in [
+        ("CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_BEDROCK_BASE_URL"),
+        ("CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_VERTEX_BASE_URL"),
+        ("CLAUDE_CODE_USE_FOUNDRY", "ANTHROPIC_FOUNDRY_BASE_URL"),
     ] {
         if p.flag(flag) {
-            let routed = p
-                .var(base_url)
-                .is_some_and(|u| !host_has_suffix(&u, native_host_suffix));
+            let routed = p.var(base_url).is_some_and(|u| !is_direct_provider_api(&u));
             return if routed {
                 BillingMode::Gateway
             } else {
@@ -187,23 +179,22 @@ fn claude_api_key_declined(p: &Probe, config_dir: Option<&Path>, key: &str) -> b
     listed("rejected") && !listed("approved")
 }
 
-/// `apiKeyHelper` set in any settings file Claude Code reads.
+/// The effective `apiKeyHelper` is non-empty. Settings resolve a scalar from
+/// the highest-precedence file that sets it: managed > local > project > user,
+/// so an empty value in a higher scope switches off a helper set lower down.
 fn claude_api_key_helper_configured(p: &Probe, config_dir: Option<&Path>) -> bool {
     let project = p.project_dir.join(".claude");
     p.managed_claude_settings
         .iter()
         .cloned()
-        .chain(config_dir.map(|d| d.join("settings.json")))
         .chain([
-            project.join("settings.json"),
             project.join("settings.local.json"),
+            project.join("settings.json"),
         ])
+        .chain(config_dir.map(|d| d.join("settings.json")))
         .filter_map(|path| read_json(&path))
-        .any(|s| {
-            s.get("apiKeyHelper")
-                .and_then(|v| v.as_str())
-                .is_some_and(|v| !v.trim().is_empty())
-        })
+        .find_map(|s| s.get("apiKeyHelper").cloned())
+        .is_some_and(|v| v.as_str().is_some_and(|v| !v.trim().is_empty()))
 }
 
 /// A `/login` subscription session. On Linux/Windows the OAuth credentials sit
@@ -251,7 +242,8 @@ fn managed_claude_settings_paths() -> Vec<PathBuf> {
 // - Routing: the provider a session uses is recorded as `model_provider` on
 //   the rollout's first (`session_meta`) line. The built-in `openai` provider
 //   can only be redirected by the top-level `openai_base_url` config key
-//   (`OPENAI_BASE_URL` stopped doing that around 0.120, so it is ignored here).
+//   (`OPENAI_BASE_URL` stopped doing that around 0.120, so it is ignored here),
+//   read from the config layers a hook can see (`codex_config_layers`).
 // - Auth: `$CODEX_HOME/auth.json` (default `~/.codex`) carries `auth_mode`.
 //   It can be absent while logged in (keyring / ephemeral credential store).
 // - `CODEX_ACCESS_TOKEN` overrides auth.json in every mode; `CODEX_API_KEY`
@@ -273,24 +265,8 @@ fn codex(p: &Probe) -> BillingMode {
     let bedrock_auth = auth_json.as_ref().is_some_and(codex_auth_is_bedrock);
     let access_token = p.var("CODEX_ACCESS_TOKEN").is_some();
 
-    // Only the user's config: routing keys in a project `.codex/config.toml`
-    // are not honoured by Codex, and the rollout records the provider anyway.
-    let config: Option<toml::Table> = codex_home
-        .as_ref()
-        .and_then(|h| std::fs::read_to_string(h.join("config.toml")).ok())
-        .and_then(|s| s.parse().ok());
-    let config_str = |path: &[&str]| {
-        let (last, parents) = path.split_last()?;
-        let mut table = config.as_ref()?;
-        for key in parents {
-            table = table.get(*key)?.as_table()?;
-        }
-        table
-            .get(*last)?
-            .as_str()
-            .filter(|v| !v.trim().is_empty())
-            .map(str::to_string)
-    };
+    let layers = codex_config_layers(p, codex_home.as_deref());
+    let config_str = |path: &[&str]| layers.iter().find_map(|l| toml_str(l, path));
 
     let provider = p
         .transcript_path
@@ -302,19 +278,15 @@ fn codex(p: &Probe) -> BillingMode {
         if CODEX_LOCAL_PROVIDERS.contains(&provider.as_str()) {
             return BillingMode::Unknown;
         }
-        if bedrock_auth {
-            // Bedrock credentials bill per token on the AWS account, unless
-            // the access-token override replaces them.
-            return if access_token {
-                BillingMode::Unknown
-            } else {
-                BillingMode::ApiKey
-            };
-        }
-        // A custom provider bills through whatever its base URL points at.
+        // A configured provider bills through whatever its base URL points at
+        // (it carries its own credentials, so stored auth doesn't matter).
         return match config_str(&["model_providers", &provider, "base_url"]) {
             Some(url) if is_direct_provider_api(&url) => BillingMode::ApiKey,
             Some(_) => BillingMode::Gateway,
+            // A built-in provider not in the config (Bedrock): stored Bedrock
+            // credentials bill per token on the AWS account, unless the
+            // access-token override replaces them.
+            None if bedrock_auth && !access_token => BillingMode::ApiKey,
             None => BillingMode::Unknown,
         };
     }
@@ -335,6 +307,66 @@ fn codex(p: &Probe) -> BillingMode {
         Some(mode) => mode,
         None => BillingMode::Unknown,
     }
+}
+
+/// The Codex config layers a hook can see, highest precedence first (Codex's
+/// `config/src/loader`): legacy `managed_config.toml`, the user config's
+/// legacy `[profiles.<profile>]` table, the user config, the system config.
+/// Project `.codex/config.toml` files are skipped: Codex refuses routing keys
+/// there (`PROJECT_LOCAL_CONFIG_DENYLIST`). Not visible to a hook: cloud and
+/// MDM-managed layers, `--profile` files and `-c` overrides.
+fn codex_config_layers(p: &Probe, codex_home: Option<&Path>) -> Vec<toml::Table> {
+    let read =
+        |path: &Path| -> Option<toml::Table> { std::fs::read_to_string(path).ok()?.parse().ok() };
+    let user = codex_home.and_then(|h| read(&h.join("config.toml")));
+    let profile = user.as_ref().and_then(|u| {
+        let name = u.get("profile")?.as_str()?;
+        u.get("profiles")?.get(name)?.as_table().cloned()
+    });
+    p.codex_managed_config
+        .iter()
+        .filter_map(|path| read(path))
+        .chain(profile)
+        .chain(user)
+        .chain(p.codex_system_config.iter().filter_map(|path| read(path)))
+        .collect()
+}
+
+/// Non-empty string at a dotted `path` in a TOML table.
+fn toml_str(table: &toml::Table, path: &[&str]) -> Option<String> {
+    let (last, parents) = path.split_last()?;
+    let mut table = table;
+    for key in parents {
+        table = table.get(*key)?.as_table()?;
+    }
+    table
+        .get(*last)?
+        .as_str()
+        .filter(|v| !v.trim().is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(windows)]
+fn codex_system_config_paths() -> Vec<PathBuf> {
+    std::env::var_os("ProgramData")
+        .map(|d| PathBuf::from(d).join(r"OpenAI\Codex\config.toml"))
+        .into_iter()
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn codex_system_config_paths() -> Vec<PathBuf> {
+    vec![PathBuf::from("/etc/codex/config.toml")]
+}
+
+#[cfg(windows)]
+fn codex_managed_config_paths() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(not(windows))]
+fn codex_managed_config_paths() -> Vec<PathBuf> {
+    vec![PathBuf::from("/etc/codex/managed_config.toml")]
 }
 
 /// Billing implied by an `auth.json`. Without an explicit `auth_mode`, infer
@@ -365,7 +397,7 @@ fn codex_auth_is_bedrock(auth: &serde_json::Value) -> bool {
     }
 }
 
-/// Hosts of model vendors' own pay-per-token APIs. A custom Codex provider
+/// Hosts of model vendors' own pay-per-token APIs. A provider endpoint
 /// pointing at one of these is billed directly, not through a gateway; any
 /// other endpoint (LiteLLM, an internal proxy, localhost) counts as a gateway.
 fn is_direct_provider_api(url: &str) -> bool {
@@ -383,11 +415,17 @@ fn is_direct_provider_api(url: &str) -> bool {
         ".openai.azure.com",
         ".services.ai.azure.com",
         ".cognitiveservices.azure.com",
-        ".amazonaws.com",
         "-aiplatform.googleapis.com",
     ];
-    url_host(url)
-        .is_some_and(|h| EXACT.contains(&h.as_str()) || SUFFIXES.iter().any(|s| h.ends_with(s)))
+    url_host(url).is_some_and(|h| {
+        EXACT.contains(&h.as_str())
+            || SUFFIXES.iter().any(|s| h.ends_with(s))
+            // Bedrock's own endpoints, including FIPS and VPC (PrivateLink)
+            // ones, but not other AWS-hosted hosts such as API Gateway, which
+            // can front a customer's gateway.
+            || (h.ends_with(".amazonaws.com")
+                && h.split('.').any(|label| label.starts_with("bedrock")))
+    })
 }
 
 /// `model_provider` from the rollout's leading `session_meta` line.
@@ -429,10 +467,6 @@ fn host_is(url: &str, expected: &str) -> bool {
     url_host(url).is_some_and(|h| h == expected)
 }
 
-fn host_has_suffix(url: &str, suffix: &str) -> bool {
-    url_host(url).is_some_and(|h| h.ends_with(suffix))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +480,8 @@ mod tests {
         project: TempDir,
         env: HashMap<String, String>,
         managed: Vec<PathBuf>,
+        codex_system: Vec<PathBuf>,
+        codex_managed: Vec<PathBuf>,
         transcript: Option<PathBuf>,
     }
 
@@ -456,6 +492,8 @@ mod tests {
                 project: TempDir::new().unwrap(),
                 env: HashMap::new(),
                 managed: Vec::new(),
+                codex_system: Vec::new(),
+                codex_managed: Vec::new(),
                 transcript: None,
             }
         }
@@ -482,6 +520,20 @@ mod tests {
             self
         }
 
+        fn system_config(mut self, contents: &str) -> Self {
+            let path = self.home.path().join("etc/codex/config.toml");
+            write(&path, contents);
+            self.codex_system.push(path);
+            self
+        }
+
+        fn managed_codex_config(mut self, contents: &str) -> Self {
+            let path = self.home.path().join("etc/codex/managed_config.toml");
+            write(&path, contents);
+            self.codex_managed.push(path);
+            self
+        }
+
         fn rollout(mut self, first_line: serde_json::Value) -> Self {
             let path = self.home.path().join("rollout.jsonl");
             write(
@@ -502,6 +554,8 @@ mod tests {
                     project_dir: self.project.path().to_path_buf(),
                     managed_claude_settings: self.managed.clone(),
                     transcript_path: self.transcript.clone(),
+                    codex_system_config: self.codex_system.clone(),
+                    codex_managed_config: self.codex_managed.clone(),
                 },
             )
         }
@@ -1012,9 +1066,131 @@ mod tests {
             Some("gw.example.com")
         );
         assert_eq!(url_host("https://"), None);
-        assert!(!host_has_suffix(
-            "https://evilamazonaws.com",
-            ".amazonaws.com"
-        ));
+    }
+
+    #[test]
+    fn direct_provider_hosts() {
+        for direct in [
+            "https://api.openai.com/v1",
+            "https://my-res.openai.azure.com/openai",
+            "https://my-res.services.ai.azure.com",
+            "https://us-east5-aiplatform.googleapis.com/v1",
+            "https://bedrock-runtime.eu-west-1.amazonaws.com",
+            "https://bedrock-runtime-fips.us-east-1.amazonaws.com",
+            "https://vpce-0abc.bedrock-runtime.us-east-1.vpce.amazonaws.com",
+        ] {
+            assert!(is_direct_provider_api(direct), "{direct}");
+        }
+        for gateway in [
+            "http://localhost:4000",
+            "https://litellm.example.com",
+            "https://abc123.execute-api.eu-west-1.amazonaws.com/prod",
+            "https://my-apim.azure-api.net/openai",
+            "https://evilamazonaws.com/bedrock",
+            "https://api.openai.com.evil.example",
+        ] {
+            assert!(!is_direct_provider_api(gateway), "{gateway}");
+        }
+    }
+
+    // ── review round 2: precedence and routing ──────────────────────────────
+
+    #[test]
+    fn claude_helper_overridden_by_an_empty_higher_scope_value_is_off() {
+        let f = Fixture::new()
+            .home_file(".claude/.credentials.json", CLAUDE_OAUTH_CREDENTIALS)
+            .home_file(
+                ".claude/settings.json",
+                r#"{"apiKeyHelper":"~/bin/key.sh"}"#,
+            )
+            .project_file(".claude/settings.local.json", r#"{"apiKeyHelper":""}"#)
+            .env("ANTHROPIC_BASE_URL", "https://litellm.example.com");
+        assert_eq!(f.detect(Agent::ClaudeCode), BillingMode::Subscription);
+
+        // A higher scope that doesn't mention the key leaves the lower one on.
+        let f = Fixture::new()
+            .home_file(
+                ".claude/settings.json",
+                r#"{"apiKeyHelper":"~/bin/key.sh"}"#,
+            )
+            .project_file(".claude/settings.local.json", r#"{"model":"opus"}"#);
+        assert_eq!(f.detect(Agent::ClaudeCode), BillingMode::ApiKey);
+    }
+
+    #[test]
+    fn claude_bedrock_behind_aws_api_gateway_is_gateway() {
+        let f = Fixture::new().env("CLAUDE_CODE_USE_BEDROCK", "1").env(
+            "ANTHROPIC_BEDROCK_BASE_URL",
+            "https://abc123.execute-api.eu-west-1.amazonaws.com/prod",
+        );
+        assert_eq!(f.detect(Agent::ClaudeCode), BillingMode::Gateway);
+    }
+
+    #[test]
+    fn codex_system_config_redirect_is_gateway() {
+        let f = Fixture::new()
+            .home_file(".codex/auth.json", r#"{"auth_mode":"chatgpt"}"#)
+            .system_config("openai_base_url = \"https://gw.example.com/v1\"\n")
+            .rollout(session_meta("openai"));
+        assert_eq!(f.detect(Agent::Codex), BillingMode::Gateway);
+    }
+
+    #[test]
+    fn codex_config_layers_follow_codex_precedence() {
+        // The user config overrides the system config...
+        let f = Fixture::new()
+            .home_file(".codex/auth.json", r#"{"auth_mode":"chatgpt"}"#)
+            .system_config("openai_base_url = \"https://gw.example.com/v1\"\n")
+            .home_file(
+                ".codex/config.toml",
+                "openai_base_url = \"https://api.openai.com/v1\"\n",
+            );
+        assert_eq!(f.detect(Agent::Codex), BillingMode::Subscription);
+
+        // ...and the legacy managed config overrides the user config.
+        let f = Fixture::new()
+            .home_file(".codex/auth.json", r#"{"auth_mode":"chatgpt"}"#)
+            .home_file(
+                ".codex/config.toml",
+                "openai_base_url = \"https://api.openai.com/v1\"\n",
+            )
+            .managed_codex_config("openai_base_url = \"https://gw.example.com/v1\"\n");
+        assert_eq!(f.detect(Agent::Codex), BillingMode::Gateway);
+    }
+
+    #[test]
+    fn codex_legacy_profile_selects_the_provider() {
+        let f = Fixture::new()
+            .home_file(".codex/auth.json", r#"{"auth_mode":"chatgpt"}"#)
+            .home_file(
+                ".codex/config.toml",
+                "profile = \"work\"\nmodel_provider = \"openai\"\n\
+                 [profiles.work]\nmodel_provider = \"litellm\"\n\
+                 [model_providers.litellm]\nbase_url = \"https://litellm.example.com\"\n",
+            );
+        assert_eq!(f.detect(Agent::Codex), BillingMode::Gateway);
+    }
+
+    #[test]
+    fn codex_provider_routing_wins_over_stored_bedrock_auth() {
+        let f = Fixture::new()
+            .home_file(".codex/auth.json", r#"{"auth_mode":"bedrockApiKey"}"#)
+            .home_file(
+                ".codex/config.toml",
+                "[model_providers.litellm]\nbase_url = \"https://litellm.example.com\"\n",
+            )
+            .rollout(session_meta("litellm"));
+        assert_eq!(f.detect(Agent::Codex), BillingMode::Gateway);
+    }
+
+    #[test]
+    fn codex_custom_provider_behind_aws_api_gateway_is_gateway() {
+        let f = Fixture::new()
+            .home_file(
+                ".codex/config.toml",
+                "[model_providers.aws]\nbase_url = \"https://abc.execute-api.us-east-1.amazonaws.com/v1\"\n",
+            )
+            .rollout(session_meta("aws"));
+        assert_eq!(f.detect(Agent::Codex), BillingMode::Gateway);
     }
 }
