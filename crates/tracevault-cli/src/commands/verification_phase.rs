@@ -151,6 +151,7 @@ pub async fn open_verification_phase(
         flow_id: None,
         labels: None,
         params: None,
+        billing_mode: None,
     };
 
     // Through `resolve_client`, like every other command — NOT by pairing

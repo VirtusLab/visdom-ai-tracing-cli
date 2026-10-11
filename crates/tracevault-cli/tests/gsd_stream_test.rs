@@ -65,6 +65,7 @@ fn gsd_session_produces_gsd_tagged_request() {
         flow_id: None,
         labels: None,
         params: None,
+        billing_mode: None,
     };
     stamp_agent(&mut req, Agent::Gsd);
 

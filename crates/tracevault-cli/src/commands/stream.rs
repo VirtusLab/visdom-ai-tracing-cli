@@ -1070,6 +1070,11 @@ pub async fn run_stream(
         flow_id: ctx_flow_id,
         labels: ctx_labels,
         params: ctx_params,
+        billing_mode: Some(crate::billing::detect_current(
+            agent,
+            hook_cwd,
+            &hook_event.transcript_path,
+        )),
     };
 
     stamp_agent(&mut req, agent);
@@ -1763,6 +1768,7 @@ mod tests {
             flow_id: None,
             labels: None,
             params: None,
+            billing_mode: None,
         };
         stamp_agent(&mut req, Agent::Codex);
         assert_eq!(req.tool.as_deref(), Some("codex"));
@@ -2362,6 +2368,7 @@ mod tests {
             flow_id: None,
             labels: None,
             params: None,
+            billing_mode: None,
         }
     }
 
