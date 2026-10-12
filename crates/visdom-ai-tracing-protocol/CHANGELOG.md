@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.4](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/protocol-v0.28.3...protocol-v0.28.4) - 2026-10-12
+
+### Added
+
+- *(protocol,cli)* record each session's billing mode (VIS-748) ([#59](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/59))
+
 ## [0.25.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/protocol-v0.24.0...protocol-v0.25.0) - 2026-07-22
 
 ### Added
