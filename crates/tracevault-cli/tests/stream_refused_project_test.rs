@@ -146,6 +146,7 @@ fn sample_pending_event(event_uuid: uuid::Uuid) -> String {
         flow_id: None,
         labels: None,
         params: None,
+        billing_mode: None,
     };
     serde_json::to_string(&req).unwrap()
 }

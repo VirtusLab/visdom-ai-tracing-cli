@@ -58,6 +58,35 @@ pub struct StreamEventRequest {
     /// `None` when the client does not send this field; defaults to empty object.
     #[serde(default)]
     pub params: Option<HashMap<String, String>>,
+    /// How the agent session is paid for, as detected by the client at hook
+    /// time. `None` when the client predates this field (older CLIs never
+    /// send it); omitted from the payload when `None` so the wire stays
+    /// identical for those clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_mode: Option<BillingMode>,
+}
+
+/// How an agent session is billed. Lets the server tell real spend
+/// (gateway / API key) from subscription usage, which would otherwise be
+/// priced at API list rates and look like money spent.
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingMode {
+    /// Requests are routed through an LLM gateway (e.g. LiteLLM), which
+    /// records the actual cost.
+    Gateway,
+    /// Pay-per-token billing against the provider directly (API key, or a
+    /// cloud provider account such as Bedrock / Vertex).
+    ApiKey,
+    /// A flat-rate subscription (Claude Pro/Max/Team, ChatGPT Plus/Pro…):
+    /// token cost is an API-equivalent estimate, not spend.
+    Subscription,
+    /// The client could not tell. Also what any value this version does not
+    /// know deserializes to, so a mode added later never makes a server
+    /// built on this version reject the event.
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]

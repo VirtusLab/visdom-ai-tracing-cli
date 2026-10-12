@@ -50,6 +50,7 @@ fn codex_rollout_produces_codex_tagged_request() {
         flow_id: None,
         labels: None,
         params: None,
+        billing_mode: None,
     };
     stamp_agent(&mut req, Agent::Codex);
 

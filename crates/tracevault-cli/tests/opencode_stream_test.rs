@@ -57,6 +57,7 @@ fn opencode_inline_records_produce_opencode_tagged_request() {
         flow_id: None,
         labels: None,
         params: None,
+        billing_mode: None,
     };
     stamp_agent(&mut req, Agent::OpenCode);
 

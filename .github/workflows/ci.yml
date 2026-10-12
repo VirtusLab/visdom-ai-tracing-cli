@@ -31,3 +31,8 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      # The workspace build leaves the optional `schema` feature (utoipa
+      # derives) off; build and test it explicitly.
+      - name: Test protocol schema feature
+        run: cargo test -p visdom-ai-tracing-protocol --features schema

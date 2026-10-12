@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod api_client;
+pub mod billing;
 pub mod commands;
 pub mod config;
 pub mod context;

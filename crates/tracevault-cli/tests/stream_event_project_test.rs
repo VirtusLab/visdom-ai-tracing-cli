@@ -110,6 +110,7 @@ fn sample_stream_event_request() -> StreamEventRequest {
         flow_id: None,
         labels: None,
         params: None,
+        billing_mode: None,
     }
 }
 
