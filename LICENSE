@@ -24,6 +24,14 @@ binary form, together with their documentation (the "Software").
    agreement with Virtus Lab, and only for that organisation's internal
    business purposes.
 
+   Installing includes obtaining the Software from a channel Virtus Lab
+   publishes it through (such as GitHub, crates.io or the Homebrew tap) and
+   compiling the unmodified source, with its unmodified dependencies, using
+   standard build tooling such as `cargo install`, together with the copies
+   that this compilation and normal operation make. It also includes using
+   the GitHub Action in `action/` in your organisation's CI workflows for
+   the same purpose.
+
 3. Restrictions
 
    Except as expressly permitted in section 2, or to the extent that
