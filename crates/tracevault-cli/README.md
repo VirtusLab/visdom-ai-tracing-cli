@@ -78,4 +78,5 @@ git remote URL; it does not create new registrations.
 
 ## License
 
-Apache-2.0
+Proprietary, see [LICENSE](https://github.com/VirtusLab/visdom-ai-tracing-cli/blob/main/LICENSE).
+Versions up to 0.28.4 were released under Apache-2.0.

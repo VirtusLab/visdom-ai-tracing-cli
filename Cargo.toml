@@ -5,7 +5,9 @@ resolver = "2"
 [workspace.package]
 version = "0.28.4"
 edition = "2021"
-license = "Apache-2.0"
+# Proprietary: crates.io accepts only SPDX list identifiers in `license`, so a
+# non-standard license goes through `license-file`, and cargo packages the file.
+license-file = "LICENSE"
 authors = ["VirtusLab"]
 homepage = "https://github.com/VirtusLab/visdom-ai-tracing-cli"
 repository = "https://github.com/VirtusLab/visdom-ai-tracing-cli"

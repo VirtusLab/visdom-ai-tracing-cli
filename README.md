@@ -279,4 +279,6 @@ runs `tracevault verify --range`, and writes a pass/fail summary to the Actions 
 
 ## License
 
-Apache-2.0.
+Proprietary. The source is public, but the CLI is licensed only for use with a Visdom AI
+Tracing deployment your organisation is authorised to use; see [LICENSE](LICENSE). Versions up
+to 0.28.4 were released under Apache-2.0.
