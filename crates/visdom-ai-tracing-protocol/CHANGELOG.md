@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/protocol-v0.28.4...protocol-v0.29.0) - 2026-10-22
+
+### Other
+
+- [**breaking**] relicense the CLI as proprietary ([#61](https://github.com/VirtusLab/visdom-ai-tracing-cli/pull/61))
+
 ## [0.28.4](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/protocol-v0.28.3...protocol-v0.28.4) - 2026-10-12
 
 ### Added
