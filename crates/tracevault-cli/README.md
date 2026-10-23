@@ -53,7 +53,10 @@ persist the opt-out explicitly.
 **Commands**
 
 - `tracevault repo switch <path>` — bind the current session's tracing to the repo at `<path>`
-  (must be pre-registered with TraceVault) and print its policies.
+  (must be pre-registered with TraceVault) and print its policies. When the checkout's codebase
+  has several repo records, switch keeps the one already in use (the session's current binding,
+  else a checkout's `.tracevault/config.toml`) and errors if none of them is; pick one
+  explicitly with `--repo-id <id>`.
 - `tracevault repo switch --name <project>` — bind by the repo's registered name instead, with
   no checkout required. Useful for headless/detached workers that don't have the target repo
   cloned locally. Exactly one of `<path>` or `--name` must be given.

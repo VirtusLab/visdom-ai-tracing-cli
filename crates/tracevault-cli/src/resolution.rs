@@ -7,7 +7,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::api_client::{ApiClient, RepoListItem, ResolveProjectOutcome};
+use crate::api_client::{
+    ApiClient, RemoteRepoRef, RepoListItem, ResolveProjectOutcome, ResolveRemoteResponse,
+};
 use crate::session_state::{ProjectBinding, RepoBinding, SessionState};
 
 /// `git -C <path> remote get-url origin`, trimmed. `None` if git fails or there
@@ -122,38 +124,150 @@ pub(crate) fn pick_status_line(
         .or_else(|| cached_name.map(|n| format!("codebase: {n}")))
 }
 
-/// Resolve a filesystem path to a registered-repo binding: read its origin
+/// A checkout path resolved to its codebase: the origin URL it was resolved
+/// from, the codebase (git remote) the server deduplicates that URL to, and
+/// the live repo records linked to it.
+#[derive(Debug)]
+pub struct ResolvedCodebase {
+    pub git_url: String,
+    pub remote: ResolveRemoteResponse,
+    /// Never empty: [`resolve_path_to_codebase`] errors instead.
+    pub repos: Vec<RemoteRepoRef>,
+}
+
+/// Which of a codebase's repos to bind, as decided by [`ResolvedCodebase::choose`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoChoice {
+    /// The codebase has a single live repo.
+    Only(uuid::Uuid),
+    /// Several live repos; this one was the first of the preferred ids
+    /// (given by index into that list).
+    Preferred(uuid::Uuid, usize),
+    /// Several live repos and none of them is preferred.
+    Ambiguous,
+}
+
+impl ResolvedCodebase {
+    /// The codebase's display name: its registered name, else its URL.
+    pub fn display_name(&self) -> &str {
+        self.remote
+            .name
+            .as_deref()
+            .unwrap_or(&self.remote.normalized_url)
+    }
+
+    /// Pick the repo to bind: the only one, else the first of `preferred`
+    /// (repo ids, most preferred first) that is one of this codebase's live
+    /// repos, else none.
+    ///
+    /// Sessions are keyed by `(repo_id, session_id)` on the server, so two
+    /// repos of one codebase are NOT interchangeable for ingest: binding a
+    /// session to a different one mid-flight splits it across two session
+    /// rows (VIS-1018). Hence no silent fallback to an arbitrary repo here.
+    pub fn choose(&self, preferred: &[uuid::Uuid]) -> RepoChoice {
+        if let [only] = self.repos.as_slice() {
+            return RepoChoice::Only(only.id);
+        }
+        preferred
+            .iter()
+            .enumerate()
+            .find(|(_, id)| self.repos.iter().any(|r| r.id == **id))
+            .map_or(RepoChoice::Ambiguous, |(i, id)| {
+                RepoChoice::Preferred(*id, i)
+            })
+    }
+
+    /// `name (id)` for each live repo, lowest id first — for messages that
+    /// ask the user to pick one.
+    pub fn repo_list(&self) -> String {
+        let mut repos: Vec<_> = self.repos.iter().collect();
+        repos.sort_by_key(|r| r.id);
+        repos
+            .iter()
+            .map(|r| format!("{} ({})", r.name, r.id))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// A binding to `repo_id` of this codebase.
+    pub fn binding(&self, repo_id: uuid::Uuid) -> RepoBinding {
+        RepoBinding {
+            repo_id: repo_id.to_string(),
+            git_url: Some(self.git_url.clone()),
+            remote_id: Some(self.remote.remote_id),
+            codebase_name: self.remote.name.clone(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+}
+
+/// Resolve a filesystem path to its codebase and live repos: read its origin
 /// remote URL and ask the server. `Ok(None)` when the path has no remote or
-/// the server has no matching codebase (pre-registered-only).
-pub async fn resolve_path_to_binding(
+/// the server has no matching codebase (pre-registered-only); an error when
+/// the codebase is registered but has no live repo.
+pub async fn resolve_path_to_codebase(
     path: &Path,
     client: &ApiClient,
-) -> Result<Option<RepoBinding>, Box<dyn std::error::Error>> {
+) -> Result<Option<ResolvedCodebase>, Box<dyn std::error::Error>> {
     let Some(git_url) = git_remote_url(path) else {
         return Ok(None);
     };
-    // Resolve the CODEBASE by normalized URL (deduped), then bind to one of its
-    // repos. Any linked repo works for ingest — every repo-keyed server read
-    // resolves codebase-wide — so the lowest-id linked repo (deterministic) is
-    // fine.
+    // Resolve the CODEBASE by normalized URL (deduped), then list its repos.
     let Some(remote) = client.resolve_remote(&git_url).await? else {
         return Ok(None);
     };
     let repos = client.get_remote_repos(remote.remote_id).await?;
-    let Some(first) = repos.into_iter().min_by_key(|r| r.id) else {
+    let codebase = ResolvedCodebase {
+        git_url,
+        remote,
+        repos,
+    };
+    if codebase.repos.is_empty() {
         return Err(format!(
             "codebase {} is registered but has no tracked repo; run `tracevault init` in a checkout",
-            remote.name.as_deref().unwrap_or(&remote.normalized_url)
+            codebase.display_name()
         )
         .into());
+    }
+    Ok(Some(codebase))
+}
+
+/// The repo id a checkout's own `.tracevault/config.toml` binds, if any. `path`
+/// may be anywhere in the checkout, or in one of its linked worktrees.
+pub fn checkout_config_repo_id(path: &Path) -> Option<uuid::Uuid> {
+    let root = crate::paths::resolve_project_root(path).root;
+    crate::config::TracevaultConfig::load(&root)?
+        .repo_id?
+        .parse()
+        .ok()
+}
+
+/// Resolve a filesystem path to a registered-repo binding: read its origin
+/// remote URL and ask the server. `Ok(None)` when the path has no remote or
+/// the server has no matching codebase (pre-registered-only).
+///
+/// When the codebase has several live repos, the one the checkout's own
+/// `.tracevault/config.toml` binds wins — the repo its hooks stream to —
+/// else the lowest id (deterministic). Callers that must not guess (`repo
+/// switch`) use [`resolve_path_to_codebase`] and [`ResolvedCodebase::choose`].
+pub async fn resolve_path_to_binding(
+    path: &Path,
+    client: &ApiClient,
+) -> Result<Option<RepoBinding>, Box<dyn std::error::Error>> {
+    let Some(codebase) = resolve_path_to_codebase(path, client).await? else {
+        return Ok(None);
     };
-    Ok(Some(RepoBinding {
-        repo_id: first.id.to_string(),
-        git_url: Some(git_url),
-        remote_id: Some(remote.remote_id),
-        codebase_name: remote.name,
-        updated_at: chrono::Utc::now().to_rfc3339(),
-    }))
+    let preferred: Vec<uuid::Uuid> = checkout_config_repo_id(path).into_iter().collect();
+    let repo_id = match codebase.choose(&preferred) {
+        RepoChoice::Only(id) | RepoChoice::Preferred(id, _) => id,
+        RepoChoice::Ambiguous => codebase
+            .repos
+            .iter()
+            .map(|r| r.id)
+            .min()
+            .expect("resolve_path_to_codebase never returns an empty repo list"),
+    };
+    Ok(Some(codebase.binding(repo_id)))
 }
 
 /// Inputs for the effective-binding precedence chain. `repo_flag` and `bound`
