@@ -324,8 +324,13 @@ async fn switch(
     let in_use = in_use_repos(&dest, target_path, project_root);
     let (repo_uuid, kept) = pick_switch_repo(&codebase, repo_id, &in_use)?;
     if let Some(source) = kept {
+        let name = codebase
+            .repos
+            .iter()
+            .find(|r| r.id == repo_uuid)
+            .map_or("", |r| r.name.as_str());
         eprintln!(
-            "codebase {} has {} repo records; keeping repo {repo_uuid}, {source}",
+            "codebase {} has {} repo records; keeping repo {name}, {source}",
             codebase.display_name(),
             codebase.repos.len()
         );
