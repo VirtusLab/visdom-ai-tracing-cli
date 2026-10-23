@@ -962,10 +962,19 @@ pub fn stamp_agent(req: &mut StreamEventRequest, agent: crate::agent::Agent) {
     req.protocol_version = agent.protocol_version() as u32;
 }
 
+/// How long a hook may keep starting requests. `init` installs the hooks
+/// with a 10 s timeout and the agent kills a hook that overruns it, so a
+/// split batch (or a long pending queue) still unsent after this is queued
+/// instead: a killed hook would lose whatever it held only in memory. Half
+/// the timeout leaves room for the request already in flight.
+const DELIVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Send a hook event's parts in order. From the first failure on (or from the
-/// start when `send_failed`, i.e. older queued events are still waiting), a
-/// part is appended to the pending queue instead, behind whatever is already
-/// there. Returns whether every part was accepted.
+/// start when `send_failed`, i.e. older queued events are still waiting), or
+/// once `deadline` has passed, a part is appended to the pending queue
+/// instead, behind whatever is already there. Returns whether every part was
+/// accepted.
+#[allow(clippy::too_many_arguments)]
 async fn deliver_parts(
     client: &crate::api_client::ApiClient,
     attribution: &Attribution,
@@ -973,10 +982,12 @@ async fn deliver_parts(
     parts: Vec<StreamEventRequest>,
     pending_path: &Path,
     mut send_failed: bool,
+    deadline: std::time::Instant,
     warned: &mut bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut all_accepted = true;
     for part in parts {
+        send_failed = send_failed || std::time::Instant::now() >= deadline;
         if !send_failed {
             match send_stream_event(client, attribution, force, &part, warned).await {
                 Ok(_) => continue,
@@ -994,6 +1005,7 @@ pub async fn run_stream(
     agent: crate::agent::Agent,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Read HookEvent from stdin
+    let deadline = std::time::Instant::now() + DELIVERY_BUDGET;
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
     let mut hook_event = parse_hook_event(&input)?;
@@ -1277,12 +1289,15 @@ pub async fn run_stream(
     // not once per buffered event.
     let mut warned = false;
 
-    // Send pending events first
+    // Send pending events first. Past the delivery budget, put the rest back
+    // unsent (the queue file is already gone), so a hook killed at its timeout
+    // loses none of them.
     for (i, pending_json) in pending_events.iter().enumerate() {
         if let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(pending_json) {
-            if send_stream_event(&client, &attribution, force, &pending_req, &mut warned)
-                .await
-                .is_err()
+            if std::time::Instant::now() >= deadline
+                || send_stream_event(&client, &attribution, force, &pending_req, &mut warned)
+                    .await
+                    .is_err()
             {
                 // Re-queue only the failed event and the ones after it that
                 // were never attempted, in order. Events before `i` already
@@ -1308,6 +1323,7 @@ pub async fn run_stream(
         split_into_parts(req),
         &pending_path,
         send_failed,
+        deadline,
         &mut warned,
     )
     .await?;
@@ -3570,6 +3586,10 @@ mod tests {
         assert_eq!(big.transcript_offset, Some(1));
     }
 
+    fn far_deadline() -> std::time::Instant {
+        std::time::Instant::now() + Duration::from_secs(60)
+    }
+
     fn captured_body(captured: &str) -> StreamEventRequest {
         let body = captured.splitn(3, " | ").nth(2).expect("captured body");
         serde_json::from_str(body).expect("request body is a StreamEventRequest")
@@ -3591,6 +3611,7 @@ mod tests {
             parts.clone(),
             &pending_path,
             false,
+            far_deadline(),
             &mut false,
         )
         .await
@@ -3625,6 +3646,7 @@ mod tests {
             parts.clone(),
             &pending_path,
             false,
+            far_deadline(),
             &mut false,
         )
         .await
@@ -3665,6 +3687,7 @@ mod tests {
             parts,
             &pending_path,
             true,
+            far_deadline(),
             &mut false,
         )
         .await
@@ -3672,5 +3695,33 @@ mod tests {
 
         assert!(!all_accepted);
         assert_eq!(drain_pending(&pending_path).unwrap().len(), 1);
+    }
+
+    /// Past the delivery budget nothing more is sent: the parts are queued
+    /// before the agent can kill the hook at its timeout and lose them.
+    #[tokio::test]
+    async fn deliver_parts_queues_the_rest_once_the_budget_is_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending_path = dir.path().join("pending.jsonl");
+        let parts = split_into_parts(event_with_lines(big_lines(300, 5_000), 0));
+        let (base, rx) = crate::test_helpers::spawn_seq(vec![ok_stream_response(); parts.len()]);
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+
+        let all_accepted = deliver_parts(
+            &client,
+            &repo_attr(&uuid::Uuid::new_v4().to_string()),
+            AttributionForce::default(),
+            parts.clone(),
+            &pending_path,
+            false,
+            std::time::Instant::now(),
+            &mut false,
+        )
+        .await
+        .unwrap();
+
+        assert!(!all_accepted);
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+        assert_eq!(drain_pending(&pending_path).unwrap().len(), parts.len());
     }
 }
