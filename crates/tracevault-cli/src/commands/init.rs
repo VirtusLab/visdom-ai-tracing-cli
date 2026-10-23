@@ -289,12 +289,7 @@ pub async fn init_in_directory(
                         &codebase.remote.clone_status
                     )
                 );
-                if let Some(mut cfg) = TracevaultConfig::load(project_root) {
-                    cfg.repo_id = Some(repo_id.to_string());
-                    cfg.remote_id = Some(codebase.remote.remote_id.to_string());
-                    cfg.codebase_name = codebase.remote.name.clone();
-                    let _ = fs::write(TracevaultConfig::config_path(project_root), cfg.to_toml());
-                }
+                persist_repo_binding(project_root, repo_id, Some(&codebase.remote));
             }
             Ok(RegistrationPlan::Ambiguous(codebase)) => {
                 eprintln!(
@@ -322,6 +317,24 @@ pub async fn init_in_directory(
     }
 
     Ok(hook_gitignore_entry)
+}
+
+/// Record the repo this checkout binds — and its codebase, display-only — in
+/// an existing `.tracevault/config.toml`. Best-effort: does nothing without a
+/// config, and a failed write never fails the caller.
+pub(crate) fn persist_repo_binding(
+    project_root: &Path,
+    repo_id: uuid::Uuid,
+    codebase: Option<&crate::api_client::ResolveRemoteResponse>,
+) {
+    if let Some(mut cfg) = TracevaultConfig::load(project_root) {
+        cfg.repo_id = Some(repo_id.to_string());
+        if let Some(remote) = codebase {
+            cfg.remote_id = Some(remote.remote_id.to_string());
+            cfg.codebase_name = remote.name.clone();
+        }
+        let _ = fs::write(TracevaultConfig::config_path(project_root), cfg.to_toml());
+    }
 }
 
 /// Register a repo for a remote the server has no live repo for, and persist

@@ -1064,4 +1064,138 @@ mod tests {
             .expect("registered");
         assert_eq!(got.repo_id, HIGH);
     }
+
+    // ── in_use_repos: what switch keeps, read from real state ─────────────────
+
+    const TARGET_CFG: &str = "c0000000-0000-4000-8000-00000000000c";
+    const CWD_CFG: &str = "b0000000-0000-4000-8000-00000000000b";
+    const ACTIVE: &str = "a0000000-0000-4000-8000-00000000000a";
+    const USER: &str = "d0000000-0000-4000-8000-00000000000d";
+
+    /// A git checkout whose `.tracevault/config.toml` binds `repo_id`.
+    fn checkout_bound_to(repo_id: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(dir.path());
+        std::fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
+        std::fs::write(
+            dir.path().join(".tracevault/config.toml"),
+            format!("repo_id = \"{repo_id}\"\n"),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn ids(in_use: &[InUse]) -> Vec<String> {
+        in_use.iter().map(|u| u.repo_id.to_string()).collect()
+    }
+
+    /// Session destination: the session's own binding first, then the target
+    /// checkout's config, then this checkout's.
+    #[tokio::test]
+    async fn in_use_puts_the_session_binding_first() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let home = tempfile::tempdir().unwrap();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("XDG_STATE_HOME", home.path());
+        guard.set("XDG_CONFIG_HOME", home.path());
+        let target = checkout_bound_to(TARGET_CFG);
+        let cwd = checkout_bound_to(CWD_CFG);
+        let state = SessionState {
+            active: Some(binding(ACTIVE)),
+            ..Default::default()
+        };
+        session_state::save("sess-inuse", &state).unwrap();
+
+        let got = in_use_repos(
+            &SwitchDest::Session("sess-inuse".into()),
+            target.path(),
+            cwd.path(),
+        );
+
+        assert_eq!(ids(&got), [ACTIVE, TARGET_CFG, CWD_CFG]);
+    }
+
+    /// A session without its own binding streams to this checkout's
+    /// config.toml, so that is its current binding.
+    #[tokio::test]
+    async fn in_use_falls_back_to_what_the_session_streams_to() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let home = tempfile::tempdir().unwrap();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("XDG_STATE_HOME", home.path());
+        guard.set("XDG_CONFIG_HOME", home.path());
+        let target = checkout_bound_to(TARGET_CFG);
+        let cwd = checkout_bound_to(CWD_CFG);
+
+        let got = in_use_repos(
+            &SwitchDest::Session("sess-unbound".into()),
+            target.path(),
+            cwd.path(),
+        );
+
+        assert_eq!(ids(&got)[0], CWD_CFG);
+        assert!(
+            got[0].source.contains("current binding"),
+            "{}",
+            got[0].source
+        );
+    }
+
+    /// `--user`: the current user default comes first, not any session.
+    #[tokio::test]
+    async fn in_use_for_the_user_default_starts_with_the_user_default() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let home = tempfile::tempdir().unwrap();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("XDG_STATE_HOME", home.path());
+        guard.set("XDG_CONFIG_HOME", home.path());
+        crate::user_default::save(&binding(USER)).unwrap();
+        let target = checkout_bound_to(TARGET_CFG);
+        let cwd = checkout_bound_to(CWD_CFG);
+
+        let got = in_use_repos(&SwitchDest::UserDefault, target.path(), cwd.path());
+
+        assert_eq!(ids(&got), [USER, TARGET_CFG, CWD_CFG]);
+    }
+
+    /// End to end: an ambiguous codebase fails the switch and leaves the
+    /// session's binding as it was.
+    #[tokio::test]
+    async fn ambiguous_switch_leaves_the_session_binding_unchanged() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let home = tempfile::tempdir().unwrap();
+        let other = "99999999-0000-4000-8000-000000000009";
+        let state = SessionState {
+            active: Some(binding(other)),
+            ..Default::default()
+        };
+        let target = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(target.path());
+        add_origin_remote(target.path(), "git@github.com:org/repo.git");
+        let remote = r#"{"remote_id":"2280a1c9-0000-4000-8000-000000000003","name":"tracing","normalized_url":"github.com/org/repo","clone_status":"ready"}"#;
+        let detail = format!(
+            r#"{{"name":"tracing","normalized_url":"github.com/org/repo","clone_status":"ready","repos":[{{"id":"{LOW}","name":"tracevault"}},{{"id":"{HIGH}","name":"tracing"}}]}}"#
+        );
+        let base = spawn_n(vec![http_200(remote), http_200(&detail)]);
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("XDG_STATE_HOME", home.path());
+        guard.set("XDG_CONFIG_HOME", home.path());
+        guard.set("TRACEVAULT_SERVER_URL", &base);
+        guard.set("TRACEVAULT_API_KEY", "tok");
+        session_state::save("sess-ambiguous", &state).unwrap();
+
+        let err = switch(
+            Some(&target.path().to_string_lossy()),
+            None,
+            None,
+            false,
+            Some("sess-ambiguous"),
+            home.path(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("--repo-id"), "got: {err}");
+        assert_eq!(session_state::load("sess-ambiguous"), state);
+    }
 }
