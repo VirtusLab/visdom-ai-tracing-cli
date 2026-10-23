@@ -131,7 +131,7 @@ pub(crate) fn pick_status_line(
 pub struct ResolvedCodebase {
     pub git_url: String,
     pub remote: ResolveRemoteResponse,
-    /// Never empty: [`resolve_path_to_codebase`] errors instead.
+    /// Never empty from [`resolve_path_to_codebase`], which errors instead.
     pub repos: Vec<RemoteRepoRef>,
 }
 
@@ -212,15 +212,8 @@ pub async fn resolve_path_to_codebase(
     let Some(git_url) = git_remote_url(path) else {
         return Ok(None);
     };
-    // Resolve the CODEBASE by normalized URL (deduped), then list its repos.
-    let Some(remote) = client.resolve_remote(&git_url).await? else {
+    let Some(codebase) = resolve_url_to_codebase(&git_url, client).await? else {
         return Ok(None);
-    };
-    let repos = client.get_remote_repos(remote.remote_id).await?;
-    let codebase = ResolvedCodebase {
-        git_url,
-        remote,
-        repos,
     };
     if codebase.repos.is_empty() {
         return Err(format!(
@@ -232,6 +225,72 @@ pub async fn resolve_path_to_codebase(
     Ok(Some(codebase))
 }
 
+/// Resolve an origin URL to its codebase (by NORMALIZED URL, deduped) and
+/// list the codebase's live repos, which may be none. `Ok(None)` when the
+/// server has no matching codebase.
+pub async fn resolve_url_to_codebase(
+    git_url: &str,
+    client: &ApiClient,
+) -> Result<Option<ResolvedCodebase>, Box<dyn std::error::Error>> {
+    let Some(remote) = client.resolve_remote(git_url).await? else {
+        return Ok(None);
+    };
+    let repos = client.get_remote_repos(remote.remote_id).await?;
+    Ok(Some(ResolvedCodebase {
+        git_url: git_url.to_string(),
+        remote,
+        repos,
+    }))
+}
+
+/// What registering a checkout with the server should do, given the repos
+/// its remote's codebase already has. See [`plan_registration`].
+#[derive(Debug)]
+pub enum RegistrationPlan {
+    /// The remote's codebase has no live repo (or is unknown): register one.
+    Register,
+    /// Bind this existing repo of the codebase; register nothing.
+    Existing(ResolvedCodebase, uuid::Uuid),
+    /// The codebase has several live repos and nothing says which one this
+    /// checkout is; register nothing and let the user pick.
+    Ambiguous(ResolvedCodebase),
+}
+
+/// Decide whether `init`/`sync` may register a repo for `git_url`.
+///
+/// Registration upserts by repo NAME (the checkout's directory name), so a
+/// checkout named differently from the remote's existing repo record would
+/// create a second record for the same codebase — and sessions then split
+/// between the two (VIS-1018). So when the codebase already has live repos,
+/// bind one of them: `preferred` (the repo the checkout's config.toml already
+/// names) if the codebase links it, else the one named `repo_name`, else the
+/// only one; several and none of those → [`RegistrationPlan::Ambiguous`].
+pub async fn plan_registration(
+    client: &ApiClient,
+    git_url: &str,
+    repo_name: &str,
+    preferred: Option<uuid::Uuid>,
+) -> Result<RegistrationPlan, Box<dyn std::error::Error>> {
+    let Some(codebase) = resolve_url_to_codebase(git_url, client).await? else {
+        return Ok(RegistrationPlan::Register);
+    };
+    if codebase.repos.is_empty() {
+        return Ok(RegistrationPlan::Register);
+    }
+    let named = codebase
+        .repos
+        .iter()
+        .find(|r| r.name == repo_name)
+        .map(|r| r.id);
+    let pick = match codebase.choose(&preferred.into_iter().chain(named).collect::<Vec<_>>()) {
+        RepoChoice::Only(id) | RepoChoice::Preferred(id, _) => Some(id),
+        RepoChoice::Ambiguous => None,
+    };
+    Ok(match pick {
+        Some(id) => RegistrationPlan::Existing(codebase, id),
+        None => RegistrationPlan::Ambiguous(codebase),
+    })
+}
 /// The repo id a checkout's own `.tracevault/config.toml` binds, if any. `path`
 /// may be anywhere in the checkout, or in one of its linked worktrees.
 pub fn checkout_config_repo_id(path: &Path) -> Option<uuid::Uuid> {

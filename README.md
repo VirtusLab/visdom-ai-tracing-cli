@@ -134,6 +134,12 @@ capture sessions, adds git hooks (a pre-push policy check and a post-commit meta
 creates `.tracevault/`, and registers the repo with the server. Run it once per repo, from
 the primary checkout (not a linked worktree).
 
+If the server already has a repo record for the checkout's remote, `init` binds to it instead of
+registering a second one (a second record would split sessions between the two). When the
+remote has several records and none is named like the checkout, `init` registers nothing and
+lists them; set `repo_id` in `.tracevault/config.toml` to the right one. `tracevault sync`
+follows the same rule.
+
 **Choosing the agent — `--agent`**
 
 TraceVault captures sessions from more than one coding agent. `--agent` selects which one to

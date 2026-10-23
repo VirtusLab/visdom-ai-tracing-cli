@@ -1,6 +1,7 @@
 use crate::api_client::ApiClient;
+use crate::config::TracevaultConfig;
 use crate::credentials::resolve_credentials;
-use crate::resolution::{git_remote_url, git_repo_name};
+use crate::resolution::{git_remote_url, git_repo_name, plan_registration, RegistrationPlan};
 use std::path::Path;
 
 pub async fn sync_repo(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -30,6 +31,39 @@ pub async fn sync_repo(project_root: &Path) -> Result<(), Box<dyn std::error::Er
     let client = ApiClient::with_credential(&server_url, credential);
 
     let repo_name = git_repo_name(project_root);
+
+    // Same guard as `init`: a remote whose codebase already has a repo record
+    // must not get a second one under this checkout's directory name.
+    let preferred = TracevaultConfig::load(project_root)
+        .and_then(|c| c.repo_id)
+        .and_then(|id| id.parse::<uuid::Uuid>().ok());
+    match plan_registration(&client, &remote, &repo_name, preferred).await {
+        Ok(RegistrationPlan::Register) => {}
+        Ok(RegistrationPlan::Existing(codebase, repo_id)) => {
+            println!(
+                "Repo already registered (id: {repo_id}, codebase: {}); nothing to sync",
+                codebase.display_name()
+            );
+            return Ok(());
+        }
+        Ok(RegistrationPlan::Ambiguous(codebase)) => {
+            eprintln!(
+                "Warning: codebase {} already has {} repo records ({}) and none is named \
+                 '{repo_name}'; not registering another.",
+                codebase.display_name(),
+                codebase.repos.len(),
+                codebase.repo_list()
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: could not check the server for an existing repo of this remote ({e}); \
+                 not registering."
+            );
+            return Ok(());
+        }
+    }
 
     match client
         .register_repo(crate::api_client::RegisterRepoRequest {
