@@ -5,7 +5,7 @@
 use std::io::Write;
 
 use tracevault_cli::agent::Agent;
-use tracevault_cli::commands::stream::{read_new_transcript_lines, stamp_agent};
+use tracevault_cli::commands::stream::{read_new_transcript_lines, stamp_agent, TranscriptBatch};
 use tracevault_protocol::streaming::{StreamEventRequest, StreamEventType};
 
 #[test]
@@ -22,8 +22,12 @@ fn codex_rollout_produces_codex_tagged_request() {
     writeln!(f, r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":100,"output_tokens":10}}}}}}}}"#).unwrap();
     drop(f);
 
-    let (lines, start_offset, new_offset) =
-        read_new_transcript_lines(&transcript, &offset).unwrap();
+    let TranscriptBatch {
+        lines,
+        start_offset,
+        end_offset: new_offset,
+        ..
+    } = read_new_transcript_lines(&transcript, &offset).unwrap();
     assert_eq!(lines.len(), 3, "all three rollout lines read");
     assert_eq!(start_offset, 0, "first read starts at byte 0");
     assert!(new_offset > 0);
