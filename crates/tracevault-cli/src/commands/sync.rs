@@ -41,10 +41,15 @@ pub async fn sync_repo(project_root: &Path) -> Result<(), Box<dyn std::error::Er
     match plan_registration(&client, &remote, &repo_name, preferred).await {
         Ok(RegistrationPlan::Register) => {}
         Ok(RegistrationPlan::Existing(codebase, repo_id)) => {
-            persist_repo_binding(project_root, repo_id, Some(&codebase.remote));
+            let bound = persist_repo_binding(project_root, repo_id, Some(&codebase.remote));
             println!(
-                "Repo already registered (id: {repo_id}, codebase: {}); bound this checkout to it",
-                codebase.display_name()
+                "Repo already registered (id: {repo_id}, codebase: {}); {}",
+                codebase.display_name(),
+                if bound {
+                    "bound .tracevault/config.toml to it"
+                } else {
+                    "no .tracevault/config.toml here to bind (run `tracevault init` to create one)"
+                }
             );
             return Ok(());
         }

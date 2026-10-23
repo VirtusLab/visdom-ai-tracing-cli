@@ -74,10 +74,13 @@ pub(crate) enum ResolveRepoByNameError {
     NotFound { repo_name: String },
 }
 
-/// Resolve the server-registered repo matching `project_root`'s git-toplevel
-/// basename: derive the name via [`git_repo_name`], call `GET /repos`, and
-/// find the matching entry. Shared via the `ListFailed`/`NotFound` split so
-/// each caller can phrase its own message for either failure.
+/// Resolve the server-registered repo of `project_root`: the repo its
+/// `.tracevault/config.toml` binds, if the server lists it, else the one named
+/// like its git-toplevel basename ([`git_repo_name`]). Calls `GET /repos`.
+/// The config comes first because `init`/`sync` bind a remote's existing repo
+/// record whatever it is named (VIS-1018), so the checkout's name need not
+/// match. Shared via the `ListFailed`/`NotFound` split so each caller can
+/// phrase its own message for either failure.
 pub(crate) async fn resolve_repo_by_name(
     client: &ApiClient,
     project_root: &Path,
@@ -87,10 +90,21 @@ pub(crate) async fn resolve_repo_by_name(
         .list_repos()
         .await
         .map_err(ResolveRepoByNameError::ListFailed)?;
-    repos
-        .into_iter()
-        .find(|r| r.name == repo_name)
-        .ok_or(ResolveRepoByNameError::NotFound { repo_name })
+    let bound = checkout_config_repo_id(project_root);
+    pick_listed_repo(repos, bound, &repo_name).ok_or(ResolveRepoByNameError::NotFound { repo_name })
+}
+
+/// The listed repo with id `bound`, else the one named `repo_name`. Pure.
+fn pick_listed_repo(
+    repos: Vec<RepoListItem>,
+    bound: Option<uuid::Uuid>,
+    repo_name: &str,
+) -> Option<RepoListItem> {
+    let i = repos
+        .iter()
+        .position(|r| Some(r.id) == bound)
+        .or_else(|| repos.iter().position(|r| r.name == repo_name))?;
+    repos.into_iter().nth(i)
 }
 
 /// Render a human line for a codebase resolved via `resolve_remote` /
@@ -1410,5 +1424,33 @@ mod tests {
                 other.is_ok()
             ),
         }
+    }
+
+    // ── pick_listed_repo: config.toml binding before the checkout name ────────
+
+    fn listed(id: u128, name: &str) -> RepoListItem {
+        RepoListItem {
+            id: uuid::Uuid::from_u128(id),
+            name: name.into(),
+            github_url: None,
+            clone_status: None,
+        }
+    }
+
+    /// A checkout bound by `init` to an existing record named differently
+    /// (VIS-1018) still resolves, via its config.toml repo_id.
+    #[test]
+    fn pick_listed_repo_prefers_the_bound_id_over_the_name() {
+        let repos = vec![listed(1, "tracing"), listed(2, "tracevault")];
+        let got = pick_listed_repo(repos, Some(uuid::Uuid::from_u128(2)), "tracing").unwrap();
+        assert_eq!(got.name, "tracevault");
+    }
+
+    #[test]
+    fn pick_listed_repo_falls_back_to_the_name() {
+        let repos = vec![listed(1, "tracing"), listed(2, "tracevault")];
+        let got = pick_listed_repo(repos, Some(uuid::Uuid::from_u128(9)), "tracing").unwrap();
+        assert_eq!(got.name, "tracing");
+        assert!(pick_listed_repo(vec![listed(1, "x")], None, "y").is_none());
     }
 }
