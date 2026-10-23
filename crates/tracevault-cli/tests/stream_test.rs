@@ -1,7 +1,6 @@
 use std::fs;
 use std::io::Write;
 use tempfile::TempDir;
-use tracevault_cli::commands::stream::TranscriptBatch;
 
 fn setup_session_dir() -> (TempDir, std::path::PathBuf) {
     let tmp = TempDir::new().unwrap();
@@ -22,25 +21,18 @@ fn test_read_new_transcript_lines() {
     )
     .unwrap();
 
-    let TranscriptBatch {
-        lines,
-        start_offset,
-        end_offset: new_offset,
-        ..
-    } = tracevault_cli::commands::stream::read_new_transcript_lines(&transcript_path, &offset_path)
-        .unwrap();
+    let (lines, start_offset, new_offset) =
+        tracevault_cli::commands::stream::read_new_transcript_lines(&transcript_path, &offset_path)
+            .unwrap();
     assert_eq!(lines.len(), 2);
     assert_eq!(start_offset, 0, "first read starts at byte 0");
     assert!(new_offset > 0);
 
     fs::write(&offset_path, new_offset.to_string()).unwrap();
 
-    let TranscriptBatch {
-        lines,
-        start_offset: start_offset2,
-        ..
-    } = tracevault_cli::commands::stream::read_new_transcript_lines(&transcript_path, &offset_path)
-        .unwrap();
+    let (lines, start_offset2, _) =
+        tracevault_cli::commands::stream::read_new_transcript_lines(&transcript_path, &offset_path)
+            .unwrap();
     assert_eq!(lines.len(), 0);
     assert_eq!(
         start_offset2, new_offset,
@@ -53,12 +45,9 @@ fn test_read_new_transcript_lines() {
         .unwrap();
     writeln!(f, "{{\"type\":\"user\",\"message\":\"more\"}}").unwrap();
 
-    let TranscriptBatch {
-        lines,
-        start_offset: start_offset3,
-        ..
-    } = tracevault_cli::commands::stream::read_new_transcript_lines(&transcript_path, &offset_path)
-        .unwrap();
+    let (lines, start_offset3, _) =
+        tracevault_cli::commands::stream::read_new_transcript_lines(&transcript_path, &offset_path)
+            .unwrap();
     assert_eq!(lines.len(), 1);
     assert_eq!(
         start_offset3, new_offset,

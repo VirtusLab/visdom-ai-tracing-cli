@@ -5,7 +5,7 @@
 use std::io::Write;
 
 use tracevault_cli::agent::Agent;
-use tracevault_cli::commands::stream::{read_new_transcript_lines, stamp_agent, TranscriptBatch};
+use tracevault_cli::commands::stream::{read_new_transcript_lines, stamp_agent};
 use tracevault_protocol::streaming::{StreamEventRequest, StreamEventType};
 
 #[test]
@@ -29,12 +29,8 @@ fn gsd_session_produces_gsd_tagged_request() {
     .unwrap();
     drop(f);
 
-    let TranscriptBatch {
-        lines,
-        start_offset,
-        end_offset: new_offset,
-        ..
-    } = read_new_transcript_lines(&transcript, &offset).unwrap();
+    let (lines, start_offset, new_offset) =
+        read_new_transcript_lines(&transcript, &offset).unwrap();
     assert_eq!(lines.len(), 2, "both pi session lines read");
     assert_eq!(start_offset, 0, "first read starts at byte 0");
     assert!(new_offset > 0);

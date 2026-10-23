@@ -39,42 +39,25 @@ pub fn apply_context(
     (flow_id, labels, params)
 }
 
-/// New transcript lines since the last persisted read position, with the
-/// position each line starts at — what a batch too large for one request is
-/// split on (see [`split_into_parts`]).
+/// Returns `(lines, start_offset, end_offset)`: `start_offset` is the seek
+/// position read from `offset_path` (0 if absent), and `end_offset` is the
+/// byte offset after the last line read (the old `bytes_read`).
 ///
-/// `start_offset` is the seek position read from `offset_path` (0 if absent),
-/// and `end_offset` is the byte offset after the last line read. Callers send
-/// `start_offset` as `StreamEventRequest::transcript_offset` (so the server's
-/// `chunk_index = transcript_offset + line_index` is stable per physical line
-/// across overlapping/retried reads) and persist `end_offset` to
-/// `.stream_offset` as the next read's seek position.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TranscriptBatch {
-    pub lines: Vec<serde_json::Value>,
-    /// Start position of each line in `lines` (same length): the byte offset
-    /// for a transcript file, the record number for inline records.
-    pub line_starts: Vec<i64>,
-    pub start_offset: i64,
-    pub end_offset: i64,
-}
-
+/// Callers should send `start_offset` as `StreamEventRequest::transcript_offset`
+/// (so the server's `chunk_index = transcript_offset + line_index` is stable
+/// per physical line across overlapping/retried reads) and persist
+/// `end_offset` to `.stream_offset` as the next read's seek position.
 pub fn read_new_transcript_lines(
     transcript_path: &Path,
     offset_path: &Path,
-) -> Result<TranscriptBatch, io::Error> {
+) -> Result<(Vec<serde_json::Value>, i64, i64), io::Error> {
     // An empty path means "no transcript yet" — Codex documents `transcript_path`
     // as nullable (e.g. on SessionStart before a rollout exists), and the hook
     // payload deserializes null/absent to "". Guard explicitly so we never hand
     // `Path::new("")` to `exists()`/`File::open` (whose behavior on an empty path
     // is platform-dependent); treat it as a clean no-op.
     if transcript_path.as_os_str().is_empty() || !transcript_path.exists() {
-        return Ok(TranscriptBatch {
-            lines: vec![],
-            line_starts: vec![],
-            start_offset: 0,
-            end_offset: 0,
-        });
+        return Ok((vec![], 0, 0));
     }
 
     let offset: i64 = if offset_path.exists() {
@@ -92,12 +75,10 @@ pub fn read_new_transcript_lines(
 
     let reader = io::BufReader::new(file);
     let mut lines = Vec::new();
-    let mut line_starts = Vec::new();
     let mut bytes_read = offset;
 
     for line_result in reader.lines() {
         let line = line_result?;
-        let line_start = bytes_read;
         // +1 for the newline character
         bytes_read += line.len() as i64 + 1;
         if line.trim().is_empty() {
@@ -105,16 +86,10 @@ pub fn read_new_transcript_lines(
         }
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
             lines.push(value);
-            line_starts.push(line_start);
         }
     }
 
-    Ok(TranscriptBatch {
-        lines,
-        line_starts,
-        start_offset: offset,
-        end_offset: bytes_read,
-    })
+    Ok((lines, offset, bytes_read))
 }
 
 /// Store `transcript_path` in the session's `metadata.json`, which is where
@@ -847,45 +822,27 @@ pub fn inline_offset_bump(start_offset: i64, records_len: i64) -> (i64, i64) {
     (start_offset, start_offset + records_len)
 }
 
-/// One request of a hook event's delivery, and the transcript read position
-/// just past the lines it carries — what `.stream_offset` may advance to once
-/// this part (and every part before it) is accepted.
-#[derive(Debug, Clone)]
-pub struct EventPart {
-    pub request: StreamEventRequest,
-    pub next_offset: i64,
-}
-
 /// Split a hook event whose transcript batch does not fit in one request
-/// ([`MAX_REQUEST_BYTES`]) into several requests, so no line is dropped.
-///
-/// `line_starts[i]` is where `req.transcript_lines[i]` starts (byte offset, or
-/// record number for inline records) and `end_offset` is the position just
-/// past the batch. A request that fits is returned unchanged as the only part.
+/// ([`MAX_REQUEST_BYTES`]) into several requests, so no line is dropped. A
+/// request that fits is returned unchanged as the only part.
 ///
 /// Otherwise the event itself (its type, tool payload and `event_uuid`) goes
 /// in the LAST part, with as many trailing lines as fit beside it; the lines
 /// before those go, in order, in `Transcript` parts, which the server handles
-/// as lines only. Every part carries the position of its own first line as
-/// `transcript_offset` (the first part keeps the batch's), so a line's
-/// `chunk_index` is the same as when a later read starts at that part — a
-/// retry after a partial delivery dedupes on the server instead of
-/// duplicating. A single line larger than the cap is sent alone; it cannot be
-/// split.
-pub fn split_into_parts(
-    mut req: StreamEventRequest,
-    line_starts: &[i64],
-    end_offset: i64,
-) -> Vec<EventPart> {
+/// as lines only. A single line larger than the cap is sent alone; it cannot
+/// be split.
+///
+/// Every line keeps the chunk_index it would have had unsplit: a part's
+/// `transcript_offset` is the batch's plus the index of the part's first line
+/// in the batch. Where the batch is cut therefore never matters — not between
+/// two hooks of one session that read from the same offset concurrently and
+/// split different lengths, and not between a delivery and its retry.
+pub fn split_into_parts(mut req: StreamEventRequest) -> Vec<StreamEventRequest> {
     if req.serialized_len() <= MAX_REQUEST_BYTES {
-        return vec![EventPart {
-            request: req,
-            next_offset: end_offset,
-        }];
+        return vec![req];
     }
     let lines = req.transcript_lines.take().unwrap_or_default();
-    debug_assert_eq!(lines.len(), line_starts.len());
-    let batch_offset = req.transcript_offset;
+    let batch_offset = req.transcript_offset.unwrap_or(0);
     // The event part without lines: shed its tool payload if even that does
     // not fit, as before.
     req.truncate_large_fields();
@@ -902,9 +859,8 @@ pub fn split_into_parts(
     };
 
     // Trailing lines that fit beside the event.
-    let event_envelope = envelope(&req);
     let mut tail_start = lines.len();
-    let mut used = event_envelope;
+    let mut used = envelope(&req);
     while tail_start > 0 && used + sizes[tail_start - 1] <= MAX_REQUEST_BYTES {
         tail_start -= 1;
         used += sizes[tail_start];
@@ -940,38 +896,21 @@ pub fn split_into_parts(
     }
     groups.push(tail_start..lines.len());
 
-    let position = |i: usize| {
-        if i == 0 {
-            batch_offset
-        } else if i < line_starts.len() {
-            Some(line_starts[i])
-        } else {
-            Some(end_offset)
-        }
-    };
     let last = groups.len() - 1;
     let mut lines = lines.into_iter();
     groups
         .into_iter()
         .enumerate()
         .map(|(n, range)| {
-            let mut request = if n == last {
+            let mut part = if n == last {
                 req.clone()
             } else {
                 transcript_template.clone()
             };
             let part_lines: Vec<_> = lines.by_ref().take(range.len()).collect();
-            request.transcript_lines = (!part_lines.is_empty()).then_some(part_lines);
-            request.transcript_offset = position(range.start);
-            let next_offset = if n == last {
-                end_offset
-            } else {
-                position(range.end).unwrap_or(end_offset)
-            };
-            EventPart {
-                request,
-                next_offset,
-            }
+            part.transcript_lines = (!part_lines.is_empty()).then_some(part_lines);
+            part.transcript_offset = Some(batch_offset + range.start as i64);
+            part
         })
         .collect()
 }
@@ -1023,45 +962,31 @@ pub fn stamp_agent(req: &mut StreamEventRequest, agent: crate::agent::Agent) {
     req.protocol_version = agent.protocol_version() as u32;
 }
 
-/// Send a hook event's parts in order, advancing `.stream_offset` past each
-/// part once it is accepted. From the first failure on (or from the start when
-/// `send_failed`, i.e. older queued events are still waiting), a part is
-/// appended to the pending queue instead, behind whatever is already there.
-///
-/// `.stream_offset` advances past a QUEUED part too, for every agent: the queue
-/// now owns those lines and delivers them with the part's own
-/// `transcript_offset`. Re-reading them as well would send them again under a
-/// different `transcript_offset` (the next read starts at the failed part, and
-/// splits differently), and the server would store them twice. The inline
-/// (OpenCode) records are consumed from the hook event and could not be
-/// re-read anyway.
-#[allow(clippy::too_many_arguments)]
+/// Send a hook event's parts in order. From the first failure on (or from the
+/// start when `send_failed`, i.e. older queued events are still waiting), a
+/// part is appended to the pending queue instead, behind whatever is already
+/// there. Returns whether every part was accepted.
 async fn deliver_parts(
     client: &crate::api_client::ApiClient,
     attribution: &Attribution,
     force: AttributionForce,
-    parts: Vec<EventPart>,
+    parts: Vec<StreamEventRequest>,
     pending_path: &Path,
-    offset_path: &Path,
     mut send_failed: bool,
     warned: &mut bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut all_accepted = true;
     for part in parts {
         if !send_failed {
-            match send_stream_event(client, attribution, force, &part.request, warned).await {
-                // 10. On success advance .stream_offset past this part
-                Ok(_) => {
-                    fs::write(offset_path, part.next_offset.to_string())?;
-                    continue;
-                }
+            match send_stream_event(client, attribution, force, &part, warned).await {
+                Ok(_) => continue,
                 Err(_) => send_failed = true,
             }
         }
-        // 11. On failure queue it, and the parts after it, unsent.
-        append_pending(pending_path, &serde_json::to_string(&part.request)?)?;
-        fs::write(offset_path, part.next_offset.to_string())?;
+        all_accepted = false;
+        append_pending(pending_path, &serde_json::to_string(&part)?)?;
     }
-    Ok(())
+    Ok(all_accepted)
 }
 
 pub async fn run_stream(
@@ -1145,13 +1070,8 @@ pub async fn run_stream(
     // transcript_offset carries the batch START byte offset so the server
     // derives a stable per-line chunk_index across overlapping/retried reads;
     // .stream_offset persists the END (next read position).
-    let file_batch = read_new_transcript_lines(transcript_path, &offset_path)?;
-    let file_line_starts = file_batch.line_starts;
-    let (transcript_lines, start_offset, new_offset) = (
-        file_batch.lines,
-        file_batch.start_offset,
-        file_batch.end_offset,
-    );
+    let (transcript_lines, start_offset, new_offset) =
+        read_new_transcript_lines(transcript_path, &offset_path)?;
 
     // Fileless inline path (OpenCode): a plugin-based agent with no single
     // tailable transcript supplies records directly on the hook event. When
@@ -1198,15 +1118,6 @@ pub async fn run_stream(
     } else {
         (transcript_lines, start_offset, new_offset)
     };
-    // Where each line starts, for splitting a batch too large for one request:
-    // the byte offsets from the read above, or record numbers for inline
-    // records (whose offset is a record counter).
-    let line_starts: Vec<i64> = if is_inline {
-        (start_offset..start_offset + transcript_lines.len() as i64).collect()
-    } else {
-        file_line_starts
-    };
-
     // 5. Build StreamEventRequest
     let stream_event_type = match event_type {
         "notification" => StreamEventType::SessionStart,
@@ -1390,18 +1301,30 @@ pub async fn run_stream(
 
     // Send the current event — several requests when its transcript batch
     // exceeds the request cap (see `split_into_parts`), never dropping lines.
-    let parts = split_into_parts(req, &line_starts, new_offset);
-    deliver_parts(
+    let all_accepted = deliver_parts(
         &client,
         &attribution,
         force,
-        parts,
+        split_into_parts(req),
         &pending_path,
-        &offset_path,
         send_failed,
         &mut warned,
     )
     .await?;
+    // 10. Advance .stream_offset once every part is accepted. The inline
+    // (OpenCode) path CONSUMES its records from the hook event — they are not
+    // re-readable like a transcript file — so its record counter must advance
+    // whenever the event is accepted for delivery, INCLUDING when parts were
+    // queued after a failure. Otherwise the next inline event reuses these
+    // chunk_indexes and the server drops the overlap via ON CONFLICT. The queued
+    // parts already carry their `transcript_offset`, so the records keep their
+    // indices on drain. (File-based agents must NOT advance on failure: their
+    // next read re-covers these lines from the same start offset, so every line
+    // gets the same chunk_index again and the server dedupes it — whatever the
+    // queue meanwhile delivered or lost.)
+    if all_accepted || is_inline {
+        fs::write(&offset_path, new_offset.to_string())?;
+    }
 
     // 12. Always print HookResponse::allow() to stdout
     let response = HookResponse::allow();
@@ -2015,12 +1938,8 @@ mod tests {
         // handing `Path::new("")` to exists()/File::open.
         let dir = tempfile::tempdir().unwrap();
         let offset_path = dir.path().join(".stream_offset");
-        let TranscriptBatch {
-            lines,
-            start_offset,
-            end_offset,
-            ..
-        } = read_new_transcript_lines(std::path::Path::new(""), &offset_path).unwrap();
+        let (lines, start_offset, end_offset) =
+            read_new_transcript_lines(std::path::Path::new(""), &offset_path).unwrap();
         assert!(
             lines.is_empty(),
             "empty path must yield no transcript lines"
@@ -2044,12 +1963,8 @@ mod tests {
         )
         .unwrap();
 
-        let TranscriptBatch {
-            lines,
-            start_offset,
-            end_offset,
-            ..
-        } = read_new_transcript_lines(&transcript_path, &offset_path).unwrap();
+        let (lines, start_offset, end_offset) =
+            read_new_transcript_lines(&transcript_path, &offset_path).unwrap();
         assert_eq!(lines.len(), 2);
         assert_eq!(start_offset, 0, "first read starts at byte 0");
         assert!(end_offset > 0);
@@ -2063,12 +1978,8 @@ mod tests {
         writeln!(f, "{{\"type\":\"user\",\"message\":\"more\"}}").unwrap();
         drop(f);
 
-        let TranscriptBatch {
-            lines: lines2,
-            start_offset: start_offset2,
-            end_offset: end_offset2,
-            ..
-        } = read_new_transcript_lines(&transcript_path, &offset_path).unwrap();
+        let (lines2, start_offset2, end_offset2) =
+            read_new_transcript_lines(&transcript_path, &offset_path).unwrap();
         assert_eq!(lines2.len(), 1);
         assert_eq!(
             start_offset2, end_offset,
@@ -3511,38 +3422,55 @@ mod tests {
     }
 
     /// The tool event a hook would build around a transcript batch.
-    fn event_with_batch(batch: &TranscriptBatch) -> StreamEventRequest {
+    fn event_with_lines(lines: Vec<serde_json::Value>, offset: i64) -> StreamEventRequest {
         StreamEventRequest {
             tool_name: Some("Bash".into()),
             tool_use_id: Some("toolu_1".into()),
             tool_input: Some(serde_json::json!({"command": "ls"})),
             event_uuid: Some(uuid::Uuid::now_v7()),
-            transcript_lines: Some(batch.lines.clone()),
-            transcript_offset: Some(batch.start_offset),
+            transcript_lines: Some(lines),
+            transcript_offset: Some(offset),
             ..sample_stream_event_request()
         }
     }
 
-    fn part_lines(part: &EventPart) -> Vec<serde_json::Value> {
-        part.request.transcript_lines.clone().unwrap_or_default()
+    fn part_lines(part: &StreamEventRequest) -> Vec<serde_json::Value> {
+        part.transcript_lines.clone().unwrap_or_default()
+    }
+
+    /// `(chunk_index, line)` for every line of `parts`, as the server derives
+    /// it: `transcript_offset + index within the request`.
+    fn chunk_indexes(parts: &[StreamEventRequest]) -> Vec<(i64, serde_json::Value)> {
+        parts
+            .iter()
+            .flat_map(|p| {
+                let offset = p.transcript_offset.unwrap();
+                part_lines(p)
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(i, l)| (offset + i as i64, l))
+            })
+            .collect()
+    }
+
+    /// `n` lines of about `bytes` each.
+    fn big_lines(n: usize, bytes: usize) -> Vec<serde_json::Value> {
+        (0..n)
+            .map(|i| serde_json::json!({"n": i, "text": "y".repeat(bytes)}))
+            .collect()
     }
 
     #[test]
     fn split_leaves_a_request_under_the_cap_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let transcript = write_transcript(dir.path(), 3, 100);
-        let batch =
-            read_new_transcript_lines(&transcript, &dir.path().join(".stream_offset")).unwrap();
-        let req = event_with_batch(&batch);
+        let req = event_with_lines(big_lines(3, 100), 0);
 
-        let parts = split_into_parts(req.clone(), &batch.line_starts, batch.end_offset);
+        let parts = split_into_parts(req.clone());
 
         assert_eq!(parts.len(), 1);
         assert_eq!(
-            serde_json::to_value(&parts[0].request).unwrap(),
+            serde_json::to_value(&parts[0]).unwrap(),
             serde_json::to_value(&req).unwrap()
         );
-        assert_eq!(parts[0].next_offset, batch.end_offset);
     }
 
     /// The prod loss: a batch over 512 KiB used to go out with
@@ -3553,34 +3481,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // ~1.5 MiB: three to four requests' worth.
         let transcript = write_transcript(dir.path(), 300, 5_000);
-        let batch =
+        let (lines, start, _) =
             read_new_transcript_lines(&transcript, &dir.path().join(".stream_offset")).unwrap();
-        let req = event_with_batch(&batch);
+        let req = event_with_lines(lines.clone(), start);
         assert!(req.serialized_len() > MAX_REQUEST_BYTES);
 
-        let parts = split_into_parts(req.clone(), &batch.line_starts, batch.end_offset);
+        let parts = split_into_parts(req.clone());
 
         assert!(parts.len() >= 3, "got {} parts", parts.len());
         for part in &parts {
             assert!(
-                part.request.serialized_len() <= MAX_REQUEST_BYTES,
+                part.serialized_len() <= MAX_REQUEST_BYTES,
                 "part of {} bytes exceeds the cap",
-                part.request.serialized_len()
+                part.serialized_len()
             );
         }
         let sent: Vec<_> = parts.iter().flat_map(part_lines).collect();
-        assert_eq!(sent, batch.lines, "every line, once, in order");
+        assert_eq!(sent, lines, "every line, once, in order");
 
         // The event goes once, last; the parts before it are lines only.
         let (event, transcript_parts) = parts.split_last().unwrap();
-        assert_eq!(event.request.event_type, StreamEventType::ToolUse);
-        assert_eq!(event.request.event_uuid, req.event_uuid);
-        assert_eq!(event.request.tool_input, req.tool_input);
+        assert_eq!(event.event_type, StreamEventType::ToolUse);
+        assert_eq!(event.event_uuid, req.event_uuid);
+        assert_eq!(event.tool_input, req.tool_input);
         for part in transcript_parts {
-            assert_eq!(part.request.event_type, StreamEventType::Transcript);
-            assert!(part.request.event_uuid.is_none());
-            assert!(part.request.tool_input.is_none());
-            assert!(part.request.tool_name.is_none());
+            assert_eq!(part.event_type, StreamEventType::Transcript);
+            assert!(part.event_uuid.is_none());
+            assert!(part.tool_input.is_none());
+            assert!(part.tool_name.is_none());
         }
         assert!(
             !part_lines(event).is_empty(),
@@ -3588,62 +3516,36 @@ mod tests {
         );
     }
 
-    /// Each part's `transcript_offset` is where its first line starts, and
-    /// `next_offset` is where the next part starts: a later read from any
-    /// part boundary sends that part's lines with the same chunk_index
-    /// (`transcript_offset + line index`), so a retry dedupes on the server.
+    /// Every line gets the chunk_index it has unsplit (`batch offset + its
+    /// index in the batch`), so the server stores the same rows as for one
+    /// request.
     #[test]
-    fn split_offsets_match_a_read_starting_at_each_part() {
-        let dir = tempfile::tempdir().unwrap();
-        let transcript = write_transcript(dir.path(), 300, 5_000);
-        let offset_path = dir.path().join(".stream_offset");
-        let batch = read_new_transcript_lines(&transcript, &offset_path).unwrap();
-        let parts = split_into_parts(
-            event_with_batch(&batch),
-            &batch.line_starts,
-            batch.end_offset,
-        );
+    fn split_keeps_each_lines_unsplit_chunk_index() {
+        let lines = big_lines(300, 5_000);
+        let parts = split_into_parts(event_with_lines(lines.clone(), 1_000));
 
-        assert_eq!(parts[0].request.transcript_offset, Some(batch.start_offset));
-        assert_eq!(parts.last().unwrap().next_offset, batch.end_offset);
-        for pair in parts.windows(2) {
-            let (part, next) = (&pair[0], &pair[1]);
-            assert_eq!(Some(part.next_offset), next.request.transcript_offset);
-
-            fs::write(&offset_path, part.next_offset.to_string()).unwrap();
-            let reread = read_new_transcript_lines(&transcript, &offset_path).unwrap();
-            assert_eq!(reread.start_offset, part.next_offset);
-            assert_eq!(reread.lines[..part_lines(next).len()], part_lines(next)[..]);
-        }
+        let expected: Vec<_> = lines
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| (1_000 + i as i64, l))
+            .collect();
+        assert_eq!(chunk_indexes(&parts), expected);
     }
 
-    /// Inline (OpenCode) records are numbered, not byte-addressed: a part's
-    /// offset is the record number of its first record.
+    /// Two hooks of one session read from the same offset concurrently and
+    /// see different lengths, so they cut the batch at different places: a
+    /// line shared by both must still get one chunk_index, or ON CONFLICT
+    /// keeps both copies.
     #[test]
-    fn split_numbers_inline_records_from_the_batch_offset() {
-        let records: Vec<_> = (0..300)
-            .map(|i| serde_json::json!({"n": i, "text": "y".repeat(5_000)}))
-            .collect();
-        let req = StreamEventRequest {
-            transcript_lines: Some(records),
-            transcript_offset: Some(40),
-            ..sample_stream_event_request()
-        };
-        let starts: Vec<i64> = (40..340).collect();
+    fn split_gives_a_line_one_chunk_index_whatever_the_batch_length() {
+        let lines = big_lines(10, 200_000);
+        let short = chunk_indexes(&split_into_parts(event_with_lines(lines[..4].to_vec(), 0)));
+        let long = chunk_indexes(&split_into_parts(event_with_lines(lines.clone(), 0)));
 
-        let parts = split_into_parts(req, &starts, 340);
-
-        assert!(parts.len() > 1);
-        let mut expected = 40;
-        for part in &parts {
-            let n = part_lines(part).len() as i64;
-            if n > 0 {
-                assert_eq!(part.request.transcript_offset, Some(expected));
-            }
-            expected += n;
-            assert_eq!(part.next_offset, expected);
+        for (index, line) in &short {
+            let in_long = long.iter().find(|(_, l)| l == line).unwrap();
+            assert_eq!(in_long.0, *index, "line {line} indexed differently");
         }
-        assert_eq!(expected, 340);
     }
 
     /// A single line over the cap cannot be split: it goes alone rather than
@@ -3655,13 +3557,8 @@ mod tests {
             serde_json::json!({"n": 1, "text": "z".repeat(MAX_REQUEST_BYTES)}),
             serde_json::json!({"n": 2}),
         ];
-        let req = StreamEventRequest {
-            transcript_lines: Some(lines.clone()),
-            transcript_offset: Some(0),
-            ..sample_stream_event_request()
-        };
 
-        let parts = split_into_parts(req, &[0, 10, 600_000], 600_010);
+        let parts = split_into_parts(event_with_lines(lines.clone(), 0));
 
         let sent: Vec<_> = parts.iter().flat_map(part_lines).collect();
         assert_eq!(sent, lines);
@@ -3670,7 +3567,7 @@ mod tests {
             .find(|p| part_lines(p).contains(&lines[1]))
             .unwrap();
         assert_eq!(part_lines(big).len(), 1, "the oversized line travels alone");
-        assert_eq!(big.request.transcript_offset, Some(10));
+        assert_eq!(big.transcript_offset, Some(1));
     }
 
     fn captured_body(captured: &str) -> StreamEventRequest {
@@ -3678,82 +3575,62 @@ mod tests {
         serde_json::from_str(body).expect("request body is a StreamEventRequest")
     }
 
-    /// Every part reaches the server with its own offset, and `.stream_offset`
-    /// ends past the whole batch.
+    /// Every part reaches the server, in order, with its own offset.
     #[tokio::test]
-    async fn deliver_parts_sends_every_part_and_advances_the_offset() {
+    async fn deliver_parts_sends_every_part() {
         let dir = tempfile::tempdir().unwrap();
-        let transcript = write_transcript(dir.path(), 300, 5_000);
-        let offset_path = dir.path().join(".stream_offset");
         let pending_path = dir.path().join("pending.jsonl");
-        let batch = read_new_transcript_lines(&transcript, &offset_path).unwrap();
-        let parts = split_into_parts(
-            event_with_batch(&batch),
-            &batch.line_starts,
-            batch.end_offset,
-        );
+        let parts = split_into_parts(event_with_lines(big_lines(300, 5_000), 0));
         let (base, rx) = crate::test_helpers::spawn_seq(vec![ok_stream_response(); parts.len()]);
         let client = crate::api_client::ApiClient::new(&base, Some("tok"));
 
-        deliver_parts(
+        let all_accepted = deliver_parts(
             &client,
             &repo_attr(&uuid::Uuid::new_v4().to_string()),
             AttributionForce::default(),
             parts.clone(),
             &pending_path,
-            &offset_path,
             false,
             &mut false,
         )
         .await
         .unwrap();
 
+        assert!(all_accepted);
         for part in &parts {
             let got = captured_body(&rx.recv_timeout(crate::test_helpers::RECV_TIMEOUT).unwrap());
-            assert_eq!(got.transcript_offset, part.request.transcript_offset);
-            assert_eq!(got.transcript_lines, part.request.transcript_lines);
+            assert_eq!(got.transcript_offset, part.transcript_offset);
+            assert_eq!(got.transcript_lines, part.transcript_lines);
         }
-        assert_eq!(
-            fs::read_to_string(&offset_path).unwrap(),
-            batch.end_offset.to_string()
-        );
         assert!(drain_pending(&pending_path).unwrap().is_empty());
     }
 
     /// A part that fails is queued with the parts after it, in order and
-    /// unsent; nothing is lost, and `.stream_offset` moves past the queued
-    /// parts so the next read does not send their lines a second time under
-    /// another offset.
+    /// unsent, and the delivery reports that not everything was accepted (so
+    /// a file-based hook keeps `.stream_offset` where it was).
     #[tokio::test]
     async fn deliver_parts_queues_the_failed_part_and_the_rest() {
         let dir = tempfile::tempdir().unwrap();
-        let transcript = write_transcript(dir.path(), 300, 5_000);
-        let offset_path = dir.path().join(".stream_offset");
         let pending_path = dir.path().join("pending.jsonl");
-        let batch = read_new_transcript_lines(&transcript, &offset_path).unwrap();
-        let parts = split_into_parts(
-            event_with_batch(&batch),
-            &batch.line_starts,
-            batch.end_offset,
-        );
+        let parts = split_into_parts(event_with_lines(big_lines(300, 5_000), 0));
         assert!(parts.len() >= 3);
         let unavailable = crate::test_helpers::http_json("503 Service Unavailable", "{}");
         let (base, rx) = crate::test_helpers::spawn_seq(vec![ok_stream_response(), unavailable]);
         let client = crate::api_client::ApiClient::new(&base, Some("tok"));
 
-        deliver_parts(
+        let all_accepted = deliver_parts(
             &client,
             &repo_attr(&uuid::Uuid::new_v4().to_string()),
             AttributionForce::default(),
             parts.clone(),
             &pending_path,
-            &offset_path,
             false,
             &mut false,
         )
         .await
         .unwrap();
 
+        assert!(!all_accepted);
         assert!(rx.recv_timeout(crate::test_helpers::RECV_TIMEOUT).is_ok());
         assert!(rx.recv_timeout(crate::test_helpers::RECV_TIMEOUT).is_ok());
         assert!(
@@ -3767,13 +3644,9 @@ mod tests {
             .collect();
         assert_eq!(queued.len(), parts.len() - 1);
         for (q, part) in queued.iter().zip(&parts[1..]) {
-            assert_eq!(q.transcript_offset, part.request.transcript_offset);
-            assert_eq!(q.transcript_lines, part.request.transcript_lines);
+            assert_eq!(q.transcript_offset, part.transcript_offset);
+            assert_eq!(q.transcript_lines, part.transcript_lines);
         }
-        assert_eq!(
-            fs::read_to_string(&offset_path).unwrap(),
-            batch.end_offset.to_string()
-        );
     }
 
     /// Older events still queued (`send_failed`): the new parts queue behind
@@ -3781,25 +3654,23 @@ mod tests {
     #[tokio::test]
     async fn deliver_parts_queues_everything_behind_an_earlier_failure() {
         let dir = tempfile::tempdir().unwrap();
-        let offset_path = dir.path().join(".stream_offset");
         let pending_path = dir.path().join("pending.jsonl");
-        let parts = split_into_parts(sample_stream_event_request(), &[], 7);
+        let parts = split_into_parts(sample_stream_event_request());
         let client = crate::api_client::ApiClient::new("http://127.0.0.1:9", Some("tok"));
 
-        deliver_parts(
+        let all_accepted = deliver_parts(
             &client,
             &repo_attr(&uuid::Uuid::new_v4().to_string()),
             AttributionForce::default(),
             parts,
             &pending_path,
-            &offset_path,
             true,
             &mut false,
         )
         .await
         .unwrap();
 
+        assert!(!all_accepted);
         assert_eq!(drain_pending(&pending_path).unwrap().len(), 1);
-        assert_eq!(fs::read_to_string(&offset_path).unwrap(), "7");
     }
 }
