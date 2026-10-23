@@ -1,7 +1,7 @@
 use crate::api_client::ApiClient;
 use crate::config::{user_config_path_in, TracevaultConfig, UserContext};
 use crate::context::Context;
-use crate::resolution::{git_remote_url, git_repo_name};
+use crate::resolution::{git_remote_url, git_repo_name, RegistrationPlan};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -188,6 +188,12 @@ pub async fn init_in_directory(
         eprintln!("Run 'git remote add origin <url>' then 'tracevault sync' to register.");
     }
 
+    // The repo a previous `init` bound, read before the config is rewritten:
+    // re-running `init` keeps it if its codebase still links it.
+    let previous_repo_id = TracevaultConfig::load(project_root)
+        .and_then(|c| c.repo_id)
+        .and_then(|id| id.parse::<uuid::Uuid>().ok());
+
     // Write config (include server_url if available)
     let mut config = TracevaultConfig::default();
     if let Some(url) = server_url {
@@ -254,45 +260,132 @@ pub async fn init_in_directory(
         // codebase-resolve step doesn't need to shell out to git again.
         let origin_url = remote.clone();
 
-        match client
-            .register_repo(crate::api_client::RegisterRepoRequest {
-                repo_name,
-                github_url: Some(remote),
-            })
-            .await
+        // A remote whose codebase already has a repo record binds to it:
+        // registering would upsert by THIS checkout's directory name, i.e. a
+        // second record for the same codebase whenever the names differ.
+        match crate::resolution::plan_registration(
+            &client,
+            &origin_url,
+            &repo_name,
+            previous_repo_id,
+        )
+        .await
         {
-            Ok(resp) => {
-                println!("Repo registered on server (id: {})", resp.repo_id);
-                // Save repo_id to config
-                if let Some(mut cfg) = TracevaultConfig::load(project_root) {
-                    cfg.repo_id = Some(resp.repo_id.to_string());
-                    // Best-effort: resolve the codebase (deduped by normalized
-                    // remote URL) and surface it to the user. Must never fail
-                    // init — `repo_id` above stays authoritative for ingest;
-                    // `remote_id`/`codebase_name` here are recorded for
-                    // display only.
-                    if let Ok(Some(remote)) = client.resolve_remote(&origin_url).await {
-                        println!(
-                            "{}",
-                            crate::resolution::codebase_line(
-                                remote.name.as_deref(),
-                                &remote.normalized_url,
-                                &remote.clone_status
-                            )
-                        );
-                        cfg.remote_id = Some(remote.remote_id.to_string());
-                        cfg.codebase_name = remote.name.clone();
-                    }
-                    let _ = fs::write(TracevaultConfig::config_path(project_root), cfg.to_toml());
-                }
+            Ok(RegistrationPlan::Existing(codebase, repo_id)) => {
+                println!(
+                    "Bound to existing repo {} (id: {repo_id}); not registering another record \
+                     for this codebase",
+                    codebase
+                        .repos
+                        .iter()
+                        .find(|r| r.id == repo_id)
+                        .map_or("", |r| r.name.as_str())
+                );
+                println!(
+                    "{}",
+                    crate::resolution::codebase_line(
+                        codebase.remote.name.as_deref(),
+                        &codebase.remote.normalized_url,
+                        &codebase.remote.clone_status
+                    )
+                );
+                persist_repo_binding(project_root, repo_id, Some(&codebase.remote));
             }
+            Ok(RegistrationPlan::Ambiguous(codebase)) => {
+                eprintln!(
+                    "Warning: codebase {} already has {} repo records ({}) and none is named \
+                     '{repo_name}'; not registering another. Set `repo_id = \"<id>\"` in \
+                     .tracevault/config.toml to the one this checkout belongs to.",
+                    codebase.display_name(),
+                    codebase.repos.len(),
+                    codebase.repo_list()
+                );
+            }
+            Ok(RegistrationPlan::Register) => {
+                register_new_repo(&client, project_root, repo_name, origin_url).await;
+            }
+            // Without knowing what the server already has, registering could
+            // create the duplicate this check exists to prevent.
             Err(e) => {
-                eprintln!("{}", registration_failure_message(e.as_ref()));
+                eprintln!(
+                    "Warning: could not check the server for an existing repo of this remote \
+                     ({e}); not registering. Run `tracevault init` again once the server is \
+                     reachable."
+                );
             }
         }
     }
 
     Ok(hook_gitignore_entry)
+}
+
+/// Record the repo this checkout binds — and its codebase, display-only — in
+/// an existing `.tracevault/config.toml`, returning whether it was written.
+///
+/// Never creates the config: a checkout without one is in workspace mode (a
+/// global install binds sessions with `repo switch`), and writing one would
+/// silently pin it to bound mode. A failed write never fails the caller.
+pub(crate) fn persist_repo_binding(
+    project_root: &Path,
+    repo_id: uuid::Uuid,
+    codebase: Option<&crate::api_client::ResolveRemoteResponse>,
+) -> bool {
+    let Some(mut cfg) = TracevaultConfig::load(project_root) else {
+        return false;
+    };
+    cfg.repo_id = Some(repo_id.to_string());
+    if let Some(remote) = codebase {
+        cfg.remote_id = Some(remote.remote_id.to_string());
+        cfg.codebase_name = remote.name.clone();
+    }
+    fs::write(TracevaultConfig::config_path(project_root), cfg.to_toml()).is_ok()
+}
+
+/// Register a repo for a remote the server has no live repo for, and persist
+/// its id (plus the codebase, display-only) to config.toml. Failure is a
+/// warning, never a failed `init`.
+async fn register_new_repo(
+    client: &ApiClient,
+    project_root: &Path,
+    repo_name: String,
+    origin_url: String,
+) {
+    match client
+        .register_repo(crate::api_client::RegisterRepoRequest {
+            repo_name,
+            github_url: Some(origin_url.clone()),
+        })
+        .await
+    {
+        Ok(resp) => {
+            println!("Repo registered on server (id: {})", resp.repo_id);
+            // Save repo_id to config
+            if let Some(mut cfg) = TracevaultConfig::load(project_root) {
+                cfg.repo_id = Some(resp.repo_id.to_string());
+                // Best-effort: resolve the codebase (deduped by normalized
+                // remote URL) and surface it to the user. Must never fail
+                // init — `repo_id` above stays authoritative for ingest;
+                // `remote_id`/`codebase_name` here are recorded for
+                // display only.
+                if let Ok(Some(remote)) = client.resolve_remote(&origin_url).await {
+                    println!(
+                        "{}",
+                        crate::resolution::codebase_line(
+                            remote.name.as_deref(),
+                            &remote.normalized_url,
+                            &remote.clone_status
+                        )
+                    );
+                    cfg.remote_id = Some(remote.remote_id.to_string());
+                    cfg.codebase_name = remote.name.clone();
+                }
+                let _ = fs::write(TracevaultConfig::config_path(project_root), cfg.to_toml());
+            }
+        }
+        Err(e) => {
+            eprintln!("{}", registration_failure_message(e.as_ref()));
+        }
+    }
 }
 
 /// The warning line for a failed repo registration during `init`. A 403 means
@@ -1805,7 +1898,12 @@ mod tests {
 
         let repo_id = "11111111-1111-4111-8111-111111111111";
         let body = format!(r#"{{"repo_id":"{repo_id}"}}"#);
-        let base = spawn_once(http_response("200 OK", &body));
+        // The remote is unknown (domain 404), so init registers; the resolve
+        // after registering may fail, it is display-only.
+        let (base, _rx) = crate::test_helpers::spawn_seq(vec![
+            http_response("404 Not Found", NO_REMOTE),
+            http_response("200 OK", &body),
+        ]);
 
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", tmp.path());
@@ -1844,7 +1942,10 @@ mod tests {
         crate::test_helpers::init_git_repo(root);
         add_origin_remote(root, "git@github.com:org/repo.git");
 
-        let base = spawn_once(http_response("403 Forbidden", ""));
+        let (base, _rx) = crate::test_helpers::spawn_seq(vec![
+            http_response("404 Not Found", NO_REMOTE),
+            http_response("403 Forbidden", ""),
+        ]);
 
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", tmp.path());
@@ -1961,5 +2062,198 @@ mod tests {
             msg.to_lowercase().contains("version mismatch"),
             "a 404 registration failure should hint at a version mismatch; got: {msg}"
         );
+    }
+
+    // ── VIS-1018: init never registers a second repo for a known remote ───────
+
+    /// The server's domain-404 body for an untracked remote.
+    const NO_REMOTE: &str = r#"{"error":"No remote for that URL"}"#;
+    const REMOTE_ID: &str = "2280a1c9-0000-4000-8000-000000000003";
+    const CANONICAL: &str = "44000761-0000-4000-8000-000000000001";
+    const STRAY: &str = "7995d35d-0000-4000-8000-000000000002";
+
+    fn resolve_remote_ok() -> String {
+        http_response(
+            "200 OK",
+            &format!(
+                r#"{{"remote_id":"{REMOTE_ID}","name":"tracing","normalized_url":"github.com/org/repo","clone_status":"ready"}}"#
+            ),
+        )
+    }
+
+    fn remote_detail(repos: &[(&str, &str)]) -> String {
+        let repos: Vec<String> = repos
+            .iter()
+            .map(|(id, name)| format!(r#"{{"id":"{id}","name":"{name}"}}"#))
+            .collect();
+        http_response(
+            "200 OK",
+            &format!(
+                r#"{{"name":"tracing","normalized_url":"github.com/org/repo","clone_status":"ready","repos":[{}]}}"#,
+                repos.join(",")
+            ),
+        )
+    }
+
+    /// Run `init` against `responses` and return the persisted repo_id and
+    /// every request the server saw.
+    async fn init_against(root: &Path, responses: Vec<String>) -> (Option<String>, Vec<String>) {
+        let (base, rx) = crate::test_helpers::spawn_seq(responses);
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", root);
+        _guard.set("TRACEVAULT_API_KEY", "tok");
+        _guard.remove("TRACEVAULT_SERVER_URL");
+
+        init_in_directory(
+            root,
+            Some(&base),
+            None,
+            true,
+            crate::config::UserContext::Toggle(false),
+            crate::agent::Agent::Codex,
+        )
+        .await
+        .expect("init succeeds");
+
+        let cfg = crate::config::TracevaultConfig::load(root).expect("config.toml written by init");
+        (cfg.repo_id, rx.try_iter().collect())
+    }
+
+    fn registered(requests: &[String]) -> bool {
+        requests.iter().any(|r| r.starts_with("POST /api/v1/repos"))
+    }
+
+    /// The prod incident: the checkout's directory is not named like the
+    /// remote's existing repo. init binds that repo, and registers nothing.
+    #[tokio::test]
+    async fn init_binds_the_existing_repo_of_a_known_remote() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        add_origin_remote(tmp.path(), "git@github.com:org/repo.git");
+
+        let (repo_id, requests) = init_against(
+            tmp.path(),
+            vec![
+                resolve_remote_ok(),
+                remote_detail(&[(CANONICAL, "tracevault")]),
+            ],
+        )
+        .await;
+
+        assert_eq!(repo_id.as_deref(), Some(CANONICAL));
+        assert!(!registered(&requests), "requests: {requests:?}");
+    }
+
+    /// Several records and one is named like this checkout: that one — the
+    /// record registering would have upserted anyway.
+    #[tokio::test]
+    async fn init_binds_the_record_named_like_the_checkout() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        add_origin_remote(tmp.path(), "git@github.com:org/repo.git");
+        let dir_name = crate::resolution::git_repo_name(tmp.path());
+
+        let (repo_id, requests) = init_against(
+            tmp.path(),
+            vec![
+                resolve_remote_ok(),
+                remote_detail(&[(CANONICAL, "tracevault"), (STRAY, &dir_name)]),
+            ],
+        )
+        .await;
+
+        assert_eq!(repo_id.as_deref(), Some(STRAY));
+        assert!(!registered(&requests));
+    }
+
+    /// Re-running init keeps the repo the previous config.toml bound.
+    #[tokio::test]
+    async fn init_rerun_keeps_the_previously_bound_repo() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        add_origin_remote(tmp.path(), "git@github.com:org/repo.git");
+        fs::create_dir_all(tmp.path().join(".tracevault")).unwrap();
+        fs::write(
+            tmp.path().join(".tracevault/config.toml"),
+            format!("repo_id = \"{STRAY}\"\n"),
+        )
+        .unwrap();
+
+        let (repo_id, requests) = init_against(
+            tmp.path(),
+            vec![
+                resolve_remote_ok(),
+                remote_detail(&[(CANONICAL, "tracevault"), (STRAY, "tracing-old")]),
+            ],
+        )
+        .await;
+
+        assert_eq!(repo_id.as_deref(), Some(STRAY));
+        assert!(!registered(&requests));
+    }
+
+    /// Several records, nothing says which: no guess, no new record.
+    #[tokio::test]
+    async fn init_registers_nothing_when_the_codebase_is_ambiguous() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        add_origin_remote(tmp.path(), "git@github.com:org/repo.git");
+
+        let (repo_id, requests) = init_against(
+            tmp.path(),
+            vec![
+                resolve_remote_ok(),
+                remote_detail(&[(CANONICAL, "tracevault"), (STRAY, "tracing-old")]),
+            ],
+        )
+        .await;
+
+        assert_eq!(repo_id, None);
+        assert!(!registered(&requests));
+    }
+
+    /// A known codebase with no live repo (e.g. its last one was tombstoned)
+    /// still registers.
+    #[tokio::test]
+    async fn init_registers_for_a_codebase_without_live_repos() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        add_origin_remote(tmp.path(), "git@github.com:org/repo.git");
+
+        let (repo_id, requests) = init_against(
+            tmp.path(),
+            vec![
+                resolve_remote_ok(),
+                remote_detail(&[]),
+                http_response("201 Created", &format!(r#"{{"repo_id":"{CANONICAL}"}}"#)),
+            ],
+        )
+        .await;
+
+        assert_eq!(repo_id.as_deref(), Some(CANONICAL));
+        assert!(registered(&requests));
+    }
+
+    /// If the server cannot say what it has, init does not register blind.
+    #[tokio::test]
+    async fn init_does_not_register_when_the_remote_check_fails() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        add_origin_remote(tmp.path(), "git@github.com:org/repo.git");
+
+        let (repo_id, requests) = init_against(
+            tmp.path(),
+            vec![http_response("500 Internal Server Error", "{}")],
+        )
+        .await;
+
+        assert_eq!(repo_id, None);
+        assert!(!registered(&requests));
     }
 }
