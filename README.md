@@ -244,7 +244,7 @@ install hooks for (default `claude-code`):
 |---|---|---|
 | `tracevault init` | `.claude/settings.json` (or `.claude/settings.local.json`) hooks | Claude Code (default) |
 | `tracevault init --agent codex` | `.codex/hooks.json` hooks | OpenAI Codex CLI |
-| `tracevault init --agent gsd` (alias `gsd2`) | the TraceVault extension, registered with `gsd install -l` (the extension itself lives in `~/.gsd/`) | GSD (pi) |
+| `tracevault init --agent gsd` (alias `gsd2`) | the TraceVault extension, written to `gsd-extension/` in the TraceVault config directory and registered for this repo with `gsd install -l` | GSD (pi) |
 | `tracevault init --agent opencode` | `.opencode/plugins/tracevault.ts` plugin | OpenCode |
 
 All of them wire the same capture pipeline: the agent's hooks invoke `tracevault`, which
@@ -290,10 +290,11 @@ sessions get bound to a repo:
 tracevault init --global                    # ~/.claude/settings.json + ~/.claude/CLAUDE.md
 tracevault init --global --agent codex      # ~/.codex/hooks.json  + ~/.codex/AGENTS.md
 tracevault init --global --agent gsd        # GSD extension for all GSD sessions
-tracevault init --global --agent opencode   # ~/.config/opencode/plugins/tracevault.ts
+tracevault init --global --agent opencode   # <config dir>/opencode/plugins/tracevault.ts
 ```
 
-It does not need a git repository. It also writes the user-level `config.toml` in the
+`<config dir>` is the platform config directory: `~/.config` on Linux (`$XDG_CONFIG_HOME` if
+set), `~/Library/Application Support` on macOS. It does not need a git repository. It also writes the user-level `config.toml` in the
 TraceVault config directory, which enables the user context layer (see below) for repos that
 do not configure it themselves; `--no-user-context` and `--user-context <path>` apply to it.
 `--global` cannot be combined with `--server-url`, `--claude-settings` or `--no-gitignore`.
@@ -503,7 +504,7 @@ Commands that bind a session to a repo or a project, used with the `--global` in
 |---|---|
 | `repo switch <path> [--repo-id <uuid>] [--user]` | Bind the session to the registered repo that the checkout at `<path>` belongs to (resolved from its `origin` remote) and print the repo's policies. `--repo-id` picks one record when the codebase has several. `--user` (implied when there is no session id) writes the machine-wide default instead. `--name` is deprecated and always errors |
 | `repo status [--path <path>]` | Show the session's repo binding; `--path` resolves a checkout once instead |
-| `repo reset [--user]` | Clear the session's repo binding, or with `--user` the machine-wide default |
+| `repo reset [--user]` | Clear **all** of the session's bindings — repo and project, including subagent overrides — or with `--user` only the machine-wide default repo |
 | `project switch <name> [--user] [--project-attribution derived\|explicit]` | Bind the session (or, with `--user`, every session) to the project with this exact, case-sensitive name. `explicit` forces attribution; see [Project attribution](#project-attribution--tracevault_project-and-tracevault_project_attribution) |
 | `project status [--project <name>]` | Show which project the session is attributed to and why; `--project` is a display-only what-if |
 
