@@ -133,12 +133,9 @@ pub struct ResolveRemoteResponse {
     pub clone_status: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RemoteRepoRef {
     pub id: uuid::Uuid,
-    // Reserved for display (e.g. a future `repo status`/error message listing
-    // a codebase's linked repos by name); not read by any caller yet.
-    #[allow(dead_code)]
     pub name: String,
 }
 

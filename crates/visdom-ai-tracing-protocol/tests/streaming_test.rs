@@ -348,3 +348,22 @@ fn old_client_payload_parses_with_billing_mode_none() {
     let parsed: StreamEventRequest = serde_json::from_value(value).unwrap();
     assert_eq!(parsed.billing_mode, None);
 }
+
+/// Transcript lines are never shed to fit the cap — a dropped line is lost
+/// for good (VIS-1018). Only the tool payload is, response first.
+#[test]
+fn truncate_large_fields_keeps_transcript_lines() {
+    let big = "x".repeat(MAX_REQUEST_BYTES);
+    let mut req = StreamEventRequest {
+        tool_input: Some(json!({ "content": big.clone() })),
+        tool_response: Some(json!({ "stdout": big.clone() })),
+        transcript_lines: Some(vec![json!({ "type": "user", "text": big })]),
+        ..request_with_billing_mode(None)
+    };
+
+    req.truncate_large_fields();
+
+    assert!(req.tool_response.is_none());
+    assert!(req.tool_input.is_none());
+    assert_eq!(req.transcript_lines.map(|l| l.len()), Some(1));
+}

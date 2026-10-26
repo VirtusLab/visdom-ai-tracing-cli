@@ -7,7 +7,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::api_client::{ApiClient, RepoListItem, ResolveProjectOutcome};
+use crate::api_client::{
+    ApiClient, RemoteRepoRef, RepoListItem, ResolveProjectOutcome, ResolveRemoteResponse,
+};
 use crate::session_state::{ProjectBinding, RepoBinding, SessionState};
 
 /// `git -C <path> remote get-url origin`, trimmed. `None` if git fails or there
@@ -72,10 +74,13 @@ pub(crate) enum ResolveRepoByNameError {
     NotFound { repo_name: String },
 }
 
-/// Resolve the server-registered repo matching `project_root`'s git-toplevel
-/// basename: derive the name via [`git_repo_name`], call `GET /repos`, and
-/// find the matching entry. Shared via the `ListFailed`/`NotFound` split so
-/// each caller can phrase its own message for either failure.
+/// Resolve the server-registered repo of `project_root`: the repo its
+/// `.tracevault/config.toml` binds, if the server lists it, else the one named
+/// like its git-toplevel basename ([`git_repo_name`]). Calls `GET /repos`.
+/// The config comes first because `init`/`sync` bind a remote's existing repo
+/// record whatever it is named (VIS-1018), so the checkout's name need not
+/// match. Shared via the `ListFailed`/`NotFound` split so each caller can
+/// phrase its own message for either failure.
 pub(crate) async fn resolve_repo_by_name(
     client: &ApiClient,
     project_root: &Path,
@@ -85,10 +90,21 @@ pub(crate) async fn resolve_repo_by_name(
         .list_repos()
         .await
         .map_err(ResolveRepoByNameError::ListFailed)?;
-    repos
-        .into_iter()
-        .find(|r| r.name == repo_name)
-        .ok_or(ResolveRepoByNameError::NotFound { repo_name })
+    let bound = checkout_config_repo_id(project_root);
+    pick_listed_repo(repos, bound, &repo_name).ok_or(ResolveRepoByNameError::NotFound { repo_name })
+}
+
+/// The listed repo with id `bound`, else the one named `repo_name`. Pure.
+fn pick_listed_repo(
+    repos: Vec<RepoListItem>,
+    bound: Option<uuid::Uuid>,
+    repo_name: &str,
+) -> Option<RepoListItem> {
+    let i = repos
+        .iter()
+        .position(|r| Some(r.id) == bound)
+        .or_else(|| repos.iter().position(|r| r.name == repo_name))?;
+    repos.into_iter().nth(i)
 }
 
 /// Render a human line for a codebase resolved via `resolve_remote` /
@@ -122,38 +138,209 @@ pub(crate) fn pick_status_line(
         .or_else(|| cached_name.map(|n| format!("codebase: {n}")))
 }
 
+/// A checkout path resolved to its codebase: the origin URL it was resolved
+/// from, the codebase (git remote) the server deduplicates that URL to, and
+/// the live repo records linked to it.
+#[derive(Debug)]
+pub struct ResolvedCodebase {
+    pub git_url: String,
+    pub remote: ResolveRemoteResponse,
+    /// Never empty from [`resolve_path_to_codebase`], which errors instead.
+    pub repos: Vec<RemoteRepoRef>,
+}
+
+/// Which of a codebase's repos to bind, as decided by [`ResolvedCodebase::choose`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoChoice {
+    /// The codebase has a single live repo.
+    Only(uuid::Uuid),
+    /// Several live repos; this one was the first of the preferred ids
+    /// (given by index into that list).
+    Preferred(uuid::Uuid, usize),
+    /// Several live repos and none of them is preferred.
+    Ambiguous,
+}
+
+impl ResolvedCodebase {
+    /// The codebase's display name: its registered name, else its URL.
+    pub fn display_name(&self) -> &str {
+        self.remote
+            .name
+            .as_deref()
+            .unwrap_or(&self.remote.normalized_url)
+    }
+
+    /// Pick the repo to bind: the only one, else the first of `preferred`
+    /// (repo ids, most preferred first) that is one of this codebase's live
+    /// repos, else none.
+    ///
+    /// Sessions are keyed by `(repo_id, session_id)` on the server, so two
+    /// repos of one codebase are NOT interchangeable for ingest: binding a
+    /// session to a different one mid-flight splits it across two session
+    /// rows (VIS-1018). Hence no silent fallback to an arbitrary repo here.
+    pub fn choose(&self, preferred: &[uuid::Uuid]) -> RepoChoice {
+        if let [only] = self.repos.as_slice() {
+            return RepoChoice::Only(only.id);
+        }
+        preferred
+            .iter()
+            .enumerate()
+            .find(|(_, id)| self.repos.iter().any(|r| r.id == **id))
+            .map_or(RepoChoice::Ambiguous, |(i, id)| {
+                RepoChoice::Preferred(*id, i)
+            })
+    }
+
+    /// `name (id)` for each live repo, lowest id first — for messages that
+    /// ask the user to pick one.
+    pub fn repo_list(&self) -> String {
+        let mut repos: Vec<_> = self.repos.iter().collect();
+        repos.sort_by_key(|r| r.id);
+        repos
+            .iter()
+            .map(|r| format!("{} ({})", r.name, r.id))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// A binding to `repo_id` of this codebase.
+    pub fn binding(&self, repo_id: uuid::Uuid) -> RepoBinding {
+        RepoBinding {
+            repo_id: repo_id.to_string(),
+            git_url: Some(self.git_url.clone()),
+            remote_id: Some(self.remote.remote_id),
+            codebase_name: self.remote.name.clone(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+}
+
+/// Resolve a filesystem path to its codebase and live repos: read its origin
+/// remote URL and ask the server. `Ok(None)` when the path has no remote or
+/// the server has no matching codebase (pre-registered-only); an error when
+/// the codebase is registered but has no live repo.
+pub async fn resolve_path_to_codebase(
+    path: &Path,
+    client: &ApiClient,
+) -> Result<Option<ResolvedCodebase>, Box<dyn std::error::Error>> {
+    let Some(git_url) = git_remote_url(path) else {
+        return Ok(None);
+    };
+    let Some(codebase) = resolve_url_to_codebase(&git_url, client).await? else {
+        return Ok(None);
+    };
+    if codebase.repos.is_empty() {
+        return Err(format!(
+            "codebase {} is registered but has no tracked repo; run `tracevault init` in a checkout",
+            codebase.display_name()
+        )
+        .into());
+    }
+    Ok(Some(codebase))
+}
+
+/// Resolve an origin URL to its codebase (by NORMALIZED URL, deduped) and
+/// list the codebase's live repos, which may be none. `Ok(None)` when the
+/// server has no matching codebase.
+pub async fn resolve_url_to_codebase(
+    git_url: &str,
+    client: &ApiClient,
+) -> Result<Option<ResolvedCodebase>, Box<dyn std::error::Error>> {
+    let Some(remote) = client.resolve_remote(git_url).await? else {
+        return Ok(None);
+    };
+    let repos = client.get_remote_repos(remote.remote_id).await?;
+    Ok(Some(ResolvedCodebase {
+        git_url: git_url.to_string(),
+        remote,
+        repos,
+    }))
+}
+
+/// What registering a checkout with the server should do, given the repos
+/// its remote's codebase already has. See [`plan_registration`].
+#[derive(Debug)]
+pub enum RegistrationPlan {
+    /// The remote's codebase has no live repo (or is unknown): register one.
+    Register,
+    /// Bind this existing repo of the codebase; register nothing.
+    Existing(ResolvedCodebase, uuid::Uuid),
+    /// The codebase has several live repos and nothing says which one this
+    /// checkout is; register nothing and let the user pick.
+    Ambiguous(ResolvedCodebase),
+}
+
+/// Decide whether `init`/`sync` may register a repo for `git_url`.
+///
+/// Registration upserts by repo NAME (the checkout's directory name), so a
+/// checkout named differently from the remote's existing repo record would
+/// create a second record for the same codebase — and sessions then split
+/// between the two (VIS-1018). So when the codebase already has live repos,
+/// bind one of them: `preferred` (the repo the checkout's config.toml already
+/// names) if the codebase links it, else the one named `repo_name`, else the
+/// only one; several and none of those → [`RegistrationPlan::Ambiguous`].
+pub async fn plan_registration(
+    client: &ApiClient,
+    git_url: &str,
+    repo_name: &str,
+    preferred: Option<uuid::Uuid>,
+) -> Result<RegistrationPlan, Box<dyn std::error::Error>> {
+    let Some(codebase) = resolve_url_to_codebase(git_url, client).await? else {
+        return Ok(RegistrationPlan::Register);
+    };
+    if codebase.repos.is_empty() {
+        return Ok(RegistrationPlan::Register);
+    }
+    let named = codebase
+        .repos
+        .iter()
+        .find(|r| r.name == repo_name)
+        .map(|r| r.id);
+    let pick = match codebase.choose(&preferred.into_iter().chain(named).collect::<Vec<_>>()) {
+        RepoChoice::Only(id) | RepoChoice::Preferred(id, _) => Some(id),
+        RepoChoice::Ambiguous => None,
+    };
+    Ok(match pick {
+        Some(id) => RegistrationPlan::Existing(codebase, id),
+        None => RegistrationPlan::Ambiguous(codebase),
+    })
+}
+/// The repo id a checkout's own `.tracevault/config.toml` binds, if any. `path`
+/// may be anywhere in the checkout, or in one of its linked worktrees.
+pub fn checkout_config_repo_id(path: &Path) -> Option<uuid::Uuid> {
+    let root = crate::paths::resolve_project_root(path).root;
+    crate::config::TracevaultConfig::load(&root)?
+        .repo_id?
+        .parse()
+        .ok()
+}
+
 /// Resolve a filesystem path to a registered-repo binding: read its origin
 /// remote URL and ask the server. `Ok(None)` when the path has no remote or
 /// the server has no matching codebase (pre-registered-only).
+///
+/// When the codebase has several live repos, the one the checkout's own
+/// `.tracevault/config.toml` binds wins — the repo its hooks stream to —
+/// else the lowest id (deterministic). Callers that must not guess (`repo
+/// switch`) use [`resolve_path_to_codebase`] and [`ResolvedCodebase::choose`].
 pub async fn resolve_path_to_binding(
     path: &Path,
     client: &ApiClient,
 ) -> Result<Option<RepoBinding>, Box<dyn std::error::Error>> {
-    let Some(git_url) = git_remote_url(path) else {
+    let Some(codebase) = resolve_path_to_codebase(path, client).await? else {
         return Ok(None);
     };
-    // Resolve the CODEBASE by normalized URL (deduped), then bind to one of its
-    // repos. Any linked repo works for ingest — every repo-keyed server read
-    // resolves codebase-wide — so the lowest-id linked repo (deterministic) is
-    // fine.
-    let Some(remote) = client.resolve_remote(&git_url).await? else {
-        return Ok(None);
+    let preferred: Vec<uuid::Uuid> = checkout_config_repo_id(path).into_iter().collect();
+    let repo_id = match codebase.choose(&preferred) {
+        RepoChoice::Only(id) | RepoChoice::Preferred(id, _) => id,
+        RepoChoice::Ambiguous => codebase
+            .repos
+            .iter()
+            .map(|r| r.id)
+            .min()
+            .expect("resolve_path_to_codebase never returns an empty repo list"),
     };
-    let repos = client.get_remote_repos(remote.remote_id).await?;
-    let Some(first) = repos.into_iter().min_by_key(|r| r.id) else {
-        return Err(format!(
-            "codebase {} is registered but has no tracked repo; run `tracevault init` in a checkout",
-            remote.name.as_deref().unwrap_or(&remote.normalized_url)
-        )
-        .into());
-    };
-    Ok(Some(RepoBinding {
-        repo_id: first.id.to_string(),
-        git_url: Some(git_url),
-        remote_id: Some(remote.remote_id),
-        codebase_name: remote.name,
-        updated_at: chrono::Utc::now().to_rfc3339(),
-    }))
+    Ok(Some(codebase.binding(repo_id)))
 }
 
 /// Inputs for the effective-binding precedence chain. `repo_flag` and `bound`
@@ -1237,5 +1424,33 @@ mod tests {
                 other.is_ok()
             ),
         }
+    }
+
+    // ── pick_listed_repo: config.toml binding before the checkout name ────────
+
+    fn listed(id: u128, name: &str) -> RepoListItem {
+        RepoListItem {
+            id: uuid::Uuid::from_u128(id),
+            name: name.into(),
+            github_url: None,
+            clone_status: None,
+        }
+    }
+
+    /// A checkout bound by `init` to an existing record named differently
+    /// (VIS-1018) still resolves, via its config.toml repo_id.
+    #[test]
+    fn pick_listed_repo_prefers_the_bound_id_over_the_name() {
+        let repos = vec![listed(1, "tracing"), listed(2, "tracevault")];
+        let got = pick_listed_repo(repos, Some(uuid::Uuid::from_u128(2)), "tracing").unwrap();
+        assert_eq!(got.name, "tracevault");
+    }
+
+    #[test]
+    fn pick_listed_repo_falls_back_to_the_name() {
+        let repos = vec![listed(1, "tracing"), listed(2, "tracevault")];
+        let got = pick_listed_repo(repos, Some(uuid::Uuid::from_u128(9)), "tracing").unwrap();
+        assert_eq!(got.name, "tracing");
+        assert!(pick_listed_repo(vec![listed(1, "x")], None, "y").is_none());
     }
 }

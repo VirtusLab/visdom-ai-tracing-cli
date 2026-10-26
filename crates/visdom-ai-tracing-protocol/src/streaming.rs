@@ -141,20 +141,29 @@ pub fn is_file_modifying_tool(tool_name: &str) -> bool {
     matches!(tool_name, "Write" | "Edit" | "Bash")
 }
 
+/// The largest serialized `StreamEventRequest` a client sends in one request.
+/// Prevents 413 errors on both real-time sends and flush.
+pub const MAX_REQUEST_BYTES: usize = 512 * 1024;
+
 impl StreamEventRequest {
-    /// Drop optional fields largest-first until the serialized payload is
-    /// under 512 KB. Prevents 413 errors on both real-time sends and flush.
+    /// Length of the request's JSON body.
+    pub fn serialized_len(&self) -> usize {
+        serde_json::to_string(self).map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Drop the tool payload, response first, until the serialized request is
+    /// under [`MAX_REQUEST_BYTES`].
+    ///
+    /// Transcript lines are never dropped here: a batch that does not fit has
+    /// to be split across requests instead (each with its own
+    /// `transcript_offset`), because a dropped line is lost for good — the
+    /// client's read position has already moved past it.
     pub fn truncate_large_fields(&mut self) {
-        const MAX_BYTES: usize = 512 * 1024;
-        if serde_json::to_string(self).map(|s| s.len()).unwrap_or(0) <= MAX_BYTES {
-            return;
-        }
-        self.transcript_lines = None;
-        if serde_json::to_string(self).map(|s| s.len()).unwrap_or(0) <= MAX_BYTES {
+        if self.serialized_len() <= MAX_REQUEST_BYTES {
             return;
         }
         self.tool_response = None;
-        if serde_json::to_string(self).map(|s| s.len()).unwrap_or(0) <= MAX_BYTES {
+        if self.serialized_len() <= MAX_REQUEST_BYTES {
             return;
         }
         self.tool_input = None;

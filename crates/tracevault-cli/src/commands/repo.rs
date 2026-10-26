@@ -5,7 +5,8 @@ use std::path::Path;
 use crate::api_client::{resolve_client, ApiClient};
 use crate::credentials::resolve_credentials;
 use crate::resolution::{
-    binding_from_config, effective_binding, resolve_path_to_binding, BindingSource, ResolveInputs,
+    binding_from_config, checkout_config_repo_id, effective_binding, resolve_path_to_binding,
+    resolve_path_to_codebase, BindingSource, RepoChoice, ResolveInputs, ResolvedCodebase,
 };
 use crate::session_state::{self, RepoBinding, SessionState};
 
@@ -24,6 +25,12 @@ pub enum RepoCmd {
         /// errors; bind by checkout path instead (`tracevault repo switch <path>`).
         #[arg(long, group = "target")]
         name: Option<String>,
+        /// Which of the codebase's repo records to bind, when <path>'s
+        /// codebase has several. Without it, switch keeps the repo already in
+        /// use (the session's current binding, else a checkout's
+        /// `.tracevault/config.toml`) and errors if none of them is.
+        #[arg(long, requires = "path")]
+        repo_id: Option<uuid::Uuid>,
         /// Write a session-independent user-level default instead of a session
         /// binding. Implied when no session id is available.
         #[arg(long)]
@@ -80,12 +87,14 @@ pub async fn run(
         RepoCmd::Switch {
             path,
             name,
+            repo_id,
             user,
             session_id,
         } => {
             switch(
                 path.as_deref(),
                 name.as_deref(),
+                repo_id,
                 user,
                 session_id.as_deref(),
                 project_root,
@@ -96,20 +105,70 @@ pub async fn run(
     }
 }
 
-/// Resolve a path to a binding for `repo switch`, turning "unregistered" into
-/// a clear error (switch should fail loudly, unlike the best-effort `--path`
-/// status override).
-async fn resolve_switch_binding(
+/// Resolve a path to its codebase for `repo switch`, turning "unregistered"
+/// into a clear error (switch should fail loudly, unlike the best-effort
+/// `--path` status override).
+async fn resolve_switch_codebase(
     path: &Path,
     client: &ApiClient,
-) -> Result<RepoBinding, Box<dyn std::error::Error>> {
-    resolve_path_to_binding(path, client).await?.ok_or_else(|| {
-        format!(
-            "repo at {} is not registered with TraceVault; nothing to bind",
-            path.display()
+) -> Result<ResolvedCodebase, Box<dyn std::error::Error>> {
+    resolve_path_to_codebase(path, client)
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "repo at {} is not registered with TraceVault; nothing to bind",
+                path.display()
+            )
+            .into()
+        })
+}
+
+/// A repo id `repo switch` should keep if the codebase links it, and where it
+/// comes from (for the message saying which one was kept).
+struct InUse {
+    repo_id: uuid::Uuid,
+    source: String,
+}
+
+/// Which of the codebase's repos `repo switch` binds. Pure.
+///
+/// An explicit `--repo-id` wins, if it is one of the codebase's repos. Else
+/// the only repo; else the first `in_use` repo the codebase links — the
+/// destination's current binding comes first, so a session is never moved to
+/// another repo of the same codebase mid-flight (that splits it across two
+/// session rows on the server, VIS-1018). Else an error listing the repos.
+/// `Ok` carries the repo id and, when several repos were possible, which
+/// `in_use` source decided.
+fn pick_switch_repo(
+    codebase: &ResolvedCodebase,
+    explicit: Option<uuid::Uuid>,
+    in_use: &[InUse],
+) -> Result<(uuid::Uuid, Option<String>), Box<dyn std::error::Error>> {
+    if let Some(id) = explicit {
+        if codebase.repos.iter().any(|r| r.id == id) {
+            return Ok((id, None));
+        }
+        return Err(format!(
+            "repo {id} is not a repo of codebase {}; its repos are: {}",
+            codebase.display_name(),
+            codebase.repo_list()
         )
-        .into()
-    })
+        .into());
+    }
+    let preferred: Vec<uuid::Uuid> = in_use.iter().map(|u| u.repo_id).collect();
+    match codebase.choose(&preferred) {
+        RepoChoice::Only(id) => Ok((id, None)),
+        RepoChoice::Preferred(id, i) => Ok((id, Some(in_use[i].source.clone()))),
+        RepoChoice::Ambiguous => Err(format!(
+            "codebase {} has {} repo records: {}. None of them is this binding's current \
+             repo or a checkout's .tracevault/config.toml repo, so switch will not guess; \
+             choose one with `tracevault repo switch <path> --repo-id <id>`",
+            codebase.display_name(),
+            codebase.repos.len(),
+            codebase.repo_list()
+        )
+        .into()),
+    }
 }
 
 /// Apply a switch to session state (session-level active binding). Pure.
@@ -191,9 +250,53 @@ fn switch_destination(user: bool, session_id: Option<String>) -> SwitchDest {
     }
 }
 
+/// The repos `repo switch` should keep, most preferred first: what the
+/// destination currently resolves to (for a session, exactly what its hooks
+/// stream to: session binding → this checkout's config.toml → user default;
+/// for `--user`, the current user default), then the target checkout's own
+/// config.toml, then this checkout's. Ids that are not UUIDs are skipped.
+fn in_use_repos(dest: &SwitchDest, target: &Path, project_root: &Path) -> Vec<InUse> {
+    let bound = crate::config::TracevaultConfig::load(project_root)
+        .as_ref()
+        .and_then(binding_from_config);
+    let user_default = crate::user_default::load();
+    let current = match dest {
+        SwitchDest::Session(id) => effective_binding(ResolveInputs {
+            repo_flag: None,
+            session: &session_state::load(id),
+            worktree_path: None,
+            bound,
+            user_default,
+        })
+        .map(|(b, source)| (b, source.to_string())),
+        SwitchDest::UserDefault => {
+            user_default.map(|b| (b, BindingSource::UserDefault.to_string()))
+        }
+    };
+    let mut in_use: Vec<InUse> = current
+        .and_then(|(b, source)| {
+            Some(InUse {
+                repo_id: b.repo_id.parse().ok()?,
+                source: format!("the current binding ({source})"),
+            })
+        })
+        .into_iter()
+        .collect();
+    for checkout in [target, project_root] {
+        if let Some(repo_id) = checkout_config_repo_id(checkout) {
+            in_use.push(InUse {
+                repo_id,
+                source: format!("{}'s .tracevault/config.toml", checkout.display()),
+            });
+        }
+    }
+    in_use
+}
+
 async fn switch(
     path: Option<&str>,
     name: Option<&str>,
+    repo_id: Option<uuid::Uuid>,
     user: bool,
     session_id: Option<&str>,
     project_root: &Path,
@@ -205,25 +308,36 @@ async fn switch(
 
     let client = resolve_client(project_root)?;
 
-    let binding = match target {
-        SwitchTarget::Path(p) => resolve_switch_binding(Path::new(p), &client).await?,
-    };
-
-    // Validate the repo id BEFORE persisting anything: a malformed repo_id must
-    // not leave a persisted binding behind.
-    let repo_uuid = binding.repo_id.parse::<uuid::Uuid>().map_err(|e| {
-        format!(
-            "server returned an invalid repo id {:?}: {e}",
-            binding.repo_id
-        )
-    })?;
+    let SwitchTarget::Path(p) = target;
+    let target_path = Path::new(p);
+    let codebase = resolve_switch_codebase(target_path, &client).await?;
 
     // A session id is optional now: with one (and no --user) we bind that
     // session; without one (or with --user) we set the user-level default,
     // which any new session inherits. This is what lets a container bind its
     // repo before Claude — and its session — exists.
     let session = resolve_session_id(session_id).ok();
-    match switch_destination(user, session) {
+    let dest = switch_destination(user, session);
+
+    // Resolve the repo BEFORE persisting anything: an ambiguous codebase must
+    // not leave a persisted binding behind.
+    let in_use = in_use_repos(&dest, target_path, project_root);
+    let (repo_uuid, kept) = pick_switch_repo(&codebase, repo_id, &in_use)?;
+    if let Some(source) = kept {
+        let name = codebase
+            .repos
+            .iter()
+            .find(|r| r.id == repo_uuid)
+            .map_or("", |r| r.name.as_str());
+        eprintln!(
+            "codebase {} has {} repo records; keeping repo {name}, {source}",
+            codebase.display_name(),
+            codebase.repos.len()
+        );
+    }
+    let binding = codebase.binding(repo_uuid);
+
+    match dest {
         SwitchDest::Session(id) => {
             let mut state = session_state::load(&id);
             apply_switch(&mut state, binding.clone());
@@ -659,7 +773,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_switch_binding_ok_for_registered_repo() {
+    async fn resolve_switch_codebase_ok_for_registered_repo() {
         // Path resolution now goes through the codebase (remote) resolver:
         // resolve_remote finds the codebase, then get_remote_repos returns its
         // linked repos — the switch binds to the first one.
@@ -678,16 +792,17 @@ mod tests {
         let base = spawn_n(vec![http_200(&remote), http_200(&detail)]);
         let client = ApiClient::new(&base, Some("tok"));
 
-        let got = resolve_switch_binding(tmp.path(), &client)
+        let codebase = resolve_switch_codebase(tmp.path(), &client)
             .await
-            .expect("expected Ok binding");
+            .expect("expected Ok codebase");
+        let got = codebase.binding(pick_switch_repo(&codebase, None, &[]).unwrap().0);
         assert_eq!(got.repo_id, repo_id);
         assert_eq!(got.remote_id, Some(remote_id.parse().unwrap()));
         assert_eq!(got.codebase_name.as_deref(), Some("repo"));
     }
 
     #[tokio::test]
-    async fn resolve_switch_binding_errors_for_unregistered_repo() {
+    async fn resolve_switch_codebase_errors_for_unregistered_repo() {
         let tmp = tempfile::tempdir().unwrap();
         crate::test_helpers::init_git_repo(tmp.path());
         add_origin_remote(tmp.path(), "git@github.com:org/unregistered.git");
@@ -704,7 +819,7 @@ mod tests {
         let base = spawn_once(Box::leak(resp.into_boxed_str()));
         let client = ApiClient::new(&base, Some("tok"));
 
-        let err = resolve_switch_binding(tmp.path(), &client)
+        let err = resolve_switch_codebase(tmp.path(), &client)
             .await
             .expect_err("expected Err for unregistered repo");
         assert!(
@@ -714,7 +829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_switch_binding_flags_bare_404_as_version_skew() {
+    async fn resolve_switch_codebase_flags_bare_404_as_version_skew() {
         // A bare 404 (no JSON error body) is axum's "no route matched"
         // fallback — the shape an old server sends for a route it doesn't
         // have yet. `repo switch` must not misreport this as "not
@@ -728,7 +843,7 @@ mod tests {
         let base = spawn_once(resp);
         let client = ApiClient::new(&base, Some("tok"));
 
-        let err = resolve_switch_binding(tmp.path(), &client)
+        let err = resolve_switch_codebase(tmp.path(), &client)
             .await
             .expect_err("expected Err for a bare route-404");
         assert!(
@@ -797,5 +912,295 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no tracked repo"), "got: {err}");
+    }
+
+    // ── VIS-1018: several repo records for one codebase ───────────────────────
+
+    const LOW: &str = "44000761-0000-4000-8000-000000000001";
+    const HIGH: &str = "7995d35d-0000-4000-8000-000000000002";
+
+    fn codebase_with(repo_ids: &[&str]) -> ResolvedCodebase {
+        ResolvedCodebase {
+            git_url: "git@github.com:org/repo.git".into(),
+            remote: crate::api_client::ResolveRemoteResponse {
+                remote_id: uuid::Uuid::from_u128(7),
+                name: Some("repo".into()),
+                normalized_url: "github.com/org/repo".into(),
+                clone_status: "ready".into(),
+            },
+            repos: repo_ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| crate::api_client::RemoteRepoRef {
+                    id: id.parse().unwrap(),
+                    name: format!("repo-{i}"),
+                })
+                .collect(),
+        }
+    }
+
+    fn in_use(repo_id: &str, source: &str) -> InUse {
+        InUse {
+            repo_id: repo_id.parse().unwrap(),
+            source: source.into(),
+        }
+    }
+
+    /// The prod split: the session streamed to the higher-id repo (its
+    /// config.toml binding); a switch to the same checkout must keep it, not
+    /// move the session to the lowest id.
+    #[test]
+    fn switch_keeps_the_current_binding_over_the_lowest_id() {
+        let codebase = codebase_with(&[LOW, HIGH]);
+        let (id, kept) =
+            pick_switch_repo(&codebase, None, &[in_use(HIGH, "the current binding")]).unwrap();
+        assert_eq!(id.to_string(), HIGH);
+        assert_eq!(kept.as_deref(), Some("the current binding"));
+    }
+
+    /// The current binding outranks a checkout's config.toml.
+    #[test]
+    fn switch_prefers_the_current_binding_over_a_checkout_config() {
+        let codebase = codebase_with(&[LOW, HIGH]);
+        let (id, _) = pick_switch_repo(
+            &codebase,
+            None,
+            &[
+                in_use(LOW, "the current binding"),
+                in_use(HIGH, "config.toml"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(id.to_string(), LOW);
+    }
+
+    /// A current binding to another codebase says nothing about this one:
+    /// the next in-use repo that this codebase links decides.
+    #[test]
+    fn switch_skips_in_use_repos_of_other_codebases() {
+        let codebase = codebase_with(&[LOW, HIGH]);
+        let other = "99999999-0000-4000-8000-000000000009";
+        let (id, kept) = pick_switch_repo(
+            &codebase,
+            None,
+            &[
+                in_use(other, "the current binding"),
+                in_use(HIGH, "config.toml"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(id.to_string(), HIGH);
+        assert_eq!(kept.as_deref(), Some("config.toml"));
+    }
+
+    /// Several repos and none in use: an error naming them, never a guess.
+    #[test]
+    fn switch_reports_ambiguity_instead_of_picking() {
+        let codebase = codebase_with(&[LOW, HIGH]);
+        let err = pick_switch_repo(&codebase, None, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(LOW) && err.contains(HIGH), "got: {err}");
+        assert!(err.contains("--repo-id"), "got: {err}");
+    }
+
+    /// `--repo-id` is the explicit choice, also against the current binding.
+    #[test]
+    fn switch_repo_id_flag_overrides_the_current_binding() {
+        let codebase = codebase_with(&[LOW, HIGH]);
+        let (id, kept) = pick_switch_repo(
+            &codebase,
+            Some(LOW.parse().unwrap()),
+            &[in_use(HIGH, "the current binding")],
+        )
+        .unwrap();
+        assert_eq!(id.to_string(), LOW);
+        assert_eq!(kept, None);
+    }
+
+    #[test]
+    fn switch_repo_id_flag_must_name_a_repo_of_the_codebase() {
+        let codebase = codebase_with(&[LOW, HIGH]);
+        let other = "99999999-0000-4000-8000-000000000009";
+        let err = pick_switch_repo(&codebase, Some(other.parse().unwrap()), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not a repo of codebase"), "got: {err}");
+    }
+
+    /// One repo: nothing to choose, whatever is in use elsewhere.
+    #[test]
+    fn switch_binds_the_only_repo() {
+        let codebase = codebase_with(&[LOW]);
+        let other = "99999999-0000-4000-8000-000000000009";
+        let (id, kept) =
+            pick_switch_repo(&codebase, None, &[in_use(other, "the current binding")]).unwrap();
+        assert_eq!(id.to_string(), LOW);
+        assert_eq!(kept, None);
+    }
+
+    /// `resolve_path_to_binding` (used by `check` and `repo status --path`)
+    /// picks the repo the checkout's own config.toml binds — the one its hooks
+    /// stream to — rather than the lowest id.
+    #[tokio::test]
+    async fn resolve_path_prefers_the_checkout_config_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        add_origin_remote(tmp.path(), "git@github.com:org/repo.git");
+        std::fs::create_dir_all(tmp.path().join(".tracevault")).unwrap();
+        std::fs::write(
+            tmp.path().join(".tracevault/config.toml"),
+            format!("repo_id = \"{HIGH}\"\n"),
+        )
+        .unwrap();
+        let remote_id = "44000761-8d22-4256-bd2c-27a0ba278c6f";
+        let remote = format!(
+            r#"{{"remote_id":"{remote_id}","name":"repo","normalized_url":"github.com/org/repo","clone_status":"ready"}}"#
+        );
+        let detail = format!(
+            r#"{{"name":"repo","normalized_url":"github.com/org/repo","clone_status":"ready","repos":[{{"id":"{LOW}","name":"tracevault"}},{{"id":"{HIGH}","name":"tracing"}}]}}"#
+        );
+        let base = spawn_n(vec![http_200(&remote), http_200(&detail)]);
+        let client = ApiClient::new(&base, Some("tok"));
+
+        let got = resolve_path_to_binding(tmp.path(), &client)
+            .await
+            .unwrap()
+            .expect("registered");
+        assert_eq!(got.repo_id, HIGH);
+    }
+
+    // ── in_use_repos: what switch keeps, read from real state ─────────────────
+
+    const TARGET_CFG: &str = "c0000000-0000-4000-8000-00000000000c";
+    const CWD_CFG: &str = "b0000000-0000-4000-8000-00000000000b";
+    const ACTIVE: &str = "a0000000-0000-4000-8000-00000000000a";
+    const USER: &str = "d0000000-0000-4000-8000-00000000000d";
+
+    /// A git checkout whose `.tracevault/config.toml` binds `repo_id`.
+    fn checkout_bound_to(repo_id: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(dir.path());
+        std::fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
+        std::fs::write(
+            dir.path().join(".tracevault/config.toml"),
+            format!("repo_id = \"{repo_id}\"\n"),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn ids(in_use: &[InUse]) -> Vec<String> {
+        in_use.iter().map(|u| u.repo_id.to_string()).collect()
+    }
+
+    /// Session destination: the session's own binding first, then the target
+    /// checkout's config, then this checkout's.
+    #[tokio::test]
+    async fn in_use_puts_the_session_binding_first() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let home = tempfile::tempdir().unwrap();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("XDG_STATE_HOME", home.path());
+        guard.set("XDG_CONFIG_HOME", home.path());
+        let target = checkout_bound_to(TARGET_CFG);
+        let cwd = checkout_bound_to(CWD_CFG);
+        let state = SessionState {
+            active: Some(binding(ACTIVE)),
+            ..Default::default()
+        };
+        session_state::save("sess-inuse", &state).unwrap();
+
+        let got = in_use_repos(
+            &SwitchDest::Session("sess-inuse".into()),
+            target.path(),
+            cwd.path(),
+        );
+
+        assert_eq!(ids(&got), [ACTIVE, TARGET_CFG, CWD_CFG]);
+    }
+
+    /// A session without its own binding streams to this checkout's
+    /// config.toml, so that is its current binding.
+    #[tokio::test]
+    async fn in_use_falls_back_to_what_the_session_streams_to() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let home = tempfile::tempdir().unwrap();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("XDG_STATE_HOME", home.path());
+        guard.set("XDG_CONFIG_HOME", home.path());
+        let target = checkout_bound_to(TARGET_CFG);
+        let cwd = checkout_bound_to(CWD_CFG);
+
+        let got = in_use_repos(
+            &SwitchDest::Session("sess-unbound".into()),
+            target.path(),
+            cwd.path(),
+        );
+
+        assert_eq!(ids(&got)[0], CWD_CFG);
+        assert!(
+            got[0].source.contains("current binding"),
+            "{}",
+            got[0].source
+        );
+    }
+
+    /// `--user`: the current user default comes first, not any session.
+    #[tokio::test]
+    async fn in_use_for_the_user_default_starts_with_the_user_default() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let home = tempfile::tempdir().unwrap();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("XDG_STATE_HOME", home.path());
+        guard.set("XDG_CONFIG_HOME", home.path());
+        crate::user_default::save(&binding(USER)).unwrap();
+        let target = checkout_bound_to(TARGET_CFG);
+        let cwd = checkout_bound_to(CWD_CFG);
+
+        let got = in_use_repos(&SwitchDest::UserDefault, target.path(), cwd.path());
+
+        assert_eq!(ids(&got), [USER, TARGET_CFG, CWD_CFG]);
+    }
+
+    /// End to end: an ambiguous codebase fails the switch and leaves the
+    /// session's binding as it was.
+    #[tokio::test]
+    async fn ambiguous_switch_leaves_the_session_binding_unchanged() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let home = tempfile::tempdir().unwrap();
+        let other = "99999999-0000-4000-8000-000000000009";
+        let state = SessionState {
+            active: Some(binding(other)),
+            ..Default::default()
+        };
+        let target = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(target.path());
+        add_origin_remote(target.path(), "git@github.com:org/repo.git");
+        let remote = r#"{"remote_id":"2280a1c9-0000-4000-8000-000000000003","name":"tracing","normalized_url":"github.com/org/repo","clone_status":"ready"}"#;
+        let detail = format!(
+            r#"{{"name":"tracing","normalized_url":"github.com/org/repo","clone_status":"ready","repos":[{{"id":"{LOW}","name":"tracevault"}},{{"id":"{HIGH}","name":"tracing"}}]}}"#
+        );
+        let base = spawn_n(vec![http_200(remote), http_200(&detail)]);
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("XDG_STATE_HOME", home.path());
+        guard.set("XDG_CONFIG_HOME", home.path());
+        guard.set("TRACEVAULT_SERVER_URL", &base);
+        guard.set("TRACEVAULT_API_KEY", "tok");
+        session_state::save("sess-ambiguous", &state).unwrap();
+
+        let err = switch(
+            Some(&target.path().to_string_lossy()),
+            None,
+            None,
+            false,
+            Some("sess-ambiguous"),
+            home.path(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("--repo-id"), "got: {err}");
+        assert_eq!(session_state::load("sess-ambiguous"), state);
     }
 }
