@@ -43,8 +43,8 @@ the server as they happen.
 server id (`repo_id`) into `.tracevault/config.toml` only when you are already logged in. The
 hooks send events under that id; without it they send nothing. Run without credentials, `init`
 still installs the hooks and exits successfully, printing only
-`Not logged in. Run 'tracevault login' to register this repo with the server.` — no later
-command reports an error. If that happened, log in and run `tracevault sync` in the repo: it
+`Not logged in. Run 'tracevault login' to register this repo with the server.` — and the hooks
+then drop every event silently. If that happened, log in and run `tracevault sync` in the repo: it
 registers the repo and writes the missing `repo_id`. (Re-running `tracevault init` also works,
 but it rewrites `.tracevault/config.toml` from defaults, dropping anything you changed there.)
 
@@ -57,8 +57,8 @@ tracevault init --global
 
 This installs the hooks once, into `~/.claude/settings.json`, so they run in every Claude Code
 session on the machine — but **it does not by itself make every session recorded.** A session
-is recorded only when it is bound to a repo the server knows, in one of these ways
-(highest precedence first):
+is recorded only when it resolves to a repo the server knows or to a project. For a repo, in
+one of these ways (highest precedence first):
 
 1. **`tracevault repo switch <path>` inside the session.** `init --global` adds a note to
    `~/.claude/CLAUDE.md` telling the agent to run this before working on a repo, so this
@@ -72,11 +72,20 @@ is recorded only when it is bound to a repo the server knows, in one of these wa
 3. **A user-level default: `tracevault repo switch --user <path>`.** Every session not bound
    by points 1–2 is then attributed to that one repo, whatever directory it runs in.
 
-A session bound none of these ways records nothing, again without an error. If something else
+A session with no repo is still recorded, repo-less, when it resolves to a project:
+`TRACEVAULT_PROJECT` set to a project UUID, a `tracevault project switch` in the session, or a
+user-level `tracevault project switch --user` default (which then catches every unbound session
+on the machine) — see [Project attribution](#project-attribution--tracevault_project-and-tracevault_project_attribution).
+A session that resolves to neither records nothing, again without an error. If something else
 regenerates `~/.claude/CLAUDE.md`, the note from point 1 is lost; re-run `tracevault init
 --global` to restore it (it is idempotent).
 
 ### Check the result
+
+The definitive check is end to end: start a Claude Code session in the repo, have it do
+something (any tool call), and look for the session in the dashboard under **Traces →
+Sessions**. The checks below are quicker but only show that the setup is right, not that
+events arrived:
 
 - In a per-repo setup, `.tracevault/config.toml` contains a `repo_id = "…"` line. No line, no
   capture.
@@ -372,24 +381,181 @@ tracevault context show
 tracevault context clear
 ```
 
-### Other commands
+## Command reference
 
-| Command | What it does |
+Every command and flag of `tracevault` 0.29. `tracevault <command> --help` prints the same from
+the binary you have installed.
+
+### Setup
+
+**`tracevault login --server-url <URL> [--no-browser]`** — sign in through Keycloak; see
+[`tracevault login`](#tracevault-login--sign-in-humans). `--server-url` is required.
+
+| Flag | Meaning |
 |---|---|
-| `tracevault status [--session-id <id>]` | Diagnose the setup: login, hooks, repo binding, server registration, pending events |
-| `tracevault sync` | Register the repo with the server (or bind to its existing record) and store `repo_id` in `.tracevault/config.toml` if the repo has one |
-| `tracevault check` | Evaluate the server's policies for the session; the pre-push hook runs it and blocks the push on failure |
-| `tracevault flush` | Retry events that failed to stream in real time |
-| `tracevault stats` | Show local session statistics |
-| `tracevault verify --commits <sha,...>` / `--range <a..b>` | Verify commits are registered and sealed on the server |
-| `tracevault verify-start [--session-id <id>]` | Open (or re-open) a verification phase for the session |
-| `tracevault agent-policies` | Print agent-readable instructions derived from the repo's policies |
-| `tracevault proxy info` | Print the LLM proxy URL and setup instructions for AI tools |
-| `tracevault repo switch <path>` / `repo status` / `repo reset` | Workspace mode: bind, show or clear the repo a session (or, with `--user`, every session) is attributed to |
-| `tracevault project switch <name>` / `project status` | Bind or show the project a session (or, with `--user`, every session) is attributed to |
-| `tracevault logout` | Revoke and delete the stored login |
+| `--server-url <URL>` | The TraceVault server to sign in to (required) |
+| `--no-browser` | Only print the verification URL; also implied in CI, containers and Linux sessions without a display |
 
-`tracevault <command> --help` lists every flag.
+**`tracevault logout`** — revoke the refresh token at Keycloak (best-effort) and delete the
+credentials file.
+
+**`tracevault init [OPTIONS]`** — set up capture in the current directory, which must be the
+root of a git repository's primary checkout; see
+[`tracevault init`](#tracevault-init--set-up-tracing-in-a-repo). With `--global`, set it up for
+every session on the machine instead.
+
+| Flag | Meaning |
+|---|---|
+| `--agent <claude-code\|codex\|gsd\|opencode>` | Which agent to install hooks for (default `claude-code`; `gsd2` is an alias of `gsd`) |
+| `--claude-settings <shared\|local>` | Claude Code only: `.claude/settings.json` or `.claude/settings.local.json`. Omitted: asks in a terminal, otherwise `shared` |
+| `--no-gitignore` | Do not add `.tracevault/` and the hook file to the root `.gitignore` |
+| `--server-url <URL>` | Store this server URL in `.tracevault/config.toml` (lowest-precedence source; see [credentials](#tracevault-login--sign-in-humans)) |
+| `--user-context <path>` | Enable the user context layer, reading this file |
+| `--no-user-context` | Disable the user context layer (conflicts with `--user-context`) |
+| `--global` | Install machine-wide instead of in this repo; does not need git. Conflicts with `--server-url`, `--claude-settings`, `--no-gitignore` |
+
+**`tracevault sync`** — register the repo with the server, or bind to its existing record, and
+write `repo_id` into `.tracevault/config.toml` if the repo has one. Needs a login (or API key)
+and an `origin` remote. The pre-push hook runs it before every push.
+
+**`tracevault status [--session-id <id>]`** — diagnose the setup: authentication, global and
+repo installation, git and agent hooks, the session's repo/project binding, the repo on the
+server and its server-side clone, and pending events. Exits 1 if any check is an error (`✗`).
+`--session-id` picks the session whose binding is checked; default `$TRACEVAULT_SESSION_ID`,
+else the most recent session with a workspace binding.
+
+### Day to day
+
+**`tracevault check`** — evaluate the server's policies for the sessions behind the commits
+being pushed; exits 1 when a blocking policy fails. The pre-push hook runs it (feeding it git's
+pre-push input) and aborts the push on failure.
+
+**`tracevault flush`** — retry events that failed to stream in real time (network blip, server
+down) from the local queue.
+
+**`tracevault stats`** — print local session statistics (sessions, events) for this repo.
+
+**`tracevault verify (--range <a..b> | --commits <sha,sha,...>)`** — check that commits are
+registered and sealed on the server. `--range` is a git range expanded with `git rev-list`;
+`--commits` is a comma-separated list. If both are given, `--range` is used. Exits 1 on
+failure. The [GitHub Action](#github-action) runs it.
+
+**`tracevault verify-start [--session-id <id>]`** — open (or re-open) a *verification phase*
+for the session: the agent declares it has finished changing code and is now running checks.
+Only tool calls after this point are evaluated by policies scoped to the verification phase;
+calling it again resets the phase. Without `--session-id` it uses `$TRACEVAULT_SESSION_ID` if
+that session has events in this worktree, else detects the session by worktree.
+
+**`tracevault agent-policies`** — print agent-readable instructions rendered from the policies
+configured on the server for this repo, for an agent to read at session start (for example from
+`CLAUDE.md`).
+
+**`tracevault proxy info`** — print the TraceVault LLM proxy URL and setup instructions for AI
+tools (Claude Code, GSD2, Cursor, Codex CLI, …).
+
+### Context
+
+`tracevault context set|update|show|clear|source` — see
+[`tracevault context`](#tracevault-context--tagging-events-with-flow-and-metadata).
+
+| Command | Flags |
+|---|---|
+| `context set` | `--flow <id>`, `--label <l>` (repeatable, comma-separated accepted), `--param key=value` (repeatable), `--global`, `--user`. Replaces the whole context of the target file |
+| `context update` | `--flow <id>`, `--label <l>`, `--param key=value`, `--remove-label <l>`, `--remove-param <key>` (all repeatable), `--global`, `--user`. Merges into the target file |
+| `context show` | — |
+| `context clear` | `--global`, `--user` |
+| `context source` | exactly one of `--enable`, `--disable`, `--path <file>`, `--default` |
+
+Target file: the per-worktree file in a linked worktree, the repo file in the primary
+checkout; `--global` forces the repo file, `--user` the user-context file (and wins over
+`--global`).
+
+### Workspace mode — `repo` and `project`
+
+Commands that bind a session to a repo or a project, used with the `--global` install (see
+[Quick start](#every-session-on-the-machine----global)) and by launchers. Every one of them takes
+`--session-id <id>` (default `$TRACEVAULT_SESSION_ID`).
+
+| Command | Meaning |
+|---|---|
+| `repo switch <path> [--repo-id <uuid>] [--user]` | Bind the session to the registered repo that the checkout at `<path>` belongs to (resolved from its `origin` remote) and print the repo's policies. `--repo-id` picks one record when the codebase has several. `--user` (implied when there is no session id) writes the machine-wide default instead. `--name` is deprecated and always errors |
+| `repo status [--path <path>]` | Show the session's repo binding; `--path` resolves a checkout once instead |
+| `repo reset [--user]` | Clear the session's repo binding, or with `--user` the machine-wide default |
+| `project switch <name> [--user] [--project-attribution derived\|explicit]` | Bind the session (or, with `--user`, every session) to the project with this exact, case-sensitive name. `explicit` forces attribution; see [Project attribution](#project-attribution--tracevault_project-and-tracevault_project_attribution) |
+| `project status [--project <name>]` | Show which project the session is attributed to and why; `--project` is a display-only what-if |
+
+### Run by hooks, not by hand
+
+These are hidden from `--help`. `init` installs them; you never need to run them.
+
+| Command | Run by |
+|---|---|
+| `tracevault stream --event <event> [--agent <agent>]` | The agent's hooks, on every captured event (`--agent` defaults to `claude-code`) |
+| `tracevault session-start` | The agent's `SessionStart` hook: exports `TRACEVAULT_SESSION_ID` into the agent's shell and injects the bound repo's policies |
+| `tracevault user-prompt` | The agent's `UserPromptSubmit` hook: re-injects the policies when the session's repo has changed |
+| `tracevault commit-push` | The git `post-commit` hook, in the background: sends the commit's metadata |
+
+## What `init` installs
+
+**Claude Code** (`.claude/settings.json` or `.claude/settings.local.json`; with `--global`,
+`~/.claude/settings.json`). Existing hooks and settings are kept; re-running adds nothing twice.
+
+| Claude Code event | Matcher | Command |
+|---|---|---|
+| `PreToolUse` | `Write\|Edit\|Bash` | `tracevault stream --event pre-tool-use` |
+| `PostToolUse` | all tools | `tracevault stream --event post-tool-use` |
+| `Notification` | all | `tracevault stream --event notification` |
+| `Stop` | all | `tracevault stream --event stop` |
+| `SessionStart` | all | `tracevault session-start` |
+| `UserPromptSubmit` | all | `tracevault user-prompt` |
+
+**Codex** (`.codex/hooks.json`; with `--global`, `~/.codex/hooks.json`): `SessionStart` and
+`UserPromptSubmit` as above, plus `PostToolUse` and `Stop` streamed with `--agent codex`. There
+is deliberately no `PreToolUse` hook for Codex.
+
+**Git hooks** (per-repo `init` only; an existing hook keeps its content and gets a TraceVault
+block appended):
+
+- `pre-push` — `tracevault sync`, then `tracevault check`; a failed check aborts the push.
+- `post-commit` — `tracevault commit-push`, in the background.
+
+**Files**: `.tracevault/` (with `config.toml`, `sessions/`, `cache/` and its own `.gitignore`),
+and — unless `--no-gitignore` — entries for `.tracevault/` and the hook file in the root
+`.gitignore`.
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `TRACEVAULT_SERVER_URL` | Server URL; wins over the credentials file and `.tracevault/config.toml` |
+| `TRACEVAULT_API_KEY` | API key (`tvk_…`) for CI and automation; wins over an interactive login |
+| `TRACEVAULT_PROJECT` | Project UUID to attribute events to; see [Project attribution](#project-attribution--tracevault_project-and-tracevault_project_attribution) |
+| `TRACEVAULT_PROJECT_ATTRIBUTION` | `explicit` to force attribution to that project; anything else means `derived` |
+| `TRACEVAULT_SESSION_ID` | Default session for `status`, `verify-start`, `repo …` and `project …`; the `SessionStart` hook exports it into the agent's shell |
+| `TRACEVAULT_NO_BROWSER` | Any value: `login` does not open a browser |
+| `XDG_STATE_HOME` | Base for per-session state (`$XDG_STATE_HOME/tracevault/sessions`, default `~/.local/state/tracevault/sessions`) |
+
+The capture hook also reads the agent's own environment and auth files — for Claude Code
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_OAUTH_TOKEN`,
+`CLAUDE_CONFIG_DIR`; for Codex `CODEX_HOME`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN` — only to
+tell the server how the session is billed (gateway, API key or subscription). It never sends
+their values.
+
+## Files
+
+All user-level files live in the TraceVault config directory: `~/.config/tracevault/` on Linux
+(`$XDG_CONFIG_HOME/tracevault/` if set), `~/Library/Application Support/tracevault/` on macOS.
+
+| File | Written by | Holds |
+|---|---|---|
+| `credentials.json` | `login` (mode `0600`) | Server URL, access and refresh token |
+| `config.toml` | `init --global` | User-level settings (the user context layer) |
+| `context.json` | `context … --user` | The user context layer (default location) |
+| `default_repo.toml` | `repo switch --user` | Machine-wide default repo binding |
+| `user_project.toml` | `project switch --user` | Machine-wide default project binding |
+| `<repo>/.tracevault/config.toml` | `init`, `sync`, `context source` | `repo_id`, `user_context`, the agent, and optionally `server_url` / `api_key` / `default_project` |
+| `<repo>/.tracevault/context.json` | `context …` | The repo context layer |
+| `<repo>/.tracevault/worktrees/<key>/context.json` | `context …` in a linked worktree | The worktree context layer |
 
 ## GitHub Action
 
