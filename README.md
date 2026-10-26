@@ -21,6 +21,72 @@ or from crates.io:
 cargo install tracevault-cli
 ```
 
+## Quick start
+
+There are two ways to set up capture. Start with the per-repo setup unless you know you need
+the machine-wide one.
+
+### One repository
+
+Run these from the root of the repository you want traced — the primary checkout (not a
+linked worktree), with an `origin` remote:
+
+```sh
+tracevault login --server-url https://your-tracevault-server.example.com   # once per machine
+tracevault init                                                            # once per repo
+```
+
+Then start a new Claude Code session in the repo. Its sessions are captured and streamed to
+the server as they happen.
+
+**Log in before `init`.** `init` registers the repo with the server and writes the repo's
+server id (`repo_id`) into `.tracevault/config.toml` only when you are already logged in. The
+hooks send events under that id; without it they send nothing. Run without credentials, `init`
+still installs the hooks and exits successfully, printing only
+`Not logged in. Run 'tracevault login' to register this repo with the server.` — no later
+command reports an error. If that happened, log in and run `tracevault sync` in the repo: it
+registers the repo and writes the missing `repo_id`. (Re-running `tracevault init` also works,
+but it rewrites `.tracevault/config.toml` from defaults, dropping anything you changed there.)
+
+### Every session on the machine — `--global`
+
+```sh
+tracevault login --server-url https://your-tracevault-server.example.com
+tracevault init --global
+```
+
+This installs the hooks once, into `~/.claude/settings.json`, so they run in every Claude Code
+session on the machine — but **it does not by itself make every session recorded.** A session
+is recorded only when it is bound to a repo the server knows, in one of these ways
+(highest precedence first):
+
+1. **`tracevault repo switch <path>` inside the session.** `init --global` adds a note to
+   `~/.claude/CLAUDE.md` telling the agent to run this before working on a repo, so this
+   binding depends on the agent following that note. The command reads the session id from
+   `$TRACEVAULT_SESSION_ID`, which the session-start hook exports into the agent's shell; run
+   from a terminal without it, it sets the user-level default (point 3) instead. The repo must
+   already be registered — by someone's `tracevault init` or `tracevault sync` in a checkout of
+   it.
+2. **The repo has its own `tracevault init`** (a `.tracevault/config.toml` with a `repo_id`):
+   sessions started in it are recorded as with the per-repo setup.
+3. **A user-level default: `tracevault repo switch --user <path>`.** Every session not bound
+   by points 1–2 is then attributed to that one repo, whatever directory it runs in.
+
+A session bound none of these ways records nothing, again without an error. If something else
+regenerates `~/.claude/CLAUDE.md`, the note from point 1 is lost; re-run `tracevault init
+--global` to restore it (it is idempotent).
+
+### Check the result
+
+- In a per-repo setup, `.tracevault/config.toml` contains a `repo_id = "…"` line. No line, no
+  capture.
+- `tracevault status` shows `✓ Logged in` and `✓ Repo registered on server`. In bound mode it
+  finds the server repo by the checkout's directory name, so it can show `✓` even when
+  `repo_id` is missing locally — the line above is the authoritative check.
+- Inside an agent session (or with `--session-id <id>`), `tracevault status` also checks the
+  session's binding: `✗ Recording — nothing will be recorded` means the session is bound to
+  neither a repo nor a project.
+
 ## Usage
 
 ### `tracevault login` — sign in (humans)
@@ -35,11 +101,14 @@ touches TraceVault.
 tracevault login --server-url https://your-tracevault-server.example.com
 ```
 
-It prints a verification URL and a one-time code, tries to open your browser (skip that with
-`--no-browser`, which is also implied in CI/containers/headless sessions), and waits while you
-approve. On success it writes `~/.config/tracevault/credentials.json` (mode `0600`) holding a
-short-lived access token plus a long-lived `offline_access` **refresh token**, and prints the
-account and role the server resolved for you.
+It prints a verification URL and a one-time code, tries to open your browser, and waits while
+you approve. It skips the browser with `--no-browser`, or when `TRACEVAULT_NO_BROWSER` or `CI`
+/ `GITHUB_ACTIONS` is set, inside a container (`/.dockerenv`), or — on Linux and other
+non-macOS Unix — when neither `DISPLAY` nor `WAYLAND_DISPLAY` is set. On success it writes
+`credentials.json` (mode `0600`) into the TraceVault config directory — `~/.config/tracevault/`
+on Linux (`$XDG_CONFIG_HOME/tracevault/` if set), `~/Library/Application Support/tracevault/`
+on macOS — holding a short-lived access token plus a long-lived `offline_access` **refresh
+token**, and prints the account and role the server resolved for you.
 
 That refresh token is what makes unattended use work: every command refreshes the access token
 by itself shortly before it expires, so git hooks and background captures never stop to
@@ -49,9 +118,10 @@ prompt. Nothing has to be re-run periodically.
 removed either way) and deletes the credentials file.
 
 If sign-in succeeds but the server answers "not authorized", the account has no `tracevault`
-grant in Control Plane. The credentials are still saved; an administrator has to grant
-`tracevault` plus the project roles you need (`tracevault.viewer` / `tracevault.operator`) in
-Control Plane, or the `ai-tracing-admin` Keycloak realm role. No new login is needed afterwards.
+grant in Control Plane. The credentials are still saved, but `login` exits with status 1. An
+administrator has to grant `tracevault` plus the project roles you need (`tracevault.viewer` /
+`tracevault.operator`) in Control Plane, or the `ai-tracing-admin` Keycloak realm role. No new
+login is needed afterwards.
 
 **CI and automation do not use `tracevault login`.** They keep using a long-lived API key,
 which never expires and needs no browser:
@@ -61,10 +131,12 @@ export TRACEVAULT_SERVER_URL=https://your-tracevault-server.example.com
 export TRACEVAULT_API_KEY=tvk_...
 ```
 
-`TRACEVAULT_API_KEY` takes precedence over the credentials file, so a key set in the
-environment always wins on a machine that also has an interactive login. A server deployed
-without Keycloak supports only this API-key path, and `tracevault login` says exactly that
-instead of starting a flow that cannot complete.
+Each setting is taken from the first source that has it: the environment
+(`TRACEVAULT_SERVER_URL`, `TRACEVAULT_API_KEY`), then the credentials file, then `server_url`
+/ `api_key` in the repo's `.tracevault/config.toml`. So a key set in the environment always
+wins on a machine that also has an interactive login. A server deployed without Keycloak
+supports only this API-key path, and `tracevault login` says exactly that instead of starting
+a flow that cannot complete.
 
 ### Project attribution — `TRACEVAULT_PROJECT` and `TRACEVAULT_PROJECT_ATTRIBUTION`
 
@@ -80,9 +152,12 @@ export TRACEVAULT_PROJECT=22222222-2222-4222-8222-222222222222
 export TRACEVAULT_PROJECT_ATTRIBUTION=explicit
 ```
 
-**`TRACEVAULT_PROJECT`** sits above every remembered binding (session, repo config,
-deduction, user default) and below only a `--project` flag and a subagent's per-worktree
-override, so a `.tracevault/config.toml` baked into a pod image cannot outrank the launcher.
+**`TRACEVAULT_PROJECT`** is one tier of the project chain the capture hook uses, which is, from
+highest precedence: a subagent's per-worktree override → `TRACEVAULT_PROJECT` → the session's
+`project switch` binding → the user-level default (`project switch --user`). When none applies,
+the hook sends no project and the server derives it from the repo. The capture hook never
+reads `default_project` from `.tracevault/config.toml` (a name would need a network lookup), so
+a config file baked into a pod image cannot outrank the launcher.
 
 > **Only the UUID form is honoured.** Resolving a name needs a `list_projects` round trip,
 > and the capture hook runs per event in a short-lived process, so it never makes one: a
@@ -122,7 +197,8 @@ re-attributed to some other project** — fix the grant (or drop the force) and 
 drain delivers it.
 
 Use `tracevault project status` to see which tier won, which mode is in effect, and — when
-the binding carries a persisted force — whether that force is still live. `tracevault
+the binding carries a persisted force — whether that force is still live. Its `--project`
+flag is a what-if for that display only; nothing on the capture path takes one. `tracevault
 status` answers a narrower question as part of the full diagnostic: whether the tier that
 won is one the capture path actually honours. It does not report the attribution mode or
 the force.
@@ -131,14 +207,20 @@ the force.
 
 `tracevault init` wires TraceVault into a repository: it installs the AI-agent hooks that
 capture sessions, adds git hooks (a pre-push policy check and a post-commit metadata push),
-creates `.tracevault/`, and registers the repo with the server. Run it once per repo, from
-the primary checkout (not a linked worktree).
+creates `.tracevault/`, and — when you are logged in and the repo has an `origin` remote —
+registers the repo with the server and stores its `repo_id` in `.tracevault/config.toml`
+(see [Quick start](#one-repository) for what happens otherwise). Run it once per repo, from the
+root of the primary checkout (not a linked worktree).
 
 If the server already has a repo record for the checkout's remote, `init` binds to it instead of
 registering a second one (a second record would split sessions between the two). When the
 remote has several records and none is named like the checkout, `init` registers nothing and
 lists them; set `repo_id` in `.tracevault/config.toml` to the right one. `tracevault sync`
 follows the same rule.
+
+`init` writes `.tracevault/config.toml` from scratch each time it runs, so re-running it
+resets settings changed since (for example `tracevault context source`, or a pinned
+`server_url` / `api_key` / `default_project`).
 
 **Choosing the agent — `--agent`**
 
@@ -147,18 +229,28 @@ install hooks for (default `claude-code`):
 
 | Command | Installs | For |
 |---|---|---|
-| `tracevault init` | `.claude/settings.json` hooks | Claude Code (default) |
+| `tracevault init` | `.claude/settings.json` (or `.claude/settings.local.json`) hooks | Claude Code (default) |
 | `tracevault init --agent codex` | `.codex/hooks.json` hooks | OpenAI Codex CLI |
+| `tracevault init --agent gsd` (alias `gsd2`) | the TraceVault extension, registered with `gsd install -l` (the extension itself lives in `~/.gsd/`) | GSD (pi) |
+| `tracevault init --agent opencode` | `.opencode/plugins/tracevault.ts` plugin | OpenCode |
 
-Both wire the same capture pipeline: the agent's hooks invoke `tracevault`, which streams the
-session (transcript, tokens, cost, file changes) to the server tagged with the agent, so
-Claude Code and Codex sessions show up side by side, each with its own badge. Codex file
-changes come from the `apply_patch` tool event on Codex >= 0.153 (which carries the patch in
-its hook payload) and from the session rollout on older versions.
+All of them wire the same capture pipeline: the agent's hooks invoke `tracevault`, which
+streams the session (transcript, tokens, cost, file changes) to the server tagged with the
+agent, so sessions from different agents show up side by side, each with its own badge. Codex
+file changes come from the `apply_patch` tool event on Codex >= 0.153 (which carries the patch
+in its hook payload) and from the session rollout on older versions.
 
-`--claude-settings shared|local` chooses between `.claude/settings.json` (committed) and
-`.claude/settings.local.json` (git-ignored). It applies only to `--agent claude-code`; with
-`--agent codex` it is rejected (Codex always writes `.codex/hooks.json`).
+`--claude-settings shared|local` chooses between `.claude/settings.json` and
+`.claude/settings.local.json`. Without it, `init` asks when run in a terminal and otherwise
+uses `shared`. It applies only to `--agent claude-code` and is rejected with any other agent.
+
+Unless you pass `--no-gitignore`, `init` adds `.tracevault/` and the agent's hook file (for
+Claude Code, whichever settings file you chose — `settings.json` included) to the root
+`.gitignore`, so nothing needs to be committed and every contributor runs `tracevault init`
+for themselves. Pass `--no-gitignore` if you want to commit the hook file.
+
+`--server-url <URL>` stores a server URL in `.tracevault/config.toml`; it is only needed when
+the URL does not come from `tracevault login` or `TRACEVAULT_SERVER_URL`.
 
 **Codex hook trust — required once, or nothing is captured**
 
@@ -176,18 +268,26 @@ record, which is appropriate when the hook source is your own installed CLI.
 **Global install — `--global`**
 
 `--global` installs hooks once for every session on the machine instead of per-repo, paired
-with workspace mode (bind a repo mid-session with `tracevault repo switch`):
+with workspace mode — see [Quick start](#every-session-on-the-machine----global) for how
+sessions get bound to a repo:
 
 ```sh
-tracevault init --global                 # ~/.claude/settings.json + ~/.claude/CLAUDE.md
-tracevault init --global --agent codex   # ~/.codex/hooks.json  + ~/.codex/AGENTS.md
+tracevault init --global                    # ~/.claude/settings.json + ~/.claude/CLAUDE.md
+tracevault init --global --agent codex      # ~/.codex/hooks.json  + ~/.codex/AGENTS.md
+tracevault init --global --agent gsd        # GSD extension for all GSD sessions
+tracevault init --global --agent opencode   # ~/.config/opencode/plugins/tracevault.ts
 ```
+
+It does not need a git repository. It also writes the user-level `config.toml` in the
+TraceVault config directory, which enables the user context layer (see below) for repos that
+do not configure it themselves; `--no-user-context` and `--user-context <path>` apply to it.
+`--global` cannot be combined with `--server-url`, `--claude-settings` or `--no-gitignore`.
 
 ### `tracevault context` — tagging events with flow and metadata
 
-`tracevault context` manages context (flow ID, labels, params) that the Claude Code hook
-stamps on every captured event. This drives grouping and filtering in the Flows view and
-the analytics UI.
+`tracevault context` manages context (flow ID, labels, params) that the capture hook stamps on
+every captured event, whichever agent produced it. This drives grouping and filtering in the
+Flows view and the analytics UI.
 
 **Three layers, low → high precedence**
 
@@ -195,9 +295,9 @@ the analytics UI.
 user  →  repo (global)  →  worktree
 ```
 
-- **User** — optional, cross-repo, opt-in. Lives outside the repo (e.g.
-  `~/.config/tracevault/context.json`), so it follows *you* across every project instead of
-  being scoped to one repo.
+- **User** — optional, cross-repo, opt-in. Lives outside the repo (by default `context.json`
+  in the TraceVault config directory, e.g. `~/.config/tracevault/context.json` on Linux), so
+  it follows *you* across every project instead of being scoped to one repo.
 - **Repo (global)** — `.tracevault/context.json`, shared by all worktrees of the repo.
 - **Worktree** — `.tracevault/worktrees/<key>/context.json`, present only in a linked git
   worktree.
@@ -214,27 +314,34 @@ from the output).
 
 **Enabling the user layer — `user_context` in `config.toml`**
 
-Off by default for compatibility: a `config.toml` without the field, or with
-`user_context = false`, never consults a user layer. `tracevault init` enables it by default
-for newly initialized projects (`--no-user-context` to opt out, `--user-context <path>` to
-point it at an explicit file up front). The field accepts four forms:
+Whether the user layer is consulted is decided by `user_context` in the repo's
+`.tracevault/config.toml`. If the repo config does not set it, the user-level `config.toml`
+(written by `tracevault init --global`) decides; if neither sets it, the layer is off.
+`tracevault init` writes `user_context = true` into the repo config by default
+(`--no-user-context` to write `false`, `--user-context <path>` to point it at an explicit file
+up front). The field accepts four forms:
 
 | `config.toml` | Meaning |
 |---|---|
-| `user_context = false` (or field absent) | disabled — no user layer is consulted |
-| `user_context = true` | enabled, reading `~/.config/tracevault/context.json` |
+| `user_context = false` | disabled — no user layer is consulted, whatever the user-level config says |
+| `user_context = true` | enabled, reading `context.json` in the TraceVault config directory |
 | `user_context = "/custom/path.json"` | enabled, reading from that file |
-| `[user_context]` with `enable = false` / `path = "..."` | disabled, but remembers a path for later re-enabling |
+| `[user_context]` with `enable` / `path = "..."` | `enable` defaults to `true`; `enable = false` disables the layer but keeps the path in the file |
 
-Change it after the fact with `tracevault context source` (one of `--enable`, `--disable`,
-`--path <file>`, or `--default` is required):
+Change the repo's setting after the fact with `tracevault context source` (one of `--enable`,
+`--disable`, `--path <file>`, or `--default` is required). It edits only the current repo's
+`.tracevault/config.toml` and fails if the repo has none. `--enable` and `--default` both write
+`user_context = true`, so they use the default path and discard a remembered one:
 
 ```sh
 tracevault context source --enable                 # turn on at the default path
 tracevault context source --path ~/team-ctx.json    # turn on, reading a custom file
-tracevault context source --default                 # turn on and reset to the default path
+tracevault context source --default                 # same as --enable
 tracevault context source --disable                 # turn off
 ```
+
+To set the user layer up for every repo at once, use `tracevault init --global`
+(optionally with `--user-context <path>`), which writes the user-level config.
 
 **Editing each layer**
 
@@ -255,16 +362,34 @@ from — useful for debugging why a value did or didn't win.
 **Examples**
 
 ```sh
-# One-time: point your personal context at a file you reuse across every repo
-tracevault context source --path ~/.config/tracevault/context.json
+# Personal context, used by every repo that does not opt out
 tracevault context set --user --label solo-dev --param editor=nvim
 
-# Per-repo, as before
+# Per-repo
 tracevault context set --flow add-payment-retry --label payments --label backend
 tracevault context update --param env=staging --remove-label backend
 tracevault context show
 tracevault context clear
 ```
+
+### Other commands
+
+| Command | What it does |
+|---|---|
+| `tracevault status [--session-id <id>]` | Diagnose the setup: login, hooks, repo binding, server registration, pending events |
+| `tracevault sync` | Register the repo with the server (or bind to its existing record) and store `repo_id` in `.tracevault/config.toml` if the repo has one |
+| `tracevault check` | Evaluate the server's policies for the session; the pre-push hook runs it and blocks the push on failure |
+| `tracevault flush` | Retry events that failed to stream in real time |
+| `tracevault stats` | Show local session statistics |
+| `tracevault verify --commits <sha,...>` / `--range <a..b>` | Verify commits are registered and sealed on the server |
+| `tracevault verify-start [--session-id <id>]` | Open (or re-open) a verification phase for the session |
+| `tracevault agent-policies` | Print agent-readable instructions derived from the repo's policies |
+| `tracevault proxy info` | Print the LLM proxy URL and setup instructions for AI tools |
+| `tracevault repo switch <path>` / `repo status` / `repo reset` | Workspace mode: bind, show or clear the repo a session (or, with `--user`, every session) is attributed to |
+| `tracevault project switch <name>` / `project status` | Bind or show the project a session (or, with `--user`, every session) is attributed to |
+| `tracevault logout` | Revoke and delete the stored login |
+
+`tracevault <command> --help` lists every flag.
 
 ## GitHub Action
 
@@ -282,6 +407,10 @@ runs `tracevault verify --range`, and writes a pass/fail summary to the Actions 
     api-key: ${{ secrets.TRACEVAULT_API_KEY }}
     # version: v0.20.1   # optional; defaults to the latest release
 ```
+
+It installs the `x86_64-unknown-linux-gnu` build, so it needs an x86_64 Linux runner. It
+supports `push`, `pull_request` and `pull_request_target` events and fails on any other. On
+the push that creates a branch it verifies only the head commit.
 
 ## License
 
