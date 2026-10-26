@@ -41,8 +41,9 @@ the server as they happen.
 
 **Log in before `init`.** `init` registers the repo with the server and writes the repo's
 server id (`repo_id`) into `.tracevault/config.toml` only when you are already logged in. The
-hooks send events under that id; without it they send nothing. Run without credentials, `init`
-still installs the hooks and exits successfully, printing only
+hooks send events under that id; without it — and without any of the workspace-mode bindings
+described [below](#every-session-on-the-machine----global) — they send nothing. Run without
+credentials, `init` still installs the hooks and exits successfully, printing only
 `Not logged in. Run 'tracevault login' to register this repo with the server.` — and the hooks
 then drop every event silently. If that happened, log in and run `tracevault sync` in the repo: it
 registers the repo and writes the missing `repo_id`. (Re-running `tracevault init` also works,
@@ -63,8 +64,10 @@ one of these ways (highest precedence first):
 1. **`tracevault repo switch <path>` inside the session.** `init --global` adds a note to
    `~/.claude/CLAUDE.md` telling the agent to run this before working on a repo, so this
    binding depends on the agent following that note. The command reads the session id from
-   `$TRACEVAULT_SESSION_ID`, which the session-start hook exports into the agent's shell; run
-   from a terminal without it, it sets the user-level default (point 3) instead. The repo must
+   `$TRACEVAULT_SESSION_ID`, which the session-start hook exports into Claude Code's shell
+   (through Claude Code's `CLAUDE_ENV_FILE`; other agents do not get it, so pass
+   `--session-id <id>` there). Run without a session id, it sets the user-level default
+   (point 3) instead. The repo must
    already be registered — by someone's `tracevault init` or `tracevault sync` in a checkout of
    it.
 2. **The repo has its own `tracevault init`** (a `.tracevault/config.toml` with a `repo_id`):
@@ -87,8 +90,9 @@ something (any tool call), and look for the session in the dashboard under **Tra
 Sessions**. The checks below are quicker but only show that the setup is right, not that
 events arrived:
 
-- In a per-repo setup, `.tracevault/config.toml` contains a `repo_id = "…"` line. No line, no
-  capture.
+- In a per-repo setup, `.tracevault/config.toml` contains a `repo_id = "…"` line. Without it,
+  sessions in the repo are captured only if bound some other way (workspace mode, a user-level
+  default, a project) — and then not necessarily to this repo.
 - `tracevault status` shows `✓ Logged in` and `✓ Repo registered on server`. In bound mode it
   finds the server repo by the checkout's directory name, so it can show `✓` even when
   `repo_id` is missing locally — the line above is the authoritative check.
@@ -252,6 +256,8 @@ in its hook payload) and from the session rollout on older versions.
 `--claude-settings shared|local` chooses between `.claude/settings.json` and
 `.claude/settings.local.json`. Without it, `init` asks when run in a terminal and otherwise
 uses `shared`. It applies only to `--agent claude-code` and is rejected with any other agent.
+**`init` replaces the entire `hooks` section of the file it picks**, so hooks you had there are
+lost; see [What `init` installs](#what-init-installs).
 
 Unless you pass `--no-gitignore`, `init` adds `.tracevault/` and the agent's hook file (for
 Claude Code, whichever settings file you chose — `settings.json` included) to the root
@@ -381,6 +387,23 @@ tracevault context show
 tracevault context clear
 ```
 
+**Letting the agent tag its own work**
+
+Flow IDs, labels and params have no fixed schema; each team decides what they mean. To have
+Claude Code set context itself at the start of each task, add a rule like this to the repo's
+`CLAUDE.md`:
+
+```markdown
+When you begin a new distinct task, run:
+  tracevault context set --flow <kebab-case-task-name> --label <area-you-are-touching>
+
+Examples of areas: frontend, backend, auth, payments, infra.
+When the task is complete, run: tracevault context clear
+```
+
+Sessions in different linked worktrees each write their own worktree file, so parallel
+sessions do not overwrite each other's context.
+
 ## Command reference
 
 Every command and flag of `tracevault` 0.29. `tracevault <command> --help` prints the same from
@@ -409,7 +432,7 @@ every session on the machine instead.
 | `--agent <claude-code\|codex\|gsd\|opencode>` | Which agent to install hooks for (default `claude-code`; `gsd2` is an alias of `gsd`) |
 | `--claude-settings <shared\|local>` | Claude Code only: `.claude/settings.json` or `.claude/settings.local.json`. Omitted: asks in a terminal, otherwise `shared` |
 | `--no-gitignore` | Do not add `.tracevault/` and the hook file to the root `.gitignore` |
-| `--server-url <URL>` | Store this server URL in `.tracevault/config.toml` (lowest-precedence source; see [credentials](#tracevault-login--sign-in-humans)) |
+| `--server-url <URL>` | Register the repo with this server during this `init` (instead of the URL from the environment or your login), and store it in `.tracevault/config.toml`, where later commands treat it as the lowest-precedence source (see [credentials](#tracevault-login--sign-in-humans)) |
 | `--user-context <path>` | Enable the user context layer, reading this file |
 | `--no-user-context` | Disable the user context layer (conflicts with `--user-context`) |
 | `--global` | Install machine-wide instead of in this repo; does not need git. Conflicts with `--server-url`, `--claude-settings`, `--no-gitignore` |
@@ -461,7 +484,7 @@ tools (Claude Code, GSD2, Cursor, Codex CLI, …).
 | Command | Flags |
 |---|---|
 | `context set` | `--flow <id>`, `--label <l>` (repeatable, comma-separated accepted), `--param key=value` (repeatable), `--global`, `--user`. Replaces the whole context of the target file |
-| `context update` | `--flow <id>`, `--label <l>`, `--param key=value`, `--remove-label <l>`, `--remove-param <key>` (all repeatable), `--global`, `--user`. Merges into the target file |
+| `context update` | `--flow <id>`, and the repeatable `--label <l>`, `--param key=value`, `--remove-label <l>`, `--remove-param <key>`; `--global`, `--user`. Merges into the target file |
 | `context show` | — |
 | `context clear` | `--global`, `--user` |
 | `context source` | exactly one of `--enable`, `--disable`, `--path <file>`, `--default` |
@@ -491,14 +514,20 @@ These are hidden from `--help`. `init` installs them; you never need to run them
 | Command | Run by |
 |---|---|
 | `tracevault stream --event <event> [--agent <agent>]` | The agent's hooks, on every captured event (`--agent` defaults to `claude-code`) |
-| `tracevault session-start` | The agent's `SessionStart` hook: exports `TRACEVAULT_SESSION_ID` into the agent's shell and injects the bound repo's policies |
+| `tracevault session-start` | The agent's `SessionStart` hook: injects the bound repo's policies; under Claude Code it also exports `TRACEVAULT_SESSION_ID` into the agent's shell |
 | `tracevault user-prompt` | The agent's `UserPromptSubmit` hook: re-injects the policies when the session's repo has changed |
 | `tracevault commit-push` | The git `post-commit` hook, in the background: sends the commit's metadata |
 
 ## What `init` installs
 
 **Claude Code** (`.claude/settings.json` or `.claude/settings.local.json`; with `--global`,
-`~/.claude/settings.json`). Existing hooks and settings are kept; re-running adds nothing twice.
+`~/.claude/settings.json`).
+
+> **Per-repo `init` replaces the whole `hooks` section of the Claude Code settings file it
+> writes** — any other hooks you had in that file are lost (other settings are kept). Back the
+> file up first, or use `--claude-settings` to pick the file that has no hooks of yours.
+> `init --global` and the Codex install merge instead: existing hooks are kept and re-running
+> adds nothing twice.
 
 | Claude Code event | Matcher | Command |
 |---|---|---|
