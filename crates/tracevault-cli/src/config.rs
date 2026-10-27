@@ -262,8 +262,9 @@ impl TracevaultConfig {
     /// carry through a round trip (VIS-1046): the `api_key` it was loaded with
     /// (otherwise never serialized, see the field) and keys this CLI version
     /// does not know. Every other key follows the struct, so a `None` field
-    /// removes it. The file's key order is kept. An unreadable or malformed
-    /// file is replaced.
+    /// removes it, but a field this config holds unchanged keeps the file's
+    /// own spelling (e.g. unknown keys inside `[user_context]`). The file's key
+    /// order is kept. An unreadable or malformed file is replaced.
     pub fn save(&self, project_root: &Path) -> std::io::Result<()> {
         let path = Self::config_path(project_root);
         let mut table: toml::Table = std::fs::read_to_string(&path)
@@ -271,11 +272,25 @@ impl TracevaultConfig {
             .and_then(|content| content.parse().ok())
             .unwrap_or_default();
         let ours = toml::Table::try_from(self).map_err(std::io::Error::other)?;
+        // The file's fields as this struct reads them, to tell which ones the
+        // caller changed.
+        let as_loaded = table
+            .clone()
+            .try_into::<Self>()
+            .ok()
+            .and_then(|cfg| toml::Table::try_from(&cfg).ok())
+            .unwrap_or_default();
         // `api_key` is settled below, in place.
         table.retain(|key, _| {
             key == "api_key" || !Self::FIELDS.contains(&key) || ours.contains_key(key)
         });
-        table.extend(ours);
+        for (key, value) in ours {
+            // A serde default (`agent`) matches as loaded without being in
+            // the file: still written.
+            if !table.contains_key(&key) || as_loaded.get(&key) != Some(&value) {
+                table.insert(key, value);
+            }
+        }
         match &self.api_key {
             Some(key) => {
                 table.insert("api_key".into(), key.clone().into());
@@ -752,6 +767,59 @@ mod tests {
             reloaded.user_context,
             Some(UserContext::Full { enable: false, path: Some(ref p) }) if p == "/x.json"
         ));
+    }
+
+    #[test]
+    fn save_keeps_an_unchanged_user_context_table_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "repo_id = \"r1\"\nagent = \"claude-code\"\n\n[user_context]\npath = \"/x.json\"\nfuture_setting = 1\nenable = true\n";
+        write_config(dir.path(), original);
+
+        let mut cfg = TracevaultConfig::load(dir.path()).unwrap();
+        cfg.repo_id = Some("r2".into());
+        cfg.save(dir.path()).unwrap();
+
+        let content = fs::read_to_string(TracevaultConfig::config_path(dir.path())).unwrap();
+        assert_eq!(
+            content,
+            format!(
+                "# TraceVault configuration\n{}",
+                original.replace("r1", "r2")
+            )
+        );
+    }
+
+    #[test]
+    fn save_replaces_a_changed_user_context() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "[user_context]\npath = \"/x.json\"\nfuture_setting = 1\n",
+        );
+
+        let mut cfg = TracevaultConfig::load(dir.path()).unwrap();
+        cfg.user_context = Some(UserContext::Toggle(false));
+        cfg.save(dir.path()).unwrap();
+
+        let content = fs::read_to_string(TracevaultConfig::config_path(dir.path())).unwrap();
+        assert_eq!(
+            content,
+            "# TraceVault configuration\nuser_context = false\nagent = \"claude-code\"\n"
+        );
+    }
+
+    #[test]
+    fn save_writes_the_default_agent_into_a_file_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "repo_id = \"r1\"\n");
+
+        TracevaultConfig::load(dir.path())
+            .unwrap()
+            .save(dir.path())
+            .unwrap();
+
+        let content = fs::read_to_string(TracevaultConfig::config_path(dir.path())).unwrap();
+        assert!(content.contains("agent = \"claude-code\""), "{content}");
     }
 
     #[test]
