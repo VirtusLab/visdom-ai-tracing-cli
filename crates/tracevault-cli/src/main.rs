@@ -50,18 +50,26 @@ enum Cli {
         /// where it sets the path the user-level context is read from.
         #[arg(long, conflicts_with = "no_user_context")]
         user_context: Option<String>,
-        /// Install TraceVault hooks once into ~/.claude/ for ALL Claude Code
-        /// sessions, instead of initializing the current repo. Does not
-        /// require git. Also writes a user-level context config (honoring
-        /// --no-user-context / --user-context below). Conflicts with the
-        /// per-repo-only flags below, which this mode has no use for.
+        /// Install TraceVault once for ALL sessions of the chosen --agent on
+        /// this machine, instead of initializing the current repo: Claude Code
+        /// hooks into ~/.claude/ (settings.json + CLAUDE.md), Codex hooks into
+        /// ~/.codex/ (hooks.json + AGENTS.md), the GSD extension via
+        /// `gsd install` (global), or the OpenCode plugin into the user config
+        /// dir's opencode/plugins/. Does not require git. Also writes a
+        /// user-level context config (honoring --no-user-context /
+        /// --user-context). Conflicts with the per-repo-only flags
+        /// --server-url, --claude-settings and --no-gitignore.
         #[arg(
             long,
             conflicts_with_all = ["server_url", "claude_settings", "no_gitignore"]
         )]
         global: bool,
-        /// Which agent to install hooks for. `codex` writes .codex/hooks.json;
-        /// the default installs Claude Code hooks (unchanged behaviour).
+        /// Which agent to install hooks for. The default installs Claude Code
+        /// hooks (.claude/settings.json or settings.local.json); `codex` writes
+        /// .codex/hooks.json; `gsd` (alias `gsd2`) registers the GSD extension
+        /// with `gsd install -l`; `opencode` writes
+        /// .opencode/plugins/tracevault.ts. With --global, the user-level
+        /// equivalents instead.
         #[arg(long, value_enum, default_value = "claude-code")]
         agent: crate::agent::Agent,
     },
@@ -86,14 +94,16 @@ enum Cli {
         agent: crate::agent::Agent,
     },
     /// SessionStart hook: exports the session id and injects the bound repo's
-    /// policies as additionalContext. Installed into .claude/settings.json by
-    /// `tracevault init --global` — not intended to be run manually.
+    /// policies as additionalContext. Installed by `tracevault init` (per-repo
+    /// or --global) into the Claude Code settings or the Codex hooks.json —
+    /// not intended to be run manually.
     #[command(name = "session-start", hide = true)]
     SessionStart,
     /// UserPromptSubmit hook: reinforces the bound repo's policies as
     /// additionalContext when the effective repo has changed since the last
-    /// injection. Installed into .claude/settings.json by
-    /// `tracevault init --global` — not intended to be run manually.
+    /// injection. Installed by `tracevault init` (per-repo or --global) into
+    /// the Claude Code settings or the Codex hooks.json — not intended to be
+    /// run manually.
     #[command(name = "user-prompt", hide = true)]
     UserPrompt,
     /// Check session policies before pushing
@@ -235,10 +245,12 @@ enum ContextAction {
         #[arg(long)]
         user: bool,
     },
-    /// Show the current context (path + pretty JSON).
+    /// Show the current context, layer by layer (pretty JSON).
     ///
-    /// Prints three sections: Global (repo-wide), This worktree (linked only),
-    /// and Effective (the merged result that the hook stamps).
+    /// Prints up to four sections: User (always; its header says whether the
+    /// user layer is enabled and which file it reads), Global (repo-wide),
+    /// This worktree (linked only), and Effective (the merged result that the
+    /// hook stamps, each value annotated with the layer it came from).
     Show,
     /// Clear all context (flow, labels, params).
     ///
