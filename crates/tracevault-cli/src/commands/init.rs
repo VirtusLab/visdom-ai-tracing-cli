@@ -948,47 +948,76 @@ fn merge_hooks_into_file(hooks_path: &Path, ours: &serde_json::Value) -> io::Res
         Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(hooks_path)?,
         _ => hooks_path.to_path_buf(),
     };
-    let existing_permissions = match fs::metadata(&target) {
-        Ok(meta) => Some(meta.permissions()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+    // Another writer (a second `init`, Claude Code saving a permission) may
+    // change the file between our read and our rename; publishing then would
+    // drop its change. So the file is re-read just before the rename and the
+    // merge redone if it moved. This narrows the window, it cannot close it:
+    // Claude Code takes no lock we could share.
+    for _ in 0..3 {
+        let existing = read_existing(&target)?;
+        let mut root: serde_json::Value = match &existing {
+            Some((_, content)) => serde_json::from_str(content).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to parse {}: {e}", hooks_path.display()),
+                )
+            })?,
+            None => serde_json::json!({}),
+        };
+
+        let before = existing.is_some().then(|| root.to_string());
+        merge_hooks(&mut root, ours, hooks_path)?;
+        if before.as_deref() == Some(root.to_string().as_str()) {
+            return Ok(());
+        }
+
+        let formatted = serde_json::to_string_pretty(&root).map_err(|e| {
+            io::Error::other(format!("Failed to serialize {}: {e}", hooks_path.display()))
+        })?;
+        let tmp = unique_temp_sibling(&target);
+        let published = write_owner_only(&tmp, formatted.as_bytes())
+            .and_then(|()| {
+                // Keep the mode the user gave the file (a 0600 settings.local.json
+                // may carry credentials in `env`); a new file stays owner-only.
+                match &existing {
+                    Some((permissions, _)) => fs::set_permissions(&tmp, permissions.clone()),
+                    None => Ok(()),
+                }
+            })
+            .and_then(|()| {
+                let unchanged = read_existing(&target)?.map(|(_, c)| c)
+                    == existing.as_ref().map(|(_, c)| c.clone());
+                if unchanged {
+                    fs::rename(&tmp, &target).map(|()| true)
+                } else {
+                    Ok(false)
+                }
+            });
+        match published {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                let _ = fs::remove_file(&tmp);
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
+        }
+    }
+    Err(io::Error::other(format!(
+        "{} kept changing while TraceVault updated its hooks; re-run `tracevault init`",
+        hooks_path.display()
+    )))
+}
+
+/// The permissions and contents of `path`, or `None` when it does not exist.
+fn read_existing(path: &Path) -> io::Result<Option<(fs::Permissions, String)>> {
+    let permissions = match fs::metadata(path) {
+        Ok(meta) => meta.permissions(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let mut root: serde_json::Value = if existing_permissions.is_some() {
-        let content = fs::read_to_string(&target)?;
-        serde_json::from_str(&content).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Failed to parse {}: {e}", hooks_path.display()),
-            )
-        })?
-    } else {
-        serde_json::json!({})
-    };
-
-    let before = existing_permissions.is_some().then(|| root.to_string());
-    merge_hooks(&mut root, ours, hooks_path)?;
-    if before.as_deref() == Some(root.to_string().as_str()) {
-        return Ok(());
-    }
-
-    let formatted = serde_json::to_string_pretty(&root).map_err(|e| {
-        io::Error::other(format!("Failed to serialize {}: {e}", hooks_path.display()))
-    })?;
-    let tmp = unique_temp_sibling(&target);
-    let written = write_owner_only(&tmp, formatted.as_bytes())
-        .and_then(|()| {
-            // Keep the mode the user gave the file (a 0600 settings.local.json
-            // may carry credentials in `env`); a new file stays owner-only.
-            match existing_permissions {
-                Some(permissions) => fs::set_permissions(&tmp, permissions),
-                None => Ok(()),
-            }
-        })
-        .and_then(|()| fs::rename(&tmp, &target));
-    if written.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    written
+    Ok(Some((permissions, fs::read_to_string(path)?)))
 }
 
 /// A temp path next to `target` that no other install — in this process or a
@@ -1120,7 +1149,7 @@ const TRACEVAULT_COMMAND_PREFIX: &str = "tracevault ";
 fn is_tracevault_hook(hook: &serde_json::Value) -> bool {
     hook.get("command")
         .and_then(|c| c.as_str())
-        .is_some_and(|c| c.trim_start().starts_with(TRACEVAULT_COMMAND_PREFIX))
+        .is_some_and(|c| c.starts_with(TRACEVAULT_COMMAND_PREFIX))
 }
 
 /// Remove TraceVault-owned inner hooks from one event's matcher groups. A
@@ -1574,7 +1603,8 @@ mod tests {
             "matcher": "",
             "hooks": [
                 { "type": "command", "command": "tracevault-wrapper stream" },
-                { "type": "command", "command": "echo tracevault stream" }
+                { "type": "command", "command": "echo tracevault stream" },
+                { "type": "command", "command": " tracevault check" }
             ]
         });
         let mut settings = serde_json::json!({ "hooks": { "Stop": [foreign.clone()] } });
@@ -2174,17 +2204,32 @@ mod tests {
     #[test]
     fn concurrent_installs_never_publish_a_partial_file() {
         // Two writers flip the file between two hook sets, so every call
-        // rewrites it; every read must still parse, and no temp file remains.
+        // rewrites it, while a reader keeps parsing it: the file must always
+        // be there and complete, and no temp file may remain. A writer that
+        // keeps losing the race gives up with the "kept changing" error
+        // rather than publishing a stale snapshot.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
         fs::write(&path, FOREIGN_SETTINGS).unwrap();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (path, done) = (path.clone(), done.clone());
+            std::thread::spawn(move || {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let body = fs::read_to_string(&path).unwrap();
+                    serde_json::from_str::<serde_json::Value>(&body).unwrap();
+                }
+            })
+        };
         let writers: Vec<_> = [tracevault_hooks(), codex_hooks()]
             .into_iter()
             .map(|ours| {
                 let path = path.clone();
                 std::thread::spawn(move || {
                     for _ in 0..200 {
-                        merge_hooks_into_file(&path, &ours).unwrap();
+                        if let Err(e) = merge_hooks_into_file(&path, &ours) {
+                            assert!(e.to_string().contains("kept changing"), "{e}");
+                        }
                     }
                 })
             })
@@ -2192,6 +2237,8 @@ mod tests {
         for writer in writers {
             writer.join().unwrap();
         }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["model"], "opus");
