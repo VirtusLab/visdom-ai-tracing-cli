@@ -601,38 +601,7 @@ fn install_claude_hooks(
 ) -> Result<(), io::Error> {
     let claude_dir = project_root.join(".claude");
     fs::create_dir_all(&claude_dir)?;
-
-    let filename = target.filename();
-    let settings_path = claude_dir.join(filename);
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Failed to parse .claude/{filename}: {e}"),
-            )
-        })?
-    } else {
-        serde_json::json!({})
-    };
-
-    let hooks = tracevault_hooks();
-
-    // Merge hooks into existing settings
-    let settings_obj = settings.as_object_mut().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(".claude/{filename} is not a JSON object"),
-        )
-    })?;
-
-    settings_obj.insert("hooks".to_string(), hooks);
-
-    let formatted = serde_json::to_string_pretty(&settings)
-        .map_err(|e| io::Error::other(format!("Failed to serialize settings: {e}")))?;
-    fs::write(&settings_path, formatted)?;
-
-    Ok(())
+    merge_hooks_into_file(&claude_dir.join(target.filename()), &tracevault_hooks())
 }
 
 pub fn tracevault_hooks() -> serde_json::Value {
@@ -949,15 +918,15 @@ pub fn cleanup_stale_gsd_registration(gsd_home: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Read `hooks_path` as a JSON object (or `{}` if absent), deep-merge `ours`
-/// into its `hooks` map via [`merge_hooks`] (idempotent, never clobbers existing
-/// hooks/keys), and write the result back atomically (sibling temp file +
-/// rename). Shared by the hook-file installers so the read → merge →
-/// atomic-write pattern lives in exactly one place. Works for both Claude's
-/// `settings.json` and Codex's `hooks.json`, whose roots are the object
-/// `merge_hooks` mutates (`root["hooks"]`). On a merge error (malformed
-/// existing file) it returns before writing, so the target is never clobbered
-/// and no temp file is left behind.
+/// Read `hooks_path` as a JSON object (or `{}` if absent), bring its TraceVault
+/// hooks to `ours` via [`merge_hooks`] (foreign hooks and other keys are kept),
+/// and write the result back atomically (sibling temp file + rename). The one
+/// install path for every hook file — per-repo Claude (`settings.json` or
+/// `settings.local.json`), global Claude and Codex (`hooks.json`), whose roots
+/// are the object `merge_hooks` mutates (`root["hooks"]`). A file that is
+/// already current is not rewritten, so its formatting survives a re-run. On a
+/// merge error (malformed existing file) it returns before writing, so the
+/// target is never clobbered and no temp file is left behind.
 fn merge_hooks_into_file(hooks_path: &Path, ours: &serde_json::Value) -> io::Result<()> {
     // Defense-in-depth against path traversal: callers pass a constant filename
     // joined to a home/cwd base (global callers additionally go through
@@ -984,7 +953,11 @@ fn merge_hooks_into_file(hooks_path: &Path, ours: &serde_json::Value) -> io::Res
         serde_json::json!({})
     };
 
+    let before = hooks_path.exists().then(|| root.to_string());
     merge_hooks(&mut root, ours, hooks_path)?;
+    if before.as_deref() == Some(root.to_string().as_str()) {
+        return Ok(());
+    }
 
     let formatted = serde_json::to_string_pretty(&root).map_err(|e| {
         io::Error::other(format!("Failed to serialize {}: {e}", hooks_path.display()))
@@ -1085,18 +1058,56 @@ fn safe_join(base: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(joined)
 }
 
-/// Merge our hook entries into an existing `settings["hooks"]` object, per
-/// event, appending our entry only if no existing entry in that event's
-/// array already has an inner hook with the same `command` (dedupe → makes
-/// repeated calls idempotent). Never removes or overwrites the user's other
-/// hooks or top-level keys.
+/// An inner hook belongs to TraceVault when its `command` starts with
+/// `tracevault ` — every hook command `init` has ever installed does, and a
+/// user's own hook running something else never does. This is what lets a
+/// re-run replace exactly our entries (old matcher, timeout, status message,
+/// a dropped event) and nothing else.
+const TRACEVAULT_COMMAND_PREFIX: &str = "tracevault ";
+
+fn is_tracevault_hook(hook: &serde_json::Value) -> bool {
+    hook.get("command")
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| c.trim_start().starts_with(TRACEVAULT_COMMAND_PREFIX))
+}
+
+/// Remove TraceVault-owned inner hooks from one event's matcher groups. A
+/// group that held only our hooks is dropped; a group shared with foreign
+/// hooks keeps them and everything else it had. Groups without any of our
+/// hooks are left untouched. Returns the position of the first dropped group,
+/// so the current set can go back where the old one was — which keeps a
+/// re-run on an up-to-date file a no-op.
+fn strip_tracevault_hooks(entries: &mut Vec<serde_json::Value>) -> Option<usize> {
+    let mut slot = None;
+    let mut kept = Vec::with_capacity(entries.len());
+    for mut entry in entries.drain(..) {
+        if let Some(inner) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+            let before = inner.len();
+            inner.retain(|hook| !is_tracevault_hook(hook));
+            if inner.is_empty() && before > 0 {
+                slot.get_or_insert(kept.len());
+                continue;
+            }
+        }
+        kept.push(entry);
+    }
+    *entries = kept;
+    slot
+}
+
+/// Bring `settings["hooks"]` to exactly `ours` for TraceVault's entries while
+/// keeping every foreign hook: our inner hooks (see [`is_tracevault_hook`])
+/// are removed from every event, then the current `ours` entries are put back
+/// in their place (appended for an event that had none). Re-running converges
+/// to the current hook set, and events we no longer install lose our entries.
+/// Top-level keys and foreign hooks are never touched.
 ///
 /// Absent values (no top-level `settings`, no `hooks` key, no entry for a
 /// given event) are created fresh — that's fine. But if an EXISTING value
 /// has an unexpected shape (top-level `settings` isn't an object, an
-/// existing `hooks` isn't an object, or an existing per-event value isn't an
-/// array), this errors loudly instead of silently discarding it, mirroring
-/// `install_claude_hooks`'s treatment of a non-object settings file.
+/// existing `hooks` isn't an object, or one of our events isn't an array),
+/// this errors loudly instead of silently discarding it. A foreign event
+/// whose value isn't an array is left as it is.
 fn merge_hooks(
     settings: &mut serde_json::Value,
     ours: &serde_json::Value,
@@ -1122,59 +1133,49 @@ fn merge_hooks(
         )
     })?;
 
-    let Some(ours_obj) = ours.as_object() else {
-        return Ok(());
-    };
+    let empty = serde_json::Map::new();
+    let ours_obj = ours.as_object().unwrap_or(&empty);
 
-    for (event, our_array) in ours_obj {
-        let Some(our_entries) = our_array.as_array() else {
-            continue;
-        };
-
-        let existing_value = hooks_obj
-            .entry(event.clone())
-            .or_insert_with(|| serde_json::json!([]));
-        let existing_array = existing_value.as_array_mut().ok_or_else(|| {
-            io::Error::new(
+    // Validate before mutating anything, so an error leaves `settings` as read.
+    for event in ours_obj.keys() {
+        if hooks_obj.get(event).is_some_and(|v| !v.is_array()) {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "{} \"hooks\".\"{event}\" is not a JSON array",
                     path.display()
                 ),
-            )
-        })?;
+            ));
+        }
+    }
 
-        for our_entry in our_entries {
-            let our_command = entry_command(our_entry);
-            let already_present = existing_array
-                .iter()
-                .any(|existing_entry| entry_contains_command(existing_entry, our_command));
-            if !already_present {
-                existing_array.push(our_entry.clone());
+    let mut emptied = Vec::new();
+    for (event, value) in hooks_obj.iter_mut() {
+        let Some(existing) = value.as_array_mut() else {
+            continue;
+        };
+        let had_entries = !existing.is_empty();
+        let slot = strip_tracevault_hooks(existing);
+        let our_entries = ours_obj.get(event).and_then(|v| v.as_array());
+        match our_entries {
+            Some(our_entries) => {
+                let at = slot.unwrap_or(existing.len());
+                existing.splice(at..at, our_entries.iter().cloned());
             }
+            None if had_entries && existing.is_empty() => emptied.push(event.clone()),
+            None => {}
+        }
+    }
+    // An event that only ever held our (now retired) hooks goes away entirely.
+    hooks_obj.retain(|event, _| !emptied.contains(event));
+
+    for (event, our_array) in ours_obj {
+        if !hooks_obj.contains_key(event) {
+            hooks_obj.insert(event.clone(), our_array.clone());
         }
     }
 
     Ok(())
-}
-
-/// Extract the inner `hooks[0].command` string from a hook-event entry, if
-/// present.
-fn entry_command(entry: &serde_json::Value) -> Option<&str> {
-    entry.get("hooks")?.get(0)?.get("command")?.as_str()
-}
-
-/// Whether any of `entry`'s inner `hooks[].command` values equal `cmd`. Unlike
-/// `entry_command` (which only looks at `hooks[0]`), this scans the whole
-/// inner `hooks` array — a user entry can have our command anywhere in it
-/// (e.g. `hooks[1]`), and missing that would let a duplicate get appended.
-fn entry_contains_command(entry: &serde_json::Value, cmd: Option<&str>) -> bool {
-    let Some(hooks) = entry.get("hooks").and_then(|h| h.as_array()) else {
-        return false;
-    };
-    hooks
-        .iter()
-        .any(|hook| hook.get("command").and_then(|c| c.as_str()) == cmd)
 }
 
 /// Install TraceVault's Claude Code hooks into `claude_dir/settings.json`
@@ -1336,6 +1337,11 @@ mod tests {
         );
     }
 
+    /// The inner `hooks[0].command` of a hook-event entry, if present.
+    fn entry_command(entry: &serde_json::Value) -> Option<&str> {
+        entry.get("hooks")?.get(0)?.get("command")?.as_str()
+    }
+
     #[test]
     fn merge_hooks_into_empty_settings_adds_all_our_events() {
         let mut settings = serde_json::json!({});
@@ -1407,30 +1413,130 @@ mod tests {
     }
 
     #[test]
-    fn merge_hooks_dedupes_command_found_in_non_first_inner_hook() {
-        // The existing PreToolUse entry has our command at hooks[1], not
-        // hooks[0] — a naive `entry_command` (hooks[0] only) comparison would
-        // miss it and append a duplicate entry.
+    fn merge_hooks_keeps_foreign_hook_sharing_a_group_with_ours() {
+        // Our command sits at hooks[1] of a group the user owns: the group,
+        // its matcher and the user's hook must survive unchanged, and our
+        // command must end up exactly once — in its own current group.
         let mut settings = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
                     "matcher": "Write|Edit|Bash",
                     "hooks": [
-                        { "type": "command", "command": "other" },
+                        { "type": "command", "command": "other", "timeout": 3 },
                         { "type": "command", "command": "tracevault stream --event pre-tool-use" }
                     ]
                 }]
             }
         });
-        let ours = tracevault_hooks();
-        merge_hooks(&mut settings, &ours, Path::new("settings.json")).unwrap();
+        merge_hooks(
+            &mut settings,
+            &tracevault_hooks(),
+            Path::new("settings.json"),
+        )
+        .unwrap();
 
         let pre_tool_use = settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(
-            pre_tool_use.len(),
-            1,
-            "must not append a duplicate PreToolUse entry when our command is present at hooks[1]"
+            pre_tool_use[0],
+            serde_json::json!({
+                "matcher": "Write|Edit|Bash",
+                "hooks": [{ "type": "command", "command": "other", "timeout": 3 }]
+            })
         );
+        assert_eq!(
+            &pre_tool_use[1..],
+            tracevault_hooks()["PreToolUse"].as_array().unwrap()
+        );
+    }
+
+    /// A hook set as an older `init` wrote it: narrower PreToolUse matcher,
+    /// timeout 5, no status messages and no SessionStart/UserPromptSubmit.
+    fn stale_tracevault_hooks() -> serde_json::Value {
+        let entry = |matcher: &str, event: &str| {
+            serde_json::json!([{
+                "matcher": matcher,
+                "hooks": [{ "type": "command", "command": format!("tracevault stream --event {event}"), "timeout": 5 }]
+            }])
+        };
+        serde_json::json!({
+            "PreToolUse": entry("Write|Edit", "pre-tool-use"),
+            "PostToolUse": entry("", "post-tool-use"),
+            "Notification": entry("", "notification"),
+            "Stop": entry("", "stop"),
+        })
+    }
+
+    #[test]
+    fn merge_hooks_upgrades_stale_tracevault_entries() {
+        let mut settings = serde_json::json!({ "hooks": stale_tracevault_hooks() });
+        merge_hooks(
+            &mut settings,
+            &tracevault_hooks(),
+            Path::new("settings.json"),
+        )
+        .unwrap();
+        assert_eq!(settings["hooks"], tracevault_hooks());
+    }
+
+    #[test]
+    fn merge_hooks_removes_our_entries_from_events_we_no_longer_install() {
+        // An older Codex install with a PreToolUse hook we have since dropped,
+        // next to a foreign event and a foreign non-array value we don't own.
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{ "matcher": "", "hooks": [{ "type": "command", "command": "tracevault stream --event pre-tool-use --agent codex" }] }],
+                "SubagentStop": [{ "matcher": "", "hooks": [{ "type": "command", "command": "notify-me" }] }],
+                "Custom": "left alone"
+            }
+        });
+        merge_hooks(&mut settings, &codex_hooks(), Path::new("hooks.json")).unwrap();
+
+        let hooks = settings["hooks"].as_object().unwrap();
+        assert!(!hooks.contains_key("PreToolUse"), "retired event must go");
+        assert_eq!(hooks["SubagentStop"][0]["hooks"][0]["command"], "notify-me");
+        assert_eq!(hooks["Custom"], "left alone");
+        for (event, entries) in codex_hooks().as_object().unwrap() {
+            assert_eq!(&hooks[event], entries, "{event}");
+        }
+    }
+
+    #[test]
+    fn merge_hooks_rerun_keeps_our_entry_in_place() {
+        // Ours first, a user hook added after it: a re-run must not move ours
+        // behind the user's (that would rewrite an up-to-date file).
+        let mut settings = serde_json::json!({ "hooks": tracevault_hooks() });
+        settings["hooks"]["Stop"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "matcher": "", "hooks": [{ "type": "command", "command": "say done" }] }));
+        let before = settings.clone();
+        merge_hooks(
+            &mut settings,
+            &tracevault_hooks(),
+            Path::new("settings.json"),
+        )
+        .unwrap();
+        assert_eq!(settings.to_string(), before.to_string());
+    }
+
+    #[test]
+    fn merge_hooks_does_not_claim_commands_merely_mentioning_tracevault() {
+        let foreign = serde_json::json!({
+            "matcher": "",
+            "hooks": [
+                { "type": "command", "command": "tracevault-wrapper stream" },
+                { "type": "command", "command": "echo tracevault stream" }
+            ]
+        });
+        let mut settings = serde_json::json!({ "hooks": { "Stop": [foreign.clone()] } });
+        merge_hooks(
+            &mut settings,
+            &tracevault_hooks(),
+            Path::new("settings.json"),
+        )
+        .unwrap();
+        assert_eq!(settings["hooks"]["Stop"][0], foreign);
+        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -1840,6 +1946,179 @@ mod tests {
             .map(|e| e["hooks"][0]["command"].as_str().unwrap())
             .collect();
         assert_eq!(pre_cmds, vec!["user-pretool"], "unmanaged event untouched");
+    }
+
+    /// A settings file a user might really have: other keys, foreign hooks in
+    /// their own groups and in a group shared with ours, keys in non-sorted
+    /// order, and a stale TraceVault install.
+    const FOREIGN_SETTINGS: &str = r#"{
+  "permissions": { "allow": ["Bash(ls)"] },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "./guard.sh", "timeout": 7 } ] },
+      { "matcher": "Write|Edit", "hooks": [
+        { "type": "command", "command": "tracevault stream --event pre-tool-use", "timeout": 5 },
+        { "type": "command", "command": "prettier --check", "statusMessage": "fmt" }
+      ] }
+    ],
+    "Stop": [ { "matcher": "", "hooks": [ { "type": "command", "command": "tracevault stream --event stop", "timeout": 5 } ] } ],
+    "SubagentStop": [ { "hooks": [ { "command": "notify", "type": "command" } ], "matcher": "" } ]
+  },
+  "model": "opus"
+}"#;
+
+    /// Serialised forms of the foreign entries in [`FOREIGN_SETTINGS`], as
+    /// they must appear after an install: unchanged values, unchanged key
+    /// order; the shared group just loses our hook.
+    fn expected_foreign_entries() -> Vec<String> {
+        [
+            r#"{"matcher":"Bash","hooks":[{"type":"command","command":"./guard.sh","timeout":7}]}"#,
+            r#"{"matcher":"Write|Edit","hooks":[{"type":"command","command":"prettier --check","statusMessage":"fmt"}]}"#,
+            r#"{"hooks":[{"command":"notify","type":"command"}],"matcher":""}"#,
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    fn holds_tracevault_hook(entry: &serde_json::Value) -> bool {
+        entry["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(is_tracevault_hook)
+    }
+
+    fn assert_installed_over_foreign(path: &Path, ours: &serde_json::Value) {
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            v.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["permissions", "hooks", "model"],
+            "top-level keys kept, in their order"
+        );
+        assert_eq!(
+            v["permissions"],
+            serde_json::json!({ "allow": ["Bash(ls)"] })
+        );
+        let hooks = v["hooks"].as_object().unwrap();
+        let foreign: Vec<String> = hooks
+            .values()
+            .flat_map(|entries| entries.as_array().unwrap())
+            .filter(|e| !holds_tracevault_hook(e))
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(foreign, expected_foreign_entries());
+        let ours = ours.as_object().unwrap();
+        for (event, entries) in hooks {
+            let mine: Vec<&serde_json::Value> = entries
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| holds_tracevault_hook(e))
+                .collect();
+            let want: Vec<&serde_json::Value> = ours
+                .get(event)
+                .map(|o| o.as_array().unwrap().iter().collect())
+                .unwrap_or_default();
+            assert_eq!(mine, want, "TraceVault entries under {event}");
+        }
+        for event in ours.keys() {
+            assert!(hooks.contains_key(event), "missing {event}");
+        }
+    }
+
+    #[test]
+    fn install_claude_hooks_keeps_foreign_hooks_in_both_settings_files() {
+        for target in [ClaudeSettingsTarget::Shared, ClaudeSettingsTarget::Local] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(".claude").join(target.filename());
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, FOREIGN_SETTINGS).unwrap();
+
+            install_claude_hooks(tmp.path(), target).unwrap();
+            assert_installed_over_foreign(&path, &tracevault_hooks());
+
+            // A second run finds the file current and leaves its bytes alone.
+            let after_first = fs::read(&path).unwrap();
+            install_claude_hooks(tmp.path(), target).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), after_first, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn install_global_hooks_keeps_foreign_hooks_and_upgrades_ours() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(claude_dir.join("settings.json"), FOREIGN_SETTINGS).unwrap();
+
+        install_global_hooks(&claude_dir).unwrap();
+        assert_installed_over_foreign(&claude_dir.join("settings.json"), &tracevault_hooks());
+    }
+
+    #[test]
+    fn install_codex_hooks_keeps_foreign_hooks_and_upgrades_ours() {
+        for global in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let codex_dir = tmp.path().join(".codex");
+            fs::create_dir_all(&codex_dir).unwrap();
+            fs::write(codex_dir.join("hooks.json"), FOREIGN_SETTINGS).unwrap();
+
+            if global {
+                install_global_codex_hooks(&codex_dir).unwrap();
+            } else {
+                install_codex_hooks(tmp.path()).unwrap();
+            }
+            assert_installed_over_foreign(&codex_dir.join("hooks.json"), &codex_hooks());
+        }
+    }
+
+    #[test]
+    fn up_to_date_hook_file_is_not_rewritten() {
+        // Hand-formatted (4-space indent) but already current: no reformatting.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut body = Vec::new();
+        let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+        let mut ser = serde_json::Serializer::with_formatter(&mut body, fmt);
+        serde::Serialize::serialize(
+            &serde_json::json!({ "hooks": tracevault_hooks() }),
+            &mut ser,
+        )
+        .unwrap();
+        fs::write(&path, &body).unwrap();
+
+        install_claude_hooks(tmp.path(), ClaudeSettingsTarget::Shared).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), body);
+    }
+
+    #[test]
+    fn install_claude_hooks_refuses_malformed_settings_without_clobbering() {
+        for (target, body) in [
+            (ClaudeSettingsTarget::Shared, "{ not json"),
+            (ClaudeSettingsTarget::Local, "[1, 2]"),
+            (ClaudeSettingsTarget::Shared, r#"{"hooks": []}"#),
+            (ClaudeSettingsTarget::Local, r#"{"hooks": {"Stop": {}}}"#),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(".claude").join(target.filename());
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, body).unwrap();
+
+            let err = install_claude_hooks(tmp.path(), target).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{body}");
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                body,
+                "file must be untouched"
+            );
+            assert_eq!(
+                fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                1,
+                "no temp file left behind"
+            );
+        }
     }
 
     #[test]

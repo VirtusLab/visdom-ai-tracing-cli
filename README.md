@@ -264,8 +264,7 @@ in its hook payload) and from the session rollout on older versions.
 `--claude-settings shared|local` chooses between `.claude/settings.json` and
 `.claude/settings.local.json`. Without it, `init` asks when run in a terminal and otherwise
 uses `shared`. It applies only to `--agent claude-code` and is rejected with any other agent.
-**`init` replaces the entire `hooks` section of the file it picks**, so hooks you had there are
-lost; see [What `init` installs](#what-init-installs).
+Hooks you already have in that file are kept; see [What `init` installs](#what-init-installs).
 
 Unless you pass `--no-gitignore`, `init` adds `.tracevault/` and the agent's hook file (for
 Claude Code, whichever settings file you chose — `settings.json` included) to the root
@@ -532,11 +531,17 @@ These are hidden from `--help`. `init` installs them; you never need to run them
 **Claude Code** (`.claude/settings.json` or `.claude/settings.local.json`; with `--global`,
 `~/.claude/settings.json`).
 
-> **Per-repo `init` replaces the whole `hooks` section of the Claude Code settings file it
-> writes** — any other hooks you had in that file are lost (other settings are kept). Back the
-> file up first, or use `--claude-settings` to pick the file that has no hooks of yours.
-> `init --global` and the Codex install merge instead: existing hooks are kept and re-running
-> adds nothing twice.
+Every hook install — per-repo or `--global`, Claude Code or Codex — updates the hook file in
+place. TraceVault's own hooks are the ones whose `command` starts with `tracevault `; `init`
+replaces exactly those with the current set and leaves everything else as it was: your other
+hooks (including ones in the same matcher group as a TraceVault hook) and every other setting.
+Re-running `init` brings an older install up to date (matchers, timeouts, newly added events),
+and a file that is already current is not rewritten. A hook file that is not valid JSON, or
+whose `hooks` section has an unexpected shape, is left untouched and `init` fails with an error.
+
+Having the hooks in more than one place — `settings.json` and `settings.local.json`, or a repo
+and `--global` — does not stream events twice: Claude Code runs an identical hook command once
+even when several settings files define it.
 
 | Claude Code event | Matcher | Command |
 |---|---|---|
