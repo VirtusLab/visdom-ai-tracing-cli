@@ -145,6 +145,26 @@ pub async fn init_in_directory(
         ));
     }
 
+    // Credentials are resolved before anything is written. Without one the
+    // repo is never registered, no `repo_id` is persisted, and the hooks
+    // installed below would drop every event silently — so `init` refuses
+    // instead of leaving a setup that looks installed but records nothing
+    // (VIS-1045). A credential/URL mismatch aborts `init` too: it would
+    // otherwise register the repo against whichever instance the env var
+    // names while holding another instance's session. Resolved once, here:
+    // the config rewrite below drops a hand-written `api_key`.
+    // `io::Error::other` because this function's error type is `io::Error`.
+    let (resolved_url, resolved_credential) =
+        crate::credentials::resolve_credentials_quiet(project_root)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+    let effective_url = server_url.map(String::from).or(resolved_url);
+    if resolved_credential.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            not_logged_in_message(effective_url.as_deref()),
+        ));
+    }
+
     // Resolve the hook-file gitignore entry per agent. Claude has a
     // shared/local settings choice; Codex has a single .codex/hooks.json.
     let (claude_target, hook_gitignore_entry): (Option<ClaudeSettingsTarget>, String) = match agent
@@ -242,18 +262,7 @@ pub async fn init_in_directory(
         println!("  Detected: {}", tool.name());
     }
 
-    // A credential/URL mismatch aborts `init`: it would otherwise register the
-    // repo against whichever instance the env var names while holding another
-    // instance's session. `io::Error::other` because this function's error type
-    // is `io::Error`.
-    let (resolved_url, resolved_credential) =
-        crate::credentials::resolve_credentials_quiet(project_root)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-    let effective_url = server_url.map(String::from).or(resolved_url);
-
-    if resolved_credential.is_none() {
-        eprintln!("Not logged in. Run 'tracevault login' to register this repo with the server.");
-    } else if let (Some(url), Some(remote)) = (effective_url, remote_url) {
+    if let (Some(url), Some(remote)) = (effective_url, remote_url) {
         let client = ApiClient::with_credential(&url, resolved_credential);
         let repo_name = git_repo_name(project_root);
         // Captured before `remote` is moved into the request below, so the
@@ -317,6 +326,21 @@ pub async fn init_in_directory(
     }
 
     Ok(hook_gitignore_entry)
+}
+
+/// The error `init` fails with when no credential resolves: what went wrong,
+/// that nothing was installed, and the exact commands that fix it. `url` is
+/// the server URL already known (`--server-url`, `TRACEVAULT_SERVER_URL` or
+/// the project config), filled into the `login` command when present.
+pub fn not_logged_in_message(url: Option<&str>) -> String {
+    let url = url.unwrap_or("<URL>");
+    format!(
+        "Not logged in. Without a login TraceVault cannot register this repo, and its hooks \
+         would record nothing, so nothing was installed.\n\
+         Log in, then run init again:\n\
+         \n    tracevault login --server-url {url}\n    tracevault init\n\n\
+         (In CI, set TRACEVAULT_API_KEY instead of logging in.)"
+    )
 }
 
 /// Record the repo this checkout binds — and its codebase, display-only — in
@@ -1854,6 +1878,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         crate::test_helpers::init_git_repo(root);
+        // `init` refuses to run without a credential; a per-repo one keeps
+        // this test independent of the process env and the user's login.
+        fs::create_dir_all(root.join(".tracevault")).unwrap();
+        fs::write(
+            root.join(".tracevault/config.toml"),
+            "api_key = \"tvk_test\"\n",
+        )
+        .unwrap();
 
         let entry = init_in_directory(
             root,

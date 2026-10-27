@@ -4,10 +4,140 @@ use tracevault_cli::agent::Agent;
 use tracevault_cli::commands::init::ClaudeSettingsTarget;
 use tracevault_cli::config::UserContext;
 
+/// A fake git repo that `init` accepts: per-repo `init` refuses to run
+/// without a credential (VIS-1045), so the repo carries one in its own
+/// `.tracevault/config.toml` — the lowest-precedence source, and the only one
+/// that is per-test rather than process-wide (env) or per-user (credentials
+/// file). There is no `origin` remote, so `init` never contacts a server.
 fn tmp_git_repo() -> TempDir {
     let tmp = TempDir::new().unwrap();
     fs::create_dir(tmp.path().join(".git")).unwrap();
+    fs::create_dir(tmp.path().join(".tracevault")).unwrap();
+    fs::write(
+        tmp.path().join(".tracevault/config.toml"),
+        "api_key = \"tvk_test\"\n",
+    )
+    .unwrap();
     tmp
+}
+
+/// A real git repo (`git init`) with an `origin` remote and nothing else —
+/// the reproduction from VIS-1045.
+fn real_git_repo_with_origin() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["remote", "add", "origin", "git@github.com:org/repo.git"][..],
+    ] {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+    tmp
+}
+
+/// Run the compiled `tracevault init` in `cwd` with `HOME` (and the config
+/// dir) pointed at `home` and every credential env var cleared, so neither
+/// the developer's login nor their environment leaks in.
+fn run_init_isolated(
+    cwd: &std::path::Path,
+    home: &std::path::Path,
+    args: &[&str],
+) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_tracevault"))
+        .arg("init")
+        .args(args)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env_remove("TRACEVAULT_API_KEY")
+        .env_remove("TRACEVAULT_SERVER_URL")
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run tracevault binary")
+}
+
+/// VIS-1045: `init` before `login` used to install every hook, print one
+/// line and exit 0 — and the hooks then dropped every event, since no
+/// `repo_id` was ever written. It must now fail before installing anything
+/// and say exactly how to fix it.
+#[test]
+fn init_without_credentials_fails_and_installs_nothing() {
+    let repo = real_git_repo_with_origin();
+    let home = TempDir::new().unwrap();
+
+    let output = run_init_isolated(repo.path(), home.path(), &["--claude-settings", "shared"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr={stderr}");
+    assert!(stderr.contains("Not logged in"), "stderr={stderr}");
+    assert!(
+        stderr.contains("tracevault login --server-url <URL>"),
+        "must name the exact login command: {stderr}"
+    );
+    assert!(
+        stderr.contains("tracevault init"),
+        "must say to re-run init: {stderr}"
+    );
+
+    // Nothing that would look installed while recording nothing.
+    assert!(!repo.path().join(".tracevault").exists());
+    assert!(!repo.path().join(".claude").exists());
+    assert!(!repo.path().join(".gitignore").exists());
+    assert!(!repo.path().join(".git/hooks/pre-push").exists());
+    assert!(!repo.path().join(".git/hooks/post-commit").exists());
+}
+
+/// The login hint fills in the server URL when `init` already knows it.
+#[test]
+fn init_without_credentials_names_the_known_server_url() {
+    let repo = real_git_repo_with_origin();
+    let home = TempDir::new().unwrap();
+
+    let output = run_init_isolated(
+        repo.path(),
+        home.path(),
+        &[
+            "--claude-settings",
+            "shared",
+            "--server-url",
+            "https://tv.example.com",
+        ],
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr={stderr}");
+    assert!(
+        stderr.contains("tracevault login --server-url https://tv.example.com"),
+        "stderr={stderr}"
+    );
+    assert!(!repo.path().join(".tracevault").exists());
+}
+
+/// Every `init` error exits non-zero, not only the not-logged-in one: the
+/// `Init` arm used to print the error and fall through to exit 0, so scripts
+/// could not detect a failed setup.
+#[test]
+fn init_error_exits_non_zero() {
+    let not_a_repo = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tracevault"))
+        .args(["init", "--claude-settings", "shared"])
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("TRACEVAULT_API_KEY", "tvk_test")
+        .env_remove("TRACEVAULT_SERVER_URL")
+        .current_dir(not_a_repo.path())
+        .output()
+        .expect("failed to run tracevault binary");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr={stderr}");
+    assert!(stderr.contains("Not a git repository"), "stderr={stderr}");
 }
 
 #[tokio::test]
