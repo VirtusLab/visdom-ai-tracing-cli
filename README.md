@@ -100,11 +100,15 @@ events arrived:
 - In a per-repo setup, `.tracevault/config.toml` contains a `repo_id = "…"` line. Without it,
   sessions in the repo are captured only if bound some other way (workspace mode, a user-level
   default, a project) — and then not necessarily to this repo.
-- `tracevault status` shows `✓ Logged in` and `✓ Repo registered on server`. In bound mode it
-  finds the server repo by the checkout's directory name, so it can show `✓` even when
-  `repo_id` is missing locally — the line above is the authoritative check.
-- Inside an agent session (or with `--session-id <id>`), `tracevault status` also checks the
-  session's binding: `✗ Recording — nothing will be recorded` means the session is bound to
+- `tracevault status` shows `✓ Logged in`, `✓ Recording` and `✓ Repo registered on server`.
+  The server repo is looked up by the local `repo_id`, so a `config.toml` without one is an
+  error (`✗ Repo registered on server — … has no repo_id`), not a match by directory name.
+- Outside an agent session, `Recording` answers "will a new session in this checkout record?",
+  using the same resolution as the capture hook: `✗` when `config.toml` has no usable
+  `repo_id` and nothing else binds the checkout, `!` when nothing binds it at all (normal in
+  workspace mode, where each session binds itself with `repo switch`).
+- Inside an agent session (or with `--session-id <id>`), `Recording` checks that session's
+  binding instead: `✗ Recording — nothing will be recorded` means the session is bound to
   neither a repo nor a project.
 
 ## Usage
@@ -452,8 +456,10 @@ write `repo_id` into `.tracevault/config.toml` if the repo has one. Needs a logi
 and an `origin` remote. The pre-push hook runs it before every push.
 
 **`tracevault status [--session-id <id>]`** — diagnose the setup: authentication, global and
-repo installation, git and agent hooks, the session's repo/project binding, the repo on the
-server and its server-side clone, and pending events. Exits 1 if any check is an error (`✗`).
+repo installation, git and agent hooks (Claude Code hooks in `.claude/settings.json`,
+`.claude/settings.local.json` or `~/.claude/settings.json`), whether anything will record, the
+session's repo/project binding, the repo on the server (by `repo_id`) and its server-side clone,
+and pending events. Exits 1 if any check is an error (`✗`).
 `--session-id` picks the session whose binding is checked; default `$TRACEVAULT_SESSION_ID`,
 else the most recent session with a workspace binding.
 
