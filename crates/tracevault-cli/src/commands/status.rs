@@ -8,8 +8,8 @@ use crate::api_client::{ApiClient, GetMeError};
 use crate::config::TracevaultConfig;
 use crate::credentials::{Credential, Credentials};
 use crate::resolution::{
-    effective_project, git_remote_url, git_repo_name, resolve_effective_project,
-    ProjectResolveInputs, ProjectSource,
+    effective_project, git_remote_url, resolve_effective_project, ProjectResolveInputs,
+    ProjectSource,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -381,7 +381,7 @@ fn project_checks(
     }
 
     out.push(claude_hook_check_in(
-        &project_root.join(".claude/settings.json"),
+        &project_root.join(".claude"),
         global_settings,
     ));
 
@@ -454,24 +454,37 @@ fn global_hook_check_in(settings_path: &Path) -> Check {
     }
 }
 
-/// Claude Code hooks may live per-repo (`<repo>/.claude/settings.json`) OR
-/// globally (`~/.claude/settings.json`, `init --global`). Ok if EITHER wires
+/// The per-repo Claude settings files `init` can write hooks into
+/// (`--claude-settings shared|local`), in the order they are reported.
+const REPO_CLAUDE_SETTINGS: [&str; 2] = ["settings.json", "settings.local.json"];
+
+/// Claude Code hooks may live per-repo (`<repo>/.claude/settings.json` or
+/// `settings.local.json`, per `init --claude-settings`) OR globally
+/// (`~/.claude/settings.json`, `init --global`). Ok if ANY of them wires
 /// tracevault; an existing-but-unreadable settings file is surfaced as a Warn
-/// with the path (not a generic "not registered"); Warn if neither wires it.
-fn claude_hook_check_in(repo_settings: &Path, global_settings: Option<&Path>) -> Check {
-    let repo = read_settings_hooks(repo_settings);
-    if matches!(repo, SettingsHooks::Present) {
-        return Check::ok("Claude Code hooks", "registered in .claude/settings.json");
+/// with the path (not a generic "not registered"); Warn if none wires it.
+fn claude_hook_check_in(repo_claude_dir: &Path, global_settings: Option<&Path>) -> Check {
+    let repo: Vec<(&str, SettingsHooks)> = REPO_CLAUDE_SETTINGS
+        .iter()
+        .map(|name| (*name, read_settings_hooks(&repo_claude_dir.join(name))))
+        .collect();
+    if let Some((name, _)) = repo
+        .iter()
+        .find(|(_, h)| matches!(h, SettingsHooks::Present))
+    {
+        return Check::ok("Claude Code hooks", format!("registered in .claude/{name}"));
     }
     let global = global_settings.map(read_settings_hooks);
     if matches!(global, Some(SettingsHooks::Present)) {
         return Check::ok("Claude Code hooks", "via global install (see Installation)");
     }
-    if let SettingsHooks::Unreadable(e) = &repo {
-        return Check::warn(
-            "Claude Code hooks",
-            format!("cannot read <repo>/.claude/settings.json: {e}"),
-        );
+    for (name, hooks) in &repo {
+        if let SettingsHooks::Unreadable(e) = hooks {
+            return Check::warn(
+                "Claude Code hooks",
+                format!("cannot read <repo>/.claude/{name}: {e}"),
+            );
+        }
     }
     if let Some(SettingsHooks::Unreadable(e)) = &global {
         return Check::warn(
@@ -481,7 +494,7 @@ fn claude_hook_check_in(repo_settings: &Path, global_settings: Option<&Path>) ->
     }
     Check::warn(
         "Claude Code hooks",
-        "not registered in <repo>/.claude/settings.json or ~/.claude/settings.json (capture will miss some events)",
+        "not registered in <repo>/.claude/settings.json, <repo>/.claude/settings.local.json or ~/.claude/settings.json (capture will miss some events)",
     )
 }
 
@@ -800,8 +813,9 @@ fn unresolved_config_default_check(name: &str) -> Check {
 /// wrong; calling the real functions means the two can't drift apart.
 ///
 /// Only fires for an explicitly named session (`--session-id` /
-/// `$TRACEVAULT_SESSION_ID`, i.e. `session_id.is_some()`) — a bare scan has no
-/// committed target, so there's nothing to escalate about. Pure and
+/// `$TRACEVAULT_SESSION_ID`, i.e. `session_id.is_some()`); without one,
+/// [`checkout_recording_check`] answers the session-independent question
+/// instead. Pure and
 /// network-free: `attribution` is computed by the caller from purely local
 /// tiers (mirroring the hook), so this check — and the verdict it drives —
 /// can never be swayed by a network hiccup.
@@ -821,6 +835,65 @@ fn recording_check(
              machine, or `tracevault repo switch <path>` inside a checkout"
         ),
     ))
+}
+
+/// The session-independent half of the recording verdict: will a NEW session
+/// started in this checkout record anything, before it runs `repo switch` or
+/// `project switch`? Answers the question a plain terminal right after `init`
+/// needs, where [`recording_check`] stays silent for lack of a session.
+///
+/// `attribution` must come from [`recording_attribution`] with NO session —
+/// i.e. the hook's own gate fed only the tiers that exist before a session
+/// does (bound config, `repo switch --user`, `TRACEVAULT_PROJECT`,
+/// `project switch --user`). `config` only picks the wording and severity:
+///
+/// - a repo resolved → `Ok`;
+/// - a `config.toml` is present (bound mode) but did not yield a usable repo
+///   (`repo_id` missing or not a UUID) → `Error` when nothing resolved at all,
+///   `Warn` when a project still catches the events (they ship, but not to
+///   this repo) — the bound-mode user asked for repo attribution;
+/// - no config and nothing resolved → `Warn`, not `Error`: in workspace mode
+///   each session binds itself with `repo switch`, so this is the expected
+///   state of a plain terminal, but the user should still be told.
+fn checkout_recording_check(
+    attribution: Option<&crate::commands::stream::Attribution>,
+    config: Option<&TracevaultConfig>,
+) -> Check {
+    use crate::commands::stream::Attribution;
+    const LABEL: &str = "Recording";
+    let repo_id_problem = config.and_then(|c| match c.repo_id.as_deref() {
+        None => Some(".tracevault/config.toml has no repo_id".to_string()),
+        Some(id) if !crate::commands::stream::binding_repo_id_is_valid(id) => Some(format!(
+            ".tracevault/config.toml repo_id '{id}' is not a valid id"
+        )),
+        Some(_) => None,
+    });
+    match (attribution, repo_id_problem) {
+        (Some(Attribution::Repo { repo_id, .. }), _) => Check::ok(
+            LABEL,
+            format!("new sessions in this checkout record to repo {repo_id}"),
+        ),
+        (Some(Attribution::ProjectOnly { project_id }), Some(problem)) => Check::warn(
+            LABEL,
+            format!(
+                "{problem}: new sessions here record to project {project_id} only, not to this repo — run `tracevault sync` while logged in"
+            ),
+        ),
+        (Some(Attribution::ProjectOnly { project_id }), None) => Check::ok(
+            LABEL,
+            format!("new sessions in this checkout record to project {project_id}"),
+        ),
+        (None, Some(problem)) => Check::err(
+            LABEL,
+            format!(
+                "nothing will be recorded — {problem} and nothing else binds this checkout; run `tracevault sync` while logged in"
+            ),
+        ),
+        (None, None) => Check::warn(
+            LABEL,
+            "no session named and nothing binds this checkout — a new session here records nothing until it runs `tracevault repo switch <path>` (or bind machine-wide with `tracevault repo switch --user <path>` / `tracevault project switch --user \"<name>\"`)",
+        ),
+    }
 }
 
 /// Compose the "will this session record anything" gate exactly as
@@ -977,60 +1050,64 @@ fn offline_project_outcome(
 
 // --- Server repo ---
 
-/// How `status` should locate the repo on the server.
+/// Which repo id `status` looks up on the server, and where it came from.
+/// Always an id — never the checkout's directory name: a name match finds
+/// whatever repo of that name someone registered, which says nothing about
+/// whether THIS checkout carries an id the stream hook can attribute to.
 #[derive(Debug, Clone, PartialEq)]
-enum RepoMatch {
-    ByName(String),
-    ById(String),
+enum RepoLookup {
+    /// The explicitly named session's repo binding for this worktree (a
+    /// subagent override or the `repo switch` binding).
+    Workspace(String),
+    /// The `repo_id` in `.tracevault/config.toml` (bound mode).
+    Bound(String),
+    /// A `config.toml` exists but has no `repo_id`, and no session binding
+    /// supplies one — the state in which the stream hook drops every event
+    /// of a repo-only setup.
+    MissingRepoId,
 }
 
-/// Bound mode (a loaded project config, match by git repo NAME) takes
-/// precedence; otherwise workspace mode (the authoritative binding, match by
-/// `repo_id`). `None` when neither is available. Pure — `repo_name` is passed
-/// in so this is unit-testable without invoking git.
+/// Mirrors the hook's precedence (`effective_binding`: session bindings
+/// before bound config): the explicitly named session's binding — from
+/// [`session_repo_binding`], so a subagent's worktree override wins exactly as
+/// it does in the hook — else the config's `repo_id`. `None` when there is
+/// neither a binding nor a config. Pure, so the precedence is unit-testable
+/// without a server.
 fn server_repo_lookup(
-    config_present: bool,
-    repo_name: &str,
+    config: Option<&TracevaultConfig>,
     binding: Option<&crate::session_state::RepoBinding>,
-) -> Option<RepoMatch> {
-    if config_present {
-        return Some(RepoMatch::ByName(repo_name.to_string()));
-    }
+) -> Option<RepoLookup> {
     if let Some(b) = binding {
-        return Some(RepoMatch::ById(b.repo_id.clone()));
+        return Some(RepoLookup::Workspace(b.repo_id.clone()));
     }
-    None
+    let config = config?;
+    Some(match &config.repo_id {
+        Some(id) => RepoLookup::Bound(id.clone()),
+        None => RepoLookup::MissingRepoId,
+    })
 }
 
-/// Find the repo matching `want`, retrying by workspace-binding id if a
-/// `ByName` lookup misses. A directory rename after `tracevault init`
-/// registered the repo would otherwise make the (name-based) bound-mode
-/// lookup miss even though the binding's `repo_id` still resolves — since this
-/// is a read-only inspector, a stale name should not produce a false "not
-/// found on server" negative when a binding is available to double-check
-/// against. Returns the matched repo plus the [`RepoMatch`] that actually
-/// found it, so the caller can tell a direct hit from a fallback hit (the
-/// fallback must not be treated as if the name-based lookup had succeeded —
-/// see the `RepoMatch::ById` arm of the "Remote URL matches" check below).
-/// `ById` lookups have already tried the only id available, so they are never
-/// retried.
-fn find_repo_with_fallback<'a>(
+/// The session-scoped tiers of the hook's repo chain for `worktree`: a
+/// subagent's worktree override, else the session's active binding. Calls
+/// `resolve_stream_binding` with the config and user-default tiers left out —
+/// [`server_repo_lookup`] handles the config tier itself, and reports a
+/// missing `repo_id` there rather than letting a lower tier mask it.
+fn session_repo_binding(
+    session: &crate::session_state::SessionState,
+    worktree: &str,
+) -> Option<crate::session_state::RepoBinding> {
+    crate::commands::stream::resolve_stream_binding(session, worktree, None, None)
+}
+
+/// The server repo whose id is `id`. Compared as UUIDs, so case or
+/// formatting differences in a hand-edited id don't produce a false miss; an
+/// id that is not a UUID matches nothing (the hook would drop it too).
+fn find_repo_by_id<'a>(
     repos: &'a [crate::api_client::RepoListItem],
-    want: &RepoMatch,
-    binding: Option<&crate::session_state::RepoBinding>,
-) -> Option<(&'a crate::api_client::RepoListItem, RepoMatch)> {
-    if let Some(r) = repos.iter().find(|r| match want {
-        RepoMatch::ByName(name) => &r.name == name,
-        RepoMatch::ById(id) => &r.id.to_string() == id,
-    }) {
-        return Some((r, want.clone()));
-    }
-    if let RepoMatch::ByName(_) = want {
-        let b = binding?;
-        let r = repos.iter().find(|r| r.id.to_string() == b.repo_id)?;
-        return Some((r, RepoMatch::ById(b.repo_id.clone())));
-    }
-    None
+    id: &str,
+) -> Option<&'a crate::api_client::RepoListItem> {
+    let id: uuid::Uuid = id.trim().parse().ok()?;
+    repos.iter().find(|r| r.id == id)
 }
 
 async fn server_repo_checks(
@@ -1041,20 +1118,34 @@ async fn server_repo_checks(
 ) -> Vec<Check> {
     let mut out = Vec::new();
 
+    // The local half first: a missing `repo_id` is an error whether or not
+    // the user is logged in (init-before-login is exactly that state).
+    // `bound_mode`: the id came from config.toml, so the checkout's own
+    // `origin` is expected to match the server record (checked below).
+    let (id, source, bound_mode) = match server_repo_lookup(config, binding) {
+        None => {
+            out.push(Check::skip(
+                "Repo registered on server",
+                "not bound (need a project config.toml or a --session-id workspace binding)",
+            ));
+            return out;
+        }
+        Some(RepoLookup::MissingRepoId) => {
+            out.push(Check::err(
+                "Repo registered on server",
+                ".tracevault/config.toml has no repo_id, so sessions here are not attributed to this repo — run `tracevault sync` while logged in to register the repo and write it",
+            ));
+            return out;
+        }
+        Some(RepoLookup::Workspace(id)) => (id, "session binding", false),
+        Some(RepoLookup::Bound(id)) => (id, ".tracevault/config.toml", true),
+    };
+
     let (Some(credential), Some(server_url)) = (auth.credential.clone(), auth.server_url.as_ref())
     else {
         out.push(Check::skip(
             "Repo registered on server",
-            "not authenticated",
-        ));
-        return out;
-    };
-
-    let repo_name = git_repo_name(project_root);
-    let Some(want) = server_repo_lookup(config.is_some(), &repo_name, binding) else {
-        out.push(Check::skip(
-            "Repo registered on server",
-            "not bound (need a project config.toml or a --session-id workspace binding)",
+            format!("not authenticated (would look up repo id {id} from {source})"),
         ));
         return out;
     };
@@ -1071,24 +1162,18 @@ async fn server_repo_checks(
         }
     };
 
-    let found = find_repo_with_fallback(&repos, &want, binding);
-
-    match found {
+    match find_repo_by_id(&repos, &id) {
         None => {
-            let what = match &want {
-                RepoMatch::ByName(n) => format!("'{n}'"),
-                RepoMatch::ById(id) => format!("repo id {id}"),
-            };
             out.push(Check::err(
                 "Repo registered on server",
-                format!("{what} not found on the server. Run `tracevault init` while logged in, or `tracevault sync`."),
+                format!("repo id {id} (from {source}) not found on the server. Run `tracevault sync` while logged in."),
             ));
             return out;
         }
-        Some((r, matched_via)) => {
+        Some(r) => {
             out.push(Check::ok(
                 "Repo registered on server",
-                format!("id={}", r.id),
+                format!("id={} (from {source})", r.id),
             ));
             match r.clone_status.as_deref() {
                 Some("ready") => out.push(Check::ok("Server-side clone", "ready")),
@@ -1110,35 +1195,32 @@ async fn server_repo_checks(
                 )),
             }
 
-            match &matched_via {
-                RepoMatch::ByName(_) => {
-                    let local_remote = git_remote_url(project_root);
-                    match (local_remote.as_deref(), r.github_url.as_deref()) {
-                        (Some(local), Some(remote))
-                            if normalize_remote(local) == normalize_remote(remote) =>
-                        {
-                            out.push(Check::ok("Remote URL matches", remote.to_string()));
-                        }
-                        (Some(local), Some(remote)) => out.push(Check::warn(
-                            "Remote URL matches",
-                            format!("local={local} vs server={remote} — run `tracevault sync`"),
-                        )),
-                        (Some(local), None) => out.push(Check::warn(
-                            "Remote URL matches",
-                            format!("server has no github_url; local={local}"),
-                        )),
-                        (None, _) => out.push(Check::warn(
-                            "Remote URL matches",
-                            "no local `origin` remote configured",
-                        )),
+            if bound_mode {
+                let local_remote = git_remote_url(project_root);
+                match (local_remote.as_deref(), r.github_url.as_deref()) {
+                    (Some(local), Some(remote))
+                        if normalize_remote(local) == normalize_remote(remote) =>
+                    {
+                        out.push(Check::ok("Remote URL matches", remote.to_string()));
                     }
-                }
-                RepoMatch::ById(_) => {
-                    out.push(Check::skip(
+                    (Some(local), Some(remote)) => out.push(Check::warn(
                         "Remote URL matches",
-                        "n/a in workspace mode (bound by name/id)",
-                    ));
+                        format!("local={local} vs server={remote} — run `tracevault sync`"),
+                    )),
+                    (Some(local), None) => out.push(Check::warn(
+                        "Remote URL matches",
+                        format!("server has no github_url; local={local}"),
+                    )),
+                    (None, _) => out.push(Check::warn(
+                        "Remote URL matches",
+                        "no local `origin` remote configured",
+                    )),
                 }
+            } else {
+                out.push(Check::skip(
+                    "Remote URL matches",
+                    "n/a in workspace mode (bound by id)",
+                ));
             }
         }
     }
@@ -1316,11 +1398,6 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
     // drive the server-repo check.
     let explicit_session = session_id.is_some();
     let has_binding = binding.is_some() && explicit_session;
-    let authoritative_binding = if explicit_session {
-        binding.as_ref()
-    } else {
-        None
-    };
 
     let auth_checks_v = auth_checks(&auth, config_server_url).await;
     let install_v = vec![global_check];
@@ -1404,8 +1481,14 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
         };
 
     let mut attribution_v = Vec::new();
-    if let Some(c) = recording_check(session_id, attribution.as_ref()) {
-        attribution_v.push(c);
+    match session_id {
+        Some(_) => attribution_v.extend(recording_check(session_id, attribution.as_ref())),
+        // No session named: `attribution` was resolved with an empty session,
+        // i.e. exactly what the hook sees for a new session in this checkout.
+        None => attribution_v.push(checkout_recording_check(
+            attribution.as_ref(),
+            config.as_ref(),
+        )),
     }
     attribution_v.push(binding_check);
     attribution_v.push(project_binding_check(&project_outcome));
@@ -1413,8 +1496,21 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
         attribution_v.push(unresolved_config_default_check(&name));
     }
 
-    let server_checks_v =
-        server_repo_checks(project_root, &auth, config.as_ref(), authoritative_binding).await;
+    // The server target is the repo the hook would attribute this worktree's
+    // events to — including a subagent override — not just the session's
+    // `active` binding shown in "Workspace repo".
+    let server_binding = if explicit_session {
+        session_repo_binding(&project_session, &worktree)
+    } else {
+        None
+    };
+    let server_checks_v = server_repo_checks(
+        project_root,
+        &auth,
+        config.as_ref(),
+        server_binding.as_ref(),
+    )
+    .await;
     let session_checks_v = session_checks(project_root);
 
     let sections: Vec<(&str, Vec<Check>)> = vec![
@@ -1776,7 +1872,7 @@ mod tests {
     #[test]
     fn claude_hook_check_ok_from_global_only() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo-settings.json"); // does not exist
+        let repo = dir.path().join(".claude"); // does not exist
         let global = dir.path().join("global-settings.json");
         std::fs::write(&global, r#"{"command":"tracevault stream"}"#).unwrap();
         let c = claude_hook_check_in(&repo, Some(global.as_path()));
@@ -1791,13 +1887,59 @@ mod tests {
     #[test]
     fn claude_hook_check_ok_from_repo() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo-settings.json");
-        std::fs::write(&repo, r#"{"command":"tracevault stream"}"#).unwrap();
+        let repo = dir.path().join(".claude");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(
+            repo.join("settings.json"),
+            r#"{"command":"tracevault stream"}"#,
+        )
+        .unwrap();
         let global = dir.path().join("global-settings.json"); // does not exist
-        assert_eq!(
-            claude_hook_check_in(&repo, Some(global.as_path())).level,
-            Level::Ok
+        let c = claude_hook_check_in(&repo, Some(global.as_path()));
+        assert_eq!(c.level, Level::Ok);
+        assert!(
+            c.detail.contains(".claude/settings.json"),
+            "detail: {}",
+            c.detail
         );
+    }
+
+    #[test]
+    fn claude_hook_check_ok_from_repo_local_settings() {
+        // `init --claude-settings local` writes only settings.local.json; the
+        // check must not warn "not registered" for it (VIS-1047).
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join(".claude");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(
+            repo.join("settings.local.json"),
+            r#"{"command":"tracevault stream"}"#,
+        )
+        .unwrap();
+        let global = dir.path().join("global-settings.json"); // does not exist
+        let c = claude_hook_check_in(&repo, Some(global.as_path()));
+        assert_eq!(c.level, Level::Ok);
+        assert!(
+            c.detail.contains(".claude/settings.local.json"),
+            "detail: {}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn claude_hook_check_local_settings_win_over_hookless_shared() {
+        // A shared settings.json without our hooks (team settings) next to a
+        // local file that has them is the usual `--claude-settings local` shape.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join(".claude");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("settings.json"), r#"{"permissions":{}}"#).unwrap();
+        std::fs::write(
+            repo.join("settings.local.json"),
+            r#"{"command":"tracevault session-start"}"#,
+        )
+        .unwrap();
+        assert_eq!(claude_hook_check_in(&repo, None).level, Level::Ok);
     }
 
     #[test]
@@ -1805,11 +1947,16 @@ mod tests {
         // When the home dir can't be resolved (global_settings = None), only the
         // repo settings are consulted — never a relative fallback.
         let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo-settings.json");
-        std::fs::write(&repo, r#"{"command":"tracevault stream"}"#).unwrap();
+        let repo = dir.path().join(".claude");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(
+            repo.join("settings.json"),
+            r#"{"command":"tracevault stream"}"#,
+        )
+        .unwrap();
         assert_eq!(claude_hook_check_in(&repo, None).level, Level::Ok);
 
-        let missing = dir.path().join("nope.json");
+        let missing = dir.path().join("nope");
         assert_eq!(claude_hook_check_in(&missing, None).level, Level::Warn);
     }
 
@@ -1817,21 +1964,32 @@ mod tests {
     fn claude_hook_check_warn_when_neither() {
         let dir = tempfile::tempdir().unwrap();
         let c = claude_hook_check_in(
-            &dir.path().join("a.json"),
+            &dir.path().join(".claude"),
             Some(dir.path().join("b.json").as_path()),
         );
         assert_eq!(c.level, Level::Warn);
+        assert!(
+            c.detail.contains("settings.local.json"),
+            "detail: {}",
+            c.detail
+        );
     }
 
     #[test]
     fn claude_hook_check_warns_when_repo_settings_unreadable() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo-settings.json");
-        std::fs::create_dir(&repo).unwrap(); // directory-as-file → non-NotFound read error
+        let repo = dir.path().join(".claude");
+        // directory-as-file → non-NotFound read error
+        std::fs::create_dir_all(repo.join("settings.local.json")).unwrap();
         let global = dir.path().join("global.json"); // missing
         let c = claude_hook_check_in(&repo, Some(global.as_path()));
         assert_eq!(c.level, Level::Warn);
         assert!(c.detail.contains("cannot read"), "detail: {}", c.detail);
+        assert!(
+            c.detail.contains("settings.local.json"),
+            "detail: {}",
+            c.detail
+        );
     }
 
     #[test]
@@ -2071,97 +2229,279 @@ mod tests {
         }
     }
 
-    #[test]
-    fn find_repo_with_fallback_direct_name_hit_no_fallback_needed() {
-        let repos = vec![repo_item("11111111-1111-4111-8111-111111111111", "myrepo")];
-        let want = RepoMatch::ByName("myrepo".to_string());
-        let (r, matched_via) = find_repo_with_fallback(&repos, &want, None).unwrap();
-        assert_eq!(r.name, "myrepo");
-        assert_eq!(matched_via, want);
+    fn workspace_binding(id: &str) -> crate::session_state::RepoBinding {
+        crate::session_state::RepoBinding {
+            repo_id: id.into(),
+            git_url: None,
+            remote_id: None,
+            codebase_name: None,
+            updated_at: "t".into(),
+        }
     }
 
     #[test]
-    fn find_repo_with_fallback_falls_back_to_binding_id_on_name_miss() {
-        // Local checkout directory was renamed after registration: the
-        // git-derived name ("renamed") no longer matches the server's
-        // registered name ("myrepo"), but the workspace binding still carries
-        // the correct repo_id.
+    fn find_repo_by_id_hits_by_id_not_name() {
         let id = "11111111-1111-4111-8111-111111111111";
         let repos = vec![repo_item(id, "myrepo")];
-        let binding = crate::session_state::RepoBinding {
-            repo_id: id.to_string(),
-            git_url: None,
-            remote_id: None,
-            codebase_name: None,
-            updated_at: "t".into(),
-        };
-        let want = RepoMatch::ByName("renamed".to_string());
-        let (r, matched_via) = find_repo_with_fallback(&repos, &want, Some(&binding))
-            .expect("fallback by binding id must find the repo");
-        assert_eq!(r.name, "myrepo");
-        assert_eq!(matched_via, RepoMatch::ById(id.to_string()));
+        assert_eq!(find_repo_by_id(&repos, id).unwrap().name, "myrepo");
+        // Compared as UUIDs: an upper-cased, hand-edited id still matches.
+        assert!(find_repo_by_id(&repos, &id.to_uppercase()).is_some());
     }
 
     #[test]
-    fn find_repo_with_fallback_none_when_name_misses_and_no_binding() {
+    fn find_repo_by_id_ignores_same_named_repo() {
+        // VIS-1047: someone else registered a repo with this checkout's
+        // directory name. A name match used to show ✓ here; the id must not.
         let repos = vec![repo_item("11111111-1111-4111-8111-111111111111", "myrepo")];
-        let want = RepoMatch::ByName("renamed".to_string());
-        assert!(find_repo_with_fallback(&repos, &want, None).is_none());
+        assert!(find_repo_by_id(&repos, "22222222-2222-4222-8222-222222222222").is_none());
+        assert!(find_repo_by_id(&repos, "myrepo").is_none());
     }
 
     #[test]
-    fn find_repo_with_fallback_none_when_name_and_binding_both_miss() {
-        let repos = vec![repo_item("11111111-1111-4111-8111-111111111111", "myrepo")];
-        let binding = crate::session_state::RepoBinding {
-            repo_id: "22222222-2222-4222-8222-222222222222".to_string(),
-            git_url: None,
-            remote_id: None,
-            codebase_name: None,
-            updated_at: "t".into(),
+    fn server_repo_lookup_uses_config_repo_id() {
+        let config = TracevaultConfig {
+            repo_id: Some("rid-config".into()),
+            ..Default::default()
         };
-        let want = RepoMatch::ByName("renamed".to_string());
-        assert!(find_repo_with_fallback(&repos, &want, Some(&binding)).is_none());
+        assert_eq!(
+            server_repo_lookup(Some(&config), None),
+            Some(RepoLookup::Bound("rid-config".into()))
+        );
     }
 
     #[test]
-    fn find_repo_with_fallback_by_id_miss_is_never_retried() {
-        // An ById lookup has already tried the only id available — a miss
-        // stays a miss even with a (necessarily-matching-or-irrelevant)
-        // binding present.
-        let repos = vec![repo_item("11111111-1111-4111-8111-111111111111", "myrepo")];
-        let binding = crate::session_state::RepoBinding {
-            repo_id: "99999999-9999-4999-8999-999999999999".to_string(),
-            git_url: None,
-            remote_id: None,
-            codebase_name: None,
-            updated_at: "t".into(),
-        };
-        let want = RepoMatch::ById("99999999-9999-4999-8999-999999999999".to_string());
-        assert!(find_repo_with_fallback(&repos, &want, Some(&binding)).is_none());
+    fn server_repo_lookup_config_without_repo_id_is_missing() {
+        // VIS-1047: the state in which the hook drops every event must not be
+        // looked up by directory name and reported as registered.
+        let config = TracevaultConfig::default();
+        assert_eq!(
+            server_repo_lookup(Some(&config), None),
+            Some(RepoLookup::MissingRepoId)
+        );
     }
 
     #[test]
-    fn server_repo_lookup_prefers_config_by_name() {
-        let m = server_repo_lookup(true, "myrepo", None).unwrap();
-        assert_eq!(m, RepoMatch::ByName("myrepo".to_string()));
-    }
-
-    #[test]
-    fn server_repo_lookup_falls_back_to_binding_by_id() {
-        let b = crate::session_state::RepoBinding {
-            repo_id: "rid-1".into(),
-            git_url: None,
-            remote_id: None,
-            codebase_name: None,
-            updated_at: "t".into(),
-        };
-        let m = server_repo_lookup(false, "ignored", Some(&b)).unwrap();
-        assert_eq!(m, RepoMatch::ById("rid-1".to_string()));
+    fn server_repo_lookup_session_binding_wins_over_config() {
+        // Same precedence as `effective_binding`: a session's active binding
+        // outranks the bound config, so it is the repo the hook attributes to.
+        let config = TracevaultConfig::default();
+        let b = workspace_binding("rid-session");
+        assert_eq!(
+            server_repo_lookup(Some(&config), Some(&b)),
+            Some(RepoLookup::Workspace("rid-session".into()))
+        );
+        assert_eq!(
+            server_repo_lookup(None, Some(&b)),
+            Some(RepoLookup::Workspace("rid-session".into()))
+        );
     }
 
     #[test]
     fn server_repo_lookup_none_when_neither() {
-        assert!(server_repo_lookup(false, "x", None).is_none());
+        assert!(server_repo_lookup(None, None).is_none());
+    }
+
+    fn unauthenticated() -> AuthContext {
+        AuthContext {
+            server_url: None,
+            credential: None,
+            source: "none",
+            email_from_creds: None,
+            url_override_mismatch: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn server_repo_checks_missing_repo_id_is_error_before_login() {
+        // Init-before-login: the missing repo_id is a local fact and must be
+        // reported even though the server cannot be asked.
+        let dir = tempfile::tempdir().unwrap();
+        let config = TracevaultConfig::default();
+        let checks = server_repo_checks(dir.path(), &unauthenticated(), Some(&config), None).await;
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].level, Level::Error);
+        assert!(
+            checks[0].detail.contains("no repo_id"),
+            "detail: {}",
+            checks[0].detail
+        );
+    }
+
+    #[tokio::test]
+    async fn server_repo_checks_with_repo_id_but_no_login_is_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = TracevaultConfig {
+            repo_id: Some("22222222-2222-4222-8222-222222222222".into()),
+            ..Default::default()
+        };
+        let checks = server_repo_checks(dir.path(), &unauthenticated(), Some(&config), None).await;
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].level, Level::Skip);
+        assert!(
+            checks[0]
+                .detail
+                .contains("22222222-2222-4222-8222-222222222222"),
+            "detail: {}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn session_repo_binding_prefers_subagent_override_like_the_hook() {
+        // Codex R1: the server target must be the repo the hook attributes
+        // this worktree to — a subagent override beats the active binding.
+        let mut session = crate::session_state::SessionState {
+            active: Some(workspace_binding("11111111-1111-4111-8111-111111111111")),
+            ..Default::default()
+        };
+        session.subagents.insert(
+            "/wt/sub".into(),
+            workspace_binding("33333333-3333-4333-8333-333333333333"),
+        );
+        assert_eq!(
+            session_repo_binding(&session, "/wt/sub").unwrap().repo_id,
+            "33333333-3333-4333-8333-333333333333"
+        );
+        assert_eq!(
+            session_repo_binding(&session, "/wt/other").unwrap().repo_id,
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert!(session_repo_binding(&Default::default(), "/wt/sub").is_none());
+    }
+
+    /// Runs `recording_attribution` the way `run_status` does without a named
+    /// session, then `checkout_recording_check` on the result — in an isolated
+    /// config home so no real user-level default leaks in.
+    fn checkout_verdict(config: Option<&TracevaultConfig>) -> Check {
+        let cwd = tempfile::tempdir().unwrap();
+        let (attribution, _worktree) = recording_attribution(None, None, cwd.path(), config);
+        checkout_recording_check(attribution.as_ref(), config)
+    }
+
+    #[test]
+    fn checkout_recording_config_without_repo_id_is_error() {
+        // VIS-1047 case 3: right after an init-before-login, a plain terminal
+        // must say capture is off.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path());
+        _guard.remove("TRACEVAULT_PROJECT");
+
+        let check = checkout_verdict(Some(&TracevaultConfig::default()));
+        assert_eq!(check.level, Level::Error);
+        assert!(
+            check.detail.contains("no repo_id"),
+            "detail: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("tracevault sync"),
+            "detail: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn checkout_recording_config_with_invalid_repo_id_is_error() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path());
+        _guard.remove("TRACEVAULT_PROJECT");
+
+        let config = TracevaultConfig {
+            repo_id: Some("not-a-uuid".into()),
+            ..Default::default()
+        };
+        let check = checkout_verdict(Some(&config));
+        assert_eq!(check.level, Level::Error);
+        assert!(
+            check.detail.contains("not a valid id"),
+            "detail: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn checkout_recording_config_with_repo_id_is_ok() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path());
+        _guard.remove("TRACEVAULT_PROJECT");
+
+        let config = TracevaultConfig {
+            repo_id: Some("22222222-2222-4222-8222-222222222222".into()),
+            ..Default::default()
+        };
+        let check = checkout_verdict(Some(&config));
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check
+                .detail
+                .contains("22222222-2222-4222-8222-222222222222"),
+            "detail: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn checkout_recording_config_without_repo_id_but_user_project_is_warn() {
+        // Events still ship (project-only), but not to this repo, which is
+        // what a bound-mode checkout asked for.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path());
+        _guard.remove("TRACEVAULT_PROJECT");
+        crate::user_project_default::save(&project_binding(
+            &uuid::Uuid::from_u128(7).to_string(),
+            "p",
+        ))
+        .unwrap();
+
+        let check = checkout_verdict(Some(&TracevaultConfig::default()));
+        assert_eq!(check.level, Level::Warn);
+        assert!(check.detail.contains("project"), "detail: {}", check.detail);
+    }
+
+    #[test]
+    fn checkout_recording_user_default_repo_without_config_is_ok() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path());
+        _guard.remove("TRACEVAULT_PROJECT");
+        crate::user_default::save(&workspace_binding("11111111-1111-4111-8111-111111111111"))
+            .unwrap();
+
+        assert_eq!(checkout_verdict(None).level, Level::Ok);
+    }
+
+    #[test]
+    fn checkout_recording_nothing_bound_without_config_is_warn() {
+        // Workspace mode binds per session, so an unbound plain terminal is
+        // expected — but it is said out loud, not left green.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", cfg_tmp.path());
+        _guard.set("HOME", cfg_tmp.path());
+        _guard.remove("TRACEVAULT_PROJECT");
+
+        let check = checkout_verdict(None);
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("records nothing"),
+            "detail: {}",
+            check.detail
+        );
     }
 
     #[test]
