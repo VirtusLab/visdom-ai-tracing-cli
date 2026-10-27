@@ -197,9 +197,10 @@ fn reset(user: bool, session_id: Option<&str>) -> Result<(), Box<dyn std::error:
     apply_reset(&mut state);
     session_state::save(&id, &state)?;
     // NOTE: subagent worktree-scoped reset-to-parent is handled in sub-plan C.
+    println!("cleared workspace repo binding for session {id}");
     println!(
-        "cleared workspace repo binding for session {id}; it stays unbound (no automatic \
-         binding from the checkout's remote) until `tracevault repo switch`"
+        "it stays unbound (no automatic binding from the checkout's remote) until \
+         `tracevault repo switch`"
     );
     Ok(())
 }
