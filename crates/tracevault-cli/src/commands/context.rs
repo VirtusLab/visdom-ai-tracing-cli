@@ -598,7 +598,7 @@ pub fn run_source(
     };
     config.user_context = Some(new_user_context);
 
-    std::fs::write(TracevaultConfig::config_path(&root), config.to_toml())?;
+    config.save(&root)?;
     println!("Updated user_context.");
     Ok(())
 }
@@ -682,6 +682,28 @@ mod tests {
         run_source(dir.path(), false, false, None, true).unwrap();
         let cfg = TracevaultConfig::load(dir.path()).unwrap();
         assert!(cfg.user_context.unwrap().resolve().is_some());
+    }
+
+    /// Only `user_context` changes: a hand-written `api_key`, the other
+    /// fields, unknown keys and the key order all survive (VIS-1046).
+    #[test]
+    fn source_keeps_the_rest_of_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
+        let original = "repo_id = \"r1\"\napi_key = \"tvk_x\"\nuser_context = true\n\
+                        default_project = \"payments\"\nfuture_setting = 1\n";
+        fs::write(dir.path().join(".tracevault/config.toml"), original).unwrap();
+
+        run_source(dir.path(), false, true, None, false).unwrap();
+
+        let content = fs::read_to_string(dir.path().join(".tracevault/config.toml")).unwrap();
+        assert_eq!(
+            content,
+            format!(
+                "# TraceVault configuration\n{}agent = \"claude-code\"\n",
+                original.replace("user_context = true", "user_context = false")
+            )
+        );
     }
 
     #[test]

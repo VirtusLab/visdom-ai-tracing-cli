@@ -35,7 +35,8 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 url = "2"
 open = "5"
 dirs = "6"
-toml = "0.8"
+# `preserve_order`: `TracevaultConfig::save` keeps a hand-edited config.toml's key order.
+toml = { version = "0.8", features = ["preserve_order"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -239,9 +239,11 @@ remote has several records and none is named like the checkout, `init` registers
 lists them; set `repo_id` in `.tracevault/config.toml` to the right one. `tracevault sync`
 follows the same rule.
 
-`init` writes `.tracevault/config.toml` from scratch each time it runs, so re-running it
-resets settings changed since (for example `tracevault context source`, or a pinned
-`server_url` / `api_key` / `default_project`).
+Re-running `init` is safe: it keeps the existing `.tracevault/config.toml` (`repo_id`,
+`user_context`, a pinned `server_url` / `api_key` / `default_project`, and keys it does not
+know) and changes only what a flag on that run sets (`--server-url`, `--user-context`,
+`--no-user-context`). If that file cannot be parsed, `init` stops before writing anything;
+fix or remove it and run `init` again.
 
 **Choosing the agent — `--agent`**
 
@@ -340,9 +342,9 @@ from the output).
 Whether the user layer is consulted is decided by `user_context` in the repo's
 `.tracevault/config.toml`. If the repo config does not set it, the user-level `config.toml`
 (written by `tracevault init --global`) decides; if neither sets it, the layer is off.
-`tracevault init` writes `user_context = true` into the repo config by default
+`tracevault init` writes `user_context = true` into the repo config when it has none yet
 (`--no-user-context` to write `false`, `--user-context <path>` to point it at an explicit file
-up front). The field accepts four forms:
+up front); a re-run without either flag keeps the value already there. The field accepts four forms:
 
 | `config.toml` | Meaning |
 |---|---|

@@ -244,6 +244,65 @@ impl TracevaultConfig {
         format!("# TraceVault configuration\n{body}")
     }
 
+    /// Every key this struct reads from `config.toml`. Kept in step with the
+    /// fields by `fields_lists_every_serialized_key`.
+    const FIELDS: &'static [&'static str] = &[
+        "agent",
+        "server_url",
+        "api_key",
+        "repo_id",
+        "user_context",
+        "remote_id",
+        "codebase_name",
+        "default_project",
+    ];
+
+    /// Write this config to `project_root`'s `config.toml`. Unlike a plain
+    /// [`to_toml`](Self::to_toml) rewrite, it keeps what the struct cannot
+    /// carry through a round trip (VIS-1046): the `api_key` it was loaded with
+    /// (otherwise never serialized, see the field) and keys this CLI version
+    /// does not know. Every other key follows the struct, so a `None` field
+    /// removes it, but a field this config holds unchanged keeps the file's
+    /// own spelling (e.g. unknown keys inside `[user_context]`). The file's key
+    /// order is kept. An unreadable or malformed file is replaced.
+    pub fn save(&self, project_root: &Path) -> std::io::Result<()> {
+        let path = Self::config_path(project_root);
+        let mut table: toml::Table = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|content| content.parse().ok())
+            .unwrap_or_default();
+        let ours = toml::Table::try_from(self).map_err(std::io::Error::other)?;
+        // The file's fields as this struct reads them, to tell which ones the
+        // caller changed.
+        let as_loaded = table
+            .clone()
+            .try_into::<Self>()
+            .ok()
+            .and_then(|cfg| toml::Table::try_from(&cfg).ok())
+            .unwrap_or_default();
+        // `api_key` is settled below, in place.
+        table.retain(|key, _| {
+            key == "api_key" || !Self::FIELDS.contains(&key) || ours.contains_key(key)
+        });
+        for (key, value) in ours {
+            // A serde default (`agent`) matches as loaded without being in
+            // the file: still written.
+            if !table.contains_key(&key) || as_loaded.get(&key) != Some(&value) {
+                table.insert(key, value);
+            }
+        }
+        match &self.api_key {
+            Some(key) => {
+                table.insert("api_key".into(), key.clone().into());
+            }
+            None => {
+                table.remove("api_key");
+            }
+        }
+        let body = toml::to_string(&table).map_err(std::io::Error::other)?;
+        std::fs::write(path, format!("# TraceVault configuration\n{body}"))
+    }
+
     /// Load `config.toml`, distinguishing a **missing** file (`Ok(None)`) from a
     /// present-but-**malformed** one (`Err(message)`). Callers that need to react
     /// differently to those two cases (e.g. to avoid silently writing to a
@@ -624,5 +683,151 @@ mod tests {
     fn default_project_absent_is_omitted_from_toml() {
         let toml = TracevaultConfig::default().to_toml();
         assert!(!toml.contains("default_project"));
+    }
+
+    #[test]
+    fn fields_lists_every_serialized_key() {
+        let cfg = TracevaultConfig {
+            agent: "claude-code".into(),
+            server_url: Some("https://example.com".into()),
+            api_key: Some("tvk_x".into()),
+            repo_id: Some("r".into()),
+            user_context: Some(UserContext::Toggle(true)),
+            remote_id: Some("rm".into()),
+            codebase_name: Some("cb".into()),
+            default_project: Some("p".into()),
+        };
+        let mut keys: Vec<String> = toml::Table::try_from(&cfg)
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.push("api_key".into()); // read but never serialized
+        keys.sort();
+        let mut fields: Vec<&str> = TracevaultConfig::FIELDS.to_vec();
+        fields.sort();
+        assert_eq!(keys, fields);
+    }
+
+    fn write_config(root: &Path, content: &str) {
+        fs::create_dir_all(root.join(".tracevault")).unwrap();
+        fs::write(root.join(".tracevault/config.toml"), content).unwrap();
+    }
+
+    #[test]
+    fn save_keeps_api_key_unknown_keys_and_key_order() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "repo_id = \"r1\"\napi_key = \"tvk_abc==\"\nfuture_key = 7\nagent = \"claude-code\"\n",
+        );
+
+        let mut cfg = TracevaultConfig::load(dir.path()).unwrap();
+        cfg.repo_id = Some("r2".into());
+        cfg.save(dir.path()).unwrap();
+
+        let content = fs::read_to_string(TracevaultConfig::config_path(dir.path())).unwrap();
+        assert_eq!(
+            content,
+            "# TraceVault configuration\nrepo_id = \"r2\"\napi_key = \"tvk_abc==\"\nfuture_key = 7\nagent = \"claude-code\"\n"
+        );
+    }
+
+    #[test]
+    fn save_removes_a_known_key_set_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "codebase_name = \"old\"\nrepo_id = \"r1\"\n");
+
+        let mut cfg = TracevaultConfig::load(dir.path()).unwrap();
+        cfg.codebase_name = None;
+        cfg.save(dir.path()).unwrap();
+
+        let reloaded = TracevaultConfig::load(dir.path()).unwrap();
+        assert_eq!(reloaded.codebase_name, None);
+        assert_eq!(reloaded.repo_id.as_deref(), Some("r1"));
+    }
+
+    #[test]
+    fn save_puts_scalars_before_a_table_valued_user_context() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "[user_context]\nenable = false\npath = \"/x.json\"\n",
+        );
+
+        let mut cfg = TracevaultConfig::load(dir.path()).unwrap();
+        cfg.api_key = Some("tvk_y".into());
+        cfg.repo_id = Some("r".into());
+        cfg.save(dir.path()).unwrap();
+
+        let reloaded = TracevaultConfig::load(dir.path()).unwrap();
+        assert_eq!(reloaded.api_key.as_deref(), Some("tvk_y"));
+        assert_eq!(reloaded.repo_id.as_deref(), Some("r"));
+        assert!(matches!(
+            reloaded.user_context,
+            Some(UserContext::Full { enable: false, path: Some(ref p) }) if p == "/x.json"
+        ));
+    }
+
+    #[test]
+    fn save_keeps_an_unchanged_user_context_table_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "repo_id = \"r1\"\nagent = \"claude-code\"\n\n[user_context]\npath = \"/x.json\"\nfuture_setting = 1\nenable = true\n";
+        write_config(dir.path(), original);
+
+        let mut cfg = TracevaultConfig::load(dir.path()).unwrap();
+        cfg.repo_id = Some("r2".into());
+        cfg.save(dir.path()).unwrap();
+
+        let content = fs::read_to_string(TracevaultConfig::config_path(dir.path())).unwrap();
+        assert_eq!(
+            content,
+            format!(
+                "# TraceVault configuration\n{}",
+                original.replace("r1", "r2")
+            )
+        );
+    }
+
+    #[test]
+    fn save_replaces_a_changed_user_context() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "[user_context]\npath = \"/x.json\"\nfuture_setting = 1\n",
+        );
+
+        let mut cfg = TracevaultConfig::load(dir.path()).unwrap();
+        cfg.user_context = Some(UserContext::Toggle(false));
+        cfg.save(dir.path()).unwrap();
+
+        let content = fs::read_to_string(TracevaultConfig::config_path(dir.path())).unwrap();
+        assert_eq!(
+            content,
+            "# TraceVault configuration\nuser_context = false\nagent = \"claude-code\"\n"
+        );
+    }
+
+    #[test]
+    fn save_writes_the_default_agent_into_a_file_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "repo_id = \"r1\"\n");
+
+        TracevaultConfig::load(dir.path())
+            .unwrap()
+            .save(dir.path())
+            .unwrap();
+
+        let content = fs::read_to_string(TracevaultConfig::config_path(dir.path())).unwrap();
+        assert!(content.contains("agent = \"claude-code\""), "{content}");
+    }
+
+    #[test]
+    fn save_creates_a_missing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
+        TracevaultConfig::default().save(dir.path()).unwrap();
+        let content = fs::read_to_string(TracevaultConfig::config_path(dir.path())).unwrap();
+        assert_eq!(content, TracevaultConfig::default().to_toml());
     }
 }

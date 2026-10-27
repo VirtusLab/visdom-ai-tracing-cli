@@ -12,20 +12,17 @@ use tracevault_cli::config::UserContext;
 fn tmp_git_repo() -> TempDir {
     let tmp = TempDir::new().unwrap();
     fs::create_dir(tmp.path().join(".git")).unwrap();
-    give_api_key(tmp.path());
+    write_repo_config(tmp.path(), "api_key = \"tvk_test\"\n");
     tmp
 }
 
-/// Put a credential into the repo's `.tracevault/config.toml`. `init`
-/// rewrites that file without `api_key` (VIS-1046), so a test that runs
-/// `init` twice restores it in between.
-fn give_api_key(root: &std::path::Path) {
+fn write_repo_config(root: &std::path::Path, content: &str) {
     fs::create_dir_all(root.join(".tracevault")).unwrap();
-    fs::write(
-        root.join(".tracevault/config.toml"),
-        "api_key = \"tvk_test\"\n",
-    )
-    .unwrap();
+    fs::write(root.join(".tracevault/config.toml"), content).unwrap();
+}
+
+fn read_repo_config(root: &std::path::Path) -> String {
+    fs::read_to_string(root.join(".tracevault/config.toml")).unwrap()
 }
 
 /// A real git repo (`git init`) with an `origin` remote and nothing else —
@@ -214,7 +211,7 @@ async fn init_fails_without_git() {
         None,
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await;
@@ -235,7 +232,7 @@ async fn init_creates_tracevault_config() {
         None,
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -255,7 +252,7 @@ async fn init_creates_directory_structure() {
         None,
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -282,7 +279,7 @@ async fn init_installs_claude_hooks() {
         None,
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -308,7 +305,7 @@ async fn init_installs_session_hooks() {
         None,
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -378,7 +375,7 @@ async fn init_merges_into_existing_settings() {
         None,
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -412,7 +409,7 @@ async fn init_installs_git_pre_push_hook() {
         None,
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -469,7 +466,7 @@ async fn init_preserves_existing_pre_push_hook() {
         None,
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -493,18 +490,17 @@ async fn init_does_not_duplicate_hook_on_reinit() {
         None,
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
     .unwrap();
-    give_api_key(tmp.path());
     tracevault_cli::commands::init::init_in_directory(
         tmp.path(),
         None,
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -527,7 +523,7 @@ async fn init_installs_post_commit_hook() {
         None,
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -551,18 +547,17 @@ async fn init_does_not_duplicate_post_commit_hook_on_reinit() {
         None,
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
     .unwrap();
-    give_api_key(tmp.path());
     tracevault_cli::commands::init::init_in_directory(
         tmp.path(),
         None,
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -585,7 +580,7 @@ async fn init_local_target_writes_to_settings_local_json() {
         None,
         Some(ClaudeSettingsTarget::Local),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -613,7 +608,7 @@ async fn init_local_target_gitignores_settings_local_json() {
         None,
         Some(ClaudeSettingsTarget::Local),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -643,7 +638,7 @@ async fn init_local_target_merges_into_existing_settings_local_json() {
         None,
         Some(ClaudeSettingsTarget::Local),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -664,7 +659,7 @@ async fn init_writes_server_url_to_config() {
         Some("https://tv.example.com"),
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -684,7 +679,7 @@ async fn init_no_gitignore_skips_gitignore_update() {
         None,
         Some(ClaudeSettingsTarget::Shared),
         true,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -715,7 +710,7 @@ async fn init_default_writes_user_context_true() {
         None,
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Toggle(true),
+        Some(UserContext::Toggle(true)),
         Agent::ClaudeCode,
     )
     .await
@@ -914,7 +909,7 @@ async fn init_opencode_repo_local_installs_plugin_and_gitignores_opencode_dir() 
         None,
         None,
         false,
-        UserContext::Toggle(false),
+        Some(UserContext::Toggle(false)),
         Agent::OpenCode,
     )
     .await
@@ -947,7 +942,7 @@ async fn init_explicit_user_context_path_written() {
         None,
         Some(ClaudeSettingsTarget::Shared),
         false,
-        UserContext::Path("/tmp/my-context.json".to_string()),
+        Some(UserContext::Path("/tmp/my-context.json".to_string())),
         Agent::ClaudeCode,
     )
     .await
@@ -959,4 +954,141 @@ async fn init_explicit_user_context_path_written() {
         content.contains("user_context = \"/tmp/my-context.json\""),
         "expected explicit path, got: {content}"
     );
+}
+
+/// A real git repo (`git init`) with no remote, so `init` never contacts a
+/// server and the config it leaves behind is only what it merged.
+fn real_git_repo_without_remote() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(tmp.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git init failed");
+    tmp
+}
+
+/// A config the user has tuned: every field `init` used to reset, plus a
+/// key this CLI version does not know.
+const TUNED_CONFIG: &str = "\
+agent = \"claude-code\"
+server_url = \"https://tv.example.com\"
+api_key = \"tvk_tuned==\"
+repo_id = \"11111111-1111-4111-8111-111111111111\"
+user_context = \"/home/me/ctx.json\"
+remote_id = \"22222222-2222-4222-8222-222222222222\"
+codebase_name = \"org/repo\"
+default_project = \"payments\"
+future_setting = true
+";
+
+/// VIS-1046: re-running `init` without flags used to rewrite config.toml
+/// from defaults. It must keep every field the user set, byte for byte.
+#[test]
+fn init_rerun_without_flags_keeps_the_existing_config() {
+    let repo = real_git_repo_without_remote();
+    let home = TempDir::new().unwrap();
+    write_repo_config(repo.path(), TUNED_CONFIG);
+
+    let output = run_init_isolated(repo.path(), home.path(), &["--claude-settings", "shared"]);
+
+    assert!(
+        output.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read_repo_config(repo.path()),
+        format!("# TraceVault configuration\n{TUNED_CONFIG}")
+    );
+}
+
+/// Flags on the re-run override what they name; everything else stays.
+#[test]
+fn init_rerun_flags_override_only_their_own_fields() {
+    let repo = real_git_repo_without_remote();
+    let home = TempDir::new().unwrap();
+    write_repo_config(repo.path(), TUNED_CONFIG);
+
+    let output = run_init_isolated(
+        repo.path(),
+        home.path(),
+        &[
+            "--claude-settings",
+            "shared",
+            "--server-url",
+            "https://other.example.com",
+            "--no-user-context",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = TUNED_CONFIG
+        .replace("https://tv.example.com", "https://other.example.com")
+        .replace(
+            "user_context = \"/home/me/ctx.json\"",
+            "user_context = false",
+        );
+    assert_eq!(
+        read_repo_config(repo.path()),
+        format!("# TraceVault configuration\n{expected}")
+    );
+}
+
+/// Only what the config lacks gets a default: `user_context` is turned on.
+#[tokio::test]
+async fn init_fills_only_missing_fields_with_defaults() {
+    let tmp = tmp_git_repo();
+    write_repo_config(
+        tmp.path(),
+        "api_key = \"tvk_test\"\ndefault_project = \"payments\"\n",
+    );
+
+    tracevault_cli::commands::init::init_in_directory(
+        tmp.path(),
+        None,
+        Some(ClaudeSettingsTarget::Shared),
+        false,
+        None,
+        Agent::ClaudeCode,
+    )
+    .await
+    .unwrap();
+
+    let cfg = tracevault_cli::config::TracevaultConfig::load(tmp.path()).unwrap();
+    assert_eq!(cfg.api_key.as_deref(), Some("tvk_test"));
+    assert_eq!(cfg.default_project.as_deref(), Some("payments"));
+    assert_eq!(cfg.agent, "claude-code");
+    assert!(matches!(cfg.user_context, Some(UserContext::Toggle(true))));
+}
+
+/// A config `init` cannot parse is not replaced with defaults: `init` stops
+/// before writing anything and says how to fix it.
+#[tokio::test]
+async fn init_refuses_to_overwrite_a_malformed_config() {
+    let tmp = tmp_git_repo();
+    write_repo_config(tmp.path(), "api_key = \"tvk_test\"\nrepo_id = [unclosed\n");
+
+    let err = tracevault_cli::commands::init::init_in_directory(
+        tmp.path(),
+        None,
+        Some(ClaudeSettingsTarget::Shared),
+        false,
+        None,
+        Agent::ClaudeCode,
+    )
+    .await
+    .expect_err("a malformed config must stop init");
+
+    assert!(err.to_string().contains(".tracevault/config.toml"), "{err}");
+    assert_eq!(
+        read_repo_config(tmp.path()),
+        "api_key = \"tvk_test\"\nrepo_id = [unclosed\n"
+    );
+    assert!(!tmp.path().join(".git/hooks/pre-push").exists());
 }

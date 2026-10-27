@@ -439,7 +439,9 @@ async fn main() {
             let cwd = env::current_dir().expect("Cannot determine current directory");
             let user_context =
                 match config::UserContext::from_init_flags(no_user_context, user_context) {
-                    Ok(r) => r.unwrap_or(config::UserContext::Toggle(true)),
+                    // `None`: no flag, so `init` keeps the stored value
+                    // (on by default when there is none).
+                    Ok(r) => r,
                     Err(e) => {
                         eprintln!("Error: {e}");
                         std::process::exit(1);
