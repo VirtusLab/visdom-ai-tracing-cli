@@ -768,4 +768,59 @@ mod tests {
         ])
         .is_ok());
     }
+
+    /// Rendered `--help` of the subcommand at `path`, whitespace-collapsed so
+    /// assertions don't depend on line wrapping.
+    fn long_help(path: &[&str]) -> String {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let mut sub = &mut cmd;
+        for name in path {
+            sub = sub
+                .find_subcommand_mut(name)
+                .unwrap_or_else(|| panic!("no subcommand {name}"));
+        }
+        sub.render_long_help()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn init_help_names_every_agent_install_target() {
+        let help = long_help(&["init"]);
+        for needle in [
+            ".codex/hooks.json",
+            "gsd install -l",
+            ".opencode/plugins/tracevault.ts",
+            "~/.codex/",
+            "OpenCode plugin",
+            "--server-url, --claude-settings and --no-gitignore",
+        ] {
+            assert!(
+                help.contains(needle),
+                "init --help lacks {needle:?}: {help}"
+            );
+        }
+        assert!(!help.contains("for ALL Claude Code sessions"), "{help}");
+        // The opencode value's clap-naming note is an implementation comment.
+        assert!(!help.contains("kebab-case"), "{help}");
+    }
+
+    #[test]
+    fn hook_command_help_says_per_repo_init_installs_them() {
+        for name in ["session-start", "user-prompt"] {
+            let help = long_help(&[name]);
+            assert!(help.contains("per-repo or --global"), "{name}: {help}");
+            assert!(help.contains("Codex hooks.json"), "{name}: {help}");
+        }
+    }
+
+    #[test]
+    fn context_show_help_lists_the_user_section() {
+        let help = long_help(&["context", "show"]);
+        assert!(help.contains("User (always;"), "{help}");
+        assert!(!help.contains("three sections"), "{help}");
+    }
 }
