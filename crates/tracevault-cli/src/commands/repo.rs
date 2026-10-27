@@ -176,9 +176,14 @@ fn apply_switch(state: &mut SessionState, binding: RepoBinding) {
     state.active = Some(binding);
 }
 
-/// Clear the session's workspace binding (session-level reset). Pure.
+/// Clear the session's workspace binding (session-level reset), and keep it
+/// cleared: the hooks would otherwise bind the session again from its
+/// checkout's remote on the next event. Pure.
 fn apply_reset(state: &mut SessionState) {
-    *state = SessionState::default();
+    *state = SessionState {
+        auto_bind_off: true,
+        ..SessionState::default()
+    };
 }
 
 fn reset(user: bool, session_id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -193,6 +198,10 @@ fn reset(user: bool, session_id: Option<&str>) -> Result<(), Box<dyn std::error:
     session_state::save(&id, &state)?;
     // NOTE: subagent worktree-scoped reset-to-parent is handled in sub-plan C.
     println!("cleared workspace repo binding for session {id}");
+    println!(
+        "it stays unbound (no automatic binding from the checkout's remote) until \
+         `tracevault repo switch`"
+    );
     Ok(())
 }
 
@@ -646,7 +655,13 @@ mod tests {
             ..Default::default()
         };
         apply_reset(&mut state);
-        assert_eq!(state, SessionState::default());
+        assert_eq!(
+            state,
+            SessionState {
+                auto_bind_off: true,
+                ..SessionState::default()
+            }
+        );
     }
 
     #[test]

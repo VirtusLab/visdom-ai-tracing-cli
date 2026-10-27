@@ -1236,7 +1236,25 @@ pub async fn run_stream(
         .and_then(|opt| opt.as_ref())
         .and_then(crate::resolution::binding_from_config);
     let user_default = crate::user_default::load();
-    let binding = resolve_stream_binding(&session, &worktree_top, bound, user_default);
+    let mut binding = resolve_stream_binding(&session, &worktree_top, bound, user_default);
+    // The client is built here, not at step 8, because an unbound session may
+    // need it first: bind it from its checkout's remote, as the SessionStart
+    // hook does — this covers agents without that hook and a SessionStart
+    // whose lookup failed (VIS-1048). One lookup per remote per session.
+    let client = server_url
+        .as_deref()
+        .map(|url| crate::api_client::ApiClient::with_credential(url, credential));
+    if binding.is_none() {
+        if let Some(client) = &client {
+            let auto =
+                crate::auto_bind::bind_session(&hook_event.session_id, hook_cwd, client, deadline)
+                    .await;
+            if let Some(notice) = auto.notice {
+                eprintln!("{notice}");
+            }
+            binding = auto.binding;
+        }
+    }
     // Graceful no-op, exactly like the hook's normal success path. Do NOT
     // error: a failing hook would block the tool.
     let no_op_allow = || -> Result<(), Box<dyn std::error::Error>> {
@@ -1275,9 +1293,8 @@ pub async fn run_stream(
         return Ok(());
     };
 
-    // 8. Create ApiClient
-    let server_url = server_url.ok_or("server_url not configured")?;
-    let client = crate::api_client::ApiClient::with_credential(&server_url, credential);
+    // 8. The ApiClient (built above)
+    let client = client.ok_or("server_url not configured")?;
 
     // 9. Try drain pending queue and send
     let pending_path = pending_path_for(&session_dir, &attribution);
