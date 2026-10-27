@@ -23,6 +23,12 @@ const SESSION_ID: &str = "vis1048-auto-bind-session";
 
 const ACCEPT_DEADLINE: Duration = Duration::from_secs(5);
 
+/// A staged "response" that never answers.
+const STALL: &str = "stall";
+
+/// What Claude Code allows a TraceVault hook before killing it.
+const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn accept_with_deadline(listener: &TcpListener) -> Option<std::net::TcpStream> {
     let deadline = Instant::now() + ACCEPT_DEADLINE;
     loop {
@@ -77,6 +83,12 @@ fn spawn_server(responses: Vec<String>) -> (String, mpsc::Receiver<String>) {
             let mut body = vec![0u8; content_length];
             let _ = reader.read_exact(&mut body);
             let _ = tx.send(request_line.trim_end().to_string());
+            if response == STALL {
+                // Hold the connection open without answering, longer than
+                // any hook may wait.
+                thread::sleep(Duration::from_secs(20));
+                break;
+            }
             let mut stream = reader.into_inner();
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
@@ -289,6 +301,45 @@ fn session_start_binds_a_registered_checkout_and_events_follow() {
     assert_eq!(
         requests,
         vec![format!("POST /api/v1/repos/{REPO_ID}/stream HTTP/1.1")]
+    );
+}
+
+/// Runs `session-start` and asserts it answered with valid hook JSON well
+/// inside the hook timeout; returns its stdout.
+fn session_start_within_timeout(fx: &Fixture, base: &str) -> String {
+    let started = Instant::now();
+    let (code, stdout, stderr) = fx.session_start(base);
+    let took = started.elapsed();
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(took < HOOK_TIMEOUT, "took {took:?}");
+    serde_json::from_str::<serde_json::Value>(stdout.trim()).expect("hook JSON");
+    stdout
+}
+
+#[test]
+fn a_stalled_lookup_gives_up_in_time_and_leaves_the_session_unbound() {
+    let fx = Fixture::new("git@github.com:org/repo.git");
+    let (base, _rx) = spawn_server(vec![STALL.to_string()]);
+
+    let stdout = session_start_within_timeout(&fx, &base);
+
+    assert!(!stdout.contains("systemMessage"), "{stdout}");
+    // Nothing recorded: a later hook retries the lookup.
+    assert!(!fx.session_state().contains("auto_bind_checked"));
+    assert!(!fx.session_state().contains(REPO_ID));
+}
+
+#[test]
+fn a_stalled_policy_fetch_after_binding_still_answers_in_time() {
+    let fx = Fixture::new("git@github.com:org/repo.git");
+    let (base, _rx) = spawn_server(vec![resolved(), detail(), STALL.to_string()]);
+
+    let stdout = session_start_within_timeout(&fx, &base);
+
+    assert!(!stdout.contains("POLICY TEXT"), "{stdout}");
+    assert!(
+        fx.session_state().contains(REPO_ID),
+        "bound despite the slow fetch"
     );
 }
 
