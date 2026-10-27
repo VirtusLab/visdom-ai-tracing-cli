@@ -941,8 +941,20 @@ fn merge_hooks_into_file(hooks_path: &Path, ours: &serde_json::Value) -> io::Res
             format!("refusing to use path with '..': {}", hooks_path.display()),
         ));
     }
-    let mut root: serde_json::Value = if hooks_path.exists() {
-        let content = fs::read_to_string(hooks_path)?;
+    // A settings file symlinked to a centrally managed config is updated at its
+    // target, so the link survives (renaming over it would replace it with a
+    // regular file). A dangling link fails here instead of being overwritten.
+    let target = match fs::symlink_metadata(hooks_path) {
+        Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(hooks_path)?,
+        _ => hooks_path.to_path_buf(),
+    };
+    let existing_permissions = match fs::metadata(&target) {
+        Ok(meta) => Some(meta.permissions()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let mut root: serde_json::Value = if existing_permissions.is_some() {
+        let content = fs::read_to_string(&target)?;
         serde_json::from_str(&content).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -953,7 +965,7 @@ fn merge_hooks_into_file(hooks_path: &Path, ours: &serde_json::Value) -> io::Res
         serde_json::json!({})
     };
 
-    let before = hooks_path.exists().then(|| root.to_string());
+    let before = existing_permissions.is_some().then(|| root.to_string());
     merge_hooks(&mut root, ours, hooks_path)?;
     if before.as_deref() == Some(root.to_string().as_str()) {
         return Ok(());
@@ -962,10 +974,36 @@ fn merge_hooks_into_file(hooks_path: &Path, ours: &serde_json::Value) -> io::Res
     let formatted = serde_json::to_string_pretty(&root).map_err(|e| {
         io::Error::other(format!("Failed to serialize {}: {e}", hooks_path.display()))
     })?;
-    let tmp = hooks_path.with_extension("json.tmp");
-    fs::write(&tmp, formatted)?;
-    fs::rename(&tmp, hooks_path)?;
+    let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = target.with_file_name(tmp_name);
+    write_owner_only(&tmp, formatted.as_bytes())?;
+    // Keep the mode the user gave the file (a 0600 settings.local.json may
+    // carry credentials in `env`); a new file stays owner-only.
+    if let Some(permissions) = existing_permissions {
+        fs::set_permissions(&tmp, permissions)?;
+    }
+    fs::rename(&tmp, &target)?;
     Ok(())
+}
+
+/// Create `path` afresh, readable only by its owner on Unix, and write
+/// `contents` — so the temp copy of a settings file never exposes it while
+/// being written.
+fn write_owner_only(path: &Path, contents: &[u8]) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(contents)
 }
 
 /// Deep-merge the Codex hook set into `<project_root>/.codex/hooks.json`,
@@ -1102,20 +1140,17 @@ fn strip_tracevault_hooks(entries: &mut Vec<serde_json::Value>) -> Option<usize>
 /// to the current hook set, and events we no longer install lose our entries.
 /// Top-level keys and foreign hooks are never touched.
 ///
-/// Absent values (no top-level `settings`, no `hooks` key, no entry for a
-/// given event) are created fresh — that's fine. But if an EXISTING value
-/// has an unexpected shape (top-level `settings` isn't an object, an
-/// existing `hooks` isn't an object, or one of our events isn't an array),
-/// this errors loudly instead of silently discarding it. A foreign event
-/// whose value isn't an array is left as it is.
+/// Absent values (no `hooks` key, no entry for a given event) are created
+/// fresh — that's fine; a missing file reaches here as `{}`. But if an
+/// EXISTING value has an unexpected shape (top-level `settings` isn't an
+/// object — `null` included —, an existing `hooks` isn't an object, or one of
+/// our events isn't an array), this errors loudly instead of silently
+/// discarding it. A foreign event whose value isn't an array is left as it is.
 fn merge_hooks(
     settings: &mut serde_json::Value,
     ours: &serde_json::Value,
     path: &Path,
 ) -> io::Result<()> {
-    if settings.is_null() {
-        *settings = serde_json::json!({});
-    }
     let settings_obj = settings.as_object_mut().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2098,6 +2133,7 @@ mod tests {
         for (target, body) in [
             (ClaudeSettingsTarget::Shared, "{ not json"),
             (ClaudeSettingsTarget::Local, "[1, 2]"),
+            (ClaudeSettingsTarget::Shared, "null"),
             (ClaudeSettingsTarget::Shared, r#"{"hooks": []}"#),
             (ClaudeSettingsTarget::Local, r#"{"hooks": {"Stop": {}}}"#),
         ] {
@@ -2119,6 +2155,59 @@ mod tests {
                 "no temp file left behind"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_claude_hooks_keeps_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".claude/settings.local.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, FOREIGN_SETTINGS).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        install_claude_hooks(tmp.path(), ClaudeSettingsTarget::Local).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_installed_over_foreign(&path, &tracevault_hooks());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_claude_hooks_updates_symlinked_settings_at_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let central = tmp.path().join("central/claude-settings.json");
+        fs::create_dir_all(central.parent().unwrap()).unwrap();
+        fs::write(&central, FOREIGN_SETTINGS).unwrap();
+        let link = tmp.path().join("repo/.claude/settings.json");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&central, &link).unwrap();
+
+        install_claude_hooks(&tmp.path().join("repo"), ClaudeSettingsTarget::Shared).unwrap();
+
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_installed_over_foreign(&central, &tracevault_hooks());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_claude_hooks_refuses_dangling_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join(".claude/settings.json");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone.json"), &link).unwrap();
+
+        assert!(install_claude_hooks(tmp.path(), ClaudeSettingsTarget::Shared).is_err());
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!tmp.path().join("gone.json").exists());
     }
 
     #[test]
