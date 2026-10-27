@@ -3,6 +3,7 @@ use std::env;
 
 mod agent;
 mod api_client;
+mod auto_bind;
 mod billing;
 mod commands;
 mod config;

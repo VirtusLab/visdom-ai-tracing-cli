@@ -1099,10 +1099,10 @@ const GLOBAL_CLAUDE_MD_MARKER: &str = "<!-- tracevault:workspace-mode -->";
 const GLOBAL_CLAUDE_MD_BLOCK: &str = "\
 <!-- tracevault:workspace-mode -->
 ## TraceVault (workspace mode)
-You may be running detached from any single repository. Before working on a repo, run
-`tracevault repo switch <path>` to bind tracing and fetch that repo's policies; treat its
-output as binding. Use `--path <path>` on `tracevault repo status` for a one-off. Repos must
-already be registered with TraceVault.
+A session started in a registered repo's checkout is bound to that repo automatically. To work
+on a different repo, run `tracevault repo switch <path>` to bind tracing and fetch that repo's
+policies; treat its output as binding. Use `--path <path>` on `tracevault repo status` for a
+one-off. Repos must already be registered with TraceVault.
 ";
 
 /// Append the workspace-mode instruction block to `md_path` (creating it if

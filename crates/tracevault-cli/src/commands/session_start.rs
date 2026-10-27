@@ -6,10 +6,11 @@
 //! 1. Exports `TRACEVAULT_SESSION_ID` into Claude Code's session env file (when
 //!    present) so agent-invoked `tracevault repo …` commands can find the
 //!    session without an explicit `--session-id` flag.
-//! 2. Resolves the effective repo binding (workspace-mode precedence chain)
-//!    and, if one exists, injects that repo's policies as `SessionStart`
-//!    `additionalContext` — the reliable way to hand an agent up-to-date
-//!    policy text at the start of a session.
+//! 2. Resolves the effective repo binding (workspace-mode precedence chain;
+//!    with none, binds the session from its checkout's origin remote — see
+//!    `auto_bind`) and, if one exists, injects that repo's policies as
+//!    `SessionStart` `additionalContext` — the reliable way to hand an agent
+//!    up-to-date policy text at the start of a session.
 //!
 //! This hook must NEVER hard-fail: a failing `SessionStart` hook blocks
 //! Claude Code from starting the session. Every fallible step below is

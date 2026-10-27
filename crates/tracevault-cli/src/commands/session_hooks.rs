@@ -25,6 +25,9 @@ pub struct HookOutput {
     pub cont: Option<bool>,
     #[serde(rename = "suppressOutput", skip_serializing_if = "Option::is_none")]
     pub suppress_output: Option<bool>,
+    /// A message Claude Code shows the user (not the model).
+    #[serde(rename = "systemMessage", skip_serializing_if = "Option::is_none")]
+    pub system_message: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,6 +45,7 @@ impl HookOutput {
             hook_specific_output: None,
             cont: None,
             suppress_output: Some(true),
+            system_message: None,
         }
     }
     /// Allow + inject `context` under the given hook event name.
@@ -53,6 +57,7 @@ impl HookOutput {
             }),
             cont: None,
             suppress_output: Some(true),
+            system_message: None,
         }
     }
 }
@@ -99,7 +104,16 @@ pub fn should_inject(
 /// every hook command's error paths — a hook must always emit valid JSON,
 /// even (especially) when something upstream failed.
 pub(crate) fn print_allow() -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", serde_json::to_string(&HookOutput::allow())?);
+    print_allow_with(None)
+}
+
+/// [`print_allow`], showing the user `notice` if there is one.
+fn print_allow_with(notice: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let output = HookOutput {
+        system_message: notice,
+        ..HookOutput::allow()
+    };
+    println!("{}", serde_json::to_string(&output)?);
     Ok(())
 }
 
@@ -131,8 +145,9 @@ async fn fetch_context(client: &ApiClient, event: &str, repo_id: uuid::Uuid) -> 
     Some(HookOutput::with_context(event, cap_context(resp.content)))
 }
 
-/// Resolve the session's effective binding and, if `should_inject(event, ...)`,
-/// best-effort fetch + print policies as `additionalContext` and persist
+/// Resolve the session's effective binding (auto-binding an unbound session
+/// from its checkout's remote, whose "not registered" notice goes to the user
+/// as `systemMessage`) and, if `should_inject(event, ...)`, best-effort fetch + print policies as `additionalContext` and persist
 /// `last_injected_repo`. Always prints a valid `HookOutput`; never hard-fails.
 ///
 /// Shared by `session-start` and `user-prompt`: both need the same
@@ -148,7 +163,7 @@ pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn st
     let bound =
         crate::config::TracevaultConfig::load(&project_root).and_then(|c| binding_from_config(&c));
     let user_default = crate::user_default::load();
-    let binding = effective_binding(ResolveInputs {
+    let mut binding = effective_binding(ResolveInputs {
         repo_flag: None,
         session: &session,
         worktree_path: Some(&worktree),
@@ -157,12 +172,27 @@ pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn st
     })
     .map(|(b, _)| b);
 
+    // Nothing binds the session: bind it to the repo of the checkout it runs
+    // in, if the server knows that checkout's remote (VIS-1048).
+    let mut notice = None;
+    if binding.is_none() {
+        if let Ok((Some(server_url), credential)) =
+            crate::credentials::resolve_credentials_quiet(&project_root)
+        {
+            let client = ApiClient::with_credential(&server_url, credential);
+            let auto =
+                crate::auto_bind::bind_session(&hook_event.session_id, hook_cwd, &client).await;
+            binding = auto.binding;
+            notice = auto.notice;
+        }
+    }
+
     if !should_inject(
         event,
         binding.as_ref().map(|b| b.repo_id.as_str()),
         session.last_injected_repo.as_deref(),
     ) {
-        return print_allow();
+        return print_allow_with(notice);
     }
     // `should_inject` returning true requires `effective_repo_id.is_some()`, so
     // `binding` is always `Some` here.
@@ -309,6 +339,19 @@ mod tests {
         assert!(json.contains("\"hookSpecificOutput\""));
         assert!(json.contains("\"hookEventName\":\"SessionStart\""));
         assert!(json.contains("\"additionalContext\":\"x\""));
+    }
+
+    #[test]
+    fn a_notice_serializes_as_system_message() {
+        let out = HookOutput {
+            system_message: Some("not recorded".into()),
+            ..HookOutput::allow()
+        };
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("\"systemMessage\":\"not recorded\""));
+        assert!(!serde_json::to_string(&HookOutput::allow())
+            .unwrap()
+            .contains("systemMessage"));
     }
 
     #[test]

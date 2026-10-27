@@ -103,6 +103,15 @@ pub struct SessionState {
     pub active_project: Option<ProjectBinding>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub subagent_projects: HashMap<String, ProjectBinding>,
+    /// Origin remote URLs this session already looked up without binding
+    /// (unregistered, or ambiguous), so `auto_bind` asks the server once per
+    /// remote, not once per hook event — and says so once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auto_bind_checked: Vec<String>,
+    /// Set by `repo reset`: the session stays unbound instead of being bound
+    /// again from its checkout's remote on the next hook event.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_bind_off: bool,
 }
 
 /// `$XDG_STATE_HOME/tracevault/sessions` or `~/.local/state/tracevault/sessions`.
@@ -174,6 +183,15 @@ pub fn save(session_id: &str, state: &SessionState) -> Result<(), Box<dyn std::e
 /// that resolve the dir themselves). Absent or malformed → default state.
 pub fn load_from(sessions_dir: &std::path::Path, session_id: &str) -> SessionState {
     load_in(sessions_dir, session_id)
+}
+
+/// [`save`] into an explicit sessions dir — the write half of [`load_from`].
+pub fn save_to(
+    sessions_dir: &std::path::Path,
+    session_id: &str,
+    state: &SessionState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    save_in(sessions_dir, session_id, state)
 }
 
 #[cfg(test)]

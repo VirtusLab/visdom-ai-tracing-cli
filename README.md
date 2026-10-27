@@ -64,31 +64,45 @@ tracevault init --global
 ```
 
 This installs the hooks once, into `~/.claude/settings.json`, so they run in every Claude Code
-session on the machine — but **it does not by itself make every session recorded.** A session
-is recorded only when it resolves to a repo the server knows or to a project. For a repo, in
-one of these ways (highest precedence first):
+session on the machine. **A session started in a checkout of a repo the server knows is
+recorded and attributed to that repo with nothing more to do:** on its first hook (normally
+`SessionStart`) the CLI takes the checkout's `origin` remote, asks the server which repo it
+belongs to — once per session — and binds the session to it exactly as `tracevault repo
+switch` would. The repo must already be registered, by someone's `tracevault init` or
+`tracevault sync` in a checkout of it. If it is not, the session stays unrecorded and Claude
+Code shows a message saying so, once; run `tracevault sync` in the checkout to register it,
+then `tracevault repo switch <path>` to bind the running session. A remote whose codebase has
+several repo records on the server binds the one the checkout's `.tracevault/config.toml` names
+or the one named like the checkout's directory; with neither, it stays unbound and the message
+lists the records to pick from with `repo switch --repo-id`.
 
-1. **`tracevault repo switch <path>` inside the session.** `init --global` adds a note to
-   `~/.claude/CLAUDE.md` telling the agent to run this before working on a repo, so this
-   binding depends on the agent following that note. The command reads the session id from
-   `$TRACEVAULT_SESSION_ID`, which the session-start hook exports into Claude Code's shell
-   (through Claude Code's `CLAUDE_ENV_FILE`; other agents do not get it, so pass
-   `--session-id <id>` there). Run without a session id, it sets the user-level default
-   (point 3) instead. The repo must
-   already be registered — by someone's `tracevault init` or `tracevault sync` in a checkout of
-   it.
+That automatic binding applies only to a session nothing else binds. In order of precedence,
+a session is bound to a repo by:
+
+1. **`tracevault repo switch <path>` inside the session** — also how a session moves to work in
+   another repo. `init --global` adds a note to `~/.claude/CLAUDE.md` telling the agent to run
+   it when it does. The command reads the session id from `$TRACEVAULT_SESSION_ID`, which the
+   session-start hook exports into Claude Code's shell (through Claude Code's
+   `CLAUDE_ENV_FILE`; other agents do not get it, so pass `--session-id <id>` there). Run
+   without a session id, it sets the user-level default (point 3) instead. The automatic
+   binding is stored the same way, so a later `repo switch` replaces it, and `repo reset`
+   clears it for good (the session is not bound automatically again).
 2. **The repo has its own `tracevault init`** (a `.tracevault/config.toml` with a `repo_id`):
    sessions started in it are recorded as with the per-repo setup.
 3. **A user-level default: `tracevault repo switch --user <path>`.** Every session not bound
-   by points 1–2 is then attributed to that one repo, whatever directory it runs in.
+   by points 1–2 is then attributed to that one repo, whatever directory it runs in — the
+   automatic binding never applies while a user-level default is set.
+4. **The automatic binding** from the session's checkout, described above.
 
 A session with no repo is still recorded, repo-less, when it resolves to a project:
 `TRACEVAULT_PROJECT` set to a project UUID, a `tracevault project switch` in the session, or a
 user-level `tracevault project switch --user` default (which then catches every unbound session
 on the machine) — see [Project attribution](#project-attribution--tracevault_project-and-tracevault_project_attribution).
-A session that resolves to neither records nothing, again without an error. If something else
-regenerates `~/.claude/CLAUDE.md`, the note from point 1 is lost; re-run `tracevault init
---global` to restore it (it is idempotent).
+A session that resolves to neither — one started outside any checkout, or in one whose remote
+the server does not know — records nothing. If something else regenerates
+`~/.claude/CLAUDE.md`, the note from point 1 is lost; re-run `tracevault init --global` to
+restore it (it is idempotent). Without it, sessions are still bound automatically to the repo
+they start in, but the agent is not told to `repo switch` when it moves to another repo.
 
 ### Check the result
 
@@ -520,7 +534,7 @@ Commands that bind a session to a repo or a project, used with the `--global` in
 |---|---|
 | `repo switch <path> [--repo-id <uuid>] [--user]` | Bind the session to the registered repo that the checkout at `<path>` belongs to (resolved from its `origin` remote) and print the repo's policies. `--repo-id` picks one record when the codebase has several. `--user` (implied when there is no session id) writes the machine-wide default instead. `--name` is deprecated and always errors |
 | `repo status [--path <path>]` | Show the session's repo binding; `--path` resolves a checkout once instead |
-| `repo reset [--user]` | Clear **all** of the session's bindings — repo and project, including subagent overrides — or with `--user` only the machine-wide default repo |
+| `repo reset [--user]` | Clear **all** of the session's bindings — repo and project, including subagent overrides — and stop the hooks binding it automatically from its checkout again; or with `--user` only the machine-wide default repo |
 | `project switch <name> [--user] [--project-attribution derived\|explicit]` | Bind the session (or, with `--user`, every session) to the project with this exact, case-sensitive name. `explicit` forces attribution; see [Project attribution](#project-attribution--tracevault_project-and-tracevault_project_attribution) |
 | `project status [--project <name>]` | Show which project the session is attributed to and why; `--project` is a display-only what-if |
 
@@ -531,7 +545,7 @@ These are hidden from `--help`. `init` installs them; you never need to run them
 | Command | Run by |
 |---|---|
 | `tracevault stream --event <event> [--agent <agent>]` | The agent's hooks, on every captured event (`--agent` defaults to `claude-code`) |
-| `tracevault session-start` | The agent's `SessionStart` hook: injects the bound repo's policies; under Claude Code it also exports `TRACEVAULT_SESSION_ID` into the agent's shell |
+| `tracevault session-start` | The agent's `SessionStart` hook: binds an unbound session to the repo of its checkout's `origin` remote, injects the bound repo's policies; under Claude Code it also exports `TRACEVAULT_SESSION_ID` into the agent's shell |
 | `tracevault user-prompt` | The agent's `UserPromptSubmit` hook: re-injects the policies when the session's repo has changed |
 | `tracevault commit-push` | The git `post-commit` hook, in the background: sends the commit's metadata |
 
