@@ -974,28 +974,42 @@ fn merge_hooks_into_file(hooks_path: &Path, ours: &serde_json::Value) -> io::Res
     let formatted = serde_json::to_string_pretty(&root).map_err(|e| {
         io::Error::other(format!("Failed to serialize {}: {e}", hooks_path.display()))
     })?;
-    let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(".tmp");
-    let tmp = target.with_file_name(tmp_name);
-    write_owner_only(&tmp, formatted.as_bytes())?;
-    // Keep the mode the user gave the file (a 0600 settings.local.json may
-    // carry credentials in `env`); a new file stays owner-only.
-    if let Some(permissions) = existing_permissions {
-        fs::set_permissions(&tmp, permissions)?;
+    let tmp = unique_temp_sibling(&target);
+    let written = write_owner_only(&tmp, formatted.as_bytes())
+        .and_then(|()| {
+            // Keep the mode the user gave the file (a 0600 settings.local.json
+            // may carry credentials in `env`); a new file stays owner-only.
+            match existing_permissions {
+                Some(permissions) => fs::set_permissions(&tmp, permissions),
+                None => Ok(()),
+            }
+        })
+        .and_then(|()| fs::rename(&tmp, &target));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, &target)?;
-    Ok(())
+    written
 }
 
-/// Create `path` afresh, readable only by its owner on Unix, and write
-/// `contents` — so the temp copy of a settings file never exposes it while
-/// being written.
+/// A temp path next to `target` that no other install — in this process or a
+/// concurrent one — uses, so two `init`s never write or publish each other's
+/// half-written file.
+fn unique_temp_sibling(target: &Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or_default();
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{n}.{nanos}.tmp", std::process::id()));
+    target.with_file_name(name)
+}
+
+/// Create `path` (which must not exist), readable only by its owner on Unix,
+/// and write `contents` — so the temp copy of a settings file never exposes
+/// it while being written.
 fn write_owner_only(path: &Path, contents: &[u8]) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -2155,6 +2169,37 @@ mod tests {
                 "no temp file left behind"
             );
         }
+    }
+
+    #[test]
+    fn concurrent_installs_never_publish_a_partial_file() {
+        // Two writers flip the file between two hook sets, so every call
+        // rewrites it; every read must still parse, and no temp file remains.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        fs::write(&path, FOREIGN_SETTINGS).unwrap();
+        let writers: Vec<_> = [tracevault_hooks(), codex_hooks()]
+            .into_iter()
+            .map(|ours| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        merge_hooks_into_file(&path, &ours).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["model"], "opus");
+        assert_eq!(
+            fs::read_dir(tmp.path()).unwrap().count(),
+            1,
+            "no temp file left"
+        );
     }
 
     #[cfg(unix)]
