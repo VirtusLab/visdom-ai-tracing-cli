@@ -1056,7 +1056,8 @@ fn offline_project_outcome(
 /// whether THIS checkout carries an id the stream hook can attribute to.
 #[derive(Debug, Clone, PartialEq)]
 enum RepoLookup {
-    /// The explicitly named session's workspace binding (`repo switch`).
+    /// The explicitly named session's repo binding for this worktree (a
+    /// subagent override or the `repo switch` binding).
     Workspace(String),
     /// The `repo_id` in `.tracevault/config.toml` (bound mode).
     Bound(String),
@@ -1066,10 +1067,12 @@ enum RepoLookup {
     MissingRepoId,
 }
 
-/// Mirrors the hook's precedence (`effective_binding`: session active
-/// binding before bound config): the explicitly named session's binding,
-/// else the config's `repo_id`. `None` when there is neither a binding nor a
-/// config. Pure, so the precedence is unit-testable without a server.
+/// Mirrors the hook's precedence (`effective_binding`: session bindings
+/// before bound config): the explicitly named session's binding — from
+/// [`session_repo_binding`], so a subagent's worktree override wins exactly as
+/// it does in the hook — else the config's `repo_id`. `None` when there is
+/// neither a binding nor a config. Pure, so the precedence is unit-testable
+/// without a server.
 fn server_repo_lookup(
     config: Option<&TracevaultConfig>,
     binding: Option<&crate::session_state::RepoBinding>,
@@ -1082,6 +1085,18 @@ fn server_repo_lookup(
         Some(id) => RepoLookup::Bound(id.clone()),
         None => RepoLookup::MissingRepoId,
     })
+}
+
+/// The session-scoped tiers of the hook's repo chain for `worktree`: a
+/// subagent's worktree override, else the session's active binding. Calls
+/// `resolve_stream_binding` with the config and user-default tiers left out —
+/// [`server_repo_lookup`] handles the config tier itself, and reports a
+/// missing `repo_id` there rather than letting a lower tier mask it.
+fn session_repo_binding(
+    session: &crate::session_state::SessionState,
+    worktree: &str,
+) -> Option<crate::session_state::RepoBinding> {
+    crate::commands::stream::resolve_stream_binding(session, worktree, None, None)
 }
 
 /// The server repo whose id is `id`. Compared as UUIDs, so case or
@@ -1103,15 +1118,8 @@ async fn server_repo_checks(
 ) -> Vec<Check> {
     let mut out = Vec::new();
 
-    let (Some(credential), Some(server_url)) = (auth.credential.clone(), auth.server_url.as_ref())
-    else {
-        out.push(Check::skip(
-            "Repo registered on server",
-            "not authenticated",
-        ));
-        return out;
-    };
-
+    // The local half first: a missing `repo_id` is an error whether or not
+    // the user is logged in (init-before-login is exactly that state).
     // `bound_mode`: the id came from config.toml, so the checkout's own
     // `origin` is expected to match the server record (checked below).
     let (id, source, bound_mode) = match server_repo_lookup(config, binding) {
@@ -1131,6 +1139,15 @@ async fn server_repo_checks(
         }
         Some(RepoLookup::Workspace(id)) => (id, "session binding", false),
         Some(RepoLookup::Bound(id)) => (id, ".tracevault/config.toml", true),
+    };
+
+    let (Some(credential), Some(server_url)) = (auth.credential.clone(), auth.server_url.as_ref())
+    else {
+        out.push(Check::skip(
+            "Repo registered on server",
+            format!("not authenticated (would look up repo id {id} from {source})"),
+        ));
+        return out;
     };
 
     let client = ApiClient::with_credential(server_url, Some(credential));
@@ -1381,11 +1398,6 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
     // drive the server-repo check.
     let explicit_session = session_id.is_some();
     let has_binding = binding.is_some() && explicit_session;
-    let authoritative_binding = if explicit_session {
-        binding.as_ref()
-    } else {
-        None
-    };
 
     let auth_checks_v = auth_checks(&auth, config_server_url).await;
     let install_v = vec![global_check];
@@ -1484,8 +1496,21 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
         attribution_v.push(unresolved_config_default_check(&name));
     }
 
-    let server_checks_v =
-        server_repo_checks(project_root, &auth, config.as_ref(), authoritative_binding).await;
+    // The server target is the repo the hook would attribute this worktree's
+    // events to — including a subagent override — not just the session's
+    // `active` binding shown in "Workspace repo".
+    let server_binding = if explicit_session {
+        session_repo_binding(&project_session, &worktree)
+    } else {
+        None
+    };
+    let server_checks_v = server_repo_checks(
+        project_root,
+        &auth,
+        config.as_ref(),
+        server_binding.as_ref(),
+    )
+    .await;
     let session_checks_v = session_checks(project_root);
 
     let sections: Vec<(&str, Vec<Check>)> = vec![
@@ -2274,6 +2299,74 @@ mod tests {
     #[test]
     fn server_repo_lookup_none_when_neither() {
         assert!(server_repo_lookup(None, None).is_none());
+    }
+
+    fn unauthenticated() -> AuthContext {
+        AuthContext {
+            server_url: None,
+            credential: None,
+            source: "none",
+            email_from_creds: None,
+            url_override_mismatch: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn server_repo_checks_missing_repo_id_is_error_before_login() {
+        // Init-before-login: the missing repo_id is a local fact and must be
+        // reported even though the server cannot be asked.
+        let dir = tempfile::tempdir().unwrap();
+        let config = TracevaultConfig::default();
+        let checks = server_repo_checks(dir.path(), &unauthenticated(), Some(&config), None).await;
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].level, Level::Error);
+        assert!(
+            checks[0].detail.contains("no repo_id"),
+            "detail: {}",
+            checks[0].detail
+        );
+    }
+
+    #[tokio::test]
+    async fn server_repo_checks_with_repo_id_but_no_login_is_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = TracevaultConfig {
+            repo_id: Some("22222222-2222-4222-8222-222222222222".into()),
+            ..Default::default()
+        };
+        let checks = server_repo_checks(dir.path(), &unauthenticated(), Some(&config), None).await;
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].level, Level::Skip);
+        assert!(
+            checks[0]
+                .detail
+                .contains("22222222-2222-4222-8222-222222222222"),
+            "detail: {}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn session_repo_binding_prefers_subagent_override_like_the_hook() {
+        // Codex R1: the server target must be the repo the hook attributes
+        // this worktree to — a subagent override beats the active binding.
+        let mut session = crate::session_state::SessionState {
+            active: Some(workspace_binding("11111111-1111-4111-8111-111111111111")),
+            ..Default::default()
+        };
+        session.subagents.insert(
+            "/wt/sub".into(),
+            workspace_binding("33333333-3333-4333-8333-333333333333"),
+        );
+        assert_eq!(
+            session_repo_binding(&session, "/wt/sub").unwrap().repo_id,
+            "33333333-3333-4333-8333-333333333333"
+        );
+        assert_eq!(
+            session_repo_binding(&session, "/wt/other").unwrap().repo_id,
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert!(session_repo_binding(&Default::default(), "/wt/sub").is_none());
     }
 
     /// Runs `recording_attribution` the way `run_status` does without a named
