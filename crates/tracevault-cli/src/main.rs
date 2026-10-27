@@ -479,7 +479,10 @@ async fn main() {
                         "Other contributors run `tracevault init` to set up their own local hooks."
                     );
                 }
-                Err(e) => eprintln!("Error: {e}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Cli::Status { session_id } => {

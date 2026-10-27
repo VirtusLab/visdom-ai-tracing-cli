@@ -40,14 +40,21 @@ Then start a new Claude Code session in the repo. Its sessions are captured and 
 the server as they happen.
 
 **Log in before `init`.** `init` registers the repo with the server and writes the repo's
-server id (`repo_id`) into `.tracevault/config.toml` only when you are already logged in. The
-hooks send events under that id; without it — and without any of the workspace-mode bindings
-described [below](#every-session-on-the-machine----global) — they send nothing. Run without
-credentials, `init` still installs the hooks and exits successfully, printing only
-`Not logged in. Run 'tracevault login' to register this repo with the server.` — and the hooks
-then drop every event silently. If that happened, log in and run `tracevault sync` in the repo: it
-registers the repo and writes the missing `repo_id`. (Re-running `tracevault init` also works,
-but it rewrites `.tracevault/config.toml` from defaults, dropping anything you changed there.)
+server id (`repo_id`) into `.tracevault/config.toml`; the hooks send events under that id, and
+without it — and without any of the workspace-mode bindings described
+[below](#every-session-on-the-machine----global) — they send nothing. So per-repo `init` refuses
+to run without credentials (a login, or an API key in `TRACEVAULT_API_KEY`): it exits 1 before
+installing anything and prints the commands to run instead:
+
+```sh
+tracevault login --server-url https://your-tracevault-server.example.com
+tracevault init
+```
+
+(With `--server-url`, or `TRACEVAULT_SERVER_URL` set, the printed `login` command carries that
+URL.) A repo set up by an older CLI, which installed the hooks without a login and exited 0, has
+hooks but no `repo_id`: log in and run `tracevault sync` in the repo — it registers the repo and
+writes the missing `repo_id`. Events from before that were not recorded and cannot be recovered.
 
 ### Every session on the machine — `--global`
 
@@ -220,9 +227,10 @@ the force.
 
 `tracevault init` wires TraceVault into a repository: it installs the AI-agent hooks that
 capture sessions, adds git hooks (a pre-push policy check and a post-commit metadata push),
-creates `.tracevault/`, and — when you are logged in and the repo has an `origin` remote —
-registers the repo with the server and stores its `repo_id` in `.tracevault/config.toml`
-(see [Quick start](#one-repository) for what happens otherwise). Run it once per repo, from the
+creates `.tracevault/`, and — when the repo has an `origin` remote — registers the repo with
+the server and stores its `repo_id` in `.tracevault/config.toml`. It needs a login (or
+`TRACEVAULT_API_KEY`) and fails with exit code 1, installing nothing, without one (see
+[Quick start](#one-repository)). Every `init` error exits 1. Run it once per repo, from the
 root of the primary checkout (not a linked worktree).
 
 If the server already has a repo record for the checkout's remote, `init` binds to it instead of
