@@ -12,7 +12,7 @@
 //! (network, server error, timeout) records nothing, so a later hook retries.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::api_client::ApiClient;
 use crate::resolution::{
@@ -20,7 +20,8 @@ use crate::resolution::{
 };
 use crate::session_state::{RepoBinding, SessionState};
 
-/// Cap on the server lookup, which runs inside a hook with a 10 s timeout.
+/// Cap on the server lookup, which runs inside a hook with a 10 s timeout;
+/// the caller's deadline can shorten it further.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What the server says about a checkout's origin remote.
@@ -92,13 +93,15 @@ pub(crate) struct AutoBind {
 
 /// Bind session `session_id` (stored under `sessions_dir`) to the repo of the
 /// checkout at `cwd`, if it has an origin remote the server knows. Callers run
-/// this only when the session resolves to no repo. Never fails: anything that
-/// goes wrong leaves the session unbound.
+/// this only when the session resolves to no repo. The lookup gives up at
+/// `deadline` (the hook's own budget). Never fails: anything that goes wrong
+/// leaves the session unbound.
 pub(crate) async fn bind_session_in(
     sessions_dir: &Path,
     session_id: &str,
     cwd: &Path,
     client: &ApiClient,
+    deadline: Instant,
 ) -> AutoBind {
     let Some(git_url) = git_remote_url(cwd) else {
         return AutoBind::default();
@@ -109,26 +112,30 @@ pub(crate) async fn bind_session_in(
     ) {
         return AutoBind::default();
     }
-    let lookup = match tokio::time::timeout(LOOKUP_TIMEOUT, look_up(cwd, &git_url, client)).await {
+    let budget = LOOKUP_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+    let lookup = match tokio::time::timeout(budget, look_up(cwd, &git_url, client)).await {
         Ok(Ok(lookup)) => lookup,
         Ok(Err(_)) | Err(_) => return AutoBind::default(),
     };
-    // Reload right before saving, so a `repo switch` that ran during the
-    // lookup is not reverted.
+    // Reload after the lookup: a `repo switch` or `repo reset` that ran
+    // meanwhile, or a concurrent hook that already recorded this remote,
+    // wins over this lookup's result.
     let mut state = crate::session_state::load_from(sessions_dir, session_id);
+    if !wants_lookup(&state, &git_url) {
+        return AutoBind {
+            binding: state.active,
+            notice: None,
+        };
+    }
     let result = match lookup {
         Lookup::Bound(binding) => {
-            let binding = state.active.get_or_insert(binding).clone();
+            state.active = Some(binding.clone());
             AutoBind {
                 binding: Some(binding),
                 notice: None,
             }
         }
         Lookup::Unregistered(notice) | Lookup::Ambiguous(notice) => {
-            if state.auto_bind_checked.contains(&git_url) {
-                // A concurrent hook already said so.
-                return AutoBind::default();
-            }
             state.auto_bind_checked.push(git_url);
             AutoBind {
                 binding: None,
@@ -143,9 +150,14 @@ pub(crate) async fn bind_session_in(
 }
 
 /// [`bind_session_in`] for the session state in its usual place.
-pub(crate) async fn bind_session(session_id: &str, cwd: &Path, client: &ApiClient) -> AutoBind {
+pub(crate) async fn bind_session(
+    session_id: &str,
+    cwd: &Path,
+    client: &ApiClient,
+    deadline: Instant,
+) -> AutoBind {
     match crate::session_state::sessions_dir() {
-        Some(dir) => bind_session_in(&dir, session_id, cwd, client).await,
+        Some(dir) => bind_session_in(&dir, session_id, cwd, client, deadline).await,
         None => AutoBind::default(),
     }
 }
@@ -213,6 +225,10 @@ mod tests {
         http_json("404 Not Found", r#"{"error":"No remote for that URL"}"#)
     }
 
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(10)
+    }
+
     fn state(sessions: &Path) -> SessionState {
         crate::session_state::load_from(sessions, SESSION)
     }
@@ -224,7 +240,7 @@ mod tests {
         let (base, _rx) = spawn_seq(vec![resolved(), detail(&[(LOW, "repo")])]);
         let client = ApiClient::new(&base, Some("tok"));
 
-        let got = bind_session_in(sessions.path(), SESSION, repo.path(), &client).await;
+        let got = bind_session_in(sessions.path(), SESSION, repo.path(), &client, later()).await;
 
         let binding = got.binding.expect("bound");
         assert_eq!(binding.repo_id, LOW);
@@ -243,8 +259,8 @@ mod tests {
         let (base, rx) = spawn_seq(vec![resolved(), detail(&[(LOW, "repo")])]);
         let client = ApiClient::new(&base, Some("tok"));
 
-        bind_session_in(sessions.path(), SESSION, repo.path(), &client).await;
-        let again = bind_session_in(sessions.path(), SESSION, repo.path(), &client).await;
+        bind_session_in(sessions.path(), SESSION, repo.path(), &client, later()).await;
+        let again = bind_session_in(sessions.path(), SESSION, repo.path(), &client, later()).await;
 
         assert!(again.binding.is_none() && again.notice.is_none());
         assert_eq!(rx.try_iter().count(), 2, "one lookup: resolve + detail");
@@ -257,8 +273,8 @@ mod tests {
         let (base, rx) = spawn_seq(vec![not_found()]);
         let client = ApiClient::new(&base, Some("tok"));
 
-        let first = bind_session_in(sessions.path(), SESSION, repo.path(), &client).await;
-        let second = bind_session_in(sessions.path(), SESSION, repo.path(), &client).await;
+        let first = bind_session_in(sessions.path(), SESSION, repo.path(), &client, later()).await;
+        let second = bind_session_in(sessions.path(), SESSION, repo.path(), &client, later()).await;
 
         assert!(first.binding.is_none());
         let notice = first.notice.expect("said once");
@@ -280,7 +296,7 @@ mod tests {
         let (base, _rx) = spawn_seq(vec![resolved(), detail(&[])]);
         let client = ApiClient::new(&base, Some("tok"));
 
-        let got = bind_session_in(sessions.path(), SESSION, repo.path(), &client).await;
+        let got = bind_session_in(sessions.path(), SESSION, repo.path(), &client, later()).await;
 
         assert!(got.binding.is_none());
         assert!(got.notice.unwrap().contains("not registered"));
@@ -302,7 +318,7 @@ mod tests {
         ]);
         let client = ApiClient::new(&base, Some("tok"));
 
-        let got = bind_session_in(sessions.path(), SESSION, repo.path(), &client).await;
+        let got = bind_session_in(sessions.path(), SESSION, repo.path(), &client, later()).await;
 
         assert_eq!(got.binding.unwrap().repo_id, HIGH);
     }
@@ -314,7 +330,7 @@ mod tests {
         let (base, _rx) = spawn_seq(vec![resolved(), detail(&[(LOW, "a"), (HIGH, "b")])]);
         let client = ApiClient::new(&base, Some("tok"));
 
-        let got = bind_session_in(sessions.path(), SESSION, repo.path(), &client).await;
+        let got = bind_session_in(sessions.path(), SESSION, repo.path(), &client, later()).await;
 
         assert!(got.binding.is_none());
         let notice = got.notice.unwrap();
@@ -328,10 +344,117 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let client = ApiClient::new("http://127.0.0.1:1", Some("tok"));
 
-        let got = bind_session_in(sessions.path(), SESSION, repo.path(), &client).await;
+        let got = bind_session_in(sessions.path(), SESSION, repo.path(), &client, later()).await;
 
         assert!(got.binding.is_none() && got.notice.is_none());
         assert_eq!(state(sessions.path()), SessionState::default());
+    }
+
+    #[tokio::test]
+    async fn a_spent_deadline_skips_the_lookup_and_records_nothing() {
+        let repo = checkout("git@github.com:org/repo.git");
+        let sessions = tempfile::tempdir().unwrap();
+        let (base, rx) = spawn_seq(vec![resolved(), detail(&[(LOW, "repo")])]);
+        let client = ApiClient::new(&base, Some("tok"));
+
+        let got = bind_session_in(
+            sessions.path(),
+            SESSION,
+            repo.path(),
+            &client,
+            Instant::now(),
+        )
+        .await;
+
+        assert!(got.binding.is_none() && got.notice.is_none());
+        assert_eq!(state(sessions.path()), SessionState::default());
+        assert_eq!(rx.try_iter().count(), 0);
+    }
+
+    /// Serve `responses` in order, running `during` (another writer of the
+    /// session state) before answering the first request — i.e. while the
+    /// lookup is in flight.
+    fn spawn_with_concurrent_write(
+        responses: Vec<String>,
+        during: impl FnOnce() + Send + 'static,
+    ) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut during = Some(during);
+            for response in responses {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                    line.clear();
+                }
+                if let Some(f) = during.take() {
+                    f();
+                }
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn a_repo_reset_during_the_lookup_keeps_the_session_unbound() {
+        let repo = checkout("git@github.com:org/repo.git");
+        let sessions = tempfile::tempdir().unwrap();
+        let dir = sessions.path().to_path_buf();
+        let base = spawn_with_concurrent_write(vec![resolved(), detail(&[(LOW, "repo")])], {
+            let dir = dir.clone();
+            move || {
+                let reset = SessionState {
+                    auto_bind_off: true,
+                    ..Default::default()
+                };
+                crate::session_state::save_to(&dir, SESSION, &reset).unwrap();
+            }
+        });
+        let client = ApiClient::new(&base, Some("tok"));
+
+        let got = bind_session_in(&dir, SESSION, repo.path(), &client, later()).await;
+
+        assert!(got.binding.is_none());
+        let st = state(&dir);
+        assert!(st.active.is_none() && st.auto_bind_off);
+    }
+
+    #[tokio::test]
+    async fn a_repo_switch_during_the_lookup_wins() {
+        let repo = checkout("git@github.com:org/repo.git");
+        let sessions = tempfile::tempdir().unwrap();
+        let dir = sessions.path().to_path_buf();
+        let switched = RepoBinding {
+            repo_id: HIGH.into(),
+            git_url: None,
+            remote_id: None,
+            codebase_name: None,
+            updated_at: String::new(),
+        };
+        let base = spawn_with_concurrent_write(vec![resolved(), detail(&[(LOW, "repo")])], {
+            let dir = dir.clone();
+            let switched = switched.clone();
+            move || {
+                let state = SessionState {
+                    active: Some(switched),
+                    ..Default::default()
+                };
+                crate::session_state::save_to(&dir, SESSION, &state).unwrap();
+            }
+        });
+        let client = ApiClient::new(&base, Some("tok"));
+
+        let got = bind_session_in(&dir, SESSION, repo.path(), &client, later()).await;
+
+        assert_eq!(got.binding.as_ref(), Some(&switched));
+        assert_eq!(state(&dir).active, Some(switched));
     }
 
     #[tokio::test]
@@ -342,7 +465,7 @@ mod tests {
         // Nothing listens here: a lookup would fail, not hang, but must not happen.
         let client = ApiClient::new("http://127.0.0.1:1", Some("tok"));
 
-        let got = bind_session_in(sessions.path(), SESSION, repo.path(), &client).await;
+        let got = bind_session_in(sessions.path(), SESSION, repo.path(), &client, later()).await;
 
         assert!(got.binding.is_none() && got.notice.is_none());
         assert_eq!(state(sessions.path()), SessionState::default());

@@ -169,9 +169,21 @@ impl Fixture {
         }
     }
 
-    /// Run `tracevault <args>` as a hook for `hook_event_name`: returns
-    /// (exit code, stdout, stderr).
+    /// Run `tracevault <args>` as a hook for `hook_event_name`, with the
+    /// server and key in `TRACEVAULT_*`: returns (exit code, stdout, stderr).
     fn run(&self, args: &[&str], hook_event_name: &str, base: &str) -> (i32, String, String) {
+        self.run_with(args, hook_event_name, base, true)
+    }
+
+    /// [`Self::run`]; with `env_credentials` false the server and key come
+    /// from the credentials file `tracevault login` writes instead.
+    fn run_with(
+        &self,
+        args: &[&str],
+        hook_event_name: &str,
+        base: &str,
+        env_credentials: bool,
+    ) -> (i32, String, String) {
         let event = serde_json::json!({
             "session_id": SESSION_ID,
             "transcript_path": "",
@@ -179,14 +191,27 @@ impl Fixture {
             "hook_event_name": hook_event_name,
             "tool_name": "Bash",
         });
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tracevault"))
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tracevault"));
+        if env_credentials {
+            cmd.env("TRACEVAULT_SERVER_URL", base)
+                .env("TRACEVAULT_API_KEY", "tvk_test");
+        } else {
+            let dir = self.home.join(".config").join("tracevault");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("credentials.json"),
+                serde_json::json!({ "server_url": base, "token": "tvk_test" }).to_string(),
+            )
+            .unwrap();
+            cmd.env_remove("TRACEVAULT_SERVER_URL")
+                .env_remove("TRACEVAULT_API_KEY");
+        }
+        let mut child = cmd
             .args(args)
             .current_dir(&self.repo)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_STATE_HOME", &self.state)
-            .env("TRACEVAULT_SERVER_URL", base)
-            .env("TRACEVAULT_API_KEY", "tvk_test")
             .env_remove("TRACEVAULT_SESSION_ID")
             .env_remove("TRACEVAULT_PROJECT")
             .env_remove("TRACEVAULT_PROJECT_ATTRIBUTION")
@@ -265,6 +290,20 @@ fn session_start_binds_a_registered_checkout_and_events_follow() {
         requests,
         vec![format!("POST /api/v1/repos/{REPO_ID}/stream HTTP/1.1")]
     );
+}
+
+/// The acceptance path as a user has it: `login` wrote a credentials file,
+/// nothing is in the environment.
+#[test]
+fn a_login_credentials_file_is_enough_to_bind() {
+    let fx = Fixture::new("git@github.com:org/repo.git");
+
+    let (base, rx) = spawn_server(vec![resolved(), detail(), policies(), accepted()]);
+    let (code, stdout, stderr) = fx.run_with(&["session-start"], "SessionStart", &base, false);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(rx.try_iter().count(), 3);
+    assert!(stdout.contains("POLICY TEXT"), "stdout: {stdout}");
+    assert!(fx.session_state().contains(REPO_ID));
 }
 
 #[test]

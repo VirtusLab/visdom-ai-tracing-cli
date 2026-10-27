@@ -62,6 +62,10 @@ impl HookOutput {
     }
 }
 
+/// How long `resolve_and_inject` may spend on the network, kept under the
+/// hooks' 10 s timeout: a hook killed at its timeout prints no allow response.
+const HOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// Maximum additionalContext size (CC guidance). Larger → truncated.
 const MAX_CONTEXT: usize = 10_000;
 
@@ -155,6 +159,7 @@ async fn fetch_context(client: &ApiClient, event: &str, repo_id: uuid::Uuid) -> 
 /// hook-specific steps happen around it (SessionStart also writes the session
 /// env file, which stays in `session_start.rs`).
 pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + HOOK_BUDGET;
     let event = hook_event.hook_event_name.as_str();
     let hook_cwd = Path::new(&hook_event.cwd);
     let project_root = crate::paths::resolve_project_root(hook_cwd).root;
@@ -181,7 +186,8 @@ pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn st
         {
             let client = ApiClient::with_credential(&server_url, credential);
             let auto =
-                crate::auto_bind::bind_session(&hook_event.session_id, hook_cwd, &client).await;
+                crate::auto_bind::bind_session(&hook_event.session_id, hook_cwd, &client, deadline)
+                    .await;
             binding = auto.binding;
             notice = auto.notice;
         }
@@ -222,7 +228,12 @@ pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn st
     };
     let client = ApiClient::with_credential(&server_url, credential);
 
-    match fetch_context(&client, event, repo_uuid).await {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let fetched = tokio::time::timeout(remaining, fetch_context(&client, event, repo_uuid))
+        .await
+        .ok()
+        .flatten();
+    match fetched {
         Some(output) => {
             println!("{}", serde_json::to_string(&output)?);
             // Best-effort: persist the last-injected repo so a later

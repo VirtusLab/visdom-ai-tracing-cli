@@ -1247,7 +1247,8 @@ pub async fn run_stream(
     if binding.is_none() {
         if let Some(client) = &client {
             let auto =
-                crate::auto_bind::bind_session(&hook_event.session_id, hook_cwd, client).await;
+                crate::auto_bind::bind_session(&hook_event.session_id, hook_cwd, client, deadline)
+                    .await;
             if let Some(notice) = auto.notice {
                 eprintln!("{notice}");
             }
