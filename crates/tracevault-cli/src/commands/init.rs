@@ -113,12 +113,16 @@ pub fn validate_init_flags(
     Ok(())
 }
 
+/// Set up TraceVault in `project_root`. An existing `.tracevault/config.toml`
+/// is kept and only overridden where this run says so: `server_url` and
+/// `user_context` (`None` = no flag given) replace the stored values; every
+/// other field, and any field not overridden, survives (VIS-1046).
 pub async fn init_in_directory(
     project_root: &Path,
     server_url: Option<&str>,
     claude_settings: Option<ClaudeSettingsTarget>,
     no_gitignore: bool,
-    user_context: UserContext,
+    user_context: Option<UserContext>,
     agent: crate::agent::Agent,
 ) -> Result<String, io::Error> {
     // Check for git repository
@@ -145,14 +149,26 @@ pub async fn init_in_directory(
         ));
     }
 
+    // Re-running `init` keeps the existing config (VIS-1046), so one that
+    // cannot be parsed stops it here, before anything is written: replacing
+    // it with defaults would throw away whatever the user had in it.
+    let existing_config = TracevaultConfig::try_load(project_root).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "cannot read the existing .tracevault/config.toml ({e}). Fix or remove it, \
+                 then run `tracevault init` again."
+            ),
+        )
+    })?;
+
     // Credentials are resolved before anything is written. Without one the
     // repo is never registered, no `repo_id` is persisted, and the hooks
     // installed below would drop every event silently — so `init` refuses
     // instead of leaving a setup that looks installed but records nothing
     // (VIS-1045). A credential/URL mismatch aborts `init` too: it would
     // otherwise register the repo against whichever instance the env var
-    // names while holding another instance's session. Resolved once, here:
-    // the config rewrite below drops a hand-written `api_key`.
+    // names while holding another instance's session.
     // `io::Error::other` because this function's error type is `io::Error`.
     let (resolved_url, resolved_credential) =
         crate::credentials::resolve_credentials_quiet(project_root)
@@ -208,22 +224,25 @@ pub async fn init_in_directory(
         eprintln!("Run 'git remote add origin <url>' then 'tracevault sync' to register.");
     }
 
-    // The repo a previous `init` bound, read before the config is rewritten:
-    // re-running `init` keeps it if its codebase still links it.
-    let previous_repo_id = TracevaultConfig::load(project_root)
-        .and_then(|c| c.repo_id)
-        .and_then(|id| id.parse::<uuid::Uuid>().ok());
-
-    // Write config (include server_url if available)
-    let mut config = TracevaultConfig::default();
+    // Write config: the existing one with this run's flags applied, defaults
+    // only for what it lacks (`user_context` on, unless a flag says
+    // otherwise). Its `repo_id` stays in the file until registration below
+    // binds another one, so a re-run that cannot reach the server keeps it.
+    let mut config = existing_config.unwrap_or_default();
     if let Some(url) = server_url {
         config.server_url = Some(url.to_string());
     }
-    config.user_context = Some(user_context);
-    fs::write(
-        TracevaultConfig::config_path(project_root),
-        config.to_toml(),
-    )?;
+    config.user_context = user_context
+        .or(config.user_context)
+        .or(Some(UserContext::Toggle(true)));
+    config.save(project_root)?;
+
+    // The repo a previous `init` bound: re-running `init` keeps it if its
+    // codebase still links it.
+    let previous_repo_id = config
+        .repo_id
+        .as_deref()
+        .and_then(|id| id.parse::<uuid::Uuid>().ok());
 
     // Install the selected agent's hooks.
     match agent {
@@ -362,7 +381,7 @@ pub(crate) fn persist_repo_binding(
         cfg.remote_id = Some(remote.remote_id.to_string());
         cfg.codebase_name = remote.name.clone();
     }
-    fs::write(TracevaultConfig::config_path(project_root), cfg.to_toml()).is_ok()
+    cfg.save(project_root).is_ok()
 }
 
 /// Register a repo for a remote the server has no live repo for, and persist
@@ -403,7 +422,7 @@ async fn register_new_repo(
                     cfg.remote_id = Some(remote.remote_id.to_string());
                     cfg.codebase_name = remote.name.clone();
                 }
-                let _ = fs::write(TracevaultConfig::config_path(project_root), cfg.to_toml());
+                let _ = cfg.save(project_root);
             }
         }
         Err(e) => {
@@ -2352,7 +2371,7 @@ mod tests {
             None,
             None,
             false,
-            crate::config::UserContext::Toggle(false),
+            Some(crate::config::UserContext::Toggle(false)),
             crate::agent::Agent::Codex,
         )
         .await
@@ -2407,7 +2426,7 @@ mod tests {
             Some(&base),
             None,
             true,
-            crate::config::UserContext::Toggle(false),
+            Some(crate::config::UserContext::Toggle(false)),
             crate::agent::Agent::Codex,
         )
         .await
@@ -2449,7 +2468,7 @@ mod tests {
             Some(&base),
             None,
             true,
-            crate::config::UserContext::Toggle(false),
+            Some(crate::config::UserContext::Toggle(false)),
             crate::agent::Agent::Codex,
         )
         .await
@@ -2601,7 +2620,7 @@ mod tests {
             Some(&base),
             None,
             true,
-            crate::config::UserContext::Toggle(false),
+            Some(crate::config::UserContext::Toggle(false)),
             crate::agent::Agent::Codex,
         )
         .await
@@ -2680,6 +2699,61 @@ mod tests {
                 resolve_remote_ok(),
                 remote_detail(&[(CANONICAL, "tracevault"), (STRAY, "tracing-old")]),
             ],
+        )
+        .await;
+
+        assert_eq!(repo_id.as_deref(), Some(STRAY));
+        assert!(!registered(&requests));
+    }
+
+    /// Recording the binding keeps the rest of the config, including a
+    /// hand-written `api_key` the struct never serializes (VIS-1046).
+    #[tokio::test]
+    async fn init_binding_keeps_the_rest_of_the_config() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        add_origin_remote(tmp.path(), "git@github.com:org/repo.git");
+        fs::create_dir_all(tmp.path().join(".tracevault")).unwrap();
+        fs::write(
+            tmp.path().join(".tracevault/config.toml"),
+            "api_key = \"tvk_kept\"\ndefault_project = \"payments\"\nuser_context = false\n",
+        )
+        .unwrap();
+
+        let (repo_id, _) = init_against(
+            tmp.path(),
+            vec![
+                resolve_remote_ok(),
+                remote_detail(&[(CANONICAL, "tracevault")]),
+            ],
+        )
+        .await;
+
+        assert_eq!(repo_id.as_deref(), Some(CANONICAL));
+        let cfg = crate::config::TracevaultConfig::load(tmp.path()).unwrap();
+        assert_eq!(cfg.api_key.as_deref(), Some("tvk_kept"));
+        assert_eq!(cfg.default_project.as_deref(), Some("payments"));
+    }
+
+    /// A re-run that cannot reach the server keeps the bound `repo_id`: it is
+    /// never dropped, not even until registration would re-add it.
+    #[tokio::test]
+    async fn init_rerun_keeps_repo_id_when_the_server_check_fails() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_helpers::init_git_repo(tmp.path());
+        add_origin_remote(tmp.path(), "git@github.com:org/repo.git");
+        fs::create_dir_all(tmp.path().join(".tracevault")).unwrap();
+        fs::write(
+            tmp.path().join(".tracevault/config.toml"),
+            format!("repo_id = \"{STRAY}\"\n"),
+        )
+        .unwrap();
+
+        let (repo_id, requests) = init_against(
+            tmp.path(),
+            vec![http_response("500 Internal Server Error", "{}")],
         )
         .await;
 

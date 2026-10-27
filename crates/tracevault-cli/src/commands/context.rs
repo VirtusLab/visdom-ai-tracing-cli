@@ -598,7 +598,7 @@ pub fn run_source(
     };
     config.user_context = Some(new_user_context);
 
-    std::fs::write(TracevaultConfig::config_path(&root), config.to_toml())?;
+    config.save(&root)?;
     println!("Updated user_context.");
     Ok(())
 }
