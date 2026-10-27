@@ -94,7 +94,8 @@ enum Cli {
         #[arg(long, value_enum, default_value = "claude-code")]
         agent: crate::agent::Agent,
     },
-    /// SessionStart hook: exports the session id and injects the bound repo's
+    /// SessionStart hook: exports the session id, binds an unbound session to
+    /// the repo of its checkout's origin remote, and injects the bound repo's
     /// policies as additionalContext. Installed by `tracevault init` (per-repo
     /// or --global) into the Claude Code settings or the Codex hooks.json —
     /// not intended to be run manually.

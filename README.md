@@ -120,7 +120,8 @@ events arrived:
 - Outside an agent session, `Recording` answers "will a new session in this checkout record?",
   using the same resolution as the capture hook: `✗` when `config.toml` has no usable
   `repo_id` and nothing else binds the checkout, `!` when nothing binds it at all (normal in
-  workspace mode, where each session binds itself with `repo switch`).
+  workspace mode, where each session is bound by its hooks from the checkout's `origin`
+  remote, or with `repo switch`).
 - Inside an agent session (or with `--session-id <id>`), `Recording` checks that session's
   binding instead: `✗ Recording — nothing will be recorded` means the session is bound to
   neither a repo nor a project.

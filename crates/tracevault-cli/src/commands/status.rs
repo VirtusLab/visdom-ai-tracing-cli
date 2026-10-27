@@ -853,8 +853,9 @@ fn recording_check(
 ///   `Warn` when a project still catches the events (they ship, but not to
 ///   this repo) — the bound-mode user asked for repo attribution;
 /// - no config and nothing resolved → `Warn`, not `Error`: in workspace mode
-///   each session binds itself with `repo switch`, so this is the expected
-///   state of a plain terminal, but the user should still be told.
+///   each session is bound by its hooks from the checkout's origin remote
+///   (`auto_bind`) or by `repo switch`, so this is the expected state of a
+///   plain terminal, but the user should still be told.
 fn checkout_recording_check(
     attribution: Option<&crate::commands::stream::Attribution>,
     config: Option<&TracevaultConfig>,
@@ -891,7 +892,7 @@ fn checkout_recording_check(
         ),
         (None, None) => Check::warn(
             LABEL,
-            "no session named and nothing binds this checkout — a new session here records nothing until it runs `tracevault repo switch <path>` (or bind machine-wide with `tracevault repo switch --user <path>` / `tracevault project switch --user \"<name>\"`)",
+            "no session named and nothing binds this checkout locally — a new session here is bound by its hooks to the repo of this checkout's origin remote if the server has it registered (otherwise run `tracevault sync` while logged in), or by `tracevault repo switch <path>`",
         ),
     }
 }
@@ -2497,8 +2498,9 @@ mod tests {
 
         let check = checkout_verdict(None);
         assert_eq!(check.level, Level::Warn);
+        // Says what will bind a new session: its checkout's remote (VIS-1048).
         assert!(
-            check.detail.contains("records nothing"),
+            check.detail.contains("origin remote") && check.detail.contains("tracevault sync"),
             "detail: {}",
             check.detail
         );
