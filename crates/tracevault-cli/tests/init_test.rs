@@ -12,13 +12,20 @@ use tracevault_cli::config::UserContext;
 fn tmp_git_repo() -> TempDir {
     let tmp = TempDir::new().unwrap();
     fs::create_dir(tmp.path().join(".git")).unwrap();
-    fs::create_dir(tmp.path().join(".tracevault")).unwrap();
+    give_api_key(tmp.path());
+    tmp
+}
+
+/// Put a credential into the repo's `.tracevault/config.toml`. `init`
+/// rewrites that file without `api_key` (VIS-1046), so a test that runs
+/// `init` twice restores it in between.
+fn give_api_key(root: &std::path::Path) {
+    fs::create_dir_all(root.join(".tracevault")).unwrap();
     fs::write(
-        tmp.path().join(".tracevault/config.toml"),
+        root.join(".tracevault/config.toml"),
         "api_key = \"tvk_test\"\n",
     )
     .unwrap();
-    tmp
 }
 
 /// A real git repo (`git init`) with an `origin` remote and nothing else —
@@ -115,6 +122,65 @@ fn init_without_credentials_names_the_known_server_url() {
         "stderr={stderr}"
     );
     assert!(!repo.path().join(".tracevault").exists());
+}
+
+/// A server URL from `TRACEVAULT_SERVER_URL` fills in the login hint too.
+#[test]
+fn init_without_credentials_names_the_env_server_url() {
+    let repo = real_git_repo_with_origin();
+    let home = TempDir::new().unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tracevault"))
+        .args(["init", "--claude-settings", "shared"])
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env_remove("TRACEVAULT_API_KEY")
+        .env("TRACEVAULT_SERVER_URL", "https://env.example.com")
+        .current_dir(repo.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run tracevault binary");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr={stderr}");
+    assert!(
+        stderr.contains("tracevault login --server-url https://env.example.com"),
+        "stderr={stderr}"
+    );
+}
+
+/// A refused `init` in an already set-up checkout touches nothing: config,
+/// agent settings, git hooks and `.gitignore` stay byte-for-byte as they were.
+#[test]
+fn init_without_credentials_leaves_existing_files_unchanged() {
+    let repo = real_git_repo_with_origin();
+    let home = TempDir::new().unwrap();
+    let files = [
+        (
+            ".tracevault/config.toml",
+            "agent = \"claude-code\"\nrepo_id = \"r\"\n",
+        ),
+        (".claude/settings.json", "{\"hooks\":{\"Stop\":[]}}\n"),
+        (".git/hooks/pre-push", "#!/bin/sh\necho mine\n"),
+        (".gitignore", "target/\n"),
+    ];
+    for (path, content) in files {
+        let p = repo.path().join(path);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, content).unwrap();
+    }
+
+    let output = run_init_isolated(repo.path(), home.path(), &["--claude-settings", "shared"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    for (path, content) in files {
+        assert_eq!(
+            fs::read_to_string(repo.path().join(path)).unwrap(),
+            content,
+            "{path} must be untouched"
+        );
+    }
+    assert!(!repo.path().join(".git/hooks/post-commit").exists());
 }
 
 /// Every `init` error exits non-zero, not only the not-logged-in one: the
@@ -432,6 +498,7 @@ async fn init_does_not_duplicate_hook_on_reinit() {
     )
     .await
     .unwrap();
+    give_api_key(tmp.path());
     tracevault_cli::commands::init::init_in_directory(
         tmp.path(),
         None,
@@ -489,6 +556,7 @@ async fn init_does_not_duplicate_post_commit_hook_on_reinit() {
     )
     .await
     .unwrap();
+    give_api_key(tmp.path());
     tracevault_cli::commands::init::init_in_directory(
         tmp.path(),
         None,
