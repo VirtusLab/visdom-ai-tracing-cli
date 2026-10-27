@@ -10,9 +10,10 @@ pub enum Agent {
     /// GSD (Get Shit Done) — runs on the pi coding-agent framework.
     #[value(alias = "gsd2")]
     Gsd,
-    /// OpenCode. Named explicitly: clap's default kebab-case derivation
-    /// would otherwise split the CamelCase word boundary into `open-code`,
-    /// not the single-word `opencode` the server/CLI convention expects.
+    /// OpenCode.
+    // Named explicitly: clap's default kebab-case derivation would otherwise
+    // split the CamelCase word boundary into `open-code`, not the single-word
+    // `opencode` the server/CLI convention expects.
     #[value(name = "opencode")]
     OpenCode,
 }

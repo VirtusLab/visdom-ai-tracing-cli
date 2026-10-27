@@ -384,8 +384,9 @@ tracevault context set --user --flow personal-defaults --label solo-dev --param 
 tracevault context update --user --remove-param editor
 ```
 
-`tracevault context show` prints every layer that's present (User, Global, This worktree)
-plus an Effective section that annotates each flow/label/param with the layer it resolved
+`tracevault context show` prints the User section (always — its header says whether the layer
+is enabled and which file it reads), Global, This worktree (linked worktrees only), plus an
+Effective section that annotates each flow/label/param with the layer it resolved
 from — useful for debugging why a value did or didn't win.
 
 **Examples**
