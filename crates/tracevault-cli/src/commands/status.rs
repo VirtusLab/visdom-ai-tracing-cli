@@ -462,7 +462,7 @@ fn global_hook_check_in(settings_path: &Path) -> Check {
 fn claude_telemetry_check_in(
     settings_path: &Path,
     server_url: Option<&str>,
-    process_env: &[(String, String)],
+    env: &crate::commands::claude_telemetry::Environment,
 ) -> Check {
     use crate::commands::claude_telemetry::{inspect, logs_endpoint, TelemetryState};
     const LABEL: &str = "Claude Code telemetry";
@@ -477,7 +477,7 @@ fn claude_telemetry_check_in(
         Err(e) => return Check::warn(LABEL, format!("cannot read ~/.claude/settings.json: {e}")),
     };
     let expected = server_url.map(logs_endpoint);
-    match inspect(&settings, process_env, expected.as_deref()) {
+    match inspect(&settings, env, expected.as_deref()) {
         TelemetryState::Off => Check::skip(
             LABEL,
             "off (enable with `tracevault init --claude-telemetry`)",
@@ -1471,7 +1471,7 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
         Some(p) => claude_telemetry_check_in(
             p,
             auth.server_url.as_deref(),
-            &crate::commands::claude_telemetry::otel_process_env(),
+            &crate::commands::claude_telemetry::Environment::current(p.parent().unwrap_or(p)),
         ),
         None => Check::skip("Claude Code telemetry", "cannot determine home directory"),
     };
@@ -1913,12 +1913,24 @@ mod tests {
         let server = Some("https://tv.example.com");
 
         // No settings file: off.
-        let c = claude_telemetry_check_in(&p, server, &[]);
+        let c = claude_telemetry_check_in(
+            &p,
+            server,
+            &crate::commands::claude_telemetry::Environment::default(),
+        );
         assert_eq!(c.level, Level::Skip, "{c:?}");
 
-        crate::commands::claude_telemetry::install(dir.path(), "https://tv.example.com", &[])
-            .unwrap();
-        let c = claude_telemetry_check_in(&p, server, &[]);
+        crate::commands::claude_telemetry::install(
+            dir.path(),
+            "https://tv.example.com",
+            &crate::commands::claude_telemetry::Environment::default(),
+        )
+        .unwrap();
+        let c = claude_telemetry_check_in(
+            &p,
+            server,
+            &crate::commands::claude_telemetry::Environment::default(),
+        );
         assert_eq!(c.level, Level::Ok, "{c:?}");
         assert!(
             c.detail.contains("https://tv.example.com/otlp/v1/logs"),
@@ -1926,23 +1938,36 @@ mod tests {
         );
 
         // Logged in to another server than the one telemetry goes to.
-        let c = claude_telemetry_check_in(&p, Some("https://other.example.com"), &[]);
+        let c = claude_telemetry_check_in(
+            &p,
+            Some("https://other.example.com"),
+            &crate::commands::claude_telemetry::Environment::default(),
+        );
         assert_eq!(c.level, Level::Warn, "{c:?}");
 
         // Our helper plus someone else's exporter: our token leaks there.
-        let env = [("OTEL_METRICS_EXPORTER".to_string(), "otlp".to_string())];
+        let env = crate::commands::claude_telemetry::tests::shell("OTEL_METRICS_EXPORTER", "otlp");
         let c = claude_telemetry_check_in(&p, server, &env);
         assert_eq!(c.level, Level::Warn, "{c:?}");
 
         // Only someone else's exporter: legitimate, just not ours.
         std::fs::write(&p, r#"{"env":{"OTEL_LOGS_EXPORTER":"console"}}"#).unwrap();
-        let c = claude_telemetry_check_in(&p, server, &[]);
+        let c = claude_telemetry_check_in(
+            &p,
+            server,
+            &crate::commands::claude_telemetry::Environment::default(),
+        );
         assert_eq!(c.level, Level::Skip, "{c:?}");
         assert!(c.detail.contains("exported elsewhere"), "{c:?}");
 
         std::fs::write(&p, "{not json").unwrap();
         assert_eq!(
-            claude_telemetry_check_in(&p, server, &[]).level,
+            claude_telemetry_check_in(
+                &p,
+                server,
+                &crate::commands::claude_telemetry::Environment::default()
+            )
+            .level,
             Level::Warn
         );
     }

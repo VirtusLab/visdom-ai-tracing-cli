@@ -365,12 +365,16 @@ OpenTelemetry exporter settings in a repository's `.claude/settings*.json`:
   `--server-url` names a server other than the one you are logged in to.
 - Every other key in `settings.json` is kept, and re-running is a no-op. A re-run after logging
   in to another server moves the export there. Restart Claude Code to apply.
-- **An existing exporter setup is left alone.** If `~/.claude/settings.json` or the shell
-  environment already sets a log exporter other than `otlp`, a metrics or traces exporter, an
+- **An existing exporter setup is left alone.** If `~/.claude/settings.json`, the shell
+  environment, or managed settings (`managed-settings.json` and `managed-settings.d/` in Claude
+  Code's system directory, or the cached server-managed `~/.claude/remote-settings.json`)
+  already set a log exporter other than `otlp`, a metrics or traces exporter, an
   OTLP endpoint other than TraceVault's, static OTLP headers, a `BETA_TRACING_ENDPOINT`
   (detailed beta tracing sends logs there instead), or its own `otelHeadersHelper`,
   `init` changes nothing and prints the collector route below instead. Claude Code would send
-  the helper's token to every exporter it runs, so the two are never mixed.
+  the helper's token to every exporter it runs, so the two are never mixed. Managed settings
+  delivered only by an MDM profile or the Windows registry are not visible to `init`; if your
+  organisation configures Claude Code telemetry that way, use the collector route.
 - The server must run the OTLP receiver (`POST /otlp/v1/logs`, TraceVault server with
   VIS-1079) before you enable this; until then the exports are rejected and Claude Code shows
   an export warning.

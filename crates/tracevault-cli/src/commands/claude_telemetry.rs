@@ -86,43 +86,97 @@ fn as_text(value: &Value) -> String {
     }
 }
 
+/// What, besides `~/.claude/settings.json`, decides where Claude Code's
+/// telemetry goes: the managed settings Claude Code applies above the user's
+/// (each with a label naming its source), and the `OTEL_*` variables of the
+/// environment `init`/`status` runs in, which Claude Code also sees when
+/// started from it.
+#[derive(Debug, Default)]
+pub struct Environment {
+    pub managed: Vec<(String, Value)>,
+    pub shell: Vec<(String, String)>,
+}
+
+impl Environment {
+    /// This machine's: the file-based managed settings (`managed-settings.json`
+    /// and `managed-settings.d/*.json` in the system directory), the cached
+    /// server-managed settings (`<claude_dir>/remote-settings.json`), and the
+    /// process environment. MDM profiles and registry policies are not read.
+    pub fn current(claude_dir: &Path) -> Self {
+        let system_dir = if cfg!(target_os = "macos") {
+            Path::new("/Library/Application Support/ClaudeCode")
+        } else if cfg!(windows) {
+            Path::new(r"C:\Program Files\ClaudeCode")
+        } else {
+            Path::new("/etc/claude-code")
+        };
+        let mut files = vec![system_dir.join("managed-settings.json")];
+        if let Ok(entries) = fs::read_dir(system_dir.join("managed-settings.d")) {
+            let mut drop_ins: Vec<_> = entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.extension().is_some_and(|x| x == "json")
+                        && !p
+                            .file_name()
+                            .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+                })
+                .collect();
+            drop_ins.sort();
+            files.extend(drop_ins);
+        }
+        files.push(claude_dir.join("remote-settings.json"));
+        let managed = files
+            .into_iter()
+            .filter_map(|path| {
+                let doc = serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()?;
+                Some((path.display().to_string(), doc))
+            })
+            .collect();
+        Self {
+            managed,
+            shell: std::env::vars()
+                .filter(|(k, _)| k.starts_with("OTEL_") || k == "BETA_TRACING_ENDPOINT")
+                .collect(),
+        }
+    }
+}
+
 /// Exporter settings that are not TraceVault's, each described for the user
 /// (header values are never printed). `settings` is the parsed
-/// `~/.claude/settings.json`; `process_env` the `OTEL_*` variables of the
-/// environment `init`/`status` runs in, which Claude Code also sees when
-/// started from it. An endpoint counts as ours when it is `expected`, or the
-/// receiver of the server our helper names (an install for another server,
-/// which a re-run replaces). Detailed beta tracing is foreign too: with it,
-/// Claude Code sends its logs to `BETA_TRACING_ENDPOINT` instead.
+/// `~/.claude/settings.json`, `env` what else decides (see [`Environment`]).
+/// An endpoint counts as ours when it is `expected`, or the receiver of the
+/// server our helper names (an install for another server, which a re-run
+/// replaces). Detailed beta tracing is foreign too: with it, Claude Code sends
+/// its logs to `BETA_TRACING_ENDPOINT` instead.
 pub fn foreign_exporter_settings(
     settings: &Value,
-    process_env: &[(String, String)],
+    env: &Environment,
     expected_endpoint: Option<&str>,
 ) -> Vec<String> {
-    let helper = settings.get(HEADERS_HELPER);
-    let helper_endpoint = helper
+    let helper_endpoint = settings
+        .get(HEADERS_HELPER)
         .and_then(Value::as_str)
         .and_then(|h| h.strip_prefix(HELPER_PREFIX))
         .and_then(|rest| rest.trim().strip_prefix("--server-url "))
         .map(|server| logs_endpoint(server.trim()));
     let mut reasons = Vec::new();
-    if let Some(h) = helper.filter(|h| !is_our_helper(h)) {
-        reasons.push(format!(
-            "{HEADERS_HELPER} = `{}` (in ~/.claude/settings.json)",
-            as_text(h)
-        ));
+    let docs = std::iter::once(("~/.claude/settings.json", settings))
+        .chain(env.managed.iter().map(|(label, doc)| (label.as_str(), doc)));
+    let mut entries = Vec::new();
+    for (label, doc) in docs {
+        if let Some(h) = doc.get(HEADERS_HELPER).filter(|h| !is_our_helper(h)) {
+            reasons.push(format!("{HEADERS_HELPER} = `{}` (in {label})", as_text(h)));
+        }
+        if let Some(vars) = doc.get("env").and_then(Value::as_object) {
+            entries.extend(vars.iter().map(|(k, v)| (k.clone(), as_text(v), label)));
+        }
     }
-
-    let settings_env = settings
-        .get("env")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-        .map(|(k, v)| (k.clone(), as_text(v), "~/.claude/settings.json"));
-    let shell_env = process_env
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone(), "the shell environment"));
-    for (key, value, source) in settings_env.chain(shell_env) {
+    entries.extend(
+        env.shell
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone(), "the shell environment")),
+    );
+    for (key, value, source) in entries {
         let foreign = match key.as_str() {
             LOGS_EXPORTER => value != "otlp",
             "OTEL_METRICS_EXPORTER" | "OTEL_TRACES_EXPORTER" => {
@@ -147,13 +201,6 @@ pub fn foreign_exporter_settings(
     reasons
 }
 
-/// The `OTEL_*` (and beta tracing) variables of this process's environment.
-pub fn otel_process_env() -> Vec<(String, String)> {
-    std::env::vars()
-        .filter(|(k, _)| k.starts_with("OTEL_") || k == "BETA_TRACING_ENDPOINT")
-        .collect()
-}
-
 /// What `init --claude-telemetry` did to `~/.claude/settings.json`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum InstallOutcome {
@@ -169,7 +216,7 @@ pub enum InstallOutcome {
 pub fn merge_telemetry(
     settings: &mut Value,
     server_url: &str,
-    process_env: &[(String, String)],
+    env: &Environment,
 ) -> io::Result<InstallOutcome> {
     let endpoint = logs_endpoint(server_url);
     let root = settings.as_object_mut().ok_or_else(|| {
@@ -184,8 +231,7 @@ pub fn merge_telemetry(
             "~/.claude/settings.json \"env\" is not a JSON object",
         ));
     }
-    let reasons =
-        foreign_exporter_settings(&Value::Object(root.clone()), process_env, Some(&endpoint));
+    let reasons = foreign_exporter_settings(&Value::Object(root.clone()), env, Some(&endpoint));
     if !reasons.is_empty() {
         return Ok(InstallOutcome::Foreign(reasons));
     }
@@ -217,7 +263,7 @@ pub fn merge_telemetry(
 pub fn install(
     claude_dir: &Path,
     server_url: &str,
-    process_env: &[(String, String)],
+    env: &Environment,
 ) -> io::Result<InstallOutcome> {
     validate_server_url(server_url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     fs::create_dir_all(claude_dir)?;
@@ -225,7 +271,7 @@ pub fn install(
     let path = crate::commands::init::safe_join(&base, "settings.json")?;
     let mut outcome = InstallOutcome::Configured;
     crate::commands::init::update_json_file(&path, "Claude Code telemetry", |root| {
-        outcome = merge_telemetry(root, server_url, process_env)?;
+        outcome = merge_telemetry(root, server_url, env)?;
         Ok(())
     })?;
     Ok(outcome)
@@ -251,11 +297,11 @@ pub enum TelemetryState {
 
 pub fn inspect(
     settings: &Value,
-    process_env: &[(String, String)],
+    env: &Environment,
     expected_endpoint: Option<&str>,
 ) -> TelemetryState {
     let helper_ours = settings.get(HEADERS_HELPER).is_some_and(is_our_helper);
-    let reasons = foreign_exporter_settings(settings, process_env, expected_endpoint);
+    let reasons = foreign_exporter_settings(settings, env, expected_endpoint);
     if !reasons.is_empty() {
         return TelemetryState::Foreign {
             reasons,
@@ -382,7 +428,7 @@ pub fn is_off(claude_dir: &Path) -> bool {
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .unwrap_or_else(|| json!({}));
-    inspect(&settings, &otel_process_env(), None) == TelemetryState::Off
+    inspect(&settings, &Environment::current(claude_dir), None) == TelemetryState::Off
 }
 
 /// `tracevault otel-headers`: the JSON object Claude Code's
@@ -421,19 +467,26 @@ pub async fn otel_headers(cwd: &Path, server_url: Option<&str>) -> Result<String
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const SERVER: &str = "https://tv.example.com";
 
-    fn merged(mut settings: Value, env: &[(String, String)]) -> (Value, InstallOutcome) {
+    pub(crate) fn shell(key: &str, value: &str) -> Environment {
+        Environment {
+            shell: vec![(key.to_string(), value.to_string())],
+            ..Default::default()
+        }
+    }
+
+    fn merged(mut settings: Value, env: &Environment) -> (Value, InstallOutcome) {
         let outcome = merge_telemetry(&mut settings, SERVER, env).unwrap();
         (settings, outcome)
     }
 
     #[test]
     fn fresh_settings_get_env_and_helper() {
-        let (s, outcome) = merged(json!({}), &[]);
+        let (s, outcome) = merged(json!({}), &Environment::default());
         assert_eq!(outcome, InstallOutcome::Configured);
         assert_eq!(
             s,
@@ -461,7 +514,7 @@ mod tests {
                 "env": {"FOO": "bar", "CLAUDE_CODE_OTEL_HEADERS_HELPER_DEBOUNCE_MS": "60000",
                         "OTEL_METRICS_EXPORTER": "none"}
             }),
-            &[],
+            &Environment::default(),
         );
         assert_eq!(outcome, InstallOutcome::Configured);
         assert_eq!(s["model"], "opus");
@@ -475,8 +528,8 @@ mod tests {
 
     #[test]
     fn rerun_is_idempotent() {
-        let (once, _) = merged(json!({"a": 1}), &[]);
-        let (twice, outcome) = merged(once.clone(), &[]);
+        let (once, _) = merged(json!({"a": 1}), &Environment::default());
+        let (twice, outcome) = merged(once.clone(), &Environment::default());
         assert_eq!(outcome, InstallOutcome::Configured);
         assert_eq!(once, twice);
     }
@@ -484,8 +537,8 @@ mod tests {
     #[test]
     fn our_install_for_another_server_is_replaced() {
         let mut s = json!({});
-        merge_telemetry(&mut s, "https://old.example.com", &[]).unwrap();
-        let (s, outcome) = merged(s, &[]);
+        merge_telemetry(&mut s, "https://old.example.com", &Environment::default()).unwrap();
+        let (s, outcome) = merged(s, &Environment::default());
         assert_eq!(outcome, InstallOutcome::Configured);
         assert_eq!(
             s["env"][LOGS_ENDPOINT],
@@ -497,7 +550,7 @@ mod tests {
         );
     }
 
-    fn assert_left_alone(settings: Value, env: &[(String, String)], mentions: &str) {
+    fn assert_left_alone(settings: Value, env: &Environment, mentions: &str) {
         let (after, outcome) = merged(settings.clone(), env);
         assert_eq!(after, settings, "a foreign setup must not be touched");
         match outcome {
@@ -513,7 +566,7 @@ mod tests {
     fn foreign_logs_exporter_is_left_alone() {
         assert_left_alone(
             json!({"env": {"OTEL_LOGS_EXPORTER": "console"}}),
-            &[],
+            &Environment::default(),
             "OTEL_LOGS_EXPORTER=console",
         );
     }
@@ -525,7 +578,7 @@ mod tests {
                 "OTEL_LOGS_EXPORTER": "otlp",
                 "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "https://collector.corp/v1/logs"
             }}),
-            &[],
+            &Environment::default(),
             "https://collector.corp/v1/logs",
         );
     }
@@ -534,17 +587,17 @@ mod tests {
     fn generic_endpoint_metrics_and_static_headers_are_foreign() {
         assert_left_alone(
             json!({"env": {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4318"}}),
-            &[],
+            &Environment::default(),
             "OTEL_EXPORTER_OTLP_ENDPOINT",
         );
         assert_left_alone(
             json!({"env": {"OTEL_METRICS_EXPORTER": "otlp"}}),
-            &[],
+            &Environment::default(),
             "OTEL_METRICS_EXPORTER",
         );
         assert_left_alone(
             json!({"env": {"OTEL_EXPORTER_OTLP_HEADERS": "Authorization=Bearer secret"}}),
-            &[],
+            &Environment::default(),
             "OTEL_EXPORTER_OTLP_HEADERS is set",
         );
     }
@@ -554,33 +607,81 @@ mod tests {
         assert_left_alone(
             json!({"env": {"ENABLE_BETA_TRACING_DETAILED": "1",
                            "BETA_TRACING_ENDPOINT": "https://collector.corp"}}),
-            &[],
+            &Environment::default(),
             "BETA_TRACING_ENDPOINT",
         );
         assert_left_alone(
             json!({}),
-            &[(
-                "BETA_TRACING_ENDPOINT".to_string(),
-                "https://collector.corp".to_string(),
-            )],
+            &shell("BETA_TRACING_ENDPOINT", "https://collector.corp"),
             "BETA_TRACING_ENDPOINT",
         );
+    }
+
+    #[test]
+    fn exporter_in_managed_settings_is_foreign() {
+        // An organisation's metrics exporter would receive our helper's token.
+        let env = Environment {
+            managed: vec![(
+                "/etc/claude-code/managed-settings.json".to_string(),
+                json!({"env": {"OTEL_METRICS_EXPORTER": "otlp",
+                               "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "https://corp/v1/metrics"}}),
+            )],
+            ..Default::default()
+        };
+        assert_left_alone(json!({}), &env, "/etc/claude-code/managed-settings.json");
+
+        let helper = Environment {
+            managed: vec![(
+                "~/.claude/remote-settings.json".to_string(),
+                json!({"otelHeadersHelper": "/opt/corp/token"}),
+            )],
+            ..Default::default()
+        };
+        assert_left_alone(json!({}), &helper, "remote-settings.json");
+
+        // Managed settings that leave telemetry alone do not block it.
+        let unrelated = Environment {
+            managed: vec![(
+                "m".to_string(),
+                json!({"env": {"DISABLE_AUTOUPDATER": "1"}}),
+            )],
+            ..Default::default()
+        };
+        assert_eq!(merged(json!({}), &unrelated).1, InstallOutcome::Configured);
+    }
+
+    #[test]
+    fn environment_reads_drop_ins_and_the_server_managed_cache() {
+        // Only the cache under claude_dir is controllable here; the system
+        // directory is whatever this machine has, so assert on the cache.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("remote-settings.json"),
+            r#"{"env": {"OTEL_LOGS_EXPORTER": "console"}}"#,
+        )
+        .unwrap();
+        let env = Environment::current(dir.path());
+        assert!(env
+            .managed
+            .iter()
+            .any(|(label, doc)| label.ends_with("remote-settings.json")
+                && doc["env"]["OTEL_LOGS_EXPORTER"] == "console"));
     }
 
     #[test]
     fn a_receiver_path_on_another_host_is_not_ours() {
         // Our helper names tv.example.com; the user then pointed the
         // endpoint at their own collector, which happens to use our path.
-        let (mut s, _) = merged(json!({}), &[]);
+        let (mut s, _) = merged(json!({}), &Environment::default());
         s["env"][LOGS_ENDPOINT] = json!("https://collector.corp/otlp/v1/logs");
-        assert_left_alone(s, &[], "collector.corp");
+        assert_left_alone(s, &Environment::default(), "collector.corp");
     }
 
     #[test]
     fn foreign_header_values_are_never_reported() {
         let reasons = foreign_exporter_settings(
             &json!({"env": {"OTEL_EXPORTER_OTLP_HEADERS": "Authorization=Bearer secret"}}),
-            &[],
+            &Environment::default(),
             None,
         );
         assert!(reasons.iter().all(|r| !r.contains("secret")), "{reasons:?}");
@@ -590,7 +691,7 @@ mod tests {
     fn foreign_headers_helper_is_left_alone() {
         assert_left_alone(
             json!({"otelHeadersHelper": "/usr/local/bin/corp-otel-token"}),
-            &[],
+            &Environment::default(),
             "corp-otel-token",
         );
     }
@@ -599,18 +700,17 @@ mod tests {
     fn exporter_in_the_shell_environment_is_foreign() {
         assert_left_alone(
             json!({"model": "opus"}),
-            &[(
-                "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
-                "http://collector:4318".to_string(),
-            )],
+            &shell("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318"),
             "the shell environment",
         );
     }
 
     #[test]
     fn malformed_settings_are_an_error() {
-        assert!(merge_telemetry(&mut json!([]), SERVER, &[]).is_err());
-        assert!(merge_telemetry(&mut json!({"env": "x"}), SERVER, &[]).is_err());
+        assert!(merge_telemetry(&mut json!([]), SERVER, &Environment::default()).is_err());
+        assert!(
+            merge_telemetry(&mut json!({"env": "x"}), SERVER, &Environment::default()).is_err()
+        );
     }
 
     #[test]
@@ -619,7 +719,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         fs::write(&path, r#"{"model": "opus", "env": {"FOO": "1"}}"#).unwrap();
         assert_eq!(
-            install(dir.path(), SERVER, &[]).unwrap(),
+            install(dir.path(), SERVER, &Environment::default()).unwrap(),
             InstallOutcome::Configured
         );
         let first = fs::read_to_string(&path).unwrap();
@@ -627,20 +727,20 @@ mod tests {
         assert_eq!(v["model"], "opus");
         assert_eq!(v["env"]["FOO"], "1");
         assert_eq!(v["env"][ENABLE_TELEMETRY], "1");
-        install(dir.path(), SERVER, &[]).unwrap();
+        install(dir.path(), SERVER, &Environment::default()).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), first);
     }
 
     #[test]
     fn install_creates_settings_but_not_for_a_foreign_shell_setup() {
         let dir = tempfile::tempdir().unwrap();
-        let env = [("OTEL_LOGS_EXPORTER".to_string(), "console".to_string())];
+        let env = shell("OTEL_LOGS_EXPORTER", "console");
         assert!(matches!(
             install(dir.path(), SERVER, &env).unwrap(),
             InstallOutcome::Foreign(_)
         ));
         assert!(!dir.path().join("settings.json").exists());
-        install(dir.path(), SERVER, &[]).unwrap();
+        install(dir.path(), SERVER, &Environment::default()).unwrap();
         assert!(dir.path().join("settings.json").exists());
     }
 
@@ -653,27 +753,38 @@ mod tests {
             "ftp://tv.example.com",
             "not a url",
         ] {
-            assert!(install(dir.path(), bad, &[]).is_err(), "{bad}");
+            assert!(
+                install(dir.path(), bad, &Environment::default()).is_err(),
+                "{bad}"
+            );
         }
         assert!(!dir.path().join("settings.json").exists());
-        install(dir.path(), "http://localhost:3000/", &[]).unwrap();
+        install(
+            dir.path(),
+            "http://localhost:3000/",
+            &Environment::default(),
+        )
+        .unwrap();
     }
 
     #[test]
     fn inspect_reports_off_ours_incomplete_and_foreign() {
-        assert_eq!(inspect(&json!({}), &[], None), TelemetryState::Off);
+        assert_eq!(
+            inspect(&json!({}), &Environment::default(), None),
+            TelemetryState::Off
+        );
         assert_eq!(
             inspect(
                 &json!({"env": {"CLAUDE_CODE_ENABLE_TELEMETRY": "1"}}),
-                &[],
+                &Environment::default(),
                 None
             ),
             TelemetryState::Off
         );
 
-        let (configured, _) = merged(json!({}), &[]);
+        let (configured, _) = merged(json!({}), &Environment::default());
         assert_eq!(
-            inspect(&configured, &[], None),
+            inspect(&configured, &Environment::default(), None),
             TelemetryState::Ours {
                 endpoint: Some("https://tv.example.com/otlp/v1/logs".to_string()),
                 missing: vec![],
@@ -686,14 +797,14 @@ mod tests {
             .unwrap()
             .remove(LOGS_EXPORTER);
         assert!(matches!(
-            inspect(&incomplete, &[], None),
+            inspect(&incomplete, &Environment::default(), None),
             TelemetryState::Ours { missing, .. } if missing == vec![LOGS_EXPORTER]
         ));
 
         let mut also_metrics = configured;
         also_metrics["env"]["OTEL_METRICS_EXPORTER"] = json!("otlp");
         assert!(matches!(
-            inspect(&also_metrics, &[], None),
+            inspect(&also_metrics, &Environment::default(), None),
             TelemetryState::Foreign { ours_too: true, .. }
         ));
     }

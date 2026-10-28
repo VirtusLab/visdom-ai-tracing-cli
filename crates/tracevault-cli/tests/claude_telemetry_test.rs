@@ -12,13 +12,19 @@ use tempfile::TempDir;
 const SERVER: &str = "https://tv.example.com";
 
 fn run(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    run_in(home, home, args, env)
+}
+
+/// `stdin` is not a terminal here (`output()` closes it), so an `init`
+/// without `--claude-telemetry` never prompts.
+fn run_in(cwd: &Path, home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tracevault"));
     cmd.args(args)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
-        .current_dir(home);
+        .current_dir(cwd);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -211,6 +217,106 @@ fn global_init_leaves_a_foreign_exporter_alone_and_prints_the_collector_route() 
     let s = settings(home.path());
     assert_eq!(s["env"], foreign["env"]);
     assert!(s.get("otelHeadersHelper").is_none());
+}
+
+/// A git repo with no `origin` remote: `init` installs everything and skips
+/// server registration, so it makes no network call.
+fn git_repo() -> TempDir {
+    let repo = TempDir::new().unwrap();
+    let ok = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(repo.path())
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "git init failed");
+    repo
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repo_init_with_claude_telemetry_writes_user_level_settings_only() {
+    let home = TempDir::new().unwrap();
+    let repo = git_repo();
+    let env = [
+        ("TRACEVAULT_API_KEY", "tvk_secret"),
+        ("TRACEVAULT_SERVER_URL", SERVER),
+    ];
+    let o = run_in(
+        repo.path(),
+        home.path(),
+        &["init", "--claude-telemetry", "--claude-settings", "local"],
+        &env,
+    );
+    assert!(o.status.success(), "stderr={}", stderr(&o));
+
+    let s = settings(home.path());
+    assert_eq!(
+        s["otelHeadersHelper"],
+        "tracevault otel-headers --server-url https://tv.example.com"
+    );
+    // The repo's own settings get the hooks, never the telemetry: Claude Code
+    // ignores OTel exporter settings there.
+    let repo_settings =
+        std::fs::read_to_string(repo.path().join(".claude/settings.local.json")).unwrap();
+    assert!(
+        repo_settings.contains("tracevault stream"),
+        "{repo_settings}"
+    );
+    assert!(
+        !repo_settings.contains("otelHeadersHelper"),
+        "{repo_settings}"
+    );
+    assert!(!repo_settings.contains("OTEL_"), "{repo_settings}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn non_interactive_repo_init_without_the_flag_leaves_telemetry_off() {
+    let home = TempDir::new().unwrap();
+    let repo = git_repo();
+    let o = run_in(
+        repo.path(),
+        home.path(),
+        &["init", "--claude-settings", "local"],
+        &[
+            ("TRACEVAULT_API_KEY", "tvk_secret"),
+            ("TRACEVAULT_SERVER_URL", SERVER),
+        ],
+    );
+    assert!(o.status.success(), "stderr={}", stderr(&o));
+    assert!(!home.path().join(".claude/settings.json").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repo_init_refuses_telemetry_for_a_server_other_than_the_login() {
+    let home = TempDir::new().unwrap();
+    let repo = git_repo();
+    write_credentials(
+        home.path(),
+        serde_json::json!({"server_url": SERVER, "token": "tvk_file"}),
+    );
+    let o = run_in(
+        repo.path(),
+        home.path(),
+        &[
+            "init",
+            "--claude-telemetry",
+            "--claude-settings",
+            "local",
+            "--server-url",
+            "https://other.example.com",
+        ],
+        &[],
+    );
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("logged in to https://tv.example.com"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!home.path().join(".claude/settings.json").exists());
 }
 
 #[test]

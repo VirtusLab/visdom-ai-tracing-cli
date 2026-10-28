@@ -383,14 +383,22 @@ impl ApiClient {
     /// for a while (`tracevault otel-headers`: Claude Code reuses the header
     /// until it runs the helper again). A Keycloak access token with less than
     /// `min_valid_secs` left is refreshed first, so it does not expire between
-    /// two runs (a fresher session adopted from another process may have less,
-    /// but never under [`crate::credentials::REFRESH_WINDOW_SECS`]). An API key
-    /// is returned as is.
+    /// two runs. An API key is returned as is.
     pub async fn bearer_valid_for(&self, min_valid_secs: i64) -> Result<Option<String>, AuthError> {
         match &self.credential {
             Some(ClientCredential::Keycloak(session)) => {
                 let mut guard = session.lock().await;
-                if guard.access_expires_at.saturating_sub((self.now)()) < min_valid_secs {
+                let too_short = |s: &KeycloakSession| {
+                    s.access_expires_at.saturating_sub((self.now)()) < min_valid_secs
+                };
+                // `refresh_locked` may only adopt another process's session,
+                // which can still be too short for us; then the adopted (now
+                // current) session is refreshed for real. Two rounds at most,
+                // so a token lifetime below the minimum cannot loop.
+                for _ in 0..2 {
+                    if !too_short(&guard) {
+                        break;
+                    }
                     self.refresh_locked(&mut guard).await?;
                 }
                 Ok(Some(guard.access_token.clone()))
@@ -1113,6 +1121,33 @@ mod tests {
         assert!(refresh.contains("refresh_token=old-rt"), "{refresh}");
         let saved = Credentials::load().unwrap().auth.unwrap();
         assert_eq!(saved.access_token, "fresh-at");
+    }
+
+    /// Another process left a newer session on disk that is still too short
+    /// for the minimum: it is adopted (its refresh token is the live one) and
+    /// then refreshed, never handed out as is.
+    #[tokio::test]
+    async fn bearer_valid_for_refreshes_an_adopted_session_that_is_still_too_short() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        let (issuer, rx) =
+            spawn_idp(r#"{"access_token":"fresh-at","refresh_token":"fresh-rt","expires_in":300}"#);
+        // On disk: newer (150s) than ours (120s), but under 240s.
+        write_keycloak_file(dir.path(), "https://example.com", &issuer, NOW + 150);
+        let mut held = session(&issuer, NOW + 120);
+        held.access_token = "older-at".into();
+        let client =
+            ApiClient::with_credential("https://example.com", Some(Credential::Keycloak(held)))
+                .with_now(fixed_now);
+
+        let token = client.bearer_valid_for(240).await.unwrap();
+        assert_eq!(token.as_deref(), Some("fresh-at"));
+        rx.recv_timeout(RECV_TIMEOUT).expect("no discovery request");
+        let refresh = rx.recv_timeout(RECV_TIMEOUT).expect("no token request");
+        assert!(refresh.contains("refresh_token=old-rt"), "{refresh}");
     }
 
     /// A token valid for longer than the minimum is handed out as is: no IdP

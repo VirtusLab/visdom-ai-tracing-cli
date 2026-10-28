@@ -366,7 +366,7 @@ fn finish_claude_telemetry(
             commands::claude_telemetry::install(
                 &claude_dir,
                 &url,
-                &commands::claude_telemetry::otel_process_env(),
+                &commands::claude_telemetry::Environment::current(&claude_dir),
             )
             .map(|outcome| (url, outcome))
             .map_err(|e| e.to_string())
