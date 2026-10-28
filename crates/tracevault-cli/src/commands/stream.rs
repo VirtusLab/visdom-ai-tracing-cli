@@ -946,8 +946,14 @@ pub fn transcript_template(req: &StreamEventRequest) -> StreamEventRequest {
 /// when all its parts were accepted, as with the main transcript, so a queued
 /// or failed batch is read again (same offsets, same chunk_indexes) next time.
 /// A file whose offset cannot be read is skipped with a warning; it must not
-/// cost the other files their delivery. So is a file another hook of the
-/// session is sending right now.
+/// cost the other files their delivery.
+///
+/// A file another hook of the session is sending right now (it holds the
+/// file's lock) is skipped, unless `wait_for_lock` is set: then the lock is
+/// awaited until that instant, and only a holder still busy by then makes the
+/// file skipped, with a warning. Final hooks wait: the holder may have read
+/// before the subagent wrote its last lines, and no hook may come after a
+/// final one to send them.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_subagent_transcripts(
     client: &crate::api_client::ApiClient,
@@ -959,14 +965,32 @@ async fn deliver_subagent_transcripts(
     pending_path: &Path,
     mut send_failed: bool,
     deadline: std::time::Instant,
+    wait_for_lock: Option<std::time::Instant>,
     warned: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for file in crate::subagents::transcripts(transcript_path) {
         let offset_path = crate::subagents::offset_path(session_dir, &file);
         // Held until the offset is written (see `subagents::try_lock`).
-        let _lock = match crate::subagents::try_lock(&offset_path) {
+        let lock = loop {
+            match crate::subagents::try_lock(&offset_path) {
+                Ok(None) if wait_for_lock.is_some_and(|t| std::time::Instant::now() < t) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                other => break other,
+            }
+        };
+        let _lock = match lock {
             Ok(Some(lock)) => lock,
-            Ok(None) => continue,
+            Ok(None) => {
+                if wait_for_lock.is_some() {
+                    eprintln!(
+                        "tracevault: warning: skipping subagent transcript {}: \
+                         another hook is still sending it",
+                        file.display()
+                    );
+                }
+                continue;
+            }
             Err(e) => {
                 eprintln!(
                     "tracevault: warning: skipping subagent transcript {}: cannot lock: {e}",
@@ -1067,6 +1091,13 @@ pub fn stamp_agent(req: &mut StreamEventRequest, agent: crate::agent::Agent) {
 /// instead: a killed hook would lose whatever it held only in memory. Half
 /// the timeout leaves room for the request already in flight.
 const DELIVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long past its own delivery budget a final hook (`Stop`,
+/// `SubagentStop`) waits for a subagent file another hook is sending. The
+/// holder stops starting requests at its own budget, so this covers its last
+/// request; what is read after the budget is queued, not sent, which takes
+/// well under the two seconds left before the 10 s hook timeout.
+const FINAL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Send a hook event's parts in order. From the first failure on (or from the
 /// start when `send_failed`, i.e. older queued events are still waiting), or
@@ -1485,6 +1516,7 @@ pub async fn run_stream(
             &pending_path,
             send_failed || !all_accepted,
             deadline,
+            matches!(event_type, "stop" | "subagent-stop").then(|| deadline + FINAL_LOCK_WAIT),
             &mut warned,
         )
         .await?;
@@ -3920,6 +3952,18 @@ mod tests {
         session_dir: &Path,
         pending_path: &Path,
     ) -> Vec<StreamEventRequest> {
+        sweep_waiting(responses, main, session_dir, pending_path, None).await
+    }
+
+    /// [`sweep`] as a final hook, waiting for a busy file's lock until
+    /// `wait_for_lock`.
+    async fn sweep_waiting(
+        responses: Vec<String>,
+        main: &Path,
+        session_dir: &Path,
+        pending_path: &Path,
+        wait_for_lock: Option<Instant>,
+    ) -> Vec<StreamEventRequest> {
         let expected = responses.len();
         let (base, rx) = crate::test_helpers::spawn_seq(responses);
         let client = crate::api_client::ApiClient::new(&base, Some("tok"));
@@ -3937,6 +3981,7 @@ mod tests {
             pending_path,
             false,
             Instant::now() + Duration::from_secs(60),
+            wait_for_lock,
             &mut false,
         )
         .await
@@ -4116,6 +4161,35 @@ mod tests {
         assert_eq!(reqs.len(), 1);
         assert_eq!(part_lines(&reqs[0]).len(), 2);
         assert_eq!(agent_of(&part_lines(&reqs[0])[0]), "a1");
+    }
+
+    /// A final hook does not skip a busy file: it waits for the holder, then
+    /// sends what the holder left, here every line.
+    #[tokio::test]
+    async fn a_final_hook_waits_for_a_busy_subagent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, subagents, session_dir) = claude_session(dir.path());
+        let pending = session_dir.join("pending.jsonl");
+        append_subagent_lines(&subagents, "a1", 0..2);
+        let a1_offset =
+            crate::subagents::offset_path(&session_dir, &subagents.join("agent-a1.jsonl"));
+        let held = crate::subagents::try_lock(&a1_offset).unwrap().unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+
+        let reqs = sweep_waiting(
+            vec![ok_stream_response()],
+            &main,
+            &session_dir,
+            &pending,
+            Some(Instant::now() + Duration::from_secs(10)),
+        )
+        .await;
+        release.join().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(part_lines(&reqs[0]).len(), 2);
     }
 
     /// A subagent batch over the request cap is split like any other, within

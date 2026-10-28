@@ -45,6 +45,13 @@ fn accept_with_deadline(listener: &TcpListener) -> Option<std::net::TcpStream> {
 /// `ACCEPT_DEADLINE`, answering each with an accepted stream response and
 /// capturing its JSON body.
 fn spawn_server() -> (String, mpsc::Receiver<StreamEventRequest>) {
+    spawn_server_failing(&[])
+}
+
+/// [`spawn_server`], but the requests at the 0-based positions in `fail` get
+/// a 503 and are not captured: only what the server accepted is.
+fn spawn_server_failing(fail: &[usize]) -> (String, mpsc::Receiver<StreamEventRequest>) {
+    let fail = fail.to_vec();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
@@ -60,6 +67,7 @@ fn spawn_server() -> (String, mpsc::Receiver<StreamEventRequest>) {
         body.len()
     );
     thread::spawn(move || {
+        let mut n = 0;
         while let Some(stream) = accept_with_deadline(&listener) {
             let mut reader = BufReader::new(stream);
             let mut request_line = String::new();
@@ -86,10 +94,18 @@ fn spawn_server() -> (String, mpsc::Receiver<StreamEventRequest>) {
                 request_line.starts_with(&format!("POST /api/v1/repos/{REPO_ID}/stream ")),
                 "{request_line}"
             );
+            let failed = fail.contains(&n);
+            n += 1;
+            let mut stream = reader.into_inner();
+            if failed {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
             if let Ok(req) = serde_json::from_slice(&body) {
                 let _ = tx.send(req);
             }
-            let mut stream = reader.into_inner();
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
         }
@@ -385,5 +401,65 @@ fn flush_delivers_queued_subagent_lines() {
         .filter(|r| r.event_type == StreamEventType::Transcript)
     {
         assert_eq!(req.transcript_offset, Some(0), "offset within its own file");
+    }
+}
+
+/// A split subagent batch whose later part fails is queued; the subagent
+/// then writes more and the next hook re-reads the file, splitting it at other
+/// boundaries. Every line must still reach the server under one chunk_index
+/// (`transcript_offset` + its index in the request), whichever request carried
+/// it, so the server's dedup sees one chunk per line.
+#[test]
+fn a_split_subagent_batch_keeps_its_chunk_indexes_across_a_failed_part_and_a_retry() {
+    let fx = Fixture::new();
+    let big_line = |n: usize| {
+        format!(
+            "{}\n",
+            serde_json::json!({"agentId": "a1", "sessionId": SESSION_ID, "n": n, "text": "y".repeat(5_000)})
+        )
+    };
+    std::fs::create_dir_all(&fx.subagents).unwrap();
+    let a1 = fx.subagents.join("agent-a1.jsonl");
+    fx.main_line(0);
+    for n in 0..300 {
+        append(&a1, &big_line(n));
+    }
+
+    // Request 0 is the hook's own event, 1 the first a1 part; 2 fails, and
+    // every part after it is queued.
+    let (base, rx) = spawn_server_failing(&[2]);
+    fx.hook(&base, "post-tool-use", "PostToolUse");
+    let mut accepted = captured(&rx);
+    assert_eq!(accepted.len(), 2, "the event and the first part");
+
+    for n in 300..350 {
+        append(&a1, &big_line(n));
+    }
+    let (base, rx) = spawn_server();
+    fx.hook(&base, "stop", "Stop");
+    accepted.extend(captured(&rx));
+
+    let mut chunks: std::collections::BTreeMap<u64, std::collections::BTreeSet<i64>> =
+        Default::default();
+    for req in accepted
+        .iter()
+        .filter(|r| r.event_type == StreamEventType::Transcript)
+    {
+        let offset = req.transcript_offset.unwrap();
+        for (i, line) in lines(req).iter().enumerate() {
+            assert_eq!(agent_of(line), Some("a1"));
+            chunks
+                .entry(line["n"].as_u64().unwrap())
+                .or_default()
+                .insert(offset + i as i64);
+        }
+    }
+    assert_eq!(
+        chunks.keys().copied().collect::<Vec<_>>(),
+        (0..350).collect::<Vec<_>>(),
+        "every line delivered"
+    );
+    for (n, indexes) in &chunks {
+        assert_eq!(indexes.len(), 1, "line {n} sent under {indexes:?}");
     }
 }
