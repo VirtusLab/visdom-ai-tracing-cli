@@ -369,7 +369,8 @@ OpenTelemetry exporter settings in a repository's `.claude/settings*.json`:
   environment, or managed settings (`managed-settings.json` and `managed-settings.d/` in Claude
   Code's system directory, or the cached server-managed `~/.claude/remote-settings.json`)
   already set a log exporter other than `otlp`, a metrics or traces exporter, an
-  OTLP endpoint other than TraceVault's, static OTLP headers, a `BETA_TRACING_ENDPOINT`
+  OTLP endpoint other than TraceVault's, static OTLP headers, a non-HTTP OTLP protocol (from
+  managed settings or the shell), a `BETA_TRACING_ENDPOINT`
   (detailed beta tracing sends logs there instead), or its own `otelHeadersHelper`,
   `init` changes nothing and prints the collector route below instead. Claude Code would send
   the helper's token to every exporter it runs, so the two are never mixed. Managed settings

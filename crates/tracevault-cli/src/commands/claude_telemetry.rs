@@ -144,10 +144,15 @@ impl Environment {
 /// Exporter settings that are not TraceVault's, each described for the user
 /// (header values are never printed). `settings` is the parsed
 /// `~/.claude/settings.json`, `env` what else decides (see [`Environment`]).
-/// An endpoint counts as ours when it is `expected`, or the receiver of the
-/// server our helper names (an install for another server, which a re-run
-/// replaces). Detailed beta tracing is foreign too: with it, Claude Code sends
-/// its logs to `BETA_TRACING_ENDPOINT` instead.
+/// An endpoint counts as ours when it is `expected`, or — only in the user
+/// file, which a re-run rewrites — the receiver of the server our helper names
+/// (an install for another server). Anywhere else (managed settings, the
+/// shell) it must be `expected`: those keep routing exports after the helper
+/// moves to a new server, which would send the new server's token to the old
+/// one. An OTLP protocol other than HTTP from there is foreign too: it would
+/// override ours, and helper headers only apply over HTTP. Detailed beta
+/// tracing is foreign as well: with it, Claude Code sends its logs to
+/// `BETA_TRACING_ENDPOINT` instead.
 pub fn foreign_exporter_settings(
     settings: &Value,
     env: &Environment,
@@ -160,23 +165,29 @@ pub fn foreign_exporter_settings(
         .and_then(|rest| rest.trim().strip_prefix("--server-url "))
         .map(|server| logs_endpoint(server.trim()));
     let mut reasons = Vec::new();
-    let docs = std::iter::once(("~/.claude/settings.json", settings))
-        .chain(env.managed.iter().map(|(label, doc)| (label.as_str(), doc)));
+    let docs = std::iter::once(("~/.claude/settings.json", settings, true)).chain(
+        env.managed
+            .iter()
+            .map(|(label, doc)| (label.as_str(), doc, false)),
+    );
     let mut entries = Vec::new();
-    for (label, doc) in docs {
+    for (label, doc, user_file) in docs {
         if let Some(h) = doc.get(HEADERS_HELPER).filter(|h| !is_our_helper(h)) {
             reasons.push(format!("{HEADERS_HELPER} = `{}` (in {label})", as_text(h)));
         }
         if let Some(vars) = doc.get("env").and_then(Value::as_object) {
-            entries.extend(vars.iter().map(|(k, v)| (k.clone(), as_text(v), label)));
+            entries.extend(
+                vars.iter()
+                    .map(|(k, v)| (k.clone(), as_text(v), label, user_file)),
+            );
         }
     }
     entries.extend(
         env.shell
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone(), "the shell environment")),
+            .map(|(k, v)| (k.clone(), v.clone(), "the shell environment", false)),
     );
-    for (key, value, source) in entries {
+    for (key, value, source, user_file) in entries {
         let foreign = match key.as_str() {
             LOGS_EXPORTER => value != "otlp",
             "OTEL_METRICS_EXPORTER" | "OTEL_TRACES_EXPORTER" => {
@@ -184,7 +195,10 @@ pub fn foreign_exporter_settings(
             }
             LOGS_ENDPOINT => {
                 expected_endpoint != Some(value.as_str())
-                    && helper_endpoint.as_deref() != Some(value.as_str())
+                    && !(user_file && helper_endpoint.as_deref() == Some(value.as_str()))
+            }
+            LOGS_PROTOCOL | "OTEL_EXPORTER_OTLP_PROTOCOL" if !user_file => {
+                !matches!(value.as_str(), "http/protobuf" | "http/json")
             }
             "BETA_TRACING_ENDPOINT" => true,
             k if k.starts_with("OTEL_EXPORTER_OTLP_") && k.ends_with("ENDPOINT") => true,
@@ -409,15 +423,19 @@ pub fn prompt() -> io::Result<bool> {
     if !io::stdin().is_terminal() {
         return Ok(false);
     }
-    let mut stdout = io::stdout().lock();
+    ask(&mut io::stdin().lock(), &mut io::stdout().lock())
+}
+
+/// The question [`prompt`] asks, on any input/output: yes only for `y`/`yes`.
+fn ask(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<bool> {
     write!(
-        stdout,
+        output,
         "Also send Claude Code's per-request cost to TraceVault over OpenTelemetry \
          (writes ~/.claude/settings.json)? [y/N]: "
     )?;
-    stdout.flush()?;
+    output.flush()?;
     let mut line = String::new();
-    io::stdin().lock().read_line(&mut line)?;
+    input.read_line(&mut line)?;
     Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
@@ -615,6 +633,68 @@ pub(crate) mod tests {
             &shell("BETA_TRACING_ENDPOINT", "https://collector.corp"),
             "BETA_TRACING_ENDPOINT",
         );
+    }
+
+    #[test]
+    fn the_prompt_defaults_to_no() {
+        let answer = |text: &str| {
+            let mut out = Vec::new();
+            let yes = ask(&mut text.as_bytes(), &mut out).unwrap();
+            assert!(String::from_utf8(out).unwrap().contains("[y/N]"));
+            yes
+        };
+        assert!(answer("y\n"));
+        assert!(answer(" Yes \n"));
+        assert!(!answer("\n"));
+        assert!(!answer(""));
+        assert!(!answer("n\n"));
+        assert!(!answer("sure\n"));
+    }
+
+    #[test]
+    fn managed_endpoint_of_the_old_server_is_foreign_on_a_move() {
+        // User file: our install for old.example.com. Managed settings pin
+        // the logs endpoint to old.example.com too. Moving to tv.example.com
+        // would leave exports going to old with tv's token.
+        let mut user = json!({});
+        merge_telemetry(
+            &mut user,
+            "https://old.example.com",
+            &Environment::default(),
+        )
+        .unwrap();
+        let env = Environment {
+            managed: vec![(
+                "managed".to_string(),
+                json!({"env": {LOGS_ENDPOINT: "https://old.example.com/otlp/v1/logs"}}),
+            )],
+            ..Default::default()
+        };
+        assert_left_alone(user, &env, "old.example.com");
+    }
+
+    #[test]
+    fn managed_or_shell_grpc_protocol_is_foreign() {
+        let env = Environment {
+            managed: vec![(
+                "managed".to_string(),
+                json!({"env": {"OTEL_EXPORTER_OTLP_PROTOCOL": "grpc"}}),
+            )],
+            ..Default::default()
+        };
+        assert_left_alone(json!({}), &env, "OTEL_EXPORTER_OTLP_PROTOCOL=grpc");
+        assert_left_alone(
+            json!({}),
+            &shell(LOGS_PROTOCOL, "grpc"),
+            "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=grpc",
+        );
+        // In the user file the logs protocol is ours to set.
+        let (s, outcome) = merged(
+            json!({"env": {LOGS_PROTOCOL: "grpc"}}),
+            &Environment::default(),
+        );
+        assert_eq!(outcome, InstallOutcome::Configured);
+        assert_eq!(s["env"][LOGS_PROTOCOL], "http/protobuf");
     }
 
     #[test]
