@@ -573,8 +573,21 @@ even when several settings files define it.
 | `PostToolUse` | all tools | `tracevault stream --event post-tool-use` |
 | `Notification` | all | `tracevault stream --event notification` |
 | `Stop` | all | `tracevault stream --event stop` |
+| `SubagentStop` | all | `tracevault stream --event subagent-stop` |
 | `SessionStart` | all | `tracevault session-start` |
 | `UserPromptSubmit` | all | `tracevault user-prompt` |
+
+**Subagents.** Claude Code writes each subagent's conversation to its own file,
+`<session>/subagents/agent-<id>.jsonl` next to the session transcript, and leaves the subagent's
+messages and token usage out of the main transcript. Every `stream` hook therefore also sends what
+each of those files gained since the last hook: under the parent session, one file per request
+(never mixed with another file's lines or the main transcript's), each file with its own read
+offset in `.tracevault/sessions/<session>/.subagent_offsets/`. Subagents running in the background
+are sent while they run, and `Stop` reads every file to its end. `SubagentStop` sends only those
+files, which covers a background subagent that finishes after the session's last `Stop`. A batch
+that cannot be delivered is queued like any other event and sent by a later hook or
+`tracevault flush`. This needs a server that keys transcript chunks by the line's `agentId`; an
+older one cannot tell subagent lines from the main transcript's.
 
 **Codex** (`.codex/hooks.json`; with `--global`, `~/.codex/hooks.json`): `SessionStart` and
 `UserPromptSubmit` as above, plus `PostToolUse` and `Stop` streamed with `--agent codex`. There
