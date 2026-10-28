@@ -62,6 +62,33 @@ pub fn write_offset(offset_path: &Path, offset: i64) -> io::Result<()> {
     fs::write(offset_path, offset.to_string())
 }
 
+/// Take the exclusive lock on the file `offset_path` keys, without waiting.
+/// `None` means another hook of the session holds it.
+///
+/// A hook holds it from reading the file to writing its new offset. Parallel
+/// hooks of one session run concurrently, and without it two of them can read
+/// from one offset, the one that read less can write its offset last, and the
+/// next hook re-sends the rest from that offset: same lines, new chunk_indexes,
+/// stored twice. A hook that finds the lock taken skips the file instead of
+/// waiting (the holder may spend the whole delivery budget); a later hook, at
+/// the latest that subagent's `SubagentStop`, sends what the holder did not
+/// read. The OS drops the lock when its holder exits, even if killed.
+pub fn try_lock(offset_path: &Path) -> io::Result<Option<fs::File>> {
+    if let Some(dir) = offset_path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(offset_path.with_extension("lock"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 /// Read the lines appended to `transcript` since the offset stored in
 /// `offset_path` (0 when absent). Returns `(lines, start_offset, end_offset)`
 /// with the meaning of `commands::stream::read_new_transcript_lines`:
@@ -207,6 +234,20 @@ mod tests {
         let (lines, _, end) = read_new_lines(&file, &offset_path(dir.path(), &file)).unwrap();
         assert_eq!(lines, vec![serde_json::json!({"n": 1})]);
         assert_eq!(end, fs::metadata(&file).unwrap().len() as i64);
+    }
+
+    #[test]
+    fn try_lock_is_exclusive_per_file_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let a1 = offset_path(dir.path(), Path::new("agent-a1.jsonl"));
+        let b2 = offset_path(dir.path(), Path::new("agent-b2.jsonl"));
+
+        let held = try_lock(&a1).unwrap().expect("free lock");
+        assert!(try_lock(&a1).unwrap().is_none(), "a second holder");
+        assert!(try_lock(&b2).unwrap().is_some(), "another file is free");
+        drop(held);
+        assert!(try_lock(&a1).unwrap().is_some());
+        assert!(!a1.exists(), "the lock is not the offset file");
     }
 
     #[test]

@@ -946,7 +946,8 @@ pub fn transcript_template(req: &StreamEventRequest) -> StreamEventRequest {
 /// when all its parts were accepted, as with the main transcript, so a queued
 /// or failed batch is read again (same offsets, same chunk_indexes) next time.
 /// A file whose offset cannot be read is skipped with a warning; it must not
-/// cost the other files their delivery.
+/// cost the other files their delivery. So is a file another hook of the
+/// session is sending right now.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_subagent_transcripts(
     client: &crate::api_client::ApiClient,
@@ -962,6 +963,18 @@ async fn deliver_subagent_transcripts(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for file in crate::subagents::transcripts(transcript_path) {
         let offset_path = crate::subagents::offset_path(session_dir, &file);
+        // Held until the offset is written (see `subagents::try_lock`).
+        let _lock = match crate::subagents::try_lock(&offset_path) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!(
+                    "tracevault: warning: skipping subagent transcript {}: cannot lock: {e}",
+                    file.display()
+                );
+                continue;
+            }
+        };
         let (lines, start, end) = match crate::subagents::read_new_lines(&file, &offset_path) {
             Ok(read) => read,
             Err(e) => {
@@ -4078,6 +4091,31 @@ mod tests {
         assert!(sweep(vec![], &main, &session_dir, &pending)
             .await
             .is_empty());
+    }
+
+    /// A file another hook of the session is sending is left to it: not read,
+    /// not sent, its offset untouched. The other files still go.
+    #[tokio::test]
+    async fn a_subagent_file_another_hook_is_sending_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, subagents, session_dir) = claude_session(dir.path());
+        let pending = session_dir.join("pending.jsonl");
+        append_subagent_lines(&subagents, "a1", 0..2);
+        append_subagent_lines(&subagents, "b2", 0..1);
+        let a1_offset =
+            crate::subagents::offset_path(&session_dir, &subagents.join("agent-a1.jsonl"));
+        let held = crate::subagents::try_lock(&a1_offset).unwrap().unwrap();
+
+        let reqs = sweep(vec![ok_stream_response()], &main, &session_dir, &pending).await;
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(agent_of(&part_lines(&reqs[0])[0]), "b2");
+        assert!(!a1_offset.exists());
+
+        drop(held);
+        let reqs = sweep(vec![ok_stream_response()], &main, &session_dir, &pending).await;
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(part_lines(&reqs[0]).len(), 2);
+        assert_eq!(agent_of(&part_lines(&reqs[0])[0]), "a1");
     }
 
     /// A subagent batch over the request cap is split like any other, within
