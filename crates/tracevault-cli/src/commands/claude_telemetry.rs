@@ -79,6 +79,16 @@ fn is_our_helper(value: &Value) -> bool {
     value.as_str().is_some_and(|s| s.starts_with(HELPER_PREFIX))
 }
 
+/// The receiver of the server our helper command names, if `helper` is ours
+/// and names one.
+fn helper_logs_endpoint(helper: Option<&Value>) -> Option<String> {
+    helper
+        .and_then(Value::as_str)
+        .and_then(|h| h.strip_prefix(HELPER_PREFIX))
+        .and_then(|rest| rest.trim().strip_prefix("--server-url "))
+        .map(|server| logs_endpoint(server.trim()))
+}
+
 fn as_text(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
@@ -150,20 +160,17 @@ impl Environment {
 /// shell) it must be `expected`: those keep routing exports after the helper
 /// moves to a new server, which would send the new server's token to the old
 /// one. An OTLP protocol other than HTTP from there is foreign too: it would
-/// override ours, and helper headers only apply over HTTP. Detailed beta
-/// tracing is foreign as well: with it, Claude Code sends its logs to
+/// override ours, and helper headers only apply over HTTP (the receiver takes
+/// both `http/protobuf` and `http/json`). The same goes for our own helper
+/// there: it must name the `expected` server, since it overrides ours. Detailed
+/// beta tracing is foreign as well: with it, Claude Code sends its logs to
 /// `BETA_TRACING_ENDPOINT` instead.
 pub fn foreign_exporter_settings(
     settings: &Value,
     env: &Environment,
     expected_endpoint: Option<&str>,
 ) -> Vec<String> {
-    let helper_endpoint = settings
-        .get(HEADERS_HELPER)
-        .and_then(Value::as_str)
-        .and_then(|h| h.strip_prefix(HELPER_PREFIX))
-        .and_then(|rest| rest.trim().strip_prefix("--server-url "))
-        .map(|server| logs_endpoint(server.trim()));
+    let helper_endpoint = helper_logs_endpoint(settings.get(HEADERS_HELPER));
     let mut reasons = Vec::new();
     let docs = std::iter::once(("~/.claude/settings.json", settings, true)).chain(
         env.managed
@@ -172,8 +179,16 @@ pub fn foreign_exporter_settings(
     );
     let mut entries = Vec::new();
     for (label, doc, user_file) in docs {
-        if let Some(h) = doc.get(HEADERS_HELPER).filter(|h| !is_our_helper(h)) {
-            reasons.push(format!("{HEADERS_HELPER} = `{}` (in {label})", as_text(h)));
+        if let Some(h) = doc.get(HEADERS_HELPER) {
+            let ours = if user_file {
+                is_our_helper(h)
+            } else {
+                expected_endpoint.is_some()
+                    && helper_logs_endpoint(Some(h)).as_deref() == expected_endpoint
+            };
+            if !ours {
+                reasons.push(format!("{HEADERS_HELPER} = `{}` (in {label})", as_text(h)));
+            }
         }
         if let Some(vars) = doc.get("env").and_then(Value::as_object) {
             entries.extend(
@@ -671,6 +686,37 @@ pub(crate) mod tests {
             ..Default::default()
         };
         assert_left_alone(user, &env, "old.example.com");
+    }
+
+    #[test]
+    fn managed_helper_is_ours_only_for_the_expected_server() {
+        let managed = |helper: &str| Environment {
+            managed: vec![("managed".to_string(), json!({ HEADERS_HELPER: helper }))],
+            ..Default::default()
+        };
+        // Pinned to another TraceVault server: it overrides ours and would
+        // refuse the new login's credential.
+        assert_left_alone(
+            json!({}),
+            &managed("tracevault otel-headers --server-url https://old.example.com"),
+            "old.example.com",
+        );
+        // Exactly what we would write: fine.
+        let (_, outcome) = merged(json!({}), &managed(&helper_command(SERVER)));
+        assert_eq!(outcome, InstallOutcome::Configured);
+    }
+
+    #[test]
+    fn managed_http_json_protocol_is_accepted() {
+        // The receiver takes OTLP/HTTP JSON as well as protobuf.
+        let env = Environment {
+            managed: vec![(
+                "managed".to_string(),
+                json!({"env": {LOGS_PROTOCOL: "http/json"}}),
+            )],
+            ..Default::default()
+        };
+        assert_eq!(merged(json!({}), &env).1, InstallOutcome::Configured);
     }
 
     #[test]

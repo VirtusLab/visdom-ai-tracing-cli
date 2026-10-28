@@ -92,6 +92,105 @@ fn otel_headers_prints_the_logged_in_session_token() {
     );
 }
 
+/// A fake IdP: answers OpenID discovery (naming itself as issuer), then one
+/// token request with `token_status`/`token_body`. Returns its URL.
+fn spawn_idp(token_status: &'static str, token_body: &'static str) -> String {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let discovery = format!(
+        r#"{{"issuer":"{base}","token_endpoint":"{base}/token","device_authorization_endpoint":"{base}/device"}}"#
+    );
+    std::thread::spawn(move || {
+        for (status, body) in [("200 OK", discovery.as_str()), (token_status, token_body)] {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // Consume the whole request (headers, then any form body).
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut buf = vec![0; length];
+            let _ = reader.read_exact(&mut buf);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    base
+}
+
+fn write_expiring_session(home: &Path, issuer: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    write_credentials(
+        home,
+        serde_json::json!({
+            "server_url": SERVER,
+            "email": "dev@example.com",
+            "auth": {
+                "issuer": issuer,
+                "client_id": "tracevault-cli",
+                "refresh_token": "rt_old",
+                "access_token": "at_stale",
+                // Valid, but not for the next helper interval.
+                "access_expires_at": now + 30
+            }
+        }),
+    );
+}
+
+#[test]
+fn otel_headers_refreshes_an_expiring_session_and_persists_it() {
+    let home = TempDir::new().unwrap();
+    let issuer = spawn_idp(
+        "200 OK",
+        r#"{"access_token":"at_new","refresh_token":"rt_new","expires_in":300}"#,
+    );
+    write_expiring_session(home.path(), &issuer);
+
+    let o = run(home.path(), &["otel-headers", "--server-url", SERVER], &[]);
+    assert_eq!(
+        headers(&o),
+        serde_json::json!({"Authorization": "Bearer at_new"})
+    );
+    let saved =
+        std::fs::read_to_string(home.path().join(".config/tracevault/credentials.json")).unwrap();
+    assert!(
+        saved.contains("at_new") && saved.contains("rt_new"),
+        "{saved}"
+    );
+}
+
+#[test]
+fn otel_headers_fails_without_output_when_the_refresh_is_rejected() {
+    let home = TempDir::new().unwrap();
+    let issuer = spawn_idp("400 Bad Request", r#"{"error":"invalid_grant"}"#);
+    write_expiring_session(home.path(), &issuer);
+
+    let o = run(home.path(), &["otel-headers", "--server-url", SERVER], &[]);
+    assert!(!o.status.success());
+    assert!(
+        stdout(&o).is_empty(),
+        "no header on failure: {}",
+        stdout(&o)
+    );
+    assert!(!stderr(&o).contains("at_stale"), "{}", stderr(&o));
+}
+
 #[test]
 fn otel_headers_fails_clearly_when_not_logged_in() {
     let home = TempDir::new().unwrap();

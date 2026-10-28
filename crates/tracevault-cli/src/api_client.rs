@@ -401,6 +401,16 @@ impl ApiClient {
                     }
                     self.refresh_locked(&mut guard).await?;
                 }
+                // Still too short after a real refresh: the IdP issues tokens
+                // that live less than the minimum. The token is still handed
+                // out — it authenticates for most of the interval, where an
+                // error would authenticate nothing — but the caller is told.
+                if too_short(&guard) {
+                    eprintln!(
+                        "Warning: the access token is valid for less than {min_valid_secs}s even \
+                         after a refresh; requests made with it later may be rejected"
+                    );
+                }
                 Ok(Some(guard.access_token.clone()))
             }
             _ => self.bearer().await,
