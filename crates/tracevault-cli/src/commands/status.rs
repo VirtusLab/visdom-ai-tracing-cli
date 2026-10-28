@@ -454,6 +454,72 @@ fn global_hook_check_in(settings_path: &Path) -> Check {
     }
 }
 
+/// Whether Claude Code's cost reaches TraceVault over OpenTelemetry
+/// (`init --claude-telemetry`), read from `~/.claude/settings.json` and this
+/// process's `OTEL_*` environment. Off or exported elsewhere → Skip (both are
+/// legitimate); an incomplete install, one for another server than the login,
+/// or our token also going to someone else's exporter → Warn.
+fn claude_telemetry_check_in(
+    settings_path: &Path,
+    server_url: Option<&str>,
+    process_env: &[(String, String)],
+) -> Check {
+    use crate::commands::claude_telemetry::{inspect, logs_endpoint, TelemetryState};
+    const LABEL: &str = "Claude Code telemetry";
+    let settings = match fs::read_to_string(settings_path) {
+        Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+            Ok(v) => v,
+            Err(e) => {
+                return Check::warn(LABEL, format!("cannot parse ~/.claude/settings.json: {e}"))
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Check::warn(LABEL, format!("cannot read ~/.claude/settings.json: {e}")),
+    };
+    let expected = server_url.map(logs_endpoint);
+    match inspect(&settings, process_env, expected.as_deref()) {
+        TelemetryState::Off => Check::skip(
+            LABEL,
+            "off (enable with `tracevault init --claude-telemetry`)",
+        ),
+        TelemetryState::Foreign { reasons, ours_too } => {
+            let detail = format!("exported elsewhere: {}", reasons.join("; "));
+            if ours_too {
+                Check::warn(
+                    LABEL,
+                    format!(
+                        "{detail} — these exporters also receive TraceVault's otel-headers \
+                         token; remove them or TraceVault's otelHeadersHelper"
+                    ),
+                )
+            } else {
+                Check::skip(LABEL, format!("{detail} (see README: collector route)"))
+            }
+        }
+        TelemetryState::Ours { missing, .. } if !missing.is_empty() => Check::warn(
+            LABEL,
+            format!(
+                "incomplete ({} missing or changed): re-run `tracevault init --claude-telemetry`",
+                missing.join(", ")
+            ),
+        ),
+        TelemetryState::Ours { endpoint, .. } => {
+            let endpoint = endpoint.unwrap_or_default();
+            match expected {
+                Some(expected) if expected != endpoint => Check::warn(
+                    LABEL,
+                    format!(
+                        "exports to {endpoint}, but you are logged in to {}: re-run \
+                         `tracevault init --claude-telemetry`",
+                        server_url.unwrap_or_default()
+                    ),
+                ),
+                _ => Check::ok(LABEL, format!("exports cost to {endpoint}")),
+            }
+        }
+    }
+}
+
 /// The per-repo Claude settings files `init` can write hooks into
 /// (`--claude-settings shared|local`), in the order they are reported.
 const REPO_CLAUDE_SETTINGS: [&str; 2] = ["settings.json", "settings.local.json"];
@@ -1401,7 +1467,15 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
     let has_binding = binding.is_some() && explicit_session;
 
     let auth_checks_v = auth_checks(&auth, config_server_url).await;
-    let install_v = vec![global_check];
+    let telemetry_check = match global_settings.as_deref() {
+        Some(p) => claude_telemetry_check_in(
+            p,
+            auth.server_url.as_deref(),
+            &crate::commands::claude_telemetry::otel_process_env(),
+        ),
+        None => Check::skip("Claude Code telemetry", "cannot determine home directory"),
+    };
+    let install_v = vec![global_check, telemetry_check];
     let (proj_checks_v, config) = project_checks(
         project_root,
         global_settings.as_deref(),
@@ -1830,6 +1904,47 @@ mod tests {
             r#"{"hooks":{"PreToolUse":[]}}"#
         ));
         assert!(!settings_has_tracevault_hooks("{}"));
+    }
+
+    #[test]
+    fn claude_telemetry_check_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        let server = Some("https://tv.example.com");
+
+        // No settings file: off.
+        let c = claude_telemetry_check_in(&p, server, &[]);
+        assert_eq!(c.level, Level::Skip, "{c:?}");
+
+        crate::commands::claude_telemetry::install(dir.path(), "https://tv.example.com", &[])
+            .unwrap();
+        let c = claude_telemetry_check_in(&p, server, &[]);
+        assert_eq!(c.level, Level::Ok, "{c:?}");
+        assert!(
+            c.detail.contains("https://tv.example.com/otlp/v1/logs"),
+            "{c:?}"
+        );
+
+        // Logged in to another server than the one telemetry goes to.
+        let c = claude_telemetry_check_in(&p, Some("https://other.example.com"), &[]);
+        assert_eq!(c.level, Level::Warn, "{c:?}");
+
+        // Our helper plus someone else's exporter: our token leaks there.
+        let env = [("OTEL_METRICS_EXPORTER".to_string(), "otlp".to_string())];
+        let c = claude_telemetry_check_in(&p, server, &env);
+        assert_eq!(c.level, Level::Warn, "{c:?}");
+
+        // Only someone else's exporter: legitimate, just not ours.
+        std::fs::write(&p, r#"{"env":{"OTEL_LOGS_EXPORTER":"console"}}"#).unwrap();
+        let c = claude_telemetry_check_in(&p, server, &[]);
+        assert_eq!(c.level, Level::Skip, "{c:?}");
+        assert!(c.detail.contains("exported elsewhere"), "{c:?}");
+
+        std::fs::write(&p, "{not json").unwrap();
+        assert_eq!(
+            claude_telemetry_check_in(&p, server, &[]).level,
+            Level::Warn
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 pub mod agent_policies;
 pub mod check;
+pub mod claude_telemetry;
 pub mod commit_push;
 pub mod context;
 pub mod flush;

@@ -73,6 +73,24 @@ enum Cli {
         /// equivalents instead.
         #[arg(long, value_enum, default_value = "claude-code")]
         agent: crate::agent::Agent,
+        /// Also export Claude Code's own per-request cost to TraceVault over
+        /// OpenTelemetry: writes the OTel log exporter settings and an
+        /// `otelHeadersHelper` (`tracevault otel-headers`) into the USER-level
+        /// ~/.claude/settings.json, per-repo or with --global. An existing
+        /// exporter setup is left untouched (collector instructions are
+        /// printed instead). Without the flag, an interactive init asks.
+        #[arg(long)]
+        claude_telemetry: bool,
+    },
+    /// Print the Authorization header for Claude Code's OpenTelemetry export,
+    /// as JSON, from the TraceVault credential store. Installed as
+    /// `otelHeadersHelper` by `tracevault init --claude-telemetry` — not
+    /// intended to be run manually.
+    #[command(name = "otel-headers", hide = true)]
+    OtelHeaders {
+        /// The server telemetry is exported to: the credential must be for it.
+        #[arg(long)]
+        server_url: Option<String>,
     },
     /// Show current session status
     Status {
@@ -324,6 +342,58 @@ fn finish_global_user_context(no_user_context: bool, user_context: Option<String
     }
 }
 
+/// Configure Claude Code telemetry export after a successful `init`, when
+/// `--claude-telemetry` was given or an interactive prompt says yes. A failure
+/// exits non-zero only when the flag asked for it explicitly; an existing
+/// exporter setup is not a failure (it is left alone, by design).
+fn finish_claude_telemetry(
+    explicit: bool,
+    project_root: &std::path::Path,
+    server_flag: Option<&str>,
+) {
+    let Some(claude_dir) = dirs::home_dir().map(|h| h.join(".claude")) else {
+        eprintln!("Error: cannot determine home directory");
+        std::process::exit(1);
+    };
+    let wanted = explicit
+        || (commands::claude_telemetry::is_off(&claude_dir)
+            && commands::claude_telemetry::prompt().unwrap_or(false));
+    if !wanted {
+        return;
+    }
+    let result = commands::claude_telemetry::telemetry_server_url(project_root, server_flag)
+        .and_then(|url| {
+            commands::claude_telemetry::install(
+                &claude_dir,
+                &url,
+                &commands::claude_telemetry::otel_process_env(),
+            )
+            .map(|outcome| (url, outcome))
+            .map_err(|e| e.to_string())
+        });
+    match result {
+        Ok((url, commands::claude_telemetry::InstallOutcome::Configured)) => {
+            println!(
+                "Claude Code telemetry exports to {} (configured in {}; restart Claude Code to apply)",
+                commands::claude_telemetry::logs_endpoint(&url),
+                claude_dir.join("settings.json").display()
+            );
+        }
+        Ok((url, commands::claude_telemetry::InstallOutcome::Foreign(reasons))) => {
+            eprintln!(
+                "{}",
+                commands::claude_telemetry::collector_instructions(&url, &reasons)
+            );
+        }
+        Err(e) => {
+            eprintln!("Error: Claude Code telemetry not configured: {e}");
+            if explicit {
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -336,7 +406,12 @@ async fn main() {
             user_context,
             global,
             agent,
+            claude_telemetry,
         } => {
+            if claude_telemetry && agent != crate::agent::Agent::ClaudeCode {
+                eprintln!("Error: --claude-telemetry only applies to --agent claude-code");
+                std::process::exit(1);
+            }
             // Reject flag combinations that don't apply to the selected agent
             // (e.g. --claude-settings with --agent codex) rather than silently
             // ignoring them.
@@ -428,6 +503,8 @@ async fn main() {
                         }
 
                         finish_global_user_context(no_user_context, user_context);
+                        let cwd = env::current_dir().expect("Cannot determine current directory");
+                        finish_claude_telemetry(claude_telemetry, &cwd, None);
                         return;
                     }
                     crate::agent::Agent::OpenCode => {
@@ -494,6 +571,9 @@ async fn main() {
                     println!(
                         "Other contributors run `tracevault init` to set up their own local hooks."
                     );
+                    if agent == crate::agent::Agent::ClaudeCode {
+                        finish_claude_telemetry(claude_telemetry, &cwd, server_url.as_deref());
+                    }
                 }
                 Err(e) => {
                     eprintln!("Error: {e}");
@@ -512,6 +592,16 @@ async fn main() {
                 commands::status::run_status(&project_root, &cwd, effective.as_deref()).await;
             if code != 0 {
                 std::process::exit(code);
+            }
+        }
+        Cli::OtelHeaders { server_url } => {
+            let cwd = env::current_dir().expect("Cannot determine current directory");
+            match commands::claude_telemetry::otel_headers(&cwd, server_url.as_deref()).await {
+                Ok(headers) => println!("{headers}"),
+                Err(e) => {
+                    eprintln!("tracevault otel-headers: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Cli::Stream { event, agent } => {
