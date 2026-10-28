@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.1](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.29.0...v0.29.1) - 2026-10-28
+
+### Added
+
+- *(stream)* send Claude Code subagent transcripts under the parent session
+- *(hooks)* bind an unbound session to its checkout's repo automatically
+
+### Fixed
+
+- *(stream)* cap queued-event retries in flight and write subagent offsets atomically
+- *(stream)* give up a hook request past its budget plus 2 s and queue it
+- *(stream)* final hooks wait for a busy subagent file instead of skipping it
+- *(stream)* serialize each subagent file's sweep across concurrent hooks
+- *(repo)* keep the reset line unchanged; explain auto-binding on its own line
+- *(hooks)* bound auto-binding by the hook budget; let reset/switch win a race
+- *(status)* check local repo_id before auth; server target follows subagent override
+- *(status)* report what the capture hook actually does (VIS-1047)
+- *(cli)* keep unchanged config fields verbatim on save; test context source (VIS-1046)
+- *(cli)* keep the existing config when re-running init (VIS-1046)
+- *(cli)* redo the hook merge when the file changes underneath; exact ownership prefix (VIS-1044)
+- *(cli)* give each hook install its own temp file (VIS-1044)
+- *(cli)* keep hook file permissions and symlinks, refuse a null file (VIS-1044)
+- *(cli)* keep foreign hooks on every init and converge ours (VIS-1044)
+- *(cli)* refuse per-repo init without credentials; exit 1 on init errors (VIS-1045)
+
+### Other
+
+- Merge pull request #73 from VirtusLab/VIS-1078-subagent-transcripts
+- *(subagents)* drop internal figures from the module comment
+- *(status)* a new workspace-mode session is bound from its checkout's remote
+- *(hooks)* session-start answers in time when the lookup or policy fetch stalls
+- *(cli)* assert the rendered --help of init, hook commands and context show
+- *(cli)* fix stale --help texts for context show, init and hook commands
+- *(cli)* keep init re-run tests hermetic; cover env URL hint and untouched files (VIS-1045)
+
 ## [0.29.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.28.4...v0.29.0) - 2026-10-26
 
 ### Other
