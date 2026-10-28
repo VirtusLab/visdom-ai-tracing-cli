@@ -937,9 +937,9 @@ pub fn cleanup_stale_gsd_registration(gsd_home: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Read `hooks_path` as a JSON object (or `{}` if absent), bring its TraceVault
-/// hooks to `ours` via [`merge_hooks`] (foreign hooks and other keys are kept),
-/// and write the result back atomically (sibling temp file + rename). The one
+/// Bring the TraceVault hooks in `hooks_path` to `ours` via [`merge_hooks`]
+/// (foreign hooks and other keys are kept), written through
+/// [`update_json_file`]. The one
 /// install path for every hook file — per-repo Claude (`settings.json` or
 /// `settings.local.json`), global Claude and Codex (`hooks.json`), whose roots
 /// are the object `merge_hooks` mutates (`root["hooks"]`). A file that is
@@ -947,25 +947,42 @@ pub fn cleanup_stale_gsd_registration(gsd_home: &Path) -> io::Result<()> {
 /// merge error (malformed existing file) it returns before writing, so the
 /// target is never clobbered and no temp file is left behind.
 fn merge_hooks_into_file(hooks_path: &Path, ours: &serde_json::Value) -> io::Result<()> {
+    update_json_file(hooks_path, "its hooks", |root| {
+        merge_hooks(root, ours, hooks_path)
+    })
+}
+
+/// Read `path` as JSON (or `{}` if absent), apply `mutate`, and write the
+/// result back atomically (sibling temp file + rename), keeping the file's
+/// mode, a symlink's target, and — when `mutate` changed nothing — the file
+/// untouched. A missing file that `mutate` leaves as `{}` is not created. On a
+/// `mutate` error (malformed existing file) it returns before writing, so the
+/// target is never clobbered and no temp file is left behind. `what` names
+/// what is being updated, for the error when the file keeps changing.
+pub(crate) fn update_json_file(
+    path: &Path,
+    what: &str,
+    mut mutate: impl FnMut(&mut serde_json::Value) -> io::Result<()>,
+) -> io::Result<()> {
     // Defense-in-depth against path traversal: callers pass a constant filename
     // joined to a home/cwd base (global callers additionally go through
     // `safe_join`), so a `..` component should never appear — reject it outright
     // rather than read/write through it.
-    if hooks_path
+    if path
         .components()
         .any(|c| c == std::path::Component::ParentDir)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("refusing to use path with '..': {}", hooks_path.display()),
+            format!("refusing to use path with '..': {}", path.display()),
         ));
     }
     // A settings file symlinked to a centrally managed config is updated at its
     // target, so the link survives (renaming over it would replace it with a
     // regular file). A dangling link fails here instead of being overwritten.
-    let target = match fs::symlink_metadata(hooks_path) {
-        Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(hooks_path)?,
-        _ => hooks_path.to_path_buf(),
+    let target = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path)?,
+        _ => path.to_path_buf(),
     };
     // Another writer (a second `init`, Claude Code saving a permission) may
     // change the file between our read and our rename; publishing then would
@@ -978,20 +995,22 @@ fn merge_hooks_into_file(hooks_path: &Path, ours: &serde_json::Value) -> io::Res
             Some((_, content)) => serde_json::from_str(content).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("Failed to parse {}: {e}", hooks_path.display()),
+                    format!("Failed to parse {}: {e}", path.display()),
                 )
             })?,
             None => serde_json::json!({}),
         };
 
         let before = existing.is_some().then(|| root.to_string());
-        merge_hooks(&mut root, ours, hooks_path)?;
-        if before.as_deref() == Some(root.to_string().as_str()) {
+        mutate(&mut root)?;
+        if before.as_deref() == Some(root.to_string().as_str())
+            || (existing.is_none() && root == serde_json::json!({}))
+        {
             return Ok(());
         }
 
         let formatted = serde_json::to_string_pretty(&root).map_err(|e| {
-            io::Error::other(format!("Failed to serialize {}: {e}", hooks_path.display()))
+            io::Error::other(format!("Failed to serialize {}: {e}", path.display()))
         })?;
         let tmp = unique_temp_sibling(&target);
         let published = write_owner_only(&tmp, formatted.as_bytes())
@@ -1024,8 +1043,8 @@ fn merge_hooks_into_file(hooks_path: &Path, ours: &serde_json::Value) -> io::Res
         }
     }
     Err(io::Error::other(format!(
-        "{} kept changing while TraceVault updated its hooks; re-run `tracevault init`",
-        hooks_path.display()
+        "{} kept changing while TraceVault updated {what}; re-run `tracevault init`",
+        path.display()
     )))
 }
 
@@ -1143,7 +1162,7 @@ fn append_workspace_md(md_path: &Path) -> io::Result<()> {
 /// Join a constant file name to `base` and confirm the result stays directly
 /// within `base` — defense-in-depth so a path derived from the environment
 /// ($HOME) cannot escape the intended `.claude` directory.
-fn safe_join(base: &Path, name: &str) -> io::Result<PathBuf> {
+pub(crate) fn safe_join(base: &Path, name: &str) -> io::Result<PathBuf> {
     let joined = base.join(name);
     if joined.parent() != Some(base) {
         return Err(io::Error::new(

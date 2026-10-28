@@ -379,6 +379,26 @@ impl ApiClient {
         }
     }
 
+    /// The bearer token for a caller that hands it to someone else to use
+    /// for a while (`tracevault otel-headers`: Claude Code reuses the header
+    /// until it runs the helper again). A Keycloak access token with less than
+    /// `min_valid_secs` left is refreshed first, so it does not expire between
+    /// two runs (a fresher session adopted from another process may have less,
+    /// but never under [`crate::credentials::REFRESH_WINDOW_SECS`]). An API key
+    /// is returned as is.
+    pub async fn bearer_valid_for(&self, min_valid_secs: i64) -> Result<Option<String>, AuthError> {
+        match &self.credential {
+            Some(ClientCredential::Keycloak(session)) => {
+                let mut guard = session.lock().await;
+                if guard.access_expires_at.saturating_sub((self.now)()) < min_valid_secs {
+                    self.refresh_locked(&mut guard).await?;
+                }
+                Ok(Some(guard.access_token.clone()))
+            }
+            _ => self.bearer().await,
+        }
+    }
+
     /// Refresh the held session in place and persist it. Caller holds the
     /// session lock, which is what makes "one refresh at a time" true.
     ///
