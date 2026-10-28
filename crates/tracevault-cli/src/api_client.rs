@@ -1087,6 +1087,79 @@ mod tests {
         assert_eq!(saved.email, "a@b.com", "unrelated fields must be preserved");
     }
 
+    /// `otel-headers` needs a token that outlives Claude Code's helper
+    /// interval: one with 120s left is fine for `bearer` (outside its 60s
+    /// window) but is refreshed for a 240s minimum, and persisted.
+    #[tokio::test]
+    async fn bearer_valid_for_refreshes_a_token_expiring_within_the_minimum() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        let (issuer, rx) =
+            spawn_idp(r#"{"access_token":"fresh-at","refresh_token":"fresh-rt","expires_in":300}"#);
+        write_keycloak_file(dir.path(), "https://example.com", &issuer, NOW + 120);
+        let client = ApiClient::with_credential(
+            "https://example.com",
+            Some(Credential::Keycloak(session(&issuer, NOW + 120))),
+        )
+        .with_now(fixed_now);
+
+        let token = client.bearer_valid_for(240).await.unwrap();
+        assert_eq!(token.as_deref(), Some("fresh-at"));
+        rx.recv_timeout(RECV_TIMEOUT).expect("no discovery request");
+        let refresh = rx.recv_timeout(RECV_TIMEOUT).expect("no token request");
+        assert!(refresh.contains("refresh_token=old-rt"), "{refresh}");
+        let saved = Credentials::load().unwrap().auth.unwrap();
+        assert_eq!(saved.access_token, "fresh-at");
+    }
+
+    /// A token valid for longer than the minimum is handed out as is: no IdP
+    /// call (the issuer here is unreachable, so one would fail the test).
+    #[tokio::test]
+    async fn bearer_valid_for_keeps_a_token_valid_long_enough() {
+        let client = ApiClient::with_credential(
+            "https://example.com",
+            Some(Credential::Keycloak(session(
+                "http://127.0.0.1:9",
+                NOW + 241,
+            ))),
+        )
+        .with_now(fixed_now);
+        let token = client.bearer_valid_for(240).await.unwrap();
+        assert_eq!(token.as_deref(), Some("old-at"));
+    }
+
+    /// A rejected refresh is an error, never the stale token.
+    #[tokio::test]
+    async fn bearer_valid_for_fails_when_the_refresh_is_rejected() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", dir.path());
+
+        let (issuer, _rx) = spawn_seq_with(|base| {
+            vec![
+                http_json(
+                    "200 OK",
+                    &format!(
+                        r#"{{"issuer":"{base}","token_endpoint":"{base}/token","device_authorization_endpoint":"{base}/device"}}"#
+                    ),
+                ),
+                http_json("400 Bad Request", r#"{"error":"invalid_grant"}"#),
+            ]
+        });
+        write_keycloak_file(dir.path(), "https://example.com", &issuer, NOW + 120);
+        let client = ApiClient::with_credential(
+            "https://example.com",
+            Some(Credential::Keycloak(session(&issuer, NOW + 120))),
+        )
+        .with_now(fixed_now);
+
+        assert!(client.bearer_valid_for(240).await.is_err());
+    }
+
     /// Two git hooks can run at once, and `tracevault status` builds two
     /// clients from one credential. If another process already refreshed, this
     /// one must ADOPT that session rather than present the refresh token that

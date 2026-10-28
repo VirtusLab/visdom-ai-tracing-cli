@@ -90,16 +90,21 @@ fn as_text(value: &Value) -> String {
 /// (header values are never printed). `settings` is the parsed
 /// `~/.claude/settings.json`; `process_env` the `OTEL_*` variables of the
 /// environment `init`/`status` runs in, which Claude Code also sees when
-/// started from it. An endpoint counts as ours when it is `expected`, or ends
-/// in the receiver path while the helper is ours (an install for another
-/// server, which a re-run replaces).
+/// started from it. An endpoint counts as ours when it is `expected`, or the
+/// receiver of the server our helper names (an install for another server,
+/// which a re-run replaces). Detailed beta tracing is foreign too: with it,
+/// Claude Code sends its logs to `BETA_TRACING_ENDPOINT` instead.
 pub fn foreign_exporter_settings(
     settings: &Value,
     process_env: &[(String, String)],
     expected_endpoint: Option<&str>,
 ) -> Vec<String> {
     let helper = settings.get(HEADERS_HELPER);
-    let helper_ours = helper.is_some_and(is_our_helper);
+    let helper_endpoint = helper
+        .and_then(Value::as_str)
+        .and_then(|h| h.strip_prefix(HELPER_PREFIX))
+        .and_then(|rest| rest.trim().strip_prefix("--server-url "))
+        .map(|server| logs_endpoint(server.trim()));
     let mut reasons = Vec::new();
     if let Some(h) = helper.filter(|h| !is_our_helper(h)) {
         reasons.push(format!(
@@ -125,8 +130,9 @@ pub fn foreign_exporter_settings(
             }
             LOGS_ENDPOINT => {
                 expected_endpoint != Some(value.as_str())
-                    && !(helper_ours && value.ends_with(LOGS_PATH))
+                    && helper_endpoint.as_deref() != Some(value.as_str())
             }
+            "BETA_TRACING_ENDPOINT" => true,
             k if k.starts_with("OTEL_EXPORTER_OTLP_") && k.ends_with("ENDPOINT") => true,
             k if k.starts_with("OTEL_EXPORTER_OTLP_") && k.ends_with("HEADERS") => {
                 reasons.push(format!("{key} is set (in {source})"));
@@ -141,10 +147,10 @@ pub fn foreign_exporter_settings(
     reasons
 }
 
-/// The `OTEL_*` variables of this process's environment.
+/// The `OTEL_*` (and beta tracing) variables of this process's environment.
 pub fn otel_process_env() -> Vec<(String, String)> {
     std::env::vars()
-        .filter(|(k, _)| k.starts_with("OTEL_"))
+        .filter(|(k, _)| k.starts_with("OTEL_") || k == "BETA_TRACING_ENDPOINT")
         .collect()
 }
 
@@ -541,6 +547,33 @@ mod tests {
             &[],
             "OTEL_EXPORTER_OTLP_HEADERS is set",
         );
+    }
+
+    #[test]
+    fn beta_tracing_endpoint_is_foreign() {
+        assert_left_alone(
+            json!({"env": {"ENABLE_BETA_TRACING_DETAILED": "1",
+                           "BETA_TRACING_ENDPOINT": "https://collector.corp"}}),
+            &[],
+            "BETA_TRACING_ENDPOINT",
+        );
+        assert_left_alone(
+            json!({}),
+            &[(
+                "BETA_TRACING_ENDPOINT".to_string(),
+                "https://collector.corp".to_string(),
+            )],
+            "BETA_TRACING_ENDPOINT",
+        );
+    }
+
+    #[test]
+    fn a_receiver_path_on_another_host_is_not_ours() {
+        // Our helper names tv.example.com; the user then pointed the
+        // endpoint at their own collector, which happens to use our path.
+        let (mut s, _) = merged(json!({}), &[]);
+        s["env"][LOGS_ENDPOINT] = json!("https://collector.corp/otlp/v1/logs");
+        assert_left_alone(s, &[], "collector.corp");
     }
 
     #[test]

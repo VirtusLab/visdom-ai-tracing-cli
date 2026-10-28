@@ -367,7 +367,8 @@ OpenTelemetry exporter settings in a repository's `.claude/settings*.json`:
   in to another server moves the export there. Restart Claude Code to apply.
 - **An existing exporter setup is left alone.** If `~/.claude/settings.json` or the shell
   environment already sets a log exporter other than `otlp`, a metrics or traces exporter, an
-  OTLP endpoint other than TraceVault's, static OTLP headers, or its own `otelHeadersHelper`,
+  OTLP endpoint other than TraceVault's, static OTLP headers, a `BETA_TRACING_ENDPOINT`
+  (detailed beta tracing sends logs there instead), or its own `otelHeadersHelper`,
   `init` changes nothing and prints the collector route below instead. Claude Code would send
   the helper's token to every exporter it runs, so the two are never mixed.
 - The server must run the OTLP receiver (`POST /otlp/v1/logs`, TraceVault server with
