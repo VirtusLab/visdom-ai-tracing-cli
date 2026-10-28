@@ -214,6 +214,15 @@ impl Fixture {
 
     /// Run `tracevault stream --event <event>` once against `base`.
     fn hook(&self, base: &str, event: &str, hook_event_name: &str) {
+        let out = self
+            .spawn_hook(base, event, hook_event_name)
+            .wait_with_output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+
+    /// Start `tracevault stream --event <event>` without waiting for it.
+    fn spawn_hook(&self, base: &str, event: &str, hook_event_name: &str) -> std::process::Child {
         let payload = serde_json::json!({
             "session_id": SESSION_ID,
             "transcript_path": self.transcript.to_string_lossy(),
@@ -236,8 +245,20 @@ impl Fixture {
             .unwrap()
             .write_all(payload.to_string().as_bytes())
             .unwrap();
-        let out = child.wait_with_output().unwrap();
-        assert!(out.status.success(), "{out:?}");
+        child
+    }
+
+    fn queue(&self) -> PathBuf {
+        self.session_dir().join(format!("pending-{REPO_ID}.jsonl"))
+    }
+
+    fn queued(&self) -> Vec<StreamEventRequest> {
+        std::fs::read_to_string(self.queue())
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
     }
 
     fn main_offset(&self) -> Option<String> {
@@ -493,5 +514,110 @@ fn a_split_subagent_batch_keeps_its_chunk_indexes_across_a_failed_part_and_a_ret
     );
     for (n, indexes) in &chunks {
         assert_eq!(indexes.len(), 1, "line {n} sent under {indexes:?}");
+    }
+}
+
+/// A server that accepts connections but never answers must not hold a
+/// final hook past the agent's 10 s hook timeout, which would kill it after
+/// it emptied the queue file and before the subagent sweep: the queued
+/// events are re-queued and the new subagent lines queued, in time.
+#[test]
+fn a_stalled_server_cannot_make_a_final_hook_lose_queued_or_new_subagent_lines() {
+    let fx = Fixture::new();
+    fx.main_line(0);
+    fx.subagent_line("a1", 0);
+    fx.hook(&dead_server(), "post-tool-use", "PostToolUse");
+    assert_eq!(fx.queued().len(), 2, "the event and the a1 batch");
+
+    // Connections complete in the kernel backlog; nothing ever answers.
+    let stalled = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", stalled.local_addr().unwrap());
+    fx.subagent_line("a1", 1);
+    let started = Instant::now();
+    fx.hook(&base, "stop", "Stop");
+    assert!(
+        started.elapsed() < Duration::from_secs(9),
+        "took {:?}",
+        started.elapsed()
+    );
+
+    let queued = fx.queued();
+    let sent = sent_lines(&queued);
+    for line in [(None, 0), (Some("a1"), 0), (Some("a1"), 1)] {
+        assert!(
+            expected(&[line]).iter().all(|l| sent.contains(l)),
+            "{line:?} not queued: {sent:?}"
+        );
+    }
+    drop(stalled);
+}
+
+/// Hooks of one session overlap (parallel tool calls, a SubagentStop during a
+/// PostToolUse) while subagents append and the server fails some requests.
+/// Once a final hook and `flush` have run, every subagent line has reached
+/// the server under exactly one chunk_index.
+#[test]
+fn overlapping_hooks_deliver_every_subagent_line_under_one_chunk_index() {
+    let fx = Fixture::new();
+    fx.main_line(0);
+    let mut accepted = Vec::new();
+    let mut next = [0usize; 2];
+    for round in 0..4 {
+        for (i, agent) in ["a1", "b2"].iter().enumerate() {
+            for _ in 0..3 {
+                fx.subagent_line(agent, next[i]);
+                next[i] += 1;
+            }
+        }
+        let (base, rx) = if round % 2 == 1 {
+            spawn_server_failing(&[1, 4])
+        } else {
+            spawn_server()
+        };
+        let hooks: Vec<_> = [
+            ("post-tool-use", "PostToolUse"),
+            ("post-tool-use", "PostToolUse"),
+            ("subagent-stop", "SubagentStop"),
+        ]
+        .iter()
+        .map(|(event, name)| fx.spawn_hook(&base, event, name))
+        .collect();
+        // A subagent keeps writing while they run.
+        fx.subagent_line("a1", next[0]);
+        next[0] += 1;
+        for hook in hooks {
+            let out = hook.wait_with_output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+        accepted.extend(captured(&rx));
+    }
+    let (base, rx) = spawn_server();
+    fx.hook(&base, "stop", "Stop");
+    let out = fx.command(&base).arg("flush").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    accepted.extend(captured(&rx));
+
+    let mut chunks: std::collections::BTreeMap<(String, u64), std::collections::BTreeSet<i64>> =
+        Default::default();
+    for req in &accepted {
+        let offset = req.transcript_offset.unwrap_or(0);
+        for (i, line) in lines(req).iter().enumerate() {
+            if let Some(agent) = agent_of(line) {
+                assert_eq!(req.session_id, SESSION_ID);
+                chunks
+                    .entry((agent.to_string(), line["n"].as_u64().unwrap()))
+                    .or_default()
+                    .insert(offset + i as i64);
+            }
+        }
+    }
+    let mut want: Vec<(String, u64)> = (0..next[0] as u64)
+        .map(|n| ("a1".to_string(), n))
+        .chain((0..next[1] as u64).map(|n| ("b2".to_string(), n)))
+        .collect();
+    want.sort();
+    assert_eq!(chunks.keys().cloned().collect::<Vec<_>>(), want);
+    for (line, indexes) in &chunks {
+        assert_eq!(indexes.len(), 1, "{line:?} sent under {indexes:?}");
     }
 }

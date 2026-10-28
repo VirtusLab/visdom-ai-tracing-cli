@@ -54,11 +54,18 @@ pub fn offset_path(session_dir: &Path, transcript: &Path) -> PathBuf {
 }
 
 /// Persist `offset` as the next read position of the file `offset_path` keys.
+/// Replaced atomically: a hook killed mid-write must leave the old offset,
+/// not an empty file every later read rejects as corrupt.
 pub fn write_offset(offset_path: &Path, offset: i64) -> io::Result<()> {
-    if let Some(dir) = offset_path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    fs::write(offset_path, offset.to_string())
+    let Some(dir) = offset_path.parent() else {
+        return fs::write(offset_path, offset.to_string());
+    };
+    fs::create_dir_all(dir)?;
+    let tmp = offset_path.with_extension(format!("tmp.{}", uuid::Uuid::now_v7()));
+    fs::write(&tmp, offset.to_string())?;
+    fs::rename(&tmp, offset_path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
 }
 
 /// Take the exclusive lock on the file `offset_path` keys, without waiting.

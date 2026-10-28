@@ -1459,10 +1459,18 @@ pub async fn run_stream(
     // loses none of them.
     for (i, pending_json) in pending_events.iter().enumerate() {
         if let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(pending_json) {
+            // Capped like `deliver_parts`: the queue file is already gone, so
+            // a hook killed at its timeout mid-request would lose every event
+            // not yet re-queued, and never reach the subagent sweep.
             if std::time::Instant::now() >= deadline
-                || send_stream_event(&client, &attribution, force, &pending_req, &mut warned)
-                    .await
-                    .is_err()
+                || !matches!(
+                    tokio::time::timeout_at(
+                        (deadline + IN_FLIGHT_GRACE).into(),
+                        send_stream_event(&client, &attribution, force, &pending_req, &mut warned),
+                    )
+                    .await,
+                    Ok(Ok(_))
+                )
             {
                 // Re-queue only the failed event and the ones after it that
                 // were never attempted, in order. Events before `i` already
