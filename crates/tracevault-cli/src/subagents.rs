@@ -4,8 +4,7 @@
 //! own, `<dir of transcript_path>/<session id>/subagents/agent-<id>.jsonl`,
 //! next to an `agent-<id>.meta.json`. The main transcript holds none of the
 //! subagent's assistant lines or `usage`, so a hook that tails only
-//! `transcript_path` misses every token a subagent spends (VIS-1078: the
-//! Ruby2Kotlin run showed 41% of its billed cost).
+//! `transcript_path` misses every token a subagent spends (VIS-1078).
 //!
 //! Every line in those files carries the subagent's `agentId` and the parent
 //! `sessionId`. The stream hook sends each file's new lines under the parent
