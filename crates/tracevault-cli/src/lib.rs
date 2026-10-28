@@ -11,6 +11,7 @@ pub mod oidc;
 pub mod paths;
 pub mod resolution;
 pub mod session_state;
+pub mod subagents;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 pub mod transcript;

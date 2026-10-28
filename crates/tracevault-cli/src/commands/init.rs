@@ -661,6 +661,17 @@ pub fn tracevault_hooks() -> serde_json::Value {
                 "statusMessage": "TraceVault: finalizing session"
             }]
         }],
+        // Every hook above also sends new subagent transcript lines; this one
+        // catches a background subagent that finishes after the last `Stop`.
+        "SubagentStop": [{
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": "tracevault stream --event subagent-stop",
+                "timeout": 10,
+                "statusMessage": "TraceVault: streaming subagent transcript"
+            }]
+        }],
         "SessionStart": [{
             "matcher": "",
             "hooks": [{
@@ -1470,6 +1481,7 @@ mod tests {
             "PostToolUse",
             "Notification",
             "Stop",
+            "SubagentStop",
             "SessionStart",
             "UserPromptSubmit",
         ] {
@@ -1520,6 +1532,7 @@ mod tests {
             "PostToolUse",
             "Notification",
             "Stop",
+            "SubagentStop",
             "SessionStart",
             "UserPromptSubmit",
         ] {
@@ -1727,6 +1740,7 @@ mod tests {
             "PostToolUse",
             "Notification",
             "Stop",
+            "SubagentStop",
             "SessionStart",
             "UserPromptSubmit",
         ] {

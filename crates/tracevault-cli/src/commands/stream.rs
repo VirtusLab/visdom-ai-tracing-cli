@@ -866,19 +866,7 @@ pub fn split_into_parts(mut req: StreamEventRequest) -> Vec<StreamEventRequest> 
         used += sizes[tail_start];
     }
 
-    let transcript_template = StreamEventRequest {
-        event_type: StreamEventType::Transcript,
-        tool_name: None,
-        tool_use_id: None,
-        tool_input: None,
-        tool_response: None,
-        tool_is_error: None,
-        event_index: None,
-        event_uuid: None,
-        transcript_lines: None,
-        final_stats: None,
-        ..req.clone()
-    };
+    let transcript_template = transcript_template(&req);
     let transcript_envelope = envelope(&transcript_template);
 
     // Group the leading lines into `Transcript` parts, then the tail.
@@ -913,6 +901,141 @@ pub fn split_into_parts(mut req: StreamEventRequest) -> Vec<StreamEventRequest> 
             part
         })
         .collect()
+}
+
+/// A lines-only `Transcript` request with `req`'s session, agent and context
+/// fields but none of its event (type, tool payload, `event_uuid`), which the
+/// server handles as transcript lines only. `req`'s lines are not copied.
+/// Every field is listed, so a new one has to be decided on here.
+pub fn transcript_template(req: &StreamEventRequest) -> StreamEventRequest {
+    StreamEventRequest {
+        protocol_version: req.protocol_version,
+        tool: req.tool.clone(),
+        event_type: StreamEventType::Transcript,
+        session_id: req.session_id.clone(),
+        timestamp: req.timestamp,
+        hook_event_name: req.hook_event_name.clone(),
+        tool_name: None,
+        tool_use_id: None,
+        tool_input: None,
+        tool_response: None,
+        tool_is_error: None,
+        event_index: None,
+        event_uuid: None,
+        transcript_lines: None,
+        transcript_offset: req.transcript_offset,
+        model: req.model.clone(),
+        cwd: req.cwd.clone(),
+        final_stats: None,
+        flow_id: req.flow_id.clone(),
+        labels: req.labels.clone(),
+        params: req.params.clone(),
+        billing_mode: req.billing_mode,
+    }
+}
+
+/// Send what the session's subagents (Claude Code: see [`crate::subagents`])
+/// appended to their transcripts since the last hook. Each file goes in its
+/// own `Transcript` request(s) under the parent session, never mixed with
+/// another file's lines or the main transcript's, with `transcript_offset`
+/// counted within that file and split like any batch, so every line keeps one
+/// chunk_index per file.
+///
+/// Delivery is the event's: same budget, same queue, and once a send fails
+/// the remaining files are queued behind it. A file's offset advances only
+/// when all its parts were accepted, as with the main transcript, so a queued
+/// or failed batch is read again (same offsets, same chunk_indexes) next time.
+/// A file whose offset cannot be read is skipped with a warning; it must not
+/// cost the other files their delivery.
+///
+/// A file another hook of the session is sending right now (it holds the
+/// file's lock) is skipped, unless `wait_for_lock` is set: then the lock is
+/// awaited until that instant, and only a holder still busy by then makes the
+/// file skipped, with a warning. Final hooks wait: the holder may have read
+/// before the subagent wrote its last lines, and no hook may come after a
+/// final one to send them.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_subagent_transcripts(
+    client: &crate::api_client::ApiClient,
+    attribution: &Attribution,
+    force: AttributionForce,
+    template: &StreamEventRequest,
+    transcript_path: &Path,
+    session_dir: &Path,
+    pending_path: &Path,
+    mut send_failed: bool,
+    deadline: std::time::Instant,
+    wait_for_lock: Option<std::time::Instant>,
+    warned: &mut bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for file in crate::subagents::transcripts(transcript_path) {
+        let offset_path = crate::subagents::offset_path(session_dir, &file);
+        // Held until the offset is written (see `subagents::try_lock`).
+        let lock = loop {
+            match crate::subagents::try_lock(&offset_path) {
+                Ok(None) if wait_for_lock.is_some_and(|t| std::time::Instant::now() < t) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                other => break other,
+            }
+        };
+        let _lock = match lock {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                if wait_for_lock.is_some() {
+                    eprintln!(
+                        "tracevault: warning: skipping subagent transcript {}: \
+                         another hook is still sending it",
+                        file.display()
+                    );
+                }
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "tracevault: warning: skipping subagent transcript {}: cannot lock: {e}",
+                    file.display()
+                );
+                continue;
+            }
+        };
+        let (lines, start, end) = match crate::subagents::read_new_lines(&file, &offset_path) {
+            Ok(read) => read,
+            Err(e) => {
+                eprintln!(
+                    "tracevault: warning: skipping subagent transcript {}: {e}",
+                    file.display()
+                );
+                continue;
+            }
+        };
+        if end == start {
+            continue;
+        }
+        // Only blank or malformed lines: nothing to send, but move past them.
+        let mut accepted = true;
+        if !lines.is_empty() {
+            let mut req = template.clone();
+            req.transcript_lines = Some(lines);
+            req.transcript_offset = Some(start);
+            accepted = deliver_parts(
+                client,
+                attribution,
+                force,
+                split_into_parts(req),
+                pending_path,
+                send_failed,
+                deadline,
+                warned,
+            )
+            .await?;
+            send_failed |= !accepted;
+        }
+        if accepted {
+            crate::subagents::write_offset(&offset_path, end)?;
+        }
+    }
+    Ok(())
 }
 
 /// Choose the transcript source for a stream event. Inline records (from a
@@ -969,11 +1092,27 @@ pub fn stamp_agent(req: &mut StreamEventRequest, agent: crate::agent::Agent) {
 /// the timeout leaves room for the request already in flight.
 const DELIVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long past the delivery budget a request already in flight may run
+/// before it is given up and its part queued (the client's own timeout is
+/// 60 s, past the hook's). This bounds how long a hook holds a subagent
+/// file's lock: at most its budget plus this.
+const IN_FLIGHT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long past its own delivery budget a final hook (`Stop`,
+/// `SubagentStop`) waits for a subagent file another hook is sending. A
+/// holder started no later than the final hook and releases the lock by its
+/// budget plus [`IN_FLIGHT_GRACE`], so this outlasts every holder; what is
+/// read after the budget is queued, not sent, which takes well under the two
+/// seconds left before the 10 s hook timeout.
+const FINAL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Send a hook event's parts in order. From the first failure on (or from the
 /// start when `send_failed`, i.e. older queued events are still waiting), or
 /// once `deadline` has passed, a part is appended to the pending queue
-/// instead, behind whatever is already there. Returns whether every part was
-/// accepted.
+/// instead, behind whatever is already there. A request still in flight
+/// [`IN_FLIGHT_GRACE`] past `deadline` counts as failed: the server may have
+/// stored it, and the queued copy then dedupes on its chunk_indexes and
+/// `event_uuid`. Returns whether every part was accepted.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_parts(
     client: &crate::api_client::ApiClient,
@@ -989,9 +1128,10 @@ async fn deliver_parts(
     for part in parts {
         send_failed = send_failed || std::time::Instant::now() >= deadline;
         if !send_failed {
-            match send_stream_event(client, attribution, force, &part, warned).await {
-                Ok(_) => continue,
-                Err(_) => send_failed = true,
+            let send = send_stream_event(client, attribution, force, &part, warned);
+            match tokio::time::timeout_at((deadline + IN_FLIGHT_GRACE).into(), send).await {
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) | Err(_) => send_failed = true,
             }
         }
         all_accepted = false;
@@ -1082,8 +1222,15 @@ pub async fn run_stream(
     // transcript_offset carries the batch START byte offset so the server
     // derives a stable per-line chunk_index across overlapping/retried reads;
     // .stream_offset persists the END (next read position).
-    let (transcript_lines, start_offset, new_offset) =
-        read_new_transcript_lines(transcript_path, &offset_path)?;
+    // Claude Code's `SubagentStop` hook only sweeps the subagent transcripts
+    // (see `deliver_subagent_transcripts` below): it is not an event of the
+    // main conversation, so it neither reads nor advances `.stream_offset`.
+    let sends_main = event_type != "subagent-stop";
+    let (transcript_lines, start_offset, new_offset) = if sends_main {
+        read_new_transcript_lines(transcript_path, &offset_path)?
+    } else {
+        (vec![], 0, 0)
+    };
 
     // Fileless inline path (OpenCode): a plugin-based agent with no single
     // tailable transcript supplies records directly on the hook event. When
@@ -1189,11 +1336,7 @@ pub async fn run_stream(
         tool_is_error,
         event_index: None,
         event_uuid: Some(event_uuid),
-        transcript_lines: if transcript_lines.is_empty() {
-            None
-        } else {
-            Some(transcript_lines)
-        },
+        transcript_lines: None,
         transcript_offset: Some(start_offset),
         model: None,
         cwd: Some(hook_event.cwd.clone()),
@@ -1209,6 +1352,11 @@ pub async fn run_stream(
     };
 
     stamp_agent(&mut req, agent);
+    // Taken before the lines go in, so they are not copied.
+    let subagent_template = transcript_template(&req);
+    if !transcript_lines.is_empty() {
+        req.transcript_lines = Some(transcript_lines);
+    }
 
     // 6. Resolve credentials
     let (server_url, credential) = crate::credentials::resolve_credentials_quiet(&project_root)?;
@@ -1311,10 +1459,18 @@ pub async fn run_stream(
     // loses none of them.
     for (i, pending_json) in pending_events.iter().enumerate() {
         if let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(pending_json) {
+            // Capped like `deliver_parts`: the queue file is already gone, so
+            // a hook killed at its timeout mid-request would lose every event
+            // not yet re-queued, and never reach the subagent sweep.
             if std::time::Instant::now() >= deadline
-                || send_stream_event(&client, &attribution, force, &pending_req, &mut warned)
-                    .await
-                    .is_err()
+                || !matches!(
+                    tokio::time::timeout_at(
+                        (deadline + IN_FLIGHT_GRACE).into(),
+                        send_stream_event(&client, &attribution, force, &pending_req, &mut warned),
+                    )
+                    .await,
+                    Ok(Ok(_))
+                )
             {
                 // Re-queue only the failed event and the ones after it that
                 // were never attempted, in order. Events before `i` already
@@ -1333,17 +1489,21 @@ pub async fn run_stream(
 
     // Send the current event — several requests when its transcript batch
     // exceeds the request cap (see `split_into_parts`), never dropping lines.
-    let all_accepted = deliver_parts(
-        &client,
-        &attribution,
-        force,
-        split_into_parts(req),
-        &pending_path,
-        send_failed,
-        deadline,
-        &mut warned,
-    )
-    .await?;
+    let all_accepted = if sends_main {
+        deliver_parts(
+            &client,
+            &attribution,
+            force,
+            split_into_parts(req),
+            &pending_path,
+            send_failed,
+            deadline,
+            &mut warned,
+        )
+        .await?
+    } else {
+        true
+    };
     // 10. Advance .stream_offset once every part is accepted. The inline
     // (OpenCode) path CONSUMES its records from the hook event — they are not
     // re-readable like a transcript file — so its record counter must advance
@@ -1355,8 +1515,29 @@ pub async fn run_stream(
     // next read re-covers these lines from the same start offset, so every line
     // gets the same chunk_index again and the server dedupes it — whatever the
     // queue meanwhile delivered or lost.)
-    if all_accepted || is_inline {
+    if sends_main && (all_accepted || is_inline) {
         fs::write(&offset_path, new_offset.to_string())?;
+    }
+
+    // 11. Subagent transcripts (Claude Code keeps each subagent's conversation
+    // out of the main file). Swept on every hook, not only on `SubagentStop`,
+    // so a long-running or background subagent is sent while it runs, and
+    // `Stop` reads every file to its end.
+    if agent == crate::agent::Agent::ClaudeCode {
+        deliver_subagent_transcripts(
+            &client,
+            &attribution,
+            force,
+            &subagent_template,
+            transcript_path,
+            &session_dir,
+            &pending_path,
+            send_failed || !all_accepted,
+            deadline,
+            matches!(event_type, "stop" | "subagent-stop").then(|| deadline + FINAL_LOCK_WAIT),
+            &mut warned,
+        )
+        .await?;
     }
 
     // 12. Always print HookResponse::allow() to stdout
@@ -3740,5 +3921,373 @@ mod tests {
         assert!(!all_accepted);
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
         assert_eq!(drain_pending(&pending_path).unwrap().len(), parts.len());
+    }
+
+    /// A request that hangs is given up shortly after the budget and its part
+    /// queued, rather than held until the client's 60 s timeout: the agent
+    /// kills the hook first (losing the part), and the hook would keep a
+    /// subagent file's lock a final hook is waiting for.
+    #[tokio::test]
+    async fn deliver_parts_queues_a_request_still_in_flight_past_the_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending_path = dir.path().join("pending.jsonl");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        // Accepts (the kernel backlog does) but never answers.
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let started = Instant::now();
+
+        let all_accepted = deliver_parts(
+            &client,
+            &repo_attr(&uuid::Uuid::new_v4().to_string()),
+            AttributionForce::default(),
+            vec![event_with_lines(big_lines(1, 10), 0)],
+            &pending_path,
+            false,
+            started + Duration::from_millis(100),
+            &mut false,
+        )
+        .await
+        .unwrap();
+
+        assert!(!all_accepted);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(drain_pending(&pending_path).unwrap().len(), 1);
+        drop(listener);
+    }
+
+    // ── VIS-1078: subagent transcripts, one file per request ─────────────────
+
+    const PARENT_SESSION: &str = "parent-session";
+    const SUBAGENT_REPO: &str = "11111111-1111-1111-1111-111111111111";
+
+    /// A Claude Code session laid out as 2.1.x writes it: the main transcript
+    /// `<dir>/<session>.jsonl` and its subagents' `<dir>/<session>/subagents/`.
+    /// Returns `(main transcript, subagents dir, tracevault session dir)`.
+    fn claude_session(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let main = dir.join(format!("{PARENT_SESSION}.jsonl"));
+        fs::write(&main, "{\"type\":\"user\"}\n").unwrap();
+        let subagents = dir.join(PARENT_SESSION).join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let session_dir = dir.join("tv-session");
+        fs::create_dir_all(&session_dir).unwrap();
+        (main, subagents, session_dir)
+    }
+
+    fn subagent_line(agent: &str, n: usize) -> String {
+        serde_json::json!({"agentId": agent, "sessionId": PARENT_SESSION, "n": n}).to_string()
+    }
+
+    fn append_raw(path: &Path, text: &str) {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn append_subagent_lines(subagents: &Path, agent: &str, ns: std::ops::Range<usize>) {
+        let path = subagents.join(format!("agent-{agent}.jsonl"));
+        for n in ns {
+            append_raw(&path, &format!("{}\n", subagent_line(agent, n)));
+        }
+    }
+
+    /// One hook's sweep against a server that answers `responses` and then
+    /// stops listening, so any request beyond them fails (and is queued).
+    /// Returns the requests the server received, in order.
+    async fn sweep(
+        responses: Vec<String>,
+        main: &Path,
+        session_dir: &Path,
+        pending_path: &Path,
+    ) -> Vec<StreamEventRequest> {
+        sweep_waiting(responses, main, session_dir, pending_path, None).await
+    }
+
+    /// [`sweep`] as a final hook, waiting for a busy file's lock until
+    /// `wait_for_lock`.
+    async fn sweep_waiting(
+        responses: Vec<String>,
+        main: &Path,
+        session_dir: &Path,
+        pending_path: &Path,
+        wait_for_lock: Option<Instant>,
+    ) -> Vec<StreamEventRequest> {
+        let expected = responses.len();
+        let (base, rx) = crate::test_helpers::spawn_seq(responses);
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let event = StreamEventRequest {
+            session_id: PARENT_SESSION.into(),
+            ..sample_stream_event_request()
+        };
+        deliver_subagent_transcripts(
+            &client,
+            &repo_attr(SUBAGENT_REPO),
+            AttributionForce::default(),
+            &transcript_template(&event),
+            main,
+            session_dir,
+            pending_path,
+            false,
+            Instant::now() + Duration::from_secs(60),
+            wait_for_lock,
+            &mut false,
+        )
+        .await
+        .unwrap();
+        (0..expected)
+            .map(|_| {
+                let captured = rx.recv_timeout(Duration::from_secs(5)).expect("request");
+                assert!(
+                    captured.starts_with(&format!("POST /api/v1/repos/{SUBAGENT_REPO}/stream ")),
+                    "{captured}"
+                );
+                let body = captured.splitn(3, " | ").nth(2).unwrap();
+                serde_json::from_str(body).unwrap()
+            })
+            .collect()
+    }
+
+    fn agent_of(line: &serde_json::Value) -> &str {
+        line["agentId"].as_str().unwrap()
+    }
+
+    /// Every request carries the lines of exactly one subagent, under the
+    /// parent session, as lines only, and its `transcript_offset` is the byte
+    /// offset of its first line in that subagent's own file.
+    fn assert_one_file_per_request(subagents: &Path, reqs: &[StreamEventRequest]) {
+        for req in reqs {
+            assert_eq!(req.event_type, StreamEventType::Transcript);
+            assert_eq!(req.session_id, PARENT_SESSION);
+            assert!(req.event_uuid.is_none() && req.tool_name.is_none());
+            let lines = part_lines(req);
+            let agent = agent_of(&lines[0]);
+            assert!(
+                lines.iter().all(|l| agent_of(l) == agent),
+                "a request mixes subagent files: {lines:?}"
+            );
+            let file = fs::read_to_string(subagents.join(format!("agent-{agent}.jsonl"))).unwrap();
+            let first = file.find(&lines[0].to_string()).unwrap() as i64;
+            assert_eq!(req.transcript_offset, Some(first));
+        }
+    }
+
+    #[tokio::test]
+    async fn subagent_lines_appended_across_hooks_are_each_sent_once_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, subagents, session_dir) = claude_session(dir.path());
+        let pending = session_dir.join("pending.jsonl");
+        let ok = ok_stream_response;
+        let mut all = Vec::new();
+
+        // Hook 1: both subagents have started.
+        append_subagent_lines(&subagents, "a1", 0..2);
+        append_subagent_lines(&subagents, "b2", 0..1);
+        fs::write(subagents.join("agent-a1.meta.json"), "{}").unwrap();
+        let reqs = sweep(vec![ok(), ok()], &main, &session_dir, &pending).await;
+        assert_eq!(reqs.len(), 2);
+        all.extend(reqs);
+
+        // Hook 2: both appended; b2 is caught mid-line.
+        append_subagent_lines(&subagents, "a1", 2..3);
+        append_subagent_lines(&subagents, "b2", 1..2);
+        let partial = subagent_line("b2", 2);
+        let (head, tail) = partial.split_at(10);
+        append_raw(&subagents.join("agent-b2.jsonl"), head);
+        let reqs = sweep(vec![ok(), ok()], &main, &session_dir, &pending).await;
+        assert_eq!(reqs.len(), 2);
+        all.extend(reqs);
+
+        // Hook 3: b2 finishes the line; a1 is idle.
+        append_raw(&subagents.join("agent-b2.jsonl"), &format!("{tail}\n"));
+        let reqs = sweep(vec![ok()], &main, &session_dir, &pending).await;
+        assert_eq!(reqs.len(), 1);
+        all.extend(reqs);
+
+        // Hook 4: nothing new, nothing sent.
+        assert!(sweep(vec![], &main, &session_dir, &pending)
+            .await
+            .is_empty());
+        assert!(!pending.exists(), "nothing may have failed and been queued");
+
+        assert_one_file_per_request(&subagents, &all);
+        let mut sent: Vec<(String, u64)> = all
+            .iter()
+            .flat_map(part_lines)
+            .map(|l| (agent_of(&l).to_string(), l["n"].as_u64().unwrap()))
+            .collect();
+        sent.sort();
+        let expected: Vec<(String, u64)> = [
+            ("a1", 0),
+            ("a1", 1),
+            ("a1", 2),
+            ("b2", 0),
+            ("b2", 1),
+            ("b2", 2),
+        ]
+        .into_iter()
+        .map(|(a, n)| (a.to_string(), n))
+        .collect();
+        assert_eq!(sent, expected, "each line exactly once");
+    }
+
+    #[tokio::test]
+    async fn a_session_without_subagents_sends_nothing_extra() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join(format!("{PARENT_SESSION}.jsonl"));
+        fs::write(&main, "{\"type\":\"user\"}\n").unwrap();
+        let session_dir = dir.path().join("tv-session");
+        fs::create_dir_all(&session_dir).unwrap();
+        let pending = session_dir.join("pending.jsonl");
+
+        assert!(sweep(vec![], &main, &session_dir, &pending)
+            .await
+            .is_empty());
+        assert_eq!(fs::read_dir(&session_dir).unwrap().count(), 0);
+    }
+
+    /// A failed send queues the file's batch and leaves its offset alone, so
+    /// the next hook sends the same lines under the same chunk_indexes (the
+    /// server dedupes the queued copy). Files after the failure are queued
+    /// too, behind it, rather than sent out of order.
+    #[tokio::test]
+    async fn a_failed_subagent_send_is_queued_and_resent_with_the_same_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, subagents, session_dir) = claude_session(dir.path());
+        let pending = session_dir.join("pending.jsonl");
+        append_subagent_lines(&subagents, "a1", 0..2);
+        append_subagent_lines(&subagents, "b2", 0..1);
+
+        let error =
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let failed = sweep(vec![error.to_string()], &main, &session_dir, &pending).await;
+        assert_eq!(failed.len(), 1);
+        let queued: Vec<StreamEventRequest> = drain_pending(&pending)
+            .unwrap()
+            .iter()
+            .map(|j| serde_json::from_str(j).unwrap())
+            .collect();
+        assert_eq!(queued.len(), 2, "the failed batch and the one behind it");
+
+        let resent = sweep(
+            vec![ok_stream_response(), ok_stream_response()],
+            &main,
+            &session_dir,
+            &pending,
+        )
+        .await;
+        assert_one_file_per_request(&subagents, &resent);
+        let key = |r: &StreamEventRequest| (r.transcript_offset, part_lines(r));
+        assert_eq!(
+            resent.iter().map(key).collect::<Vec<_>>(),
+            queued.iter().map(key).collect::<Vec<_>>()
+        );
+        assert!(sweep(vec![], &main, &session_dir, &pending)
+            .await
+            .is_empty());
+    }
+
+    /// A file another hook of the session is sending is left to it: not read,
+    /// not sent, its offset untouched. The other files still go.
+    #[tokio::test]
+    async fn a_subagent_file_another_hook_is_sending_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, subagents, session_dir) = claude_session(dir.path());
+        let pending = session_dir.join("pending.jsonl");
+        append_subagent_lines(&subagents, "a1", 0..2);
+        append_subagent_lines(&subagents, "b2", 0..1);
+        let a1_offset =
+            crate::subagents::offset_path(&session_dir, &subagents.join("agent-a1.jsonl"));
+        let held = crate::subagents::try_lock(&a1_offset).unwrap().unwrap();
+
+        let reqs = sweep(vec![ok_stream_response()], &main, &session_dir, &pending).await;
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(agent_of(&part_lines(&reqs[0])[0]), "b2");
+        assert!(!a1_offset.exists());
+
+        drop(held);
+        let reqs = sweep(vec![ok_stream_response()], &main, &session_dir, &pending).await;
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(part_lines(&reqs[0]).len(), 2);
+        assert_eq!(agent_of(&part_lines(&reqs[0])[0]), "a1");
+    }
+
+    /// A final hook does not skip a busy file: it waits for the holder, then
+    /// sends what the holder left, here every line.
+    #[tokio::test]
+    async fn a_final_hook_waits_for_a_busy_subagent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, subagents, session_dir) = claude_session(dir.path());
+        let pending = session_dir.join("pending.jsonl");
+        append_subagent_lines(&subagents, "a1", 0..2);
+        let a1_offset =
+            crate::subagents::offset_path(&session_dir, &subagents.join("agent-a1.jsonl"));
+        let held = crate::subagents::try_lock(&a1_offset).unwrap().unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+
+        let reqs = sweep_waiting(
+            vec![ok_stream_response()],
+            &main,
+            &session_dir,
+            &pending,
+            Some(Instant::now() + Duration::from_secs(10)),
+        )
+        .await;
+        release.join().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(part_lines(&reqs[0]).len(), 2);
+    }
+
+    /// A subagent batch over the request cap is split like any other, within
+    /// its own file: every part holds that file's lines only and every line
+    /// keeps the chunk_index it would have had unsplit.
+    #[tokio::test]
+    async fn a_large_subagent_batch_is_split_within_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, subagents, session_dir) = claude_session(dir.path());
+        let pending = session_dir.join("pending.jsonl");
+        let big = subagents.join("agent-a1.jsonl");
+        for n in 0..300 {
+            let line = serde_json::json!({"agentId": "a1", "n": n, "text": "y".repeat(5_000)});
+            append_raw(&big, &format!("{line}\n"));
+        }
+        append_subagent_lines(&subagents, "b2", 0..1);
+
+        let scratch = dir.path().join("scratch-offset");
+        let (lines, start, _) = crate::subagents::read_new_lines(&big, &scratch).unwrap();
+        let unsplit = StreamEventRequest {
+            transcript_lines: Some(lines.clone()),
+            transcript_offset: Some(start),
+            ..transcript_template(&sample_stream_event_request())
+        };
+        let a1_parts = split_into_parts(unsplit).len();
+        assert!(a1_parts > 1, "the batch must exceed the cap");
+
+        let reqs = sweep(
+            vec![ok_stream_response(); a1_parts + 1],
+            &main,
+            &session_dir,
+            &pending,
+        )
+        .await;
+        assert!(!pending.exists());
+        let (a1, b2) = reqs.split_at(a1_parts);
+        assert!(a1.iter().flat_map(part_lines).all(|l| agent_of(&l) == "a1"));
+        assert_eq!(
+            chunk_indexes(a1),
+            lines
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| (start + i as i64, l))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(b2.len(), 1);
+        assert_eq!(agent_of(&part_lines(&b2[0])[0]), "b2");
+        assert_eq!(b2[0].transcript_offset, Some(0));
     }
 }

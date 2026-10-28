@@ -14,6 +14,7 @@ mod oidc;
 mod paths;
 mod resolution;
 mod session_state;
+mod subagents;
 #[cfg(test)]
 mod test_helpers;
 mod transcript;
