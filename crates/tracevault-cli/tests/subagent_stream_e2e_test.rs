@@ -404,6 +404,38 @@ fn flush_delivers_queued_subagent_lines() {
     }
 }
 
+/// A subagent file whose offset is corrupt is skipped, untouched; the hook
+/// still sends the other files and advances their offsets.
+#[test]
+fn a_corrupt_subagent_offset_does_not_block_the_other_files() {
+    let fx = Fixture::new();
+    fx.main_line(0);
+    fx.subagent_line("a1", 0);
+    fx.subagent_line("b2", 0);
+    let offsets = fx.session_dir().join(".subagent_offsets");
+    std::fs::create_dir_all(&offsets).unwrap();
+    std::fs::write(offsets.join("agent-a1"), "garbage").unwrap();
+
+    let (base, rx) = spawn_server();
+    fx.hook(&base, "post-tool-use", "PostToolUse");
+
+    assert_eq!(
+        sent_lines(&captured(&rx)),
+        expected(&[(None, 0), (Some("b2"), 0)])
+    );
+    assert_eq!(
+        std::fs::read_to_string(offsets.join("agent-a1")).unwrap(),
+        "garbage"
+    );
+    let b2_len = std::fs::metadata(fx.subagents.join("agent-b2.jsonl"))
+        .unwrap()
+        .len();
+    assert_eq!(
+        std::fs::read_to_string(offsets.join("agent-b2")).unwrap(),
+        b2_len.to_string()
+    );
+}
+
 /// A split subagent batch whose later part fails is queued; the subagent
 /// then writes more and the next hook re-reads the file, splitting it at other
 /// boundaries. Every line must still reach the server under one chunk_index

@@ -1092,18 +1092,27 @@ pub fn stamp_agent(req: &mut StreamEventRequest, agent: crate::agent::Agent) {
 /// the timeout leaves room for the request already in flight.
 const DELIVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long past the delivery budget a request already in flight may run
+/// before it is given up and its part queued (the client's own timeout is
+/// 60 s, past the hook's). This bounds how long a hook holds a subagent
+/// file's lock: at most its budget plus this.
+const IN_FLIGHT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How long past its own delivery budget a final hook (`Stop`,
-/// `SubagentStop`) waits for a subagent file another hook is sending. The
-/// holder stops starting requests at its own budget, so this covers its last
-/// request; what is read after the budget is queued, not sent, which takes
-/// well under the two seconds left before the 10 s hook timeout.
+/// `SubagentStop`) waits for a subagent file another hook is sending. A
+/// holder started no later than the final hook and releases the lock by its
+/// budget plus [`IN_FLIGHT_GRACE`], so this outlasts every holder; what is
+/// read after the budget is queued, not sent, which takes well under the two
+/// seconds left before the 10 s hook timeout.
 const FINAL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Send a hook event's parts in order. From the first failure on (or from the
 /// start when `send_failed`, i.e. older queued events are still waiting), or
 /// once `deadline` has passed, a part is appended to the pending queue
-/// instead, behind whatever is already there. Returns whether every part was
-/// accepted.
+/// instead, behind whatever is already there. A request still in flight
+/// [`IN_FLIGHT_GRACE`] past `deadline` counts as failed: the server may have
+/// stored it, and the queued copy then dedupes on its chunk_indexes and
+/// `event_uuid`. Returns whether every part was accepted.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_parts(
     client: &crate::api_client::ApiClient,
@@ -1119,9 +1128,10 @@ async fn deliver_parts(
     for part in parts {
         send_failed = send_failed || std::time::Instant::now() >= deadline;
         if !send_failed {
-            match send_stream_event(client, attribution, force, &part, warned).await {
-                Ok(_) => continue,
-                Err(_) => send_failed = true,
+            let send = send_stream_event(client, attribution, force, &part, warned);
+            match tokio::time::timeout_at((deadline + IN_FLIGHT_GRACE).into(), send).await {
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) | Err(_) => send_failed = true,
             }
         }
         all_accepted = false;
@@ -3903,6 +3913,39 @@ mod tests {
         assert!(!all_accepted);
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
         assert_eq!(drain_pending(&pending_path).unwrap().len(), parts.len());
+    }
+
+    /// A request that hangs is given up shortly after the budget and its part
+    /// queued, rather than held until the client's 60 s timeout: the agent
+    /// kills the hook first (losing the part), and the hook would keep a
+    /// subagent file's lock a final hook is waiting for.
+    #[tokio::test]
+    async fn deliver_parts_queues_a_request_still_in_flight_past_the_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending_path = dir.path().join("pending.jsonl");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        // Accepts (the kernel backlog does) but never answers.
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+        let started = Instant::now();
+
+        let all_accepted = deliver_parts(
+            &client,
+            &repo_attr(&uuid::Uuid::new_v4().to_string()),
+            AttributionForce::default(),
+            vec![event_with_lines(big_lines(1, 10), 0)],
+            &pending_path,
+            false,
+            started + Duration::from_millis(100),
+            &mut false,
+        )
+        .await
+        .unwrap();
+
+        assert!(!all_accepted);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(drain_pending(&pending_path).unwrap().len(), 1);
+        drop(listener);
     }
 
     // ── VIS-1078: subagent transcripts, one file per request ─────────────────
