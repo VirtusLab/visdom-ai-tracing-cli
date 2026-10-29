@@ -339,16 +339,20 @@ pub fn remove_telemetry(
     let holds = |env: &serde_json::Map<String, Value>, key: &str, value: &str| {
         env.get(key).is_some_and(|v| as_text(v) == value)
     };
-    if ours
-        .as_deref()
-        .is_some_and(|e| holds(env, LOGS_ENDPOINT, e))
-    {
+    // The interval only paces our helper, which is gone.
+    if added_interval != Some(false) && holds(env, HELPER_INTERVAL, HELPER_INTERVAL_MS) {
+        env.remove(HELPER_INTERVAL);
+    }
+    // The exporter entries are ours while the endpoint is ours or gone; once
+    // the user pointed it elsewhere, they serve the user's own exporter.
+    let endpoint_ours_or_gone = match env.get(LOGS_ENDPOINT).map(as_text) {
+        None => true,
+        Some(e) => ours.as_deref() == Some(e.as_str()),
+    };
+    if endpoint_ours_or_gone {
         env.remove(LOGS_ENDPOINT);
         if holds(env, LOGS_PROTOCOL, "http/protobuf") {
             env.remove(LOGS_PROTOCOL);
-        }
-        if added_interval != Some(false) && holds(env, HELPER_INTERVAL, HELPER_INTERVAL_MS) {
-            env.remove(HELPER_INTERVAL);
         }
         let is_exporter = |k: &str, v: &str| match k {
             "OTEL_METRICS_EXPORTER" | "OTEL_TRACES_EXPORTER" => !matches!(v, "" | "none"),
@@ -403,14 +407,23 @@ pub fn uninstall(
     Ok(removed)
 }
 
-/// Whether `<claude_dir>/settings.json` already sets the helper interval.
-/// Checked before [`install`], whose merge keeps an existing one, so the
-/// caller can record whether the interval is ours to remove later.
-pub fn has_helper_interval(claude_dir: &Path) -> bool {
-    fs::read_to_string(claude_dir.join("settings.json"))
+/// Who will own the helper interval after [`install`] (whose merge keeps an
+/// existing one), checked before it runs, for the caller to record:
+/// `Some(true)` when the install will add it, `Some(false)` when the user
+/// already set it without our telemetry, and `None` when it sits next to our
+/// own helper already (an earlier install: keep what was recorded).
+pub fn interval_added_by_install(claude_dir: &Path) -> Option<bool> {
+    let settings = fs::read_to_string(claude_dir.join("settings.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .is_some_and(|s| s["env"].get(HELPER_INTERVAL).is_some())
+        .unwrap_or_else(|| json!({}));
+    if settings["env"].get(HELPER_INTERVAL).is_none() {
+        Some(true)
+    } else if settings.get(HEADERS_HELPER).is_some_and(is_our_helper) {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 /// Claude Code variables that add content (prompt text, tool input and
@@ -925,6 +938,41 @@ pub(crate) mod tests {
         let (mut s, _) = merged(json!({}), &Environment::default());
         remove_telemetry(&mut s, &Environment::default(), Some(true)).unwrap();
         assert_eq!(s, json!({}));
+    }
+
+    #[test]
+    fn interval_ownership_is_known_before_the_install() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(interval_added_by_install(dir.path()), Some(true));
+        fs::write(
+            dir.path().join("settings.json"),
+            json!({"env": {HELPER_INTERVAL: HELPER_INTERVAL_MS}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(interval_added_by_install(dir.path()), Some(false));
+        fs::remove_file(dir.path().join("settings.json")).unwrap();
+        install(dir.path(), SERVER, &Environment::default()).unwrap();
+        assert_eq!(
+            interval_added_by_install(dir.path()),
+            None,
+            "a re-run cannot tell"
+        );
+    }
+
+    #[test]
+    fn removal_still_cleans_up_when_the_user_removed_the_endpoint() {
+        let (mut s, _) = merged(json!({}), &Environment::default());
+        s["env"].as_object_mut().unwrap().remove(LOGS_ENDPOINT);
+        remove_telemetry(&mut s, &Environment::default(), Some(true)).unwrap();
+        assert_eq!(s, json!({}));
+
+        // Pointed at their own collector: only what serves no one goes.
+        let (mut s, _) = merged(json!({}), &Environment::default());
+        s["env"][LOGS_ENDPOINT] = json!("https://collector.corp/v1/logs");
+        remove_telemetry(&mut s, &Environment::default(), Some(true)).unwrap();
+        assert!(s["env"].get(HELPER_INTERVAL).is_none());
+        assert_eq!(s["env"][LOGS_EXPORTER], "otlp");
+        assert_eq!(s["env"][LOGS_ENDPOINT], "https://collector.corp/v1/logs");
     }
 
     #[test]

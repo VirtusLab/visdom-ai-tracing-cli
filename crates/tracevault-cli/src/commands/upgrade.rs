@@ -246,12 +246,12 @@ fn upgrade_machine(
             return None;
         }
     };
-    let had_interval = claude_telemetry::has_helper_interval(&paths.claude_dir);
+    let interval_ours = claude_telemetry::interval_added_by_install(&paths.claude_dir);
     match claude_telemetry::install(&paths.claude_dir, &url, env) {
         Ok(InstallOutcome::Configured) => {
             settled(state);
-            if !had_interval {
-                state.telemetry_added_interval = Some(true);
+            if interval_ours.is_some() {
+                state.telemetry_added_interval = interval_ours;
             }
             if was_off {
                 state.telemetry_auto_enabled = Some(version.to_string());
