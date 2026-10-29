@@ -600,6 +600,68 @@ fn session_start_sends_a_repo_session_an_older_cli_recorded() {
     assert_eq!(types(&sent[0]), ["cost-state"]);
 }
 
+/// Set the transcript of `session` as last written `age_secs` ago.
+fn age(fx: &Fixture, session: &str, age_secs: u64) {
+    std::fs::File::options()
+        .write(true)
+        .open(fx.transcript(session))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(age_secs))
+        .unwrap();
+}
+
+#[test]
+fn sessions_skipped_for_their_attribution_do_not_hold_back_older_ones() {
+    // As many newer sessions as one run sends, each recorded under a project
+    // that no longer resolves, and an older one that can be sent.
+    const SENT_PER_RUN: usize = 10;
+    let fx = Fixture::new();
+    let (base, rx) = spawn_server();
+    ended_session(&fx, &base, "older");
+    age(&fx, "older", 600);
+    for i in 0..SENT_PER_RUN {
+        let id = format!("moved-{i}");
+        ended_session(&fx, &base, &id);
+        age(&fx, &id, 60 + i as u64);
+        set_recorded_attribution(
+            &fx,
+            &id,
+            Some(serde_json::json!({
+                "repo_id": REPO_ID,
+                "project_id": "22222222-2222-2222-2222-222222222222",
+            })),
+        );
+    }
+    captured(&rx);
+
+    fx.session_start(&base, "new-session");
+    let sent = captured(&rx);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].session_id, "older");
+}
+
+#[test]
+fn one_session_start_sends_at_most_ten_sessions() {
+    let fx = Fixture::new();
+    let (base, rx) = spawn_server();
+    for i in 0..12 {
+        let id = format!("s{i:02}");
+        ended_session(&fx, &base, &id);
+        age(&fx, &id, 1000 - i as u64);
+    }
+    captured(&rx);
+
+    fx.session_start(&base, "new-session");
+    let mut sent: Vec<String> = captured(&rx).into_iter().map(|r| r.session_id).collect();
+    sent.sort();
+    let expected: Vec<String> = (2..12).map(|i| format!("s{i:02}")).collect();
+    assert_eq!(sent, expected, "the 10 most recent");
+
+    fx.session_start(&base, "next-session");
+    let sent: Vec<String> = captured(&rx).into_iter().map(|r| r.session_id).collect();
+    assert_eq!(sent, ["s01", "s00"], "the rest next time");
+}
+
 #[test]
 fn session_start_stays_inside_its_timeout_when_the_server_stalls() {
     let fx = Fixture::new();

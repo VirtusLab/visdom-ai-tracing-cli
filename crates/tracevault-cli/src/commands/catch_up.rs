@@ -35,7 +35,9 @@ use crate::commands::stream::{self, SessionTarget};
 /// this by default (`cleanupPeriodDays`), so older sessions are mostly gone.
 pub const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Sessions sent per run, so one session start sends at most this many.
+/// Sessions sent per run, so one session start sends at most this many. A
+/// session skipped for its attribution does not count: it is never sent,
+/// and must not hold back older ones.
 pub const MAX_SESSIONS: usize = 10;
 
 /// Sessions with unsent lines read per run, most recent first. Most have no
@@ -129,7 +131,6 @@ pub fn candidates(
         .take(MAX_SCANNED)
         .take_while(|_| Instant::now() < deadline)
         .filter(|(_, _, _, transcript, offset)| unsent_has_cost_state(transcript, *offset))
-        .take(MAX_SESSIONS)
         .map(|(_, session_id, session_dir, transcript, _)| Candidate {
             worktree_top: worktree_top(&session_dir, project_root),
             session_id,
@@ -140,15 +141,16 @@ pub fn candidates(
 }
 
 /// Send the rest of every [`candidates`] session of `project_root`, as its
-/// `SessionEnd` hook would, starting nothing after `deadline`. Stops at the
-/// first session the server did not take in full: the rest wait for the
-/// next session start.
+/// `SessionEnd` hook would, starting nothing after `deadline`, until
+/// [`MAX_SESSIONS`] are sent. Stops at the first session the server did not
+/// take in full: the rest wait for the next session start.
 pub async fn sweep(project_root: PathBuf, current_session: String, deadline: Instant) {
     if env_sets_attribution(|name| std::env::var_os(name)) {
         return;
     }
+    let mut sent_sessions = 0;
     for c in candidates(&project_root, &current_session, SystemTime::now(), deadline) {
-        if Instant::now() >= deadline {
+        if sent_sessions >= MAX_SESSIONS || Instant::now() >= deadline {
             break;
         }
         let event = tracevault_protocol::hooks::HookEvent {
@@ -179,8 +181,9 @@ pub async fn sweep(project_root: PathBuf, current_session: String, deadline: Ins
         )
         .await;
         match sent {
-            Ok(true) => {}
-            Ok(false) => break,
+            Ok(stream::Sent::Accepted) => sent_sessions += 1,
+            Ok(stream::Sent::Skipped) => {}
+            Ok(stream::Sent::Queued) => break,
             Err(e) => {
                 eprintln!(
                     "tracevault: cannot send the end of session {}: {e}",
@@ -394,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn at_most_max_sessions_most_recent_first() {
+    fn most_recent_first() {
         let r = repo();
         let now = SystemTime::now();
         for i in 0..MAX_SESSIONS + 2 {
@@ -402,9 +405,12 @@ mod tests {
             touch(&t, now - Duration::from_secs(1000 - i as u64));
         }
         let ids = r.ids("other", now);
-        assert_eq!(ids.len(), MAX_SESSIONS);
-        assert_eq!(ids[0], format!("s{:02}", MAX_SESSIONS + 1), "newest first");
-        assert!(!ids.contains(&"s00".to_string()), "oldest left out");
+        let expected: Vec<String> = (0..MAX_SESSIONS + 2)
+            .rev()
+            .map(|i| format!("s{i:02}"))
+            .collect();
+        // The per-run cap counts sessions sent, so `sweep` applies it.
+        assert_eq!(ids, expected);
     }
 
     #[test]

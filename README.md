@@ -723,7 +723,9 @@ it), `session-start` sends it later: for each session of the repo whose unsent l
 `cost-state`, it sends them as `SessionEnd` would have. It looks at sessions written in the last
 30 days, at most 10 per session start, and stops when the server does not take them. It does
 not run when `TRACEVAULT_PROJECT` or `TRACEVAULT_PROJECT_ATTRIBUTION` is set: they attribute what
-the current process sends, and an earlier session may have run with other values.
+the current process sends, and an earlier session may have run with other values. For the same
+reason it sends a session only under the repo and project its own hooks sent under (recorded in
+`.tracevault/sessions/<session>/metadata.json`).
 
 **Subagents.** Claude Code writes each subagent's conversation to its own file,
 `<session>/subagents/agent-<id>.jsonl` next to the session transcript, and leaves the subagent's

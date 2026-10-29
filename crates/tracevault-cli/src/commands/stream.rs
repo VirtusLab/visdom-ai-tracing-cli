@@ -1315,12 +1315,21 @@ pub(crate) enum Sender {
     CatchUp,
 }
 
+/// What a [`stream_event`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sent {
+    /// Every request was accepted: nothing was left in the queue.
+    Accepted,
+    /// Something was queued: a send failed, or the deadline came first.
+    Queued,
+    /// Nothing was sent: no attribution resolved, or (catch-up) not the one
+    /// the session recorded.
+    Skipped,
+}
+
 /// Send `hook_event` (and, from a hook, what the session's subagents wrote
 /// since the last hook) as `event_type`, queueing what is not accepted by
-/// `deadline`. Prints nothing: the hook's response is the caller's. Returns
-/// whether every request was accepted, i.e. nothing was left in the queue
-/// (an event nothing can be attributed to counts as accepted: it is not sent
-/// at all).
+/// `deadline`. Prints nothing: the hook's response is the caller's.
 pub(crate) async fn stream_event(
     mut hook_event: tracevault_protocol::hooks::HookEvent,
     event_type: &str,
@@ -1328,7 +1337,7 @@ pub(crate) async fn stream_event(
     target: &SessionTarget,
     deadline: std::time::Instant,
     sender: Sender,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<Sent, Box<dyn std::error::Error>> {
     let SessionTarget {
         project_root,
         session_dir,
@@ -1551,7 +1560,7 @@ pub(crate) async fn stream_event(
     // Graceful no-op, exactly like the hook's normal success path. Do NOT
     // error: a failing hook would block the tool.
     let Some(attribution) = attribution_for(binding.as_ref(), capture_pid) else {
-        return Ok(true);
+        return Ok(Sent::Skipped);
     };
     // A hook records what it sends under, for a later catch-up of this
     // session (best-effort, like the transcript path); the catch-up sends
@@ -1563,7 +1572,7 @@ pub(crate) async fn stream_event(
         Sender::CatchUp => {
             let meta = session_metadata(session_dir);
             if !catch_up_may_send(meta.get("attribution"), &attribution) {
-                return Ok(true);
+                return Ok(Sent::Skipped);
             }
         }
     }
@@ -1673,7 +1682,11 @@ pub(crate) async fn stream_event(
         .await?;
     }
 
-    Ok(!send_failed && all_accepted)
+    Ok(if !send_failed && all_accepted {
+        Sent::Accepted
+    } else {
+        Sent::Queued
+    })
 }
 
 #[cfg(test)]
