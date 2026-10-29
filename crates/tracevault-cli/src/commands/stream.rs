@@ -1148,7 +1148,7 @@ pub async fn run_stream(
     let deadline = std::time::Instant::now() + DELIVERY_BUDGET;
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
-    let mut hook_event = parse_hook_event(&input)?;
+    let hook_event = parse_hook_event(&input)?;
 
     // Resolve project_root and session_dir via the shared git-aware resolver.
     //
@@ -1209,6 +1209,66 @@ pub async fn run_stream(
     if let Some(records) = &hook_event.transcript_records {
         let _ = record_inline_tool_calls(&session_dir, records);
     }
+
+    let target = SessionTarget {
+        project_root,
+        session_dir,
+        worktree_top,
+    };
+    stream_event(hook_event, event_type, agent, &target, deadline, true).await?;
+
+    // 12. Always print HookResponse::allow() to stdout
+    let response = HookResponse::allow();
+    println!("{}", serde_json::to_string(&response)?);
+
+    Ok(())
+}
+
+/// The server event a hook's `--event` is sent as.
+pub fn stream_event_type(event_type: &str) -> StreamEventType {
+    match event_type {
+        "notification" => StreamEventType::SessionStart,
+        // Codex, OpenCode and GSD/pi end their sessions with it.
+        "stop" => StreamEventType::SessionEnd,
+        // Claude Code's `SessionEnd` comes after `Stop`, which already ended
+        // the session on the server: it only carries the last transcript
+        // lines, among them the `cost-state` report (VIS-1108).
+        "session-end" => StreamEventType::Transcript,
+        _ => StreamEventType::ToolUse,
+    }
+}
+
+/// Where a stream event's session lives, resolved by the caller: the hook
+/// from its working directory, the catch-up sweep from the session's
+/// directory.
+pub(crate) struct SessionTarget {
+    pub project_root: std::path::PathBuf,
+    /// `<project_root>/.tracevault/sessions/<session_id>`; must exist.
+    pub session_dir: std::path::PathBuf,
+    /// The checkout the session runs in (see [`crate::paths::worktree_toplevel`]).
+    pub worktree_top: String,
+}
+
+/// Send `hook_event` (and, with `subagents`, what the session's subagents
+/// wrote since the last hook) as `event_type`, queueing what is not
+/// accepted by `deadline`. Prints nothing: the hook's response is the
+/// caller's. Returns whether every request was accepted, i.e. nothing was
+/// left in the queue (an event nothing can be attributed to counts as
+/// accepted: it is not sent at all).
+pub(crate) async fn stream_event(
+    mut hook_event: tracevault_protocol::hooks::HookEvent,
+    event_type: &str,
+    agent: crate::agent::Agent,
+    target: &SessionTarget,
+    deadline: std::time::Instant,
+    subagents: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let SessionTarget {
+        project_root,
+        session_dir,
+        worktree_top,
+    } = target;
+    let hook_cwd = Path::new(&hook_event.cwd);
 
     // 3. Mint a time-ordered event id. UUIDv7 is stamped at hook-fire time, so
     //    it both orders events and is a stable idempotency key — no shared
@@ -1278,11 +1338,7 @@ pub async fn run_stream(
         (transcript_lines, start_offset, new_offset)
     };
     // 5. Build StreamEventRequest
-    let stream_event_type = match event_type {
-        "notification" => StreamEventType::SessionStart,
-        "stop" => StreamEventType::SessionEnd,
-        _ => StreamEventType::ToolUse,
-    };
+    let stream_event_type = stream_event_type(event_type);
 
     // Extract is_error from transcript for this tool_use_id. Inline (OpenCode)
     // events have no tool_use_id, so fall back to a forwarded `toolResult`
@@ -1303,7 +1359,7 @@ pub async fn run_stream(
     // user context" — `resolve_user_context` below falls back to the user-level
     // config in that case. A malformed repo config is surfaced as an error
     // later (the required-config check), not silently dropped here.
-    let config = crate::config::TracevaultConfig::try_load(&project_root);
+    let config = crate::config::TracevaultConfig::try_load(project_root);
     // Repo config's user_context wins when the repo configured it; otherwise
     // fall back to the user-level ~/.config/tracevault/config.toml. This is
     // what lets a detached session (no checkout) still carry user context.
@@ -1359,7 +1415,7 @@ pub async fn run_stream(
     }
 
     // 6. Resolve credentials
-    let (server_url, credential) = crate::credentials::resolve_credentials_quiet(&project_root)?;
+    let (server_url, credential) = crate::credentials::resolve_credentials_quiet(project_root)?;
 
     // 7. Config (loaded above, alongside the user-level context layer
     // resolution) no longer directly gates repo_id — a missing config is not
@@ -1384,7 +1440,7 @@ pub async fn run_stream(
         .and_then(|opt| opt.as_ref())
         .and_then(crate::resolution::binding_from_config);
     let user_default = crate::user_default::load();
-    let mut binding = resolve_stream_binding(&session, &worktree_top, bound, user_default);
+    let mut binding = resolve_stream_binding(&session, worktree_top, bound, user_default);
     // The client is built here, not at step 8, because an unbound session may
     // need it first: bind it from its checkout's remote, as the SessionStart
     // hook does — this covers agents without that hook and a SessionStart
@@ -1403,13 +1459,6 @@ pub async fn run_stream(
             binding = auto.binding;
         }
     }
-    // Graceful no-op, exactly like the hook's normal success path. Do NOT
-    // error: a failing hook would block the tool.
-    let no_op_allow = || -> Result<(), Box<dyn std::error::Error>> {
-        let response = HookResponse::allow();
-        println!("{}", serde_json::to_string(&response)?);
-        Ok(())
-    };
     // Explicit local project binding (if any) overrides server-side repo
     // deduction. Computed BEFORE the attribution gate below, reusing the
     // already-loaded session + worktree used just above for the repo-binding
@@ -1436,16 +1485,17 @@ pub async fn run_stream(
     // session-state file whose repo_id could carry path separators into the
     // pending filename — such a binding degrades to project-only inside
     // `attribution_for` rather than dropping the event.)
+    // Graceful no-op, exactly like the hook's normal success path. Do NOT
+    // error: a failing hook would block the tool.
     let Some(attribution) = attribution_for(binding.as_ref(), capture_pid) else {
-        no_op_allow()?;
-        return Ok(());
+        return Ok(true);
     };
 
     // 8. The ApiClient (built above)
     let client = client.ok_or("server_url not configured")?;
 
     // 9. Try drain pending queue and send
-    let pending_path = pending_path_for(&session_dir, &attribution);
+    let pending_path = pending_path_for(session_dir, &attribution);
     let pending_events = drain_pending(&pending_path)?;
 
     let mut send_failed = false;
@@ -1489,7 +1539,11 @@ pub async fn run_stream(
 
     // Send the current event — several requests when its transcript batch
     // exceeds the request cap (see `split_into_parts`), never dropping lines.
-    let all_accepted = if sends_main {
+    // A `session-end` without new lines has nothing to send: `Stop` already
+    // ended the session on the server.
+    let sends_event = sends_main
+        && !(req.event_type == StreamEventType::Transcript && req.transcript_lines.is_none());
+    let all_accepted = if sends_event {
         deliver_parts(
             &client,
             &attribution,
@@ -1515,36 +1569,34 @@ pub async fn run_stream(
     // next read re-covers these lines from the same start offset, so every line
     // gets the same chunk_index again and the server dedupes it — whatever the
     // queue meanwhile delivered or lost.)
+    // Replaced atomically: the catch-up sweep can read it while this runs.
     if sends_main && (all_accepted || is_inline) {
-        fs::write(&offset_path, new_offset.to_string())?;
+        crate::subagents::write_offset(&offset_path, new_offset)?;
     }
 
     // 11. Subagent transcripts (Claude Code keeps each subagent's conversation
     // out of the main file). Swept on every hook, not only on `SubagentStop`,
     // so a long-running or background subagent is sent while it runs, and
-    // `Stop` reads every file to its end.
-    if agent == crate::agent::Agent::ClaudeCode {
+    // the final hooks read every file to its end.
+    if subagents && agent == crate::agent::Agent::ClaudeCode {
         deliver_subagent_transcripts(
             &client,
             &attribution,
             force,
             &subagent_template,
             transcript_path,
-            &session_dir,
+            session_dir,
             &pending_path,
             send_failed || !all_accepted,
             deadline,
-            matches!(event_type, "stop" | "subagent-stop").then(|| deadline + FINAL_LOCK_WAIT),
+            matches!(event_type, "stop" | "subagent-stop" | "session-end")
+                .then(|| deadline + FINAL_LOCK_WAIT),
             &mut warned,
         )
         .await?;
     }
 
-    // 12. Always print HookResponse::allow() to stdout
-    let response = HookResponse::allow();
-    println!("{}", serde_json::to_string(&response)?);
-
-    Ok(())
+    Ok(!send_failed && all_accepted)
 }
 
 #[cfg(test)]
@@ -1554,6 +1606,28 @@ mod tests {
     use crate::config::UserContext;
     use crate::context::{Context, EffectiveContext};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn hook_events_map_to_server_events() {
+        assert_eq!(
+            stream_event_type("notification"),
+            StreamEventType::SessionStart
+        );
+        // Every agent's `stop` ends the session; Claude Code's `session-end`
+        // comes after it and must not end it again.
+        assert_eq!(stream_event_type("stop"), StreamEventType::SessionEnd);
+        assert_eq!(
+            stream_event_type("session-end"),
+            StreamEventType::Transcript
+        );
+        for event in ["pre-tool-use", "post-tool-use", "subagent-stop", "other"] {
+            assert_eq!(
+                stream_event_type(event),
+                StreamEventType::ToolUse,
+                "{event}"
+            );
+        }
+    }
 
     // ── user layer resolution: disabled config → no user layer ────────────────
 
