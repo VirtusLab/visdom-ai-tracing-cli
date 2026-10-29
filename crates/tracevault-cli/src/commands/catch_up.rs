@@ -21,7 +21,9 @@
 //!
 //! It does not run when `TRACEVAULT_PROJECT` or
 //! `TRACEVAULT_PROJECT_ATTRIBUTION` is set: they attribute what this process
-//! sends, and an earlier session's process may have had other values.
+//! sends, and an earlier session's process may have had other values. For the
+//! same reason a session is sent only under the attribution its own hooks
+//! recorded (see [`stream::catch_up_may_send`]).
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -91,7 +93,10 @@ pub fn candidates(
     let Ok(entries) = std::fs::read_dir(&sessions) else {
         return vec![];
     };
+    // `.tracevault/sessions` is never pruned: even listing it is bounded by
+    // the deadline.
     let mut unsent: Vec<(SystemTime, String, PathBuf, PathBuf, u64)> = entries
+        .take_while(|_| Instant::now() < deadline)
         .flatten()
         .filter_map(|entry| {
             let session_id = entry.file_name().to_str()?.to_string();

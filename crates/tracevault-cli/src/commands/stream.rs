@@ -103,21 +103,66 @@ pub fn record_transcript_path(session_dir: &Path, transcript_path: &str) -> Resu
     if transcript_path.is_empty() {
         return Ok(());
     }
-    let meta_path = session_dir.join("metadata.json");
-    let mut meta = fs::read_to_string(&meta_path)
+    record_metadata(
+        session_dir,
+        "transcript_path",
+        serde_json::Value::String(transcript_path.to_string()),
+    )
+}
+
+/// The session's `metadata.json`; `{}` when it is missing or unreadable.
+pub(crate) fn session_metadata(session_dir: &Path) -> serde_json::Value {
+    fs::read_to_string(session_dir.join("metadata.json"))
         .ok()
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
         .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    if meta.get("transcript_path").and_then(|v| v.as_str()) == Some(transcript_path) {
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// Set `key` in the session's `metadata.json`, keeping its other keys. An
+/// unchanged value skips the write; the file is replaced atomically (see
+/// [`record_transcript_path`]).
+fn record_metadata(
+    session_dir: &Path,
+    key: &str,
+    value: serde_json::Value,
+) -> Result<(), io::Error> {
+    let mut meta = session_metadata(session_dir);
+    if meta.get(key) == Some(&value) {
         return Ok(());
     }
-    meta["transcript_path"] = serde_json::Value::String(transcript_path.to_string());
+    meta[key] = value;
     let tmp = session_dir.join(format!(".metadata.json.{}", uuid::Uuid::now_v7()));
     fs::write(&tmp, meta.to_string())?;
-    fs::rename(&tmp, &meta_path).inspect_err(|_| {
+    fs::rename(&tmp, session_dir.join("metadata.json")).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })
+}
+
+/// `attribution` as the session's hooks record it in `metadata.json`.
+fn attribution_record(attribution: &Attribution) -> serde_json::Value {
+    match attribution {
+        Attribution::Repo { repo_id, project } => {
+            serde_json::json!({"repo_id": repo_id, "project_id": project})
+        }
+        Attribution::ProjectOnly { project_id } => {
+            serde_json::json!({"repo_id": null, "project_id": project_id})
+        }
+    }
+}
+
+/// Whether the catch-up sweep may send an earlier session's lines under
+/// `now`, the attribution that resolves today. Bindings can change after a
+/// session ended (a new default project, say), so it must be the one the
+/// session's own hooks recorded. A session recorded by an older CLI has
+/// none: it is sent when repo-attributed, since the server keys its row by
+/// the repo and never moves a project once stamped, and left alone when
+/// project-only, since there the project picks the row.
+pub(crate) fn catch_up_may_send(recorded: Option<&serde_json::Value>, now: &Attribution) -> bool {
+    match recorded {
+        Some(recorded) => *recorded == attribution_record(now),
+        None => matches!(now, Attribution::Repo { .. }),
+    }
 }
 
 /// Fileless agents (OpenCode) have no transcript for `tracevault check` to
@@ -1508,6 +1553,20 @@ pub(crate) async fn stream_event(
     let Some(attribution) = attribution_for(binding.as_ref(), capture_pid) else {
         return Ok(true);
     };
+    // A hook records what it sends under, for a later catch-up of this
+    // session (best-effort, like the transcript path); the catch-up sends
+    // only under that.
+    match sender {
+        Sender::Hook => {
+            let _ = record_metadata(session_dir, "attribution", attribution_record(&attribution));
+        }
+        Sender::CatchUp => {
+            let meta = session_metadata(session_dir);
+            if !catch_up_may_send(meta.get("attribution"), &attribution) {
+                return Ok(true);
+            }
+        }
+    }
 
     // 8. The ApiClient (built above)
     let client = client.ok_or("server_url not configured")?;
@@ -1624,6 +1683,44 @@ mod tests {
     use crate::config::UserContext;
     use crate::context::{Context, EffectiveContext};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn catch_up_sends_only_under_the_attribution_the_session_recorded() {
+        let repo = |project: Option<uuid::Uuid>| Attribution::Repo {
+            repo_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            project,
+        };
+        let a = uuid::Uuid::from_u128(0xa);
+        let b = uuid::Uuid::from_u128(0xb);
+        let only = |project_id| Attribution::ProjectOnly { project_id };
+
+        let recorded = attribution_record(&repo(Some(a)));
+        assert!(catch_up_may_send(Some(&recorded), &repo(Some(a))));
+        assert!(!catch_up_may_send(Some(&recorded), &repo(Some(b))));
+        assert!(!catch_up_may_send(Some(&recorded), &repo(None)));
+        let recorded = attribution_record(&only(a));
+        assert!(catch_up_may_send(Some(&recorded), &only(a)));
+        assert!(!catch_up_may_send(Some(&recorded), &only(b)));
+        // Recorded by an older CLI: the repo keys the row, the project does
+        // not when there is no repo.
+        assert!(catch_up_may_send(None, &repo(Some(b))));
+        assert!(!catch_up_may_send(None, &only(a)));
+    }
+
+    #[test]
+    fn record_metadata_keeps_the_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        record_transcript_path(dir.path(), "/t.jsonl").unwrap();
+        record_metadata(
+            dir.path(),
+            "attribution",
+            serde_json::json!({"repo_id": "r"}),
+        )
+        .unwrap();
+        let meta = session_metadata(dir.path());
+        assert_eq!(meta["transcript_path"], "/t.jsonl");
+        assert_eq!(meta["attribution"]["repo_id"], "r");
+    }
 
     #[test]
     fn hook_events_map_to_server_events() {

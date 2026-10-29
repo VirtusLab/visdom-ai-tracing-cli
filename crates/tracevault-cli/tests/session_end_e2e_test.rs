@@ -121,6 +121,21 @@ fn dead_server() -> String {
     format!("http://{}", listener.local_addr().unwrap())
 }
 
+/// A server that accepts every connection and never answers, for
+/// `ACCEPT_DEADLINE` after the last one.
+fn stalled_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        while let Some(stream) = accept_with_deadline(&listener) {
+            held.push(stream);
+        }
+    });
+    format!("http://{addr}")
+}
+
 /// A temp git repo bound to `REPO_ID`, isolated home/config/state dirs, and a
 /// Claude Code project dir for the session transcripts.
 struct Fixture {
@@ -515,6 +530,90 @@ fn session_start_with_a_process_scoped_project_leaves_other_sessions_alone() {
     assert!(child.wait_with_output().unwrap().status.success());
 
     assert!(captured(&rx).is_empty());
+    assert_eq!(fx.offset("ended"), offset);
+}
+
+/// Set (or, with `None`, remove) the attribution `session`'s hooks recorded.
+fn set_recorded_attribution(fx: &Fixture, session: &str, attribution: Option<serde_json::Value>) {
+    let path = fx.session_dir(session).join("metadata.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    match attribution {
+        Some(a) => meta["attribution"] = a,
+        None => {
+            meta.as_object_mut().unwrap().remove("attribution");
+        }
+    }
+    std::fs::write(&path, meta.to_string()).unwrap();
+}
+
+#[test]
+fn hooks_record_the_attribution_they_send_under() {
+    let fx = Fixture::new();
+    let (base, rx) = spawn_server();
+    ended_session(&fx, &base, "ended");
+    captured(&rx);
+    let meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fx.session_dir("ended").join("metadata.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        meta["attribution"],
+        serde_json::json!({"repo_id": REPO_ID, "project_id": null})
+    );
+}
+
+#[test]
+fn session_start_leaves_a_session_recorded_under_another_attribution() {
+    let fx = Fixture::new();
+    let (base, rx) = spawn_server();
+    ended_session(&fx, &base, "ended");
+    captured(&rx);
+    // Its hooks sent under a project that no longer resolves for it (the
+    // default project was switched since).
+    set_recorded_attribution(
+        &fx,
+        "ended",
+        Some(serde_json::json!({
+            "repo_id": REPO_ID,
+            "project_id": "22222222-2222-2222-2222-222222222222",
+        })),
+    );
+    let offset = fx.offset("ended");
+
+    fx.session_start(&base, "new-session");
+    assert!(captured(&rx).is_empty());
+    assert_eq!(fx.offset("ended"), offset);
+}
+
+#[test]
+fn session_start_sends_a_repo_session_an_older_cli_recorded() {
+    let fx = Fixture::new();
+    let (base, rx) = spawn_server();
+    ended_session(&fx, &base, "ended");
+    captured(&rx);
+    set_recorded_attribution(&fx, "ended", None);
+
+    fx.session_start(&base, "new-session");
+    let sent = captured(&rx);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(types(&sent[0]), ["cost-state"]);
+}
+
+#[test]
+fn session_start_stays_inside_its_timeout_when_the_server_stalls() {
+    let fx = Fixture::new();
+    let (base, rx) = spawn_server();
+    ended_session(&fx, &base, "ended");
+    captured(&rx);
+    let offset = fx.offset("ended");
+
+    let started = Instant::now();
+    let out = fx.session_start(&stalled_server(), "new-session");
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(10), "took {took:?}");
+    let response: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(response.is_object());
     assert_eq!(fx.offset("ended"), offset);
 }
 
