@@ -313,9 +313,16 @@ pub fn install(
 /// names, so without our helper nothing in `env` is touched (it could be
 /// anyone's). `CLAUDE_CODE_ENABLE_TELEMETRY` and `OTEL_LOGS_EXPORTER` stay
 /// when another exporter still uses them — in this file, the managed settings
-/// or the shell (`outside`) — and a helper interval the user set stays.
+/// or the shell (`outside`; our own endpoint there, inherited by a shell
+/// Claude Code started, is not another exporter). The helper interval goes
+/// only when `added_interval` says we added it (`None`: not known, for an
+/// install older than that record; then our value counts as ours).
 /// Returns whether anything was removed.
-pub fn remove_telemetry(settings: &mut Value, outside: &Environment) -> io::Result<bool> {
+pub fn remove_telemetry(
+    settings: &mut Value,
+    outside: &Environment,
+    added_interval: Option<bool>,
+) -> io::Result<bool> {
     let root = settings.as_object_mut().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -337,16 +344,15 @@ pub fn remove_telemetry(settings: &mut Value, outside: &Environment) -> io::Resu
         .is_some_and(|e| holds(env, LOGS_ENDPOINT, e))
     {
         env.remove(LOGS_ENDPOINT);
-        for (key, value) in [
-            (LOGS_PROTOCOL, "http/protobuf"),
-            (HELPER_INTERVAL, HELPER_INTERVAL_MS),
-        ] {
-            if holds(env, key, value) {
-                env.remove(key);
-            }
+        if holds(env, LOGS_PROTOCOL, "http/protobuf") {
+            env.remove(LOGS_PROTOCOL);
+        }
+        if added_interval != Some(false) && holds(env, HELPER_INTERVAL, HELPER_INTERVAL_MS) {
+            env.remove(HELPER_INTERVAL);
         }
         let is_exporter = |k: &str, v: &str| match k {
             "OTEL_METRICS_EXPORTER" | "OTEL_TRACES_EXPORTER" => !matches!(v, "" | "none"),
+            LOGS_ENDPOINT if ours.as_deref() == Some(v) => false,
             k => k.starts_with("OTEL_EXPORTER_OTLP_") && k.ends_with("ENDPOINT"),
         };
         let other_exporter = env
@@ -379,7 +385,11 @@ pub fn remove_telemetry(settings: &mut Value, outside: &Environment) -> io::Resu
 /// [`remove_telemetry`] applied to `<claude_dir>/settings.json` (untouched
 /// when absent or holding nothing of ours). Returns whether anything was
 /// removed.
-pub fn uninstall(claude_dir: &Path, outside: &Environment) -> io::Result<bool> {
+pub fn uninstall(
+    claude_dir: &Path,
+    outside: &Environment,
+    added_interval: Option<bool>,
+) -> io::Result<bool> {
     if !claude_dir.join("settings.json").exists() {
         return Ok(false);
     }
@@ -387,10 +397,20 @@ pub fn uninstall(claude_dir: &Path, outside: &Environment) -> io::Result<bool> {
     let path = crate::commands::init::safe_join(&base, "settings.json")?;
     let mut removed = false;
     crate::commands::init::update_json_file(&path, "Claude Code telemetry", |root| {
-        removed = remove_telemetry(root, outside)?;
+        removed = remove_telemetry(root, outside, added_interval)?;
         Ok(())
     })?;
     Ok(removed)
+}
+
+/// Whether `<claude_dir>/settings.json` already sets the helper interval.
+/// Checked before [`install`], whose merge keeps an existing one, so the
+/// caller can record whether the interval is ours to remove later.
+pub fn has_helper_interval(claude_dir: &Path) -> bool {
+    fs::read_to_string(claude_dir.join("settings.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .is_some_and(|s| s["env"].get(HELPER_INTERVAL).is_some())
 }
 
 /// Claude Code variables that add content (prompt text, tool input and
@@ -806,14 +826,14 @@ pub(crate) mod tests {
     fn remove_restores_settings_from_before_the_install() {
         let before = json!({"model": "opus", "env": {"FOO": "bar"}, "hooks": {"Stop": []}});
         let (mut s, _) = merged(before.clone(), &Environment::default());
-        assert!(remove_telemetry(&mut s, &Environment::default()).unwrap());
+        assert!(remove_telemetry(&mut s, &Environment::default(), None).unwrap());
         assert_eq!(s, before);
 
         let (mut s, _) = merged(json!({}), &Environment::default());
-        assert!(remove_telemetry(&mut s, &Environment::default()).unwrap());
+        assert!(remove_telemetry(&mut s, &Environment::default(), None).unwrap());
         assert_eq!(s, json!({}), "an env object we created goes too");
         assert!(
-            !remove_telemetry(&mut s, &Environment::default()).unwrap(),
+            !remove_telemetry(&mut s, &Environment::default(), None).unwrap(),
             "nothing left to remove"
         );
     }
@@ -826,7 +846,7 @@ pub(crate) mod tests {
         );
         // Changed after the install: the user's now.
         s["env"][LOGS_PROTOCOL] = json!("http/json");
-        remove_telemetry(&mut s, &Environment::default()).unwrap();
+        remove_telemetry(&mut s, &Environment::default(), None).unwrap();
         assert_eq!(
             s,
             json!({"env": {HELPER_INTERVAL: "60000", "OTEL_METRICS_EXPORTER": "none",
@@ -836,7 +856,7 @@ pub(crate) mod tests {
         // Another exporter still needs telemetry and the OTLP logs exporter.
         let (mut s, _) = merged(json!({}), &Environment::default());
         s["env"]["OTEL_METRICS_EXPORTER"] = json!("otlp");
-        remove_telemetry(&mut s, &Environment::default()).unwrap();
+        remove_telemetry(&mut s, &Environment::default(), None).unwrap();
         assert_eq!(s["env"][ENABLE_TELEMETRY], "1");
         assert_eq!(s["env"][LOGS_EXPORTER], "otlp");
         assert!(s["env"].get(LOGS_ENDPOINT).is_none());
@@ -850,7 +870,7 @@ pub(crate) mod tests {
                                      LOGS_ENDPOINT: "https://tv.example.com/otlp/v1/logs"},
                              HEADERS_HELPER: "/opt/corp/token"});
         let mut s = foreign.clone();
-        assert!(!remove_telemetry(&mut s, &Environment::default()).unwrap());
+        assert!(!remove_telemetry(&mut s, &Environment::default(), None).unwrap());
         assert_eq!(s, foreign);
 
         // Our helper next to someone else's endpoint: only the helper goes
@@ -858,7 +878,7 @@ pub(crate) mod tests {
         let mut s = json!({"env": {LOGS_ENDPOINT: "https://collector.corp/v1/logs",
                                    LOGS_EXPORTER: "otlp"},
                            HEADERS_HELPER: helper_command(SERVER)});
-        assert!(remove_telemetry(&mut s, &Environment::default()).unwrap());
+        assert!(remove_telemetry(&mut s, &Environment::default(), None).unwrap());
         assert_eq!(
             s,
             json!({"env": {LOGS_ENDPOINT: "https://collector.corp/v1/logs",
@@ -877,19 +897,43 @@ pub(crate) mod tests {
         };
         for outside in [shell("OTEL_METRICS_EXPORTER", "otlp"), managed] {
             let (mut s, _) = merged(json!({}), &Environment::default());
-            remove_telemetry(&mut s, &outside).unwrap();
+            remove_telemetry(&mut s, &outside, None).unwrap();
             assert_eq!(s["env"][ENABLE_TELEMETRY], "1", "{outside:?}");
             assert!(s["env"].get(LOGS_ENDPOINT).is_none());
         }
     }
 
     #[test]
+    fn our_endpoint_inherited_by_the_shell_is_not_another_exporter() {
+        // `telemetry off` run from Claude Code's Bash tool sees our settings
+        // in its environment.
+        let (mut s, _) = merged(json!({}), &Environment::default());
+        let inherited = shell(LOGS_ENDPOINT, "https://tv.example.com/otlp/v1/logs");
+        assert!(remove_telemetry(&mut s, &inherited, None).unwrap());
+        assert_eq!(s, json!({}));
+    }
+
+    #[test]
+    fn a_helper_interval_the_user_had_before_survives_removal() {
+        let (mut s, _) = merged(
+            json!({"env": {HELPER_INTERVAL: HELPER_INTERVAL_MS}}),
+            &Environment::default(),
+        );
+        remove_telemetry(&mut s, &Environment::default(), Some(false)).unwrap();
+        assert_eq!(s, json!({"env": {HELPER_INTERVAL: HELPER_INTERVAL_MS}}));
+
+        let (mut s, _) = merged(json!({}), &Environment::default());
+        remove_telemetry(&mut s, &Environment::default(), Some(true)).unwrap();
+        assert_eq!(s, json!({}));
+    }
+
+    #[test]
     fn uninstall_leaves_a_missing_file_missing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!uninstall(dir.path(), &Environment::default()).unwrap());
+        assert!(!uninstall(dir.path(), &Environment::default(), None).unwrap());
         assert!(!dir.path().join("settings.json").exists());
         install(dir.path(), SERVER, &Environment::default()).unwrap();
-        assert!(uninstall(dir.path(), &Environment::default()).unwrap());
+        assert!(uninstall(dir.path(), &Environment::default(), None).unwrap());
         assert_eq!(
             fs::read_to_string(dir.path().join("settings.json")).unwrap(),
             "{}"

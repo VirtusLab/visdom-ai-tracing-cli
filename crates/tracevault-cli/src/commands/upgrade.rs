@@ -156,25 +156,22 @@ fn files_with_hooks<'a>(files: impl IntoIterator<Item = &'a PathBuf>) -> Result<
     }
 }
 
-/// Re-merge the hooks at `location` once per version. The files holding our
-/// hooks are recorded the first time (found by looking for our commands) and
-/// looked up again only when none of the recorded ones holds them any more.
-/// Returns whether `location` holds TraceVault's Claude Code hooks.
+/// Re-merge the hooks at `location` once per version, in every candidate
+/// file that holds our commands (both can, e.g. after a checkout brought in a
+/// shared `settings.json`). The files found are recorded, for the next
+/// sessions of this version (whether the location is installed) and for
+/// `status`. Returns whether `location` holds TraceVault's Claude Code hooks.
 fn upgrade_hook_location(state: &mut InstallState, location: &HookLocation, version: &str) -> bool {
     let recorded = state.repos.get(&location.key);
     let due = install_state::is_newer(version, recorded.map(|r| r.version.as_str()));
+    let was_installed = recorded.is_some_and(|r| !r.hook_files.is_empty());
     if !due {
-        return recorded.is_some_and(|r| !r.hook_files.is_empty());
-    }
-    let recorded_files = recorded.map(|r| r.hook_files.clone()).unwrap_or_default();
-    let mut found = files_with_hooks(&recorded_files);
-    if found.as_ref().is_ok_and(|f| f.is_empty()) {
-        found = files_with_hooks(&location.candidates);
+        return was_installed;
     }
     // A file that cannot be read may hold our hooks: retry next session, and
     // count the location as installed if it was before.
-    let Ok(files) = found else {
-        return !recorded_files.is_empty();
+    let Ok(files) = files_with_hooks(&location.candidates) else {
+        return was_installed;
     };
     let mut done = true;
     for file in &files {
@@ -249,9 +246,13 @@ fn upgrade_machine(
             return None;
         }
     };
+    let had_interval = claude_telemetry::has_helper_interval(&paths.claude_dir);
     match claude_telemetry::install(&paths.claude_dir, &url, env) {
         Ok(InstallOutcome::Configured) => {
             settled(state);
+            if !had_interval {
+                state.telemetry_added_interval = Some(true);
+            }
             if was_off {
                 state.telemetry_auto_enabled = Some(version.to_string());
                 Some(TELEMETRY_NOTICE.to_string())
@@ -619,6 +620,71 @@ mod tests {
             Some(TELEMETRY_NOTICE)
         );
         assert!(repo_settings(&f.paths, "settings.json")["hooks"]["SessionStart"].is_array());
+    }
+
+    #[test]
+    fn every_settings_file_with_our_hooks_is_refreshed_not_only_the_recorded_one() {
+        let f = fixture("settings.local.json");
+        run_with(&f.paths, "0.30.0", &Environment::default());
+        // A checkout later brings in a shared settings.json with old hooks.
+        let shared = f
+            .paths
+            .project_root
+            .as_ref()
+            .unwrap()
+            .join(".claude/settings.json");
+        fs::write(
+            &shared,
+            json!({"hooks": {"Stop": [{"matcher": "", "hooks": [
+                {"type": "command", "command": "tracevault stream --event stop"}]}]}})
+            .to_string(),
+        )
+        .unwrap();
+        run_with(&f.paths, "0.31.0", &Environment::default());
+        assert!(json_at(&shared)["hooks"]["SessionStart"].is_array());
+        let key = f.paths.project_root.as_ref().unwrap().display().to_string();
+        assert_eq!(
+            install_state::load_in(&f.paths.config_root).repos[&key]
+                .hook_files
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_opt_out_holding_the_lock_wins_over_a_concurrent_upgrade() {
+        // `telemetry off` holds the lock while it removes our settings and
+        // records the opt-out; an upgrade starting meanwhile does nothing,
+        // and every later one sees the opt-out.
+        let f = fixture("settings.json");
+        claude_telemetry::install(&f.paths.claude_dir, SERVER, &Environment::default()).unwrap();
+        let lock = install_state::Lock::try_take(&f.paths.config_root).unwrap();
+        assert_eq!(run_with(&f.paths, "0.30.0", &Environment::default()), None);
+        assert!(
+            claude_telemetry::uninstall(&f.paths.claude_dir, &Environment::default(), None)
+                .unwrap()
+        );
+        install_state::update_in(&f.paths.config_root, |s| s.claude_telemetry_opt_out = true)
+            .unwrap();
+        drop(lock);
+
+        for version in ["0.30.0", "0.31.0"] {
+            assert_eq!(run_with(&f.paths, version, &Environment::default()), None);
+        }
+        assert_eq!(user_settings(&f.paths), json!({}));
+        let state = install_state::load_in(&f.paths.config_root);
+        assert!(state.claude_telemetry_opt_out);
+        assert_eq!(state.configured_version.as_deref(), Some("0.31.0"));
+    }
+
+    #[test]
+    fn the_interval_the_upgrade_added_is_recorded_as_ours() {
+        let f = fixture("settings.json");
+        run_with(&f.paths, "0.30.0", &Environment::default());
+        assert_eq!(
+            install_state::load_in(&f.paths.config_root).telemetry_added_interval,
+            Some(true)
+        );
     }
 
     #[test]

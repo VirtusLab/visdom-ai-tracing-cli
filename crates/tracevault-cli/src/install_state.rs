@@ -25,6 +25,11 @@ pub struct InstallState {
     /// asking, for `status` to say so. Cleared by an explicit on/off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry_auto_enabled: Option<String>,
+    /// Whether TraceVault added the helper interval to `~/.claude/settings.json`
+    /// (so turning telemetry off removes it) or found the user's own there.
+    /// `None` for installs made before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_added_interval: Option<bool>,
     /// Per repository (primary checkout path): the version that last re-merged
     /// its hooks, and the settings files they were found in.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

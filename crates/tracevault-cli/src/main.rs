@@ -386,10 +386,14 @@ impl TelemetryChoice {
 }
 
 /// Record in the install state that this machine's telemetry is settled at
-/// this version, so the upgrade step does not redo it. Best-effort.
-fn record_telemetry_choice(opt_out: Option<bool>) {
+/// this version, so the upgrade step does not redo it, and that this install
+/// added the helper interval (`added_interval`). Best-effort.
+fn record_telemetry_choice(opt_out: Option<bool>, added_interval: bool) {
     let result = install_state::update_in(&config::tv_config_root(), |s| {
         s.configured_version = Some(install_state::CURRENT_VERSION.to_string());
+        if added_interval {
+            s.telemetry_added_interval = Some(true);
+        }
         if let Some(opt_out) = opt_out {
             s.claude_telemetry_opt_out = opt_out;
             s.telemetry_auto_enabled = None;
@@ -447,7 +451,9 @@ fn finish_claude_telemetry(
     };
     let state = install_state::load_in(&config_root);
     let off = |claude_dir: &std::path::Path| match commands::claude_telemetry::uninstall(
-        claude_dir, &env,
+        claude_dir,
+        &env,
+        state.telemetry_added_interval,
     ) {
         Ok(removed) => {
             if removed {
@@ -458,7 +464,7 @@ fn finish_claude_telemetry(
             } else {
                 println!("Claude Code telemetry is off");
             }
-            record_telemetry_choice(Some(true));
+            record_telemetry_choice(Some(true), false);
         }
         Err(e) => {
             eprintln!("Error: could not turn Claude Code telemetry off: {e}");
@@ -485,6 +491,7 @@ fn finish_claude_telemetry(
         }
         _ => {}
     }
+    let had_interval = commands::claude_telemetry::has_helper_interval(&claude_dir);
     let result = commands::claude_telemetry::telemetry_server_url(project_root, server_flag)
         .and_then(|url| {
             commands::claude_telemetry::install(&claude_dir, &url, &env)
@@ -499,14 +506,14 @@ fn finish_claude_telemetry(
                 commands::claude_telemetry::logs_endpoint(&url),
                 claude_dir.join("settings.json").display()
             );
-            record_telemetry_choice(Some(false));
+            record_telemetry_choice(Some(false), !had_interval);
         }
         Ok((url, commands::claude_telemetry::InstallOutcome::Foreign(reasons))) => {
             eprintln!(
                 "{}",
                 commands::claude_telemetry::collector_instructions(&url, &reasons)
             );
-            record_telemetry_choice(explicit.then_some(false));
+            record_telemetry_choice(explicit.then_some(false), false);
         }
         Err(e) if explicit => {
             eprintln!("Error: Claude Code telemetry not configured: {e}");
