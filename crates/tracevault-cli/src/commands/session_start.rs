@@ -72,9 +72,34 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _ = write_session_env(Path::new(&env_file), &hook_event.session_id);
     }
 
-    // 3. Resolve the effective repo binding and, if warranted, inject its
+    // 3. Once per CLI upgrade: refresh this repo's hooks and turn telemetry
+    // on (VIS-1109). Its notice is shown with whatever step 4 prints.
+    let notice = run_upgrade_step(Path::new(&hook_event.cwd));
+
+    // 4. Resolve the effective repo binding and, if warranted, inject its
     // policies. Shared with `user-prompt` (sub-plan C's UserPromptSubmit hook).
-    resolve_and_inject(&hook_event).await
+    resolve_and_inject(&hook_event, notice).await
+}
+
+/// [`upgrade::run`](crate::commands::upgrade::run) for a session in `cwd`.
+/// It must never fail the hook, so a panic in it is caught too.
+fn run_upgrade_step(cwd: &Path) -> Option<String> {
+    use crate::commands::{claude_telemetry, upgrade};
+    std::panic::catch_unwind(|| {
+        let paths = upgrade::Paths::current(cwd)?;
+        let env = claude_telemetry::Environment::current(&paths.claude_dir);
+        let credentials_root = paths
+            .project_root
+            .clone()
+            .unwrap_or_else(|| cwd.to_path_buf());
+        upgrade::run(&paths, crate::install_state::CURRENT_VERSION, &env, || {
+            claude_telemetry::telemetry_server_url(&credentials_root, None)
+        })
+    })
+    .unwrap_or_else(|_| {
+        eprintln!("tracevault: the upgrade step failed unexpectedly");
+        None
+    })
 }
 
 #[cfg(test)]

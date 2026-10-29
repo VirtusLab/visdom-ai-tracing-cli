@@ -157,8 +157,13 @@ async fn fetch_context(client: &ApiClient, event: &str, repo_id: uuid::Uuid) -> 
 /// Shared by `session-start` and `user-prompt`: both need the same
 /// resolve-binding → decide → fetch-and-inject flow, differing only in which
 /// hook-specific steps happen around it (SessionStart also writes the session
-/// env file, which stays in `session_start.rs`).
-pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn std::error::Error>> {
+/// env file, which stays in `session_start.rs`). `notice` is a message for the
+/// user from that hook-specific part (the upgrade step's, VIS-1109); it is
+/// shown whatever this flow decides.
+pub async fn resolve_and_inject(
+    hook_event: &HookEvent,
+    notice: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = std::time::Instant::now() + HOOK_BUDGET;
     let event = hook_event.hook_event_name.as_str();
     let hook_cwd = Path::new(&hook_event.cwd);
@@ -179,7 +184,7 @@ pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn st
 
     // Nothing binds the session: bind it to the repo of the checkout it runs
     // in, if the server knows that checkout's remote (VIS-1048).
-    let mut notice = None;
+    let mut notice = notice;
     if binding.is_none() {
         if let Ok((Some(server_url), credential)) =
             crate::credentials::resolve_credentials_quiet(&project_root)
@@ -189,7 +194,10 @@ pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn st
                 crate::auto_bind::bind_session(&hook_event.session_id, hook_cwd, &client, deadline)
                     .await;
             binding = auto.binding;
-            notice = auto.notice;
+            notice = match (notice, auto.notice) {
+                (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+                (a, b) => a.or(b),
+            };
         }
     }
 
@@ -203,13 +211,13 @@ pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn st
     // `should_inject` returning true requires `effective_repo_id.is_some()`, so
     // `binding` is always `Some` here.
     let Some(binding) = binding else {
-        return print_allow();
+        return print_allow_with(notice);
     };
 
     let Ok(repo_uuid) = binding.repo_id.parse::<uuid::Uuid>() else {
         // A corrupted/hand-edited session-state or config file could contain a
         // non-UUID repo_id — skip injection rather than fail the hook.
-        return print_allow();
+        return print_allow_with(notice);
     };
 
     // A credential/URL mismatch is a misconfiguration the user has to fix, but
@@ -220,11 +228,11 @@ pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn st
         Ok(resolved) => resolved,
         Err(e) => {
             eprintln!("Skipping context injection: {e}");
-            return print_allow();
+            return print_allow_with(notice);
         }
     };
     let Some(server_url) = server_url else {
-        return print_allow();
+        return print_allow_with(notice);
     };
     let client = ApiClient::with_credential(&server_url, credential);
 
@@ -234,7 +242,8 @@ pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn st
         .ok()
         .flatten();
     match fetched {
-        Some(output) => {
+        Some(mut output) => {
+            output.system_message = notice;
             println!("{}", serde_json::to_string(&output)?);
             // Best-effort: persist the last-injected repo so a later
             // UserPromptSubmit can avoid redundant re-injection. A save
@@ -248,7 +257,7 @@ pub async fn resolve_and_inject(hook_event: &HookEvent) -> Result<(), Box<dyn st
             let _ = crate::session_state::save(&hook_event.session_id, &fresh);
             Ok(())
         }
-        None => print_allow(),
+        None => print_allow_with(notice),
     }
 }
 
@@ -399,7 +408,7 @@ mod tests {
             transcript_records: None,
         };
 
-        let result = resolve_and_inject(&hook_event).await;
+        let result = resolve_and_inject(&hook_event, None).await;
         assert!(result.is_ok());
     }
 

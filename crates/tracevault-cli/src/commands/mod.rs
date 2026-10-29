@@ -18,6 +18,7 @@ pub mod stats;
 pub mod status;
 pub mod stream;
 pub mod sync;
+pub mod upgrade;
 pub mod user_prompt;
 pub mod verification_phase;
 pub mod verify;

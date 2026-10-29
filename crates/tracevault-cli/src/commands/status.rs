@@ -478,10 +478,7 @@ fn claude_telemetry_check_in(
     };
     let expected = server_url.map(logs_endpoint);
     match inspect(&settings, env, expected.as_deref()) {
-        TelemetryState::Off => Check::skip(
-            LABEL,
-            "off (enable with `tracevault init --claude-telemetry`)",
-        ),
+        TelemetryState::Off => Check::skip(LABEL, "off (enable with `tracevault telemetry on`)"),
         TelemetryState::Foreign { reasons, ours_too } => {
             let detail = format!("exported elsewhere: {}", reasons.join("; "));
             if ours_too {
@@ -518,6 +515,48 @@ fn claude_telemetry_check_in(
             }
         }
     }
+}
+
+/// Add what the install state knows to the telemetry check (VIS-1109): that
+/// the user opted out (so it stays off across upgrades), or that an upgrade
+/// turned it on without being asked.
+fn with_telemetry_choice(mut check: Check, state: &crate::install_state::InstallState) -> Check {
+    match check.level {
+        Level::Skip if state.claude_telemetry_opt_out && check.detail.starts_with("off") => {
+            check.detail =
+                "off — you opted out, upgrades keep it off (`tracevault telemetry on` to enable)"
+                    .to_string();
+        }
+        Level::Ok => {
+            if let Some(version) = &state.telemetry_auto_enabled {
+                check.detail.push_str(&format!(
+                    " — turned on automatically by the upgrade to {version} \
+                     (`tracevault telemetry off` to disable)"
+                ));
+            }
+        }
+        _ => {}
+    }
+    check
+}
+
+/// The telemetry check as `status` shows it, on one line, for `tracevault
+/// telemetry status`.
+pub fn telemetry_status_line(server_url: Option<&str>) -> String {
+    let Some(settings) = dirs::home_dir().map(|h| h.join(".claude").join("settings.json")) else {
+        return "Claude Code telemetry: cannot determine home directory".to_string();
+    };
+    let check = with_telemetry_choice(
+        claude_telemetry_check_in(
+            &settings,
+            server_url,
+            &crate::commands::claude_telemetry::Environment::current(
+                settings.parent().unwrap_or(&settings),
+            ),
+        ),
+        &crate::install_state::load_in(&crate::config::tv_config_root()),
+    );
+    format!("{}: {}", check.label, check.detail)
 }
 
 /// The per-repo Claude settings files `init` can write hooks into
@@ -1468,10 +1507,13 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
 
     let auth_checks_v = auth_checks(&auth, config_server_url).await;
     let telemetry_check = match global_settings.as_deref() {
-        Some(p) => claude_telemetry_check_in(
-            p,
-            auth.server_url.as_deref(),
-            &crate::commands::claude_telemetry::Environment::current(p.parent().unwrap_or(p)),
+        Some(p) => with_telemetry_choice(
+            claude_telemetry_check_in(
+                p,
+                auth.server_url.as_deref(),
+                &crate::commands::claude_telemetry::Environment::current(p.parent().unwrap_or(p)),
+            ),
+            &crate::install_state::load_in(&crate::config::tv_config_root()),
         ),
         None => Check::skip("Claude Code telemetry", "cannot determine home directory"),
     };

@@ -327,18 +327,46 @@ TraceVault config directory, which enables the user context layer (see below) fo
 do not configure it themselves; `--no-user-context` and `--user-context <path>` apply to it.
 `--global` cannot be combined with `--server-url`, `--claude-settings` or `--no-gitignore`.
 
-**Claude Code's own cost — `--claude-telemetry`**
+**Claude Code's own cost — telemetry, on by default**
 
-Claude Code reports the cost of every API call it makes, but only over OpenTelemetry. With
-`--claude-telemetry` (per-repo or with `--global`; an interactive `init` asks instead, default
-no), `init` sends those reports to the TraceVault server, which then shows Claude Code's own cost
-instead of an estimate:
+Claude Code reports the cost of every API call it makes, but only over OpenTelemetry. `init`
+(per-repo or with `--global`) sends those reports to the TraceVault server, which then shows
+Claude Code's own cost instead of an estimate. This is on by default: an interactive `init` asks
+(`[Y/n]`), a non-interactive one turns it on. `--claude-telemetry` turns it on without asking,
+`--no-claude-telemetry` turns it off:
 
 ```sh
-tracevault init --global --claude-telemetry
+tracevault init --global                        # telemetry on
+tracevault init --global --no-claude-telemetry  # telemetry off, and it stays off
+tracevault telemetry off                        # the same, without re-running init
+tracevault telemetry on | status
 ```
 
-It writes to the **user-level** `~/.claude/settings.json` in both cases — Claude Code ignores
+**Turning it off** (`--no-claude-telemetry`, `tracevault telemetry off`, or no at the prompt)
+removes only what TraceVault wrote: `otelHeadersHelper` when it is TraceVault's, and the `env`
+entries below while they still hold TraceVault's values (`CLAUDE_CODE_ENABLE_TELEMETRY` and
+`OTEL_LOGS_EXPORTER` stay when another exporter still uses them). The choice is recorded in
+`~/.config/tracevault/install-state.json`, so neither a later `init` nor a CLI upgrade turns it
+back on; only `--claude-telemetry` or `tracevault telemetry on` does.
+
+**After a CLI upgrade**, the first Claude Code session that starts (its `SessionStart` hook,
+`tracevault session-start`) brings an existing install up to date, once per version:
+
+- it re-merges TraceVault's hooks into the settings file(s) of that session's repo, and into
+  `~/.claude/settings.json`, that already hold them, so hooks a newer CLI adds reach existing
+  installs (the files are found by looking for `tracevault` commands in `.claude/settings.json`
+  and `.claude/settings.local.json`, and remembered). Repos you never open again keep their old
+  hooks; re-run `tracevault init` there;
+- it turns telemetry on, unless you turned it off, another exporter is set up (below), or Claude
+  Code is set to export content (`OTEL_LOG_USER_PROMPTS` and friends, below). It then shows,
+  once: *AI Tracing: Claude Code cost telemetry is now on for new sessions (`tracevault
+  telemetry off` to disable)*, and `tracevault status` says it was turned on automatically.
+  Telemetry is user-wide, so one upgraded repo turns it on for all of them.
+
+This never fails the hook. When it cannot finish (not logged in, a settings file it cannot
+parse), it says why on the hook's stderr and the next session tries again.
+
+It writes to the **user-level** `~/.claude/settings.json` in every case — Claude Code ignores
 OpenTelemetry exporter settings in a repository's `.claude/settings*.json`:
 
 ```json
@@ -362,7 +390,8 @@ OpenTelemetry exporter settings in a repository's `.claude/settings*.json`:
   default is 29 minutes), since a login's access token is short-lived; each run hands out a
   token valid for at least 4 more minutes.
 - It needs a login: `init --claude-telemetry` fails when no credential resolves, and when
-  `--server-url` names a server other than the one you are logged in to.
+  `--server-url` names a server other than the one you are logged in to. Without the flag, a
+  missing login is only a warning, and the upgrade step turns telemetry on once you log in.
 - Every other key in `settings.json` is kept, and re-running is a no-op. A re-run after logging
   in to another server moves the export there. Restart Claude Code to apply.
 - **An existing exporter setup is left alone.** If `~/.claude/settings.json`, the shell
@@ -380,7 +409,27 @@ OpenTelemetry exporter settings in a repository's `.claude/settings*.json`:
   VIS-1079) before you enable this; until then the exports are rejected and Claude Code shows
   an export warning.
 
-`tracevault status` shows whether telemetry is configured, under *Installation*.
+**What leaves your machine.** Claude Code exports its OpenTelemetry *log events* for every
+session on this machine, in any directory, to the TraceVault server: `api_request` (model,
+`cost_usd`, token counts, duration, request ids), and also `user_prompt`,
+`assistant_response`, `tool_result`, `tool_decision`, `api_error`, `hook_registered`,
+`plugin_loaded`, `mcp_server_connection` and similar events, with session and user attributes
+(names of hooks, plugins and MCP servers, not their content). With the settings above, **no
+prompt text, response text, tool input or tool output is sent**: Claude Code redacts them
+unless `OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_ASSISTANT_RESPONSES`, `OTEL_LOG_TOOL_DETAILS`,
+`OTEL_LOG_TOOL_CONTENT` or `OTEL_LOG_RAW_API_BODIES` is set (all off by default; `user_prompt`
+then carries only `prompt_length`, `assistant_response` only `<REDACTED>`). TraceVault never
+sets them, and neither a plain `init` nor the upgrade step turns telemetry on while any of them
+is set (`--claude-telemetry` or `tracevault telemetry on` still does). Only
+`OTEL_LOGS_EXPORTER` is configured, so no metrics or traces are exported. The server reads only
+an allowlist of `api_request` fields and rejects events for sessions it does not know.
+(Checked against Claude Code's
+[monitoring documentation](https://code.claude.com/docs/en/monitoring-usage) and by capturing
+the export of Claude Code 2.1.312 with exactly these settings: a marker in the prompt did not
+appear in it, 2026-10-29.)
+
+`tracevault status` shows whether telemetry is configured, under *Installation*, and whether you
+turned it off or an upgrade turned it on; `tracevault telemetry status` prints just that line.
 
 *Collector route.* If your organisation already collects Claude Code telemetry, forward the
 `api_request` events from your OpenTelemetry Collector instead, authenticated with a TraceVault
@@ -545,7 +594,13 @@ every session on the machine instead.
 | `--user-context <path>` | Enable the user context layer, reading this file |
 | `--no-user-context` | Disable the user context layer (conflicts with `--user-context`) |
 | `--global` | Install machine-wide instead of in this repo; does not need git. Conflicts with `--server-url`, `--claude-settings`, `--no-gitignore` |
-| `--claude-telemetry` | Claude Code only: also send Claude Code's own per-request cost to TraceVault over OpenTelemetry, configured in `~/.claude/settings.json` (see [`--claude-telemetry`](#tracevault-init--set-up-tracing-in-a-repo)). Omitted: asks in a terminal, otherwise off |
+| `--claude-telemetry` | Claude Code only: send Claude Code's own per-request cost to TraceVault over OpenTelemetry, configured in `~/.claude/settings.json` (see [telemetry](#tracevault-init--set-up-tracing-in-a-repo)), without asking. Neither flag: asks in a terminal (default yes), otherwise on, unless you turned it off before |
+| `--no-claude-telemetry` | Claude Code only: turn that telemetry off (removes TraceVault's entries) and remember it across upgrades. Conflicts with `--claude-telemetry` |
+
+**`tracevault telemetry on|off|status`** — turn Claude Code telemetry on (needs a login), off
+(remembered across upgrades), or show its state, like `init --claude-telemetry` /
+`--no-claude-telemetry` without re-running `init` (see
+[telemetry](#tracevault-init--set-up-tracing-in-a-repo)).
 
 **`tracevault sync`** — register the repo with the server, or bind to its existing record, and
 write `repo_id` into `.tracevault/config.toml` if the repo has one. Needs a login (or API key)
@@ -554,7 +609,7 @@ and an `origin` remote. The pre-push hook runs it before every push.
 **`tracevault status [--session-id <id>]`** — diagnose the setup: authentication, global and
 repo installation, git and agent hooks (Claude Code hooks in `.claude/settings.json`,
 `.claude/settings.local.json` or `~/.claude/settings.json`), Claude Code telemetry
-(`--claude-telemetry`), whether anything will record, the
+(on, off by your choice, or turned on by an upgrade), whether anything will record, the
 session's repo/project binding, the repo on the server (by `repo_id`) and its server-side clone,
 and pending events. Exits 1 if any check is an error (`✗`).
 `--session-id` picks the session whose binding is checked; default `$TRACEVAULT_SESSION_ID`,
@@ -627,7 +682,7 @@ These are hidden from `--help`. `init` installs them; you never need to run them
 | Command | Run by |
 |---|---|
 | `tracevault stream --event <event> [--agent <agent>]` | The agent's hooks, on every captured event (`--agent` defaults to `claude-code`) |
-| `tracevault session-start` | The agent's `SessionStart` hook: binds an unbound session to the repo of its checkout's `origin` remote, injects the bound repo's policies; under Claude Code it also exports `TRACEVAULT_SESSION_ID` into the agent's shell |
+| `tracevault session-start` | The agent's `SessionStart` hook: binds an unbound session to the repo of its checkout's `origin` remote, injects the bound repo's policies; under Claude Code it also exports `TRACEVAULT_SESSION_ID` into the agent's shell. Once per CLI upgrade it also refreshes the hooks and turns telemetry on (see [telemetry](#tracevault-init--set-up-tracing-in-a-repo)) |
 | `tracevault user-prompt` | The agent's `UserPromptSubmit` hook: re-injects the policies when the session's repo has changed |
 | `tracevault commit-push` | The git `post-commit` hook, in the background: sends the commit's metadata |
 | `tracevault otel-headers [--server-url <URL>]` | Claude Code's `otelHeadersHelper` (`init --claude-telemetry`): prints `{"Authorization": "Bearer …"}` for the OpenTelemetry export; exits 1 when not logged in, or logged in to another server than `--server-url` |
@@ -675,9 +730,10 @@ older one cannot tell subagent lines from the main transcript's.
 `UserPromptSubmit` as above, plus `PostToolUse` and `Stop` streamed with `--agent codex`. There
 is deliberately no `PreToolUse` hook for Codex.
 
-**Claude Code telemetry** (only with `--claude-telemetry` or a yes at the prompt; always
-`~/.claude/settings.json`): the `env` entries and `otelHeadersHelper` shown under
-[`--claude-telemetry`](#tracevault-init--set-up-tracing-in-a-repo).
+**Claude Code telemetry** (unless `--no-claude-telemetry`, a no at the prompt, or an earlier
+opt-out; always `~/.claude/settings.json`): the `env` entries and `otelHeadersHelper` shown
+under [telemetry](#tracevault-init--set-up-tracing-in-a-repo). The choice and the version that
+last configured the machine go into `~/.config/tracevault/install-state.json`.
 
 **Git hooks** (per-repo `init` only; an existing hook keeps its content and gets a TraceVault
 block appended):

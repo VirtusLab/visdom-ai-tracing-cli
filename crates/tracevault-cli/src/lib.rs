@@ -7,6 +7,7 @@ pub mod config;
 pub mod context;
 pub mod credentials;
 pub mod hooks;
+pub mod install_state;
 pub mod oidc;
 pub mod paths;
 pub mod resolution;
