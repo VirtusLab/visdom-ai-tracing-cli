@@ -369,22 +369,258 @@ fn repo_init_with_claude_telemetry_writes_user_level_settings_only() {
     assert!(!repo_settings.contains("OTEL_"), "{repo_settings}");
 }
 
+const LOGIN: [(&str, &str); 2] = [
+    ("TRACEVAULT_API_KEY", "tvk_secret"),
+    ("TRACEVAULT_SERVER_URL", SERVER),
+];
+
+fn state(home: &Path) -> serde_json::Value {
+    let path = home.join(".config/tracevault/install-state.json");
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap_or_else(|_| "{}".into())).unwrap()
+}
+
+fn telemetry_on(home: &Path) -> bool {
+    home.join(".claude/settings.json").exists()
+        && settings(home)
+            .get("otelHeadersHelper")
+            .is_some_and(|h| h.as_str().unwrap().starts_with("tracevault otel-headers"))
+}
+
 #[cfg(target_os = "linux")]
 #[test]
-fn non_interactive_repo_init_without_the_flag_leaves_telemetry_off() {
+fn fresh_repo_init_turns_telemetry_on_by_default() {
     let home = TempDir::new().unwrap();
     let repo = git_repo();
     let o = run_in(
         repo.path(),
         home.path(),
         &["init", "--claude-settings", "local"],
-        &[
-            ("TRACEVAULT_API_KEY", "tvk_secret"),
-            ("TRACEVAULT_SERVER_URL", SERVER),
-        ],
+        &LOGIN,
     );
     assert!(o.status.success(), "stderr={}", stderr(&o));
-    assert!(!home.path().join(".claude/settings.json").exists());
+    assert!(telemetry_on(home.path()));
+    assert!(
+        stdout(&o).contains("tracevault telemetry off"),
+        "{}",
+        stdout(&o)
+    );
+    // Settled at this version: the upgrade step will not redo it.
+    assert_eq!(
+        state(home.path())["configured_version"],
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fresh_global_init_turns_telemetry_on_and_not_logged_in_is_only_a_warning() {
+    let home = TempDir::new().unwrap();
+    let o = run(home.path(), &["init", "--global"], &[]);
+    assert!(o.status.success(), "stderr={}", stderr(&o));
+    assert!(stderr(&o).contains("Warning"), "{}", stderr(&o));
+    assert!(!telemetry_on(home.path()));
+    assert!(state(home.path()).get("configured_version").is_none());
+
+    let o = run(home.path(), &["init", "--global"], &LOGIN);
+    assert!(o.status.success(), "stderr={}", stderr(&o));
+    assert!(telemetry_on(home.path()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn no_claude_telemetry_removes_ours_and_survives_init_and_upgrade() {
+    let home = TempDir::new().unwrap();
+    let repo = git_repo();
+    let init = |args: &[&str]| {
+        let o = run_in(repo.path(), home.path(), args, &LOGIN);
+        assert!(o.status.success(), "stderr={}", stderr(&o));
+        o
+    };
+    init(&["init", "--claude-settings", "local"]);
+    assert!(telemetry_on(home.path()));
+
+    init(&[
+        "init",
+        "--claude-settings",
+        "local",
+        "--no-claude-telemetry",
+    ]);
+    assert!(!telemetry_on(home.path()));
+    assert_eq!(settings(home.path()), serde_json::json!({}));
+    assert_eq!(state(home.path())["claude_telemetry_opt_out"], true);
+
+    // A later plain init keeps it off.
+    let o = init(&["init", "--claude-settings", "local"]);
+    assert!(stdout(&o).contains("stays off"), "{}", stdout(&o));
+    assert!(!telemetry_on(home.path()));
+
+    // So does the first session after an upgrade.
+    pretend_older_install(home.path());
+    let o = session_start(repo.path(), home.path());
+    assert!(
+        !stdout(&o).contains("telemetry is now on"),
+        "{}",
+        stdout(&o)
+    );
+    assert!(!telemetry_on(home.path()));
+
+    // Until the user turns it on explicitly.
+    let o = run_in(repo.path(), home.path(), &["telemetry", "on"], &LOGIN);
+    assert!(o.status.success(), "stderr={}", stderr(&o));
+    assert!(telemetry_on(home.path()));
+    assert!(state(home.path()).get("claude_telemetry_opt_out").is_none());
+    let o = run_in(repo.path(), home.path(), &["telemetry", "status"], &LOGIN);
+    assert!(stdout(&o).contains("exports cost to"), "{}", stdout(&o));
+    let o = run_in(repo.path(), home.path(), &["telemetry", "off"], &LOGIN);
+    assert!(o.status.success(), "stderr={}", stderr(&o));
+    assert!(!telemetry_on(home.path()));
+    let o = run_in(repo.path(), home.path(), &["telemetry", "status"], &LOGIN);
+    assert!(stdout(&o).contains("you opted out"), "{}", stdout(&o));
+}
+
+/// Make the install state look as if an older CLI had configured this
+/// machine (keeping an opt-out, if any).
+fn pretend_older_install(home: &Path) {
+    let mut s = state(home);
+    s["configured_version"] = serde_json::json!("0.0.1");
+    s.as_object_mut().unwrap().remove("repos");
+    std::fs::write(
+        home.join(".config/tracevault/install-state.json"),
+        s.to_string(),
+    )
+    .unwrap();
+}
+
+/// Run the `SessionStart` hook as Claude Code would, in `cwd`. The server is
+/// unreachable on purpose: nothing here may need it.
+fn session_start(cwd: &Path, home: &Path) -> Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tracevault"))
+        .arg("session-start")
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".state"))
+        .env("TRACEVAULT_API_KEY", "tvk_secret")
+        .env("TRACEVAULT_SERVER_URL", SERVER)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let event = serde_json::json!({
+        "session_id": "upgrade-test",
+        "transcript_path": "t",
+        "cwd": cwd,
+        "hook_event_name": "SessionStart"
+    });
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(event.to_string().as_bytes())
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert!(o.status.success(), "stderr={}", stderr(&o));
+    serde_json::from_str::<serde_json::Value>(stdout(&o).trim())
+        .expect("session-start must print hook JSON");
+    o
+}
+
+fn system_message(o: &Output) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(stdout(o).trim()).unwrap();
+    v.get("systemMessage")
+        .and_then(|m| m.as_str())
+        .map(String::from)
+}
+
+/// A repo set up by an older CLI: its hooks lack events `init` installs now,
+/// telemetry was never turned on, and there is no install state.
+fn old_install(home: &Path) -> TempDir {
+    let repo = git_repo();
+    std::fs::create_dir_all(repo.path().join(".claude")).unwrap();
+    std::fs::write(
+        repo.path().join(".claude/settings.local.json"),
+        serde_json::json!({"hooks": {
+            "Stop": [{"matcher": "", "hooks": [
+                {"type": "command", "command": "tracevault stream --event stop"}]}],
+            "SessionStart": [{"matcher": "", "hooks": [
+                {"type": "command", "command": "tracevault session-start"}]}]
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    assert!(!home.join(".config/tracevault/install-state.json").exists());
+    repo
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn existing_install_is_upgraded_on_its_first_session_with_the_notice_once() {
+    let home = TempDir::new().unwrap();
+    let repo = old_install(home.path());
+
+    let o = session_start(repo.path(), home.path());
+    let notice = system_message(&o).expect("notice on the first session");
+    assert!(notice.contains("telemetry is now on"), "{notice}");
+    assert!(notice.contains("tracevault telemetry off"), "{notice}");
+    assert!(telemetry_on(home.path()));
+    let hooks = std::fs::read_to_string(repo.path().join(".claude/settings.local.json")).unwrap();
+    assert!(
+        hooks.contains("tracevault stream --event subagent-stop"),
+        "{hooks}"
+    );
+    assert!(!repo.path().join(".claude/settings.json").exists());
+
+    let o = session_start(repo.path(), home.path());
+    assert_eq!(system_message(&o), None, "the notice is shown once");
+
+    let o = run_in(repo.path(), home.path(), &["telemetry", "status"], &LOGIN);
+    assert!(
+        stdout(&o).contains("turned on automatically"),
+        "{}",
+        stdout(&o)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn upgrade_leaves_a_foreign_exporter_untouched() {
+    let home = TempDir::new().unwrap();
+    let repo = old_install(home.path());
+    std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+    let foreign = serde_json::json!({"env": {"OTEL_METRICS_EXPORTER": "otlp",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector:4318"}});
+    std::fs::write(
+        home.path().join(".claude/settings.json"),
+        foreign.to_string(),
+    )
+    .unwrap();
+
+    let o = session_start(repo.path(), home.path());
+    assert_eq!(system_message(&o), None);
+    assert_eq!(settings(home.path()), foreign);
+    // Hooks are still brought up to date.
+    let hooks = std::fs::read_to_string(repo.path().join(".claude/settings.local.json")).unwrap();
+    assert!(hooks.contains("subagent-stop"), "{hooks}");
+}
+
+#[test]
+fn both_telemetry_flags_conflict() {
+    let home = TempDir::new().unwrap();
+    let o = run(
+        home.path(),
+        &[
+            "init",
+            "--global",
+            "--claude-telemetry",
+            "--no-claude-telemetry",
+        ],
+        &[],
+    );
+    assert!(!o.status.success());
 }
 
 #[cfg(target_os = "linux")]

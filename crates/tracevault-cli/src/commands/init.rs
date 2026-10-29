@@ -1305,6 +1305,34 @@ fn merge_hooks(
     Ok(())
 }
 
+/// Whether the Claude Code settings file at `path` holds any TraceVault hook.
+/// A missing or unparseable file holds none.
+pub(crate) fn has_tracevault_hooks(path: &Path) -> bool {
+    let Some(settings) = fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    else {
+        return false;
+    };
+    settings
+        .get("hooks")
+        .and_then(|h| h.as_object())
+        .into_iter()
+        .flat_map(|events| events.values())
+        .filter_map(|groups| groups.as_array())
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(|h| h.as_array()))
+        .flatten()
+        .any(is_tracevault_hook)
+}
+
+/// Bring the TraceVault hooks in the Claude Code settings file at `path` to
+/// the current set ([`tracevault_hooks`]), exactly as `init` would. Used by
+/// the upgrade step (VIS-1109) on a file that already holds our hooks.
+pub(crate) fn refresh_claude_hooks(path: &Path) -> io::Result<()> {
+    merge_hooks_into_file(path, &tracevault_hooks())
+}
+
 /// Install TraceVault's Claude Code hooks into `claude_dir/settings.json`
 /// (deep-merged, never clobbering existing hooks/keys) and append a
 /// workspace-mode instruction block to `claude_dir/CLAUDE.md` (idempotent,

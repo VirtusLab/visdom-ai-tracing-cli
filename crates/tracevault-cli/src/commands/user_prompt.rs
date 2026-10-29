@@ -23,5 +23,5 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Resolve the effective repo binding and, if the repo changed since
     // the last injection, inject its policies. Shared with `session-start`.
-    resolve_and_inject(&hook_event).await
+    resolve_and_inject(&hook_event, None).await
 }

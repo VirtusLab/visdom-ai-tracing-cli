@@ -10,6 +10,7 @@ mod config;
 mod context;
 mod credentials;
 mod hooks;
+mod install_state;
 mod oidc;
 mod paths;
 mod resolution;
@@ -74,14 +75,27 @@ enum Cli {
         /// equivalents instead.
         #[arg(long, value_enum, default_value = "claude-code")]
         agent: crate::agent::Agent,
-        /// Also export Claude Code's own per-request cost to TraceVault over
-        /// OpenTelemetry: writes the OTel log exporter settings and an
-        /// `otelHeadersHelper` (`tracevault otel-headers`) into the USER-level
-        /// ~/.claude/settings.json, per-repo or with --global. An existing
-        /// exporter setup is left untouched (collector instructions are
-        /// printed instead). Without the flag, an interactive init asks.
-        #[arg(long)]
+        /// Export Claude Code's own per-request cost to TraceVault over
+        /// OpenTelemetry (the default): writes the OTel log exporter settings
+        /// and an `otelHeadersHelper` (`tracevault otel-headers`) into the
+        /// USER-level ~/.claude/settings.json, per-repo or with --global. An
+        /// existing exporter setup is left untouched (collector instructions
+        /// are printed instead). Without either flag, an interactive init asks
+        /// (default yes), and a non-interactive one enables it unless you
+        /// opted out before.
+        #[arg(long, conflicts_with = "no_claude_telemetry")]
         claude_telemetry: bool,
+        /// Opt out of Claude Code telemetry: removes TraceVault's entries from
+        /// ~/.claude/settings.json and records the choice, so neither a later
+        /// `init` nor a CLI upgrade turns it back on.
+        #[arg(long)]
+        no_claude_telemetry: bool,
+    },
+    /// Claude Code telemetry (cost over OpenTelemetry, on by default): `on`,
+    /// `off` (remembered across upgrades) or `status`.
+    Telemetry {
+        #[arg(value_enum)]
+        action: TelemetryAction,
     },
     /// Print the Authorization header for Claude Code's OpenTelemetry export,
     /// as JSON, from the TraceVault credential store. Installed as
@@ -343,12 +357,57 @@ fn finish_global_user_context(no_user_context: bool, user_context: Option<String
     }
 }
 
-/// Configure Claude Code telemetry export after a successful `init`, when
-/// `--claude-telemetry` was given or an interactive prompt says yes. A failure
-/// exits non-zero only when the flag asked for it explicitly; an existing
-/// exporter setup is not a failure (it is left alone, by design).
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum TelemetryAction {
+    On,
+    Off,
+    Status,
+}
+
+/// What the user asked for Claude Code telemetry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TelemetryChoice {
+    /// `--claude-telemetry` / `telemetry on`.
+    On,
+    /// `--no-claude-telemetry` / `telemetry off`.
+    Off,
+    /// Neither flag: on, unless the user opted out before (VIS-1109).
+    Default,
+}
+
+impl TelemetryChoice {
+    fn from_flags(on: bool, off: bool) -> Self {
+        match (on, off) {
+            (true, _) => Self::On,
+            (_, true) => Self::Off,
+            _ => Self::Default,
+        }
+    }
+}
+
+/// Record in the install state that this machine's telemetry is settled at
+/// this version, so the upgrade step does not redo it. Best-effort.
+fn record_telemetry_choice(opt_out: Option<bool>) {
+    let result = install_state::update_in(&config::tv_config_root(), |s| {
+        s.configured_version = Some(install_state::CURRENT_VERSION.to_string());
+        if let Some(opt_out) = opt_out {
+            s.claude_telemetry_opt_out = opt_out;
+            s.telemetry_auto_enabled = None;
+        }
+    });
+    if let Err(e) = result {
+        eprintln!("Warning: could not record the Claude Code telemetry choice: {e}");
+    }
+}
+
+/// Configure Claude Code telemetry after a successful `init` (or for
+/// `telemetry on|off`). On by default (VIS-1109): `Default` enables it
+/// unless the user opted out before, asking first in a terminal. `Off`
+/// removes our settings and records the opt-out, which only an explicit `On`
+/// clears. A failure exits non-zero only when the user asked explicitly; an
+/// existing exporter setup is not a failure (it is left alone, by design).
 fn finish_claude_telemetry(
-    explicit: bool,
+    choice: TelemetryChoice,
     project_root: &std::path::Path,
     server_flag: Option<&str>,
 ) {
@@ -356,12 +415,44 @@ fn finish_claude_telemetry(
         eprintln!("Error: cannot determine home directory");
         std::process::exit(1);
     };
-    let wanted = explicit
-        || (commands::claude_telemetry::is_off(&claude_dir)
-            && commands::claude_telemetry::prompt().unwrap_or(false));
-    if !wanted {
-        return;
+    let state = install_state::load_in(&config::tv_config_root());
+    let off = |claude_dir: &std::path::Path| match commands::claude_telemetry::uninstall(claude_dir)
+    {
+        Ok(removed) => {
+            if removed {
+                println!(
+                    "Claude Code telemetry is off (removed TraceVault's settings from {})",
+                    claude_dir.join("settings.json").display()
+                );
+            } else {
+                println!("Claude Code telemetry is off");
+            }
+            record_telemetry_choice(Some(true));
+        }
+        Err(e) => {
+            eprintln!("Error: could not turn Claude Code telemetry off: {e}");
+            std::process::exit(1);
+        }
+    };
+    match choice {
+        TelemetryChoice::Off => return off(&claude_dir),
+        TelemetryChoice::Default if state.claude_telemetry_opt_out => {
+            println!(
+                "Claude Code telemetry stays off, as you chose earlier \
+                 (`tracevault telemetry on` to enable it)"
+            );
+            return;
+        }
+        TelemetryChoice::Default
+            if commands::claude_telemetry::is_off(&claude_dir)
+                && std::io::IsTerminal::is_terminal(&std::io::stdin())
+                && !commands::claude_telemetry::prompt().unwrap_or(true) =>
+        {
+            return off(&claude_dir);
+        }
+        _ => {}
     }
+    let explicit = choice == TelemetryChoice::On;
     let result = commands::claude_telemetry::telemetry_server_url(project_root, server_flag)
         .and_then(|url| {
             commands::claude_telemetry::install(
@@ -375,23 +466,26 @@ fn finish_claude_telemetry(
     match result {
         Ok((url, commands::claude_telemetry::InstallOutcome::Configured)) => {
             println!(
-                "Claude Code telemetry exports to {} (configured in {}; restart Claude Code to apply)",
+                "Claude Code telemetry exports to {} (configured in {}; restart Claude Code to \
+                 apply; `tracevault telemetry off` to disable)",
                 commands::claude_telemetry::logs_endpoint(&url),
                 claude_dir.join("settings.json").display()
             );
+            record_telemetry_choice(Some(false));
         }
         Ok((url, commands::claude_telemetry::InstallOutcome::Foreign(reasons))) => {
             eprintln!(
                 "{}",
                 commands::claude_telemetry::collector_instructions(&url, &reasons)
             );
+            record_telemetry_choice(explicit.then_some(false));
         }
-        Err(e) => {
+        Err(e) if explicit => {
             eprintln!("Error: Claude Code telemetry not configured: {e}");
-            if explicit {
-                std::process::exit(1);
-            }
+            std::process::exit(1);
         }
+        // Not recorded: the upgrade step retries in a later session.
+        Err(e) => eprintln!("Warning: Claude Code telemetry not configured: {e}"),
     }
 }
 
@@ -408,11 +502,17 @@ async fn main() {
             global,
             agent,
             claude_telemetry,
+            no_claude_telemetry,
         } => {
-            if claude_telemetry && agent != crate::agent::Agent::ClaudeCode {
-                eprintln!("Error: --claude-telemetry only applies to --agent claude-code");
+            if (claude_telemetry || no_claude_telemetry) && agent != crate::agent::Agent::ClaudeCode
+            {
+                eprintln!(
+                    "Error: --claude-telemetry and --no-claude-telemetry only apply to \
+                     --agent claude-code (use `tracevault telemetry off` instead)"
+                );
                 std::process::exit(1);
             }
+            let telemetry = TelemetryChoice::from_flags(claude_telemetry, no_claude_telemetry);
             // Reject flag combinations that don't apply to the selected agent
             // (e.g. --claude-settings with --agent codex) rather than silently
             // ignoring them.
@@ -505,7 +605,7 @@ async fn main() {
 
                         finish_global_user_context(no_user_context, user_context);
                         let cwd = env::current_dir().expect("Cannot determine current directory");
-                        finish_claude_telemetry(claude_telemetry, &cwd, None);
+                        finish_claude_telemetry(telemetry, &cwd, None);
                         return;
                     }
                     crate::agent::Agent::OpenCode => {
@@ -573,7 +673,7 @@ async fn main() {
                         "Other contributors run `tracevault init` to set up their own local hooks."
                     );
                     if agent == crate::agent::Agent::ClaudeCode {
-                        finish_claude_telemetry(claude_telemetry, &cwd, server_url.as_deref());
+                        finish_claude_telemetry(telemetry, &cwd, server_url.as_deref());
                     }
                 }
                 Err(e) => {
@@ -602,6 +702,27 @@ async fn main() {
                 Err(e) => {
                     eprintln!("tracevault otel-headers: {e}");
                     std::process::exit(1);
+                }
+            }
+        }
+        Cli::Telemetry { action } => {
+            let cwd = env::current_dir().expect("Cannot determine current directory");
+            let project_root = crate::paths::resolve_project_root(&cwd).root;
+            match action {
+                TelemetryAction::On => {
+                    finish_claude_telemetry(TelemetryChoice::On, &project_root, None)
+                }
+                TelemetryAction::Off => {
+                    finish_claude_telemetry(TelemetryChoice::Off, &project_root, None)
+                }
+                TelemetryAction::Status => {
+                    let server_url = crate::credentials::resolve_credentials_quiet(&project_root)
+                        .ok()
+                        .and_then(|(url, _)| url);
+                    println!(
+                        "{}",
+                        commands::status::telemetry_status_line(server_url.as_deref())
+                    );
                 }
             }
         }
