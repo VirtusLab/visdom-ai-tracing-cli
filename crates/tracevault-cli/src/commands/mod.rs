@@ -1,5 +1,4 @@
 pub mod agent_policies;
-pub mod catch_up;
 pub mod check;
 pub mod claude_telemetry;
 pub mod commit_push;

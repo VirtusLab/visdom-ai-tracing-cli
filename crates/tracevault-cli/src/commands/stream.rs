@@ -103,66 +103,21 @@ pub fn record_transcript_path(session_dir: &Path, transcript_path: &str) -> Resu
     if transcript_path.is_empty() {
         return Ok(());
     }
-    record_metadata(
-        session_dir,
-        "transcript_path",
-        serde_json::Value::String(transcript_path.to_string()),
-    )
-}
-
-/// The session's `metadata.json`; `{}` when it is missing or unreadable.
-pub(crate) fn session_metadata(session_dir: &Path) -> serde_json::Value {
-    fs::read_to_string(session_dir.join("metadata.json"))
+    let meta_path = session_dir.join("metadata.json");
+    let mut meta = fs::read_to_string(&meta_path)
         .ok()
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
         .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}))
-}
-
-/// Set `key` in the session's `metadata.json`, keeping its other keys. An
-/// unchanged value skips the write; the file is replaced atomically (see
-/// [`record_transcript_path`]).
-fn record_metadata(
-    session_dir: &Path,
-    key: &str,
-    value: serde_json::Value,
-) -> Result<(), io::Error> {
-    let mut meta = session_metadata(session_dir);
-    if meta.get(key) == Some(&value) {
+        .unwrap_or_else(|| serde_json::json!({}));
+    if meta.get("transcript_path").and_then(|v| v.as_str()) == Some(transcript_path) {
         return Ok(());
     }
-    meta[key] = value;
+    meta["transcript_path"] = serde_json::Value::String(transcript_path.to_string());
     let tmp = session_dir.join(format!(".metadata.json.{}", uuid::Uuid::now_v7()));
     fs::write(&tmp, meta.to_string())?;
-    fs::rename(&tmp, session_dir.join("metadata.json")).inspect_err(|_| {
+    fs::rename(&tmp, &meta_path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })
-}
-
-/// `attribution` as the session's hooks record it in `metadata.json`.
-fn attribution_record(attribution: &Attribution) -> serde_json::Value {
-    match attribution {
-        Attribution::Repo { repo_id, project } => {
-            serde_json::json!({"repo_id": repo_id, "project_id": project})
-        }
-        Attribution::ProjectOnly { project_id } => {
-            serde_json::json!({"repo_id": null, "project_id": project_id})
-        }
-    }
-}
-
-/// Whether the catch-up sweep may send an earlier session's lines under
-/// `now`, the attribution that resolves today. Bindings can change after a
-/// session ended (a new default project, say), so it must be the one the
-/// session's own hooks recorded. A session recorded by an older CLI has
-/// none: it is sent when repo-attributed, since the server keys its row by
-/// the repo and never moves a project once stamped, and left alone when
-/// project-only, since there the project picks the row.
-pub(crate) fn catch_up_may_send(recorded: Option<&serde_json::Value>, now: &Attribution) -> bool {
-    match recorded {
-        Some(recorded) => *recorded == attribution_record(now),
-        None => matches!(now, Attribution::Repo { .. }),
-    }
 }
 
 /// Fileless agents (OpenCode) have no transcript for `tracevault check` to
@@ -1141,7 +1096,7 @@ const DELIVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 /// before it is given up and its part queued (the client's own timeout is
 /// 60 s, past the hook's). This bounds how long a hook holds a subagent
 /// file's lock: at most its budget plus this.
-pub(crate) const IN_FLIGHT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const IN_FLIGHT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long past its own delivery budget a final hook (`Stop`,
 /// `SubagentStop`) waits for a subagent file another hook is sending. A
@@ -1193,7 +1148,7 @@ pub async fn run_stream(
     let deadline = std::time::Instant::now() + DELIVERY_BUDGET;
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
-    let hook_event = parse_hook_event(&input)?;
+    let mut hook_event = parse_hook_event(&input)?;
 
     // Resolve project_root and session_dir via the shared git-aware resolver.
     //
@@ -1254,96 +1209,6 @@ pub async fn run_stream(
     if let Some(records) = &hook_event.transcript_records {
         let _ = record_inline_tool_calls(&session_dir, records);
     }
-
-    let target = SessionTarget {
-        project_root,
-        session_dir,
-        worktree_top,
-    };
-    stream_event(
-        hook_event,
-        event_type,
-        agent,
-        &target,
-        deadline,
-        Sender::Hook,
-    )
-    .await?;
-
-    // 12. Always print HookResponse::allow() to stdout
-    let response = HookResponse::allow();
-    println!("{}", serde_json::to_string(&response)?);
-
-    Ok(())
-}
-
-/// The server event a hook's `--event` is sent as.
-pub fn stream_event_type(event_type: &str) -> StreamEventType {
-    match event_type {
-        "notification" => StreamEventType::SessionStart,
-        // Codex, OpenCode and GSD/pi end their sessions with it.
-        "stop" => StreamEventType::SessionEnd,
-        // Claude Code's `SessionEnd` comes after `Stop`, which already ended
-        // the session on the server: it only carries the last transcript
-        // lines, among them the `cost-state` report (VIS-1108).
-        "session-end" => StreamEventType::Transcript,
-        _ => StreamEventType::ToolUse,
-    }
-}
-
-/// Where a stream event's session lives, resolved by the caller: the hook
-/// from its working directory, the catch-up sweep from the session's
-/// directory.
-pub(crate) struct SessionTarget {
-    pub project_root: std::path::PathBuf,
-    /// `<project_root>/.tracevault/sessions/<session_id>`; must exist.
-    pub session_dir: std::path::PathBuf,
-    /// The checkout the session runs in (see [`crate::paths::worktree_toplevel`]).
-    pub worktree_top: String,
-}
-
-/// Who sends a [`stream_event`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Sender {
-    /// The session's own hook: it also sends the subagent transcripts, and
-    /// stamps the billing mode it detects.
-    Hook,
-    /// The catch-up sweep (`commands::catch_up`), on behalf of an earlier
-    /// session: main transcript only, and no billing mode, since this
-    /// process's credentials say nothing about that session's (the server
-    /// keeps the one it has).
-    CatchUp,
-}
-
-/// What a [`stream_event`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Sent {
-    /// Every request was accepted: nothing was left in the queue.
-    Accepted,
-    /// Something was queued: a send failed, or the deadline came first.
-    Queued,
-    /// Nothing was sent: no attribution resolved, or (catch-up) not the one
-    /// the session recorded.
-    Skipped,
-}
-
-/// Send `hook_event` (and, from a hook, what the session's subagents wrote
-/// since the last hook) as `event_type`, queueing what is not accepted by
-/// `deadline`. Prints nothing: the hook's response is the caller's.
-pub(crate) async fn stream_event(
-    mut hook_event: tracevault_protocol::hooks::HookEvent,
-    event_type: &str,
-    agent: crate::agent::Agent,
-    target: &SessionTarget,
-    deadline: std::time::Instant,
-    sender: Sender,
-) -> Result<Sent, Box<dyn std::error::Error>> {
-    let SessionTarget {
-        project_root,
-        session_dir,
-        worktree_top,
-    } = target;
-    let hook_cwd = Path::new(&hook_event.cwd);
 
     // 3. Mint a time-ordered event id. UUIDv7 is stamped at hook-fire time, so
     //    it both orders events and is a stable idempotency key — no shared
@@ -1413,7 +1278,11 @@ pub(crate) async fn stream_event(
         (transcript_lines, start_offset, new_offset)
     };
     // 5. Build StreamEventRequest
-    let stream_event_type = stream_event_type(event_type);
+    let stream_event_type = match event_type {
+        "notification" => StreamEventType::SessionStart,
+        "stop" => StreamEventType::SessionEnd,
+        _ => StreamEventType::ToolUse,
+    };
 
     // Extract is_error from transcript for this tool_use_id. Inline (OpenCode)
     // events have no tool_use_id, so fall back to a forwarded `toolResult`
@@ -1434,7 +1303,7 @@ pub(crate) async fn stream_event(
     // user context" — `resolve_user_context` below falls back to the user-level
     // config in that case. A malformed repo config is surfaced as an error
     // later (the required-config check), not silently dropped here.
-    let config = crate::config::TracevaultConfig::try_load(project_root);
+    let config = crate::config::TracevaultConfig::try_load(&project_root);
     // Repo config's user_context wins when the repo configured it; otherwise
     // fall back to the user-level ~/.config/tracevault/config.toml. This is
     // what lets a detached session (no checkout) still carry user context.
@@ -1475,8 +1344,11 @@ pub(crate) async fn stream_event(
         flow_id: ctx_flow_id,
         labels: ctx_labels,
         params: ctx_params,
-        billing_mode: (sender == Sender::Hook)
-            .then(|| crate::billing::detect_current(agent, hook_cwd, &hook_event.transcript_path)),
+        billing_mode: Some(crate::billing::detect_current(
+            agent,
+            hook_cwd,
+            &hook_event.transcript_path,
+        )),
     };
 
     stamp_agent(&mut req, agent);
@@ -1487,7 +1359,7 @@ pub(crate) async fn stream_event(
     }
 
     // 6. Resolve credentials
-    let (server_url, credential) = crate::credentials::resolve_credentials_quiet(project_root)?;
+    let (server_url, credential) = crate::credentials::resolve_credentials_quiet(&project_root)?;
 
     // 7. Config (loaded above, alongside the user-level context layer
     // resolution) no longer directly gates repo_id — a missing config is not
@@ -1512,7 +1384,7 @@ pub(crate) async fn stream_event(
         .and_then(|opt| opt.as_ref())
         .and_then(crate::resolution::binding_from_config);
     let user_default = crate::user_default::load();
-    let mut binding = resolve_stream_binding(&session, worktree_top, bound, user_default);
+    let mut binding = resolve_stream_binding(&session, &worktree_top, bound, user_default);
     // The client is built here, not at step 8, because an unbound session may
     // need it first: bind it from its checkout's remote, as the SessionStart
     // hook does — this covers agents without that hook and a SessionStart
@@ -1531,6 +1403,13 @@ pub(crate) async fn stream_event(
             binding = auto.binding;
         }
     }
+    // Graceful no-op, exactly like the hook's normal success path. Do NOT
+    // error: a failing hook would block the tool.
+    let no_op_allow = || -> Result<(), Box<dyn std::error::Error>> {
+        let response = HookResponse::allow();
+        println!("{}", serde_json::to_string(&response)?);
+        Ok(())
+    };
     // Explicit local project binding (if any) overrides server-side repo
     // deduction. Computed BEFORE the attribution gate below, reusing the
     // already-loaded session + worktree used just above for the repo-binding
@@ -1557,31 +1436,16 @@ pub(crate) async fn stream_event(
     // session-state file whose repo_id could carry path separators into the
     // pending filename — such a binding degrades to project-only inside
     // `attribution_for` rather than dropping the event.)
-    // Graceful no-op, exactly like the hook's normal success path. Do NOT
-    // error: a failing hook would block the tool.
     let Some(attribution) = attribution_for(binding.as_ref(), capture_pid) else {
-        return Ok(Sent::Skipped);
+        no_op_allow()?;
+        return Ok(());
     };
-    // A hook records what it sends under, for a later catch-up of this
-    // session (best-effort, like the transcript path); the catch-up sends
-    // only under that.
-    match sender {
-        Sender::Hook => {
-            let _ = record_metadata(session_dir, "attribution", attribution_record(&attribution));
-        }
-        Sender::CatchUp => {
-            let meta = session_metadata(session_dir);
-            if !catch_up_may_send(meta.get("attribution"), &attribution) {
-                return Ok(Sent::Skipped);
-            }
-        }
-    }
 
     // 8. The ApiClient (built above)
     let client = client.ok_or("server_url not configured")?;
 
     // 9. Try drain pending queue and send
-    let pending_path = pending_path_for(session_dir, &attribution);
+    let pending_path = pending_path_for(&session_dir, &attribution);
     let pending_events = drain_pending(&pending_path)?;
 
     let mut send_failed = false;
@@ -1625,11 +1489,7 @@ pub(crate) async fn stream_event(
 
     // Send the current event — several requests when its transcript batch
     // exceeds the request cap (see `split_into_parts`), never dropping lines.
-    // A `session-end` without new lines has nothing to send: `Stop` already
-    // ended the session on the server.
-    let sends_event = sends_main
-        && !(req.event_type == StreamEventType::Transcript && req.transcript_lines.is_none());
-    let all_accepted = if sends_event {
+    let all_accepted = if sends_main {
         deliver_parts(
             &client,
             &attribution,
@@ -1655,38 +1515,36 @@ pub(crate) async fn stream_event(
     // next read re-covers these lines from the same start offset, so every line
     // gets the same chunk_index again and the server dedupes it — whatever the
     // queue meanwhile delivered or lost.)
-    // Replaced atomically: the catch-up sweep can read it while this runs.
     if sends_main && (all_accepted || is_inline) {
-        crate::subagents::write_offset(&offset_path, new_offset)?;
+        fs::write(&offset_path, new_offset.to_string())?;
     }
 
     // 11. Subagent transcripts (Claude Code keeps each subagent's conversation
     // out of the main file). Swept on every hook, not only on `SubagentStop`,
     // so a long-running or background subagent is sent while it runs, and
-    // the final hooks read every file to its end.
-    if sender == Sender::Hook && agent == crate::agent::Agent::ClaudeCode {
+    // `Stop` reads every file to its end.
+    if agent == crate::agent::Agent::ClaudeCode {
         deliver_subagent_transcripts(
             &client,
             &attribution,
             force,
             &subagent_template,
             transcript_path,
-            session_dir,
+            &session_dir,
             &pending_path,
             send_failed || !all_accepted,
             deadline,
-            matches!(event_type, "stop" | "subagent-stop" | "session-end")
-                .then(|| deadline + FINAL_LOCK_WAIT),
+            matches!(event_type, "stop" | "subagent-stop").then(|| deadline + FINAL_LOCK_WAIT),
             &mut warned,
         )
         .await?;
     }
 
-    Ok(if !send_failed && all_accepted {
-        Sent::Accepted
-    } else {
-        Sent::Queued
-    })
+    // 12. Always print HookResponse::allow() to stdout
+    let response = HookResponse::allow();
+    println!("{}", serde_json::to_string(&response)?);
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1696,66 +1554,6 @@ mod tests {
     use crate::config::UserContext;
     use crate::context::{Context, EffectiveContext};
     use std::collections::BTreeMap;
-
-    #[test]
-    fn catch_up_sends_only_under_the_attribution_the_session_recorded() {
-        let repo = |project: Option<uuid::Uuid>| Attribution::Repo {
-            repo_id: "11111111-1111-1111-1111-111111111111".to_string(),
-            project,
-        };
-        let a = uuid::Uuid::from_u128(0xa);
-        let b = uuid::Uuid::from_u128(0xb);
-        let only = |project_id| Attribution::ProjectOnly { project_id };
-
-        let recorded = attribution_record(&repo(Some(a)));
-        assert!(catch_up_may_send(Some(&recorded), &repo(Some(a))));
-        assert!(!catch_up_may_send(Some(&recorded), &repo(Some(b))));
-        assert!(!catch_up_may_send(Some(&recorded), &repo(None)));
-        let recorded = attribution_record(&only(a));
-        assert!(catch_up_may_send(Some(&recorded), &only(a)));
-        assert!(!catch_up_may_send(Some(&recorded), &only(b)));
-        // Recorded by an older CLI: the repo keys the row, the project does
-        // not when there is no repo.
-        assert!(catch_up_may_send(None, &repo(Some(b))));
-        assert!(!catch_up_may_send(None, &only(a)));
-    }
-
-    #[test]
-    fn record_metadata_keeps_the_other_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        record_transcript_path(dir.path(), "/t.jsonl").unwrap();
-        record_metadata(
-            dir.path(),
-            "attribution",
-            serde_json::json!({"repo_id": "r"}),
-        )
-        .unwrap();
-        let meta = session_metadata(dir.path());
-        assert_eq!(meta["transcript_path"], "/t.jsonl");
-        assert_eq!(meta["attribution"]["repo_id"], "r");
-    }
-
-    #[test]
-    fn hook_events_map_to_server_events() {
-        assert_eq!(
-            stream_event_type("notification"),
-            StreamEventType::SessionStart
-        );
-        // Every agent's `stop` ends the session; Claude Code's `session-end`
-        // comes after it and must not end it again.
-        assert_eq!(stream_event_type("stop"), StreamEventType::SessionEnd);
-        assert_eq!(
-            stream_event_type("session-end"),
-            StreamEventType::Transcript
-        );
-        for event in ["pre-tool-use", "post-tool-use", "subagent-stop", "other"] {
-            assert_eq!(
-                stream_event_type(event),
-                StreamEventType::ToolUse,
-                "{event}"
-            );
-        }
-    }
 
     // ── user layer resolution: disabled config → no user layer ────────────────
 

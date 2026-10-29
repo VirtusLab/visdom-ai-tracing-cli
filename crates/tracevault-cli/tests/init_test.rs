@@ -400,10 +400,6 @@ fn tracevault_hooks_has_pre_post_and_notification() {
         hooks["SubagentStop"][0]["hooks"][0]["command"],
         "tracevault stream --event subagent-stop"
     );
-    assert_eq!(
-        hooks["SessionEnd"][0]["hooks"][0]["command"],
-        "tracevault stream --event session-end"
-    );
     assert!(hooks.get("SessionStart").is_some());
     assert!(hooks.get("UserPromptSubmit").is_some());
 }
