@@ -38,16 +38,26 @@ pub struct Paths {
     pub claude_dir: PathBuf,
     /// The session's repository (primary checkout), if it runs in one.
     pub project_root: Option<PathBuf>,
+    /// The linked worktree the session runs in, when it is not the primary
+    /// checkout: Claude Code reads that worktree's `.claude/` settings.
+    pub worktree_root: Option<PathBuf>,
 }
 
 impl Paths {
     /// This user's, for a session whose working directory is `cwd`. `None`
     /// without a home directory.
     pub fn current(cwd: &Path) -> Option<Self> {
+        let project = crate::paths::resolve_project_root(cwd);
+        let in_git = project.source == crate::paths::ProjectRootSource::Git;
+        let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let worktree = PathBuf::from(crate::paths::worktree_toplevel(cwd));
+        let worktree_root =
+            (in_git && canonical(&worktree) != canonical(&project.root)).then_some(worktree);
         Some(Self {
             config_root: crate::config::tv_config_root(),
             claude_dir: dirs::home_dir()?.join(".claude"),
-            project_root: Some(crate::paths::resolve_project_root(cwd).root),
+            project_root: Some(project.root),
+            worktree_root,
         })
     }
 }
@@ -62,7 +72,7 @@ pub fn run(
     env: &Environment,
     server_url: impl FnOnce() -> Result<String, String>,
 ) -> Option<String> {
-    let Some(_lock) = Lock::take(&paths.config_root) else {
+    let Some(_lock) = install_state::Lock::try_take(&paths.config_root) else {
         // Another session is upgrading right now; this one leaves it be.
         return None;
     };
@@ -103,11 +113,14 @@ fn hook_locations(paths: &Paths) -> Vec<HookLocation> {
         key: paths.claude_dir.display().to_string(),
         candidates: vec![paths.claude_dir.join("settings.json")],
     }];
-    if let Some(root) = &paths.project_root {
+    // The primary checkout, where `init` installs, and a linked worktree the
+    // session runs in, whose own `.claude/` Claude Code reads there.
+    for root in paths.project_root.iter().chain(&paths.worktree_root) {
         // A session in the home directory itself would name ~/.claude twice.
-        if root.join(".claude") != paths.claude_dir {
+        let key = root.display().to_string();
+        if root.join(".claude") != paths.claude_dir && out.iter().all(|l| l.key != key) {
             out.push(HookLocation {
-                key: root.display().to_string(),
+                key,
                 candidates: ["settings.json", "settings.local.json"]
                     .iter()
                     .map(|f| root.join(".claude").join(f))
@@ -116,6 +129,31 @@ fn hook_locations(paths: &Paths) -> Vec<HookLocation> {
         }
     }
     out
+}
+
+/// The `files` that hold TraceVault hooks; `Err` when one of them cannot be
+/// read or parsed, so the location is not recorded as having none.
+fn files_with_hooks<'a>(files: impl IntoIterator<Item = &'a PathBuf>) -> Result<Vec<PathBuf>, ()> {
+    let mut found = Vec::new();
+    let mut failed = false;
+    for file in files {
+        match crate::commands::init::has_tracevault_hooks(file) {
+            Ok(true) => found.push(file.clone()),
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!(
+                    "tracevault: cannot check the hooks in {}: {e}",
+                    file.display()
+                );
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        Err(())
+    } else {
+        Ok(found)
+    }
 }
 
 /// Re-merge the hooks at `location` once per version. The files holding our
@@ -128,20 +166,16 @@ fn upgrade_hook_location(state: &mut InstallState, location: &HookLocation, vers
     if !due {
         return recorded.is_some_and(|r| !r.hook_files.is_empty());
     }
-    let mut files: Vec<PathBuf> = recorded
-        .map(|r| r.hook_files.clone())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|f| crate::commands::init::has_tracevault_hooks(f))
-        .collect();
-    if files.is_empty() {
-        files = location
-            .candidates
-            .iter()
-            .filter(|f| crate::commands::init::has_tracevault_hooks(f))
-            .cloned()
-            .collect();
+    let recorded_files = recorded.map(|r| r.hook_files.clone()).unwrap_or_default();
+    let mut found = files_with_hooks(&recorded_files);
+    if found.as_ref().is_ok_and(|f| f.is_empty()) {
+        found = files_with_hooks(&location.candidates);
     }
+    // A file that cannot be read may hold our hooks: retry next session, and
+    // count the location as installed if it was before.
+    let Ok(files) = found else {
+        return !recorded_files.is_empty();
+    };
     let mut done = true;
     for file in &files {
         if let Err(e) = crate::commands::init::refresh_claude_hooks(file) {
@@ -247,48 +281,6 @@ fn read_settings(path: &Path) -> Result<Value, String> {
     }
 }
 
-/// Keeps two sessions starting at once from both running the step (and both
-/// showing the notice). A lock older than [`Lock::STALE`] was left by a
-/// killed process and is taken over.
-struct Lock(PathBuf);
-
-impl Lock {
-    const STALE: std::time::Duration = std::time::Duration::from_secs(60);
-
-    fn take(config_root: &Path) -> Option<Self> {
-        std::fs::create_dir_all(config_root).ok()?;
-        let path = config_root.join("install-state.lock");
-        for _ in 0..2 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Some(Self(path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.elapsed().ok())
-                        .is_some_and(|age| age > Self::STALE);
-                    if !stale {
-                        return None;
-                    }
-                    let _ = std::fs::remove_file(&path);
-                }
-                Err(_) => return None,
-            }
-        }
-        None
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +317,7 @@ mod tests {
             config_root: home.path().join(".config/tracevault"),
             claude_dir: home.path().join(".claude"),
             project_root: Some(repo),
+            worktree_root: None,
         };
         Fixture { _home: home, paths }
     }
@@ -488,6 +481,7 @@ mod tests {
             config_root: home.path().join(".config/tracevault"),
             claude_dir: home.path().join(".claude"),
             project_root: Some(home.path().join("repo")),
+            worktree_root: None,
         };
         assert_eq!(run_with(&paths, "0.30.0", &Environment::default()), None);
         assert!(!paths.claude_dir.join("settings.json").exists());
@@ -513,6 +507,7 @@ mod tests {
             config_root: home.path().join(".config/tracevault"),
             claude_dir,
             project_root: None,
+            worktree_root: None,
         };
         assert_eq!(
             run_with(&paths, "0.30.0", &Environment::default()).as_deref(),
@@ -598,5 +593,55 @@ mod tests {
         assert!(!install_state::load_in(&f.paths.config_root)
             .repos
             .contains_key(&key));
+    }
+
+    #[test]
+    fn unparseable_settings_are_not_recorded_as_hook_free() {
+        let f = fixture("settings.json");
+        let file = f
+            .paths
+            .project_root
+            .as_ref()
+            .unwrap()
+            .join(".claude/settings.json");
+        let good = fs::read_to_string(&file).unwrap();
+        fs::write(&file, "{ half-written").unwrap();
+        assert_eq!(run_with(&f.paths, "0.30.0", &Environment::default()), None);
+        let key = f.paths.project_root.as_ref().unwrap().display().to_string();
+        assert!(!install_state::load_in(&f.paths.config_root)
+            .repos
+            .contains_key(&key));
+
+        // Repaired: the next session at the same version does the work.
+        fs::write(&file, good).unwrap();
+        assert_eq!(
+            run_with(&f.paths, "0.30.0", &Environment::default()).as_deref(),
+            Some(TELEMETRY_NOTICE)
+        );
+        assert!(repo_settings(&f.paths, "settings.json")["hooks"]["SessionStart"].is_array());
+    }
+
+    #[test]
+    fn a_linked_worktrees_own_settings_are_refreshed_too() {
+        let f = fixture("settings.local.json");
+        let worktree = f._home.path().join("wt");
+        fs::create_dir_all(worktree.join(".claude")).unwrap();
+        fs::write(
+            worktree.join(".claude/settings.json"),
+            json!({"hooks": {"Stop": [{"matcher": "", "hooks": [
+                {"type": "command", "command": "tracevault stream --event stop"}]}]}})
+            .to_string(),
+        )
+        .unwrap();
+        let paths = Paths {
+            worktree_root: Some(worktree.clone()),
+            config_root: f.paths.config_root.clone(),
+            claude_dir: f.paths.claude_dir.clone(),
+            project_root: f.paths.project_root.clone(),
+        };
+        run_with(&paths, "0.30.0", &Environment::default());
+        let wt = json_at(&worktree.join(".claude/settings.json"));
+        assert!(wt["hooks"]["SessionStart"].is_array());
+        assert!(repo_settings(&paths, "settings.local.json")["hooks"]["SessionStart"].is_array());
     }
 }

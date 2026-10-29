@@ -404,20 +404,51 @@ fn record_telemetry_choice(opt_out: Option<bool>) {
 /// `telemetry on|off`). On by default (VIS-1109): `Default` enables it
 /// unless the user opted out before, asking first in a terminal. `Off`
 /// removes our settings and records the opt-out, which only an explicit `On`
-/// clears. A failure exits non-zero only when the user asked explicitly; an
-/// existing exporter setup is not a failure (it is left alone, by design).
+/// clears. `Default` never turns on telemetry while Claude Code is set to
+/// export content (prompt text etc.). A failure exits non-zero only when the
+/// user asked explicitly; an existing exporter setup is not a failure (it is
+/// left alone, by design).
 fn finish_claude_telemetry(
     choice: TelemetryChoice,
     project_root: &std::path::Path,
     server_flag: Option<&str>,
 ) {
+    use commands::claude_telemetry::{content_logging_in, is_off, prompt, Environment};
     let Some(claude_dir) = dirs::home_dir().map(|h| h.join(".claude")) else {
         eprintln!("Error: cannot determine home directory");
         std::process::exit(1);
     };
-    let state = install_state::load_in(&config::tv_config_root());
-    let off = |claude_dir: &std::path::Path| match commands::claude_telemetry::uninstall(claude_dir)
+    let config_root = config::tv_config_root();
+    let env = Environment::current(&claude_dir);
+    let explicit = choice != TelemetryChoice::Default;
+    let content = || content_logging_in(&claude_dir, &env);
+    // Ask before taking the lock below: the answer may take a while.
+    let mut choice = choice;
+    if choice == TelemetryChoice::Default
+        && !install_state::load_in(&config_root).claude_telemetry_opt_out
+        && is_off(&claude_dir)
+        && content().is_empty()
+        && std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && !prompt().unwrap_or(true)
     {
+        choice = TelemetryChoice::Off;
+    }
+    // The upgrade step changes the same settings and state (VIS-1109).
+    let _lock = match install_state::Lock::take(&config_root, std::time::Duration::from_secs(10)) {
+        Ok(lock) => lock,
+        Err(e) if explicit => {
+            eprintln!("Error: Claude Code telemetry not changed: {e}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Warning: Claude Code telemetry not configured: {e}");
+            return;
+        }
+    };
+    let state = install_state::load_in(&config_root);
+    let off = |claude_dir: &std::path::Path| match commands::claude_telemetry::uninstall(
+        claude_dir, &env,
+    ) {
         Ok(removed) => {
             if removed {
                 println!(
@@ -443,25 +474,22 @@ fn finish_claude_telemetry(
             );
             return;
         }
-        TelemetryChoice::Default
-            if commands::claude_telemetry::is_off(&claude_dir)
-                && std::io::IsTerminal::is_terminal(&std::io::stdin())
-                && !commands::claude_telemetry::prompt().unwrap_or(true) =>
-        {
-            return off(&claude_dir);
+        TelemetryChoice::Default if is_off(&claude_dir) && !content().is_empty() => {
+            // Not recorded: nothing was decided.
+            eprintln!(
+                "Warning: Claude Code telemetry not turned on: Claude Code is set to export \
+                 content ({}); run `tracevault telemetry on` to send it to TraceVault anyway",
+                content().join("; ")
+            );
+            return;
         }
         _ => {}
     }
-    let explicit = choice == TelemetryChoice::On;
     let result = commands::claude_telemetry::telemetry_server_url(project_root, server_flag)
         .and_then(|url| {
-            commands::claude_telemetry::install(
-                &claude_dir,
-                &url,
-                &commands::claude_telemetry::Environment::current(&claude_dir),
-            )
-            .map(|outcome| (url, outcome))
-            .map_err(|e| e.to_string())
+            commands::claude_telemetry::install(&claude_dir, &url, &env)
+                .map(|outcome| (url, outcome))
+                .map_err(|e| e.to_string())
         });
     match result {
         Ok((url, commands::claude_telemetry::InstallOutcome::Configured)) => {

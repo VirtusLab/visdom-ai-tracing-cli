@@ -411,17 +411,22 @@ OpenTelemetry exporter settings in a repository's `.claude/settings*.json`:
 
 **What leaves your machine.** Claude Code exports its OpenTelemetry *log events* for every
 session on this machine, in any directory, to the TraceVault server: `api_request` (model,
-`cost_usd`, token counts, duration, request ids), and also `user_prompt`, `tool_result`,
-`tool_decision`, `api_error` and similar events, with session and user attributes. With the
-settings above, **no prompt text, response text, tool input or tool output is sent**: Claude
-Code redacts them unless `OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_ASSISTANT_RESPONSES`,
-`OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_TOOL_CONTENT` or `OTEL_LOG_RAW_API_BODIES` is set (all off by
-default; `user_prompt` then carries only `prompt_length`). TraceVault never sets them, and the
-upgrade step does not turn telemetry on while any of them is set. Only `OTEL_LOGS_EXPORTER` is
-configured, so no metrics or traces are exported. The server reads only an allowlist of
-`api_request` fields and rejects events for sessions it does not know. (Checked against Claude
-Code's [monitoring documentation](https://code.claude.com/docs/en/monitoring-usage),
-2026-10-29.)
+`cost_usd`, token counts, duration, request ids), and also `user_prompt`,
+`assistant_response`, `tool_result`, `tool_decision`, `api_error`, `hook_registered`,
+`plugin_loaded`, `mcp_server_connection` and similar events, with session and user attributes
+(names of hooks, plugins and MCP servers, not their content). With the settings above, **no
+prompt text, response text, tool input or tool output is sent**: Claude Code redacts them
+unless `OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_ASSISTANT_RESPONSES`, `OTEL_LOG_TOOL_DETAILS`,
+`OTEL_LOG_TOOL_CONTENT` or `OTEL_LOG_RAW_API_BODIES` is set (all off by default; `user_prompt`
+then carries only `prompt_length`, `assistant_response` only `<REDACTED>`). TraceVault never
+sets them, and neither a plain `init` nor the upgrade step turns telemetry on while any of them
+is set (`--claude-telemetry` or `tracevault telemetry on` still does). Only
+`OTEL_LOGS_EXPORTER` is configured, so no metrics or traces are exported. The server reads only
+an allowlist of `api_request` fields and rejects events for sessions it does not know.
+(Checked against Claude Code's
+[monitoring documentation](https://code.claude.com/docs/en/monitoring-usage) and by capturing
+the export of Claude Code 2.1.312 with exactly these settings: a marker in the prompt did not
+appear in it, 2026-10-29.)
 
 `tracevault status` shows whether telemetry is configured, under *Installation*, and whether you
 turned it off or an upgrade turned it on; `tracevault telemetry status` prints just that line.

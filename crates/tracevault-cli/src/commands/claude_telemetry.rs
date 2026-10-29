@@ -312,9 +312,10 @@ pub fn install(
 /// write. The exporter entries are recognised by the endpoint our helper
 /// names, so without our helper nothing in `env` is touched (it could be
 /// anyone's). `CLAUDE_CODE_ENABLE_TELEMETRY` and `OTEL_LOGS_EXPORTER` stay
-/// when another exporter still uses them, and a helper interval the user set
-/// stays. Returns whether anything was removed.
-pub fn remove_telemetry(settings: &mut Value) -> io::Result<bool> {
+/// when another exporter still uses them — in this file, the managed settings
+/// or the shell (`outside`) — and a helper interval the user set stays.
+/// Returns whether anything was removed.
+pub fn remove_telemetry(settings: &mut Value, outside: &Environment) -> io::Result<bool> {
     let root = settings.as_object_mut().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -344,12 +345,23 @@ pub fn remove_telemetry(settings: &mut Value) -> io::Result<bool> {
                 env.remove(key);
             }
         }
-        let other_exporter = env.iter().any(|(k, v)| match k.as_str() {
-            "OTEL_METRICS_EXPORTER" | "OTEL_TRACES_EXPORTER" => {
-                !matches!(as_text(v).as_str(), "" | "none")
-            }
+        let is_exporter = |k: &str, v: &str| match k {
+            "OTEL_METRICS_EXPORTER" | "OTEL_TRACES_EXPORTER" => !matches!(v, "" | "none"),
             k => k.starts_with("OTEL_EXPORTER_OTLP_") && k.ends_with("ENDPOINT"),
-        });
+        };
+        let other_exporter = env
+            .iter()
+            .map(|(k, v)| (k.clone(), as_text(v)))
+            .chain(
+                outside
+                    .managed
+                    .iter()
+                    .filter_map(|(_, doc)| doc.get("env").and_then(Value::as_object))
+                    .flatten()
+                    .map(|(k, v)| (k.clone(), as_text(v))),
+            )
+            .chain(outside.shell.iter().cloned())
+            .any(|(k, v)| is_exporter(&k, &v));
         if !other_exporter {
             for (key, value) in [(LOGS_EXPORTER, "otlp"), (ENABLE_TELEMETRY, "1")] {
                 if holds(env, key, value) {
@@ -367,7 +379,7 @@ pub fn remove_telemetry(settings: &mut Value) -> io::Result<bool> {
 /// [`remove_telemetry`] applied to `<claude_dir>/settings.json` (untouched
 /// when absent or holding nothing of ours). Returns whether anything was
 /// removed.
-pub fn uninstall(claude_dir: &Path) -> io::Result<bool> {
+pub fn uninstall(claude_dir: &Path, outside: &Environment) -> io::Result<bool> {
     if !claude_dir.join("settings.json").exists() {
         return Ok(false);
     }
@@ -375,7 +387,7 @@ pub fn uninstall(claude_dir: &Path) -> io::Result<bool> {
     let path = crate::commands::init::safe_join(&base, "settings.json")?;
     let mut removed = false;
     crate::commands::init::update_json_file(&path, "Claude Code telemetry", |root| {
-        removed = remove_telemetry(root)?;
+        removed = remove_telemetry(root, outside)?;
         Ok(())
     })?;
     Ok(removed)
@@ -418,6 +430,16 @@ pub fn content_logging_settings(settings: &Value, env: &Environment) -> Vec<Stri
         })
         .map(|(key, value, source)| format!("{key}={value} (in {source})"))
         .collect()
+}
+
+/// [`content_logging_settings`] for `<claude_dir>/settings.json` (missing or
+/// unparseable: `{}`).
+pub fn content_logging_in(claude_dir: &Path, env: &Environment) -> Vec<String> {
+    let settings = fs::read_to_string(claude_dir.join("settings.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    content_logging_settings(&settings, env)
 }
 
 /// Telemetry as `status` reports it.
@@ -784,13 +806,16 @@ pub(crate) mod tests {
     fn remove_restores_settings_from_before_the_install() {
         let before = json!({"model": "opus", "env": {"FOO": "bar"}, "hooks": {"Stop": []}});
         let (mut s, _) = merged(before.clone(), &Environment::default());
-        assert!(remove_telemetry(&mut s).unwrap());
+        assert!(remove_telemetry(&mut s, &Environment::default()).unwrap());
         assert_eq!(s, before);
 
         let (mut s, _) = merged(json!({}), &Environment::default());
-        assert!(remove_telemetry(&mut s).unwrap());
+        assert!(remove_telemetry(&mut s, &Environment::default()).unwrap());
         assert_eq!(s, json!({}), "an env object we created goes too");
-        assert!(!remove_telemetry(&mut s).unwrap(), "nothing left to remove");
+        assert!(
+            !remove_telemetry(&mut s, &Environment::default()).unwrap(),
+            "nothing left to remove"
+        );
     }
 
     #[test]
@@ -801,7 +826,7 @@ pub(crate) mod tests {
         );
         // Changed after the install: the user's now.
         s["env"][LOGS_PROTOCOL] = json!("http/json");
-        remove_telemetry(&mut s).unwrap();
+        remove_telemetry(&mut s, &Environment::default()).unwrap();
         assert_eq!(
             s,
             json!({"env": {HELPER_INTERVAL: "60000", "OTEL_METRICS_EXPORTER": "none",
@@ -811,7 +836,7 @@ pub(crate) mod tests {
         // Another exporter still needs telemetry and the OTLP logs exporter.
         let (mut s, _) = merged(json!({}), &Environment::default());
         s["env"]["OTEL_METRICS_EXPORTER"] = json!("otlp");
-        remove_telemetry(&mut s).unwrap();
+        remove_telemetry(&mut s, &Environment::default()).unwrap();
         assert_eq!(s["env"][ENABLE_TELEMETRY], "1");
         assert_eq!(s["env"][LOGS_EXPORTER], "otlp");
         assert!(s["env"].get(LOGS_ENDPOINT).is_none());
@@ -825,7 +850,7 @@ pub(crate) mod tests {
                                      LOGS_ENDPOINT: "https://tv.example.com/otlp/v1/logs"},
                              HEADERS_HELPER: "/opt/corp/token"});
         let mut s = foreign.clone();
-        assert!(!remove_telemetry(&mut s).unwrap());
+        assert!(!remove_telemetry(&mut s, &Environment::default()).unwrap());
         assert_eq!(s, foreign);
 
         // Our helper next to someone else's endpoint: only the helper goes
@@ -833,7 +858,7 @@ pub(crate) mod tests {
         let mut s = json!({"env": {LOGS_ENDPOINT: "https://collector.corp/v1/logs",
                                    LOGS_EXPORTER: "otlp"},
                            HEADERS_HELPER: helper_command(SERVER)});
-        assert!(remove_telemetry(&mut s).unwrap());
+        assert!(remove_telemetry(&mut s, &Environment::default()).unwrap());
         assert_eq!(
             s,
             json!({"env": {LOGS_ENDPOINT: "https://collector.corp/v1/logs",
@@ -842,12 +867,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn remove_keeps_shared_keys_for_an_exporter_in_the_shell_or_managed_settings() {
+        let managed = Environment {
+            managed: vec![(
+                "managed".to_string(),
+                json!({"env": {"OTEL_TRACES_EXPORTER": "otlp"}}),
+            )],
+            ..Default::default()
+        };
+        for outside in [shell("OTEL_METRICS_EXPORTER", "otlp"), managed] {
+            let (mut s, _) = merged(json!({}), &Environment::default());
+            remove_telemetry(&mut s, &outside).unwrap();
+            assert_eq!(s["env"][ENABLE_TELEMETRY], "1", "{outside:?}");
+            assert!(s["env"].get(LOGS_ENDPOINT).is_none());
+        }
+    }
+
+    #[test]
     fn uninstall_leaves_a_missing_file_missing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!uninstall(dir.path()).unwrap());
+        assert!(!uninstall(dir.path(), &Environment::default()).unwrap());
         assert!(!dir.path().join("settings.json").exists());
         install(dir.path(), SERVER, &Environment::default()).unwrap();
-        assert!(uninstall(dir.path()).unwrap());
+        assert!(uninstall(dir.path(), &Environment::default()).unwrap());
         assert_eq!(
             fs::read_to_string(dir.path().join("settings.json")).unwrap(),
             "{}"

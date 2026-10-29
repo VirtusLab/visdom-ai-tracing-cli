@@ -82,6 +82,74 @@ pub fn update_in(
     save_in(config_root, &state)
 }
 
+/// Serialises whoever changes the telemetry settings together with this
+/// state: the upgrade step and `telemetry on|off` / `init`. Without it, an
+/// upgrade that read the state before an opt-out could turn telemetry back on
+/// and save its stale copy over the opt-out. Also keeps two sessions starting
+/// at once from both showing the notice. A lock older than [`Lock::STALE`]
+/// was left by a killed process and is taken over. Released on drop.
+pub struct Lock(PathBuf);
+
+impl Lock {
+    const STALE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    fn lock_path(config_root: &Path) -> PathBuf {
+        config_root.join("install-state.lock")
+    }
+
+    /// Take the lock if it is free; `None` when someone else holds it.
+    pub fn try_take(config_root: &Path) -> Option<Self> {
+        std::fs::create_dir_all(config_root).ok()?;
+        let path = Self::lock_path(config_root);
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Some(Self(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > Self::STALE);
+                    if !stale {
+                        return None;
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// Wait up to `timeout` for the lock (an upgrade step holds it for well
+    /// under a second).
+    pub fn take(config_root: &Path, timeout: std::time::Duration) -> std::io::Result<Self> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(lock) = Self::try_take(config_root) {
+                return Ok(lock);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::other(format!(
+                    "{} is held by another TraceVault process; try again",
+                    Self::lock_path(config_root).display()
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// This binary's version.
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 

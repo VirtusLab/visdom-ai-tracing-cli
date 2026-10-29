@@ -607,6 +607,26 @@ fn upgrade_leaves_a_foreign_exporter_untouched() {
     assert!(hooks.contains("subagent-stop"), "{hooks}");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn default_init_does_not_turn_telemetry_on_while_content_logging_is_set() {
+    let home = TempDir::new().unwrap();
+    let env = [LOGIN[0], LOGIN[1], ("OTEL_LOG_USER_PROMPTS", "1")];
+    let o = run(home.path(), &["init", "--global"], &env);
+    assert!(o.status.success(), "stderr={}", stderr(&o));
+    assert!(
+        stderr(&o).contains("OTEL_LOG_USER_PROMPTS=1"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!telemetry_on(home.path()));
+
+    // Asking for it explicitly is consent.
+    let o = run(home.path(), &["telemetry", "on"], &env);
+    assert!(o.status.success(), "stderr={}", stderr(&o));
+    assert!(telemetry_on(home.path()));
+}
+
 #[test]
 fn both_telemetry_flags_conflict() {
     let home = TempDir::new().unwrap();

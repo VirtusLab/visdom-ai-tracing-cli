@@ -1306,15 +1306,17 @@ fn merge_hooks(
 }
 
 /// Whether the Claude Code settings file at `path` holds any TraceVault hook.
-/// A missing or unparseable file holds none.
-pub(crate) fn has_tracevault_hooks(path: &Path) -> bool {
-    let Some(settings) = fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-    else {
-        return false;
+/// A missing file holds none; one that cannot be read or parsed is an error
+/// (it may hold some).
+pub(crate) fn has_tracevault_hooks(path: &Path) -> io::Result<bool> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
     };
-    settings
+    let settings: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(settings
         .get("hooks")
         .and_then(|h| h.as_object())
         .into_iter()
@@ -1323,7 +1325,7 @@ pub(crate) fn has_tracevault_hooks(path: &Path) -> bool {
         .flatten()
         .filter_map(|group| group.get("hooks").and_then(|h| h.as_array()))
         .flatten()
-        .any(is_tracevault_hook)
+        .any(is_tracevault_hook))
 }
 
 /// Bring the TraceVault hooks in the Claude Code settings file at `path` to
