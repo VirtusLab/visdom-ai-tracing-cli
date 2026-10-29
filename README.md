@@ -682,7 +682,7 @@ These are hidden from `--help`. `init` installs them; you never need to run them
 | Command | Run by |
 |---|---|
 | `tracevault stream --event <event> [--agent <agent>]` | The agent's hooks, on every captured event (`--agent` defaults to `claude-code`) |
-| `tracevault session-start` | The agent's `SessionStart` hook: binds an unbound session to the repo of its checkout's `origin` remote, injects the bound repo's policies; under Claude Code it also exports `TRACEVAULT_SESSION_ID` into the agent's shell. Once per CLI upgrade it also refreshes the hooks and turns telemetry on (see [telemetry](#tracevault-init--set-up-tracing-in-a-repo)) |
+| `tracevault session-start` | The agent's `SessionStart` hook: binds an unbound session to the repo of its checkout's `origin` remote, injects the bound repo's policies; under Claude Code it also exports `TRACEVAULT_SESSION_ID` into the agent's shell. Once per CLI upgrade it also refreshes the hooks and turns telemetry on (see [telemetry](#tracevault-init--set-up-tracing-in-a-repo)). It then sends the session cost earlier sessions left unsent (see [session cost](#what-init-installs)) |
 | `tracevault user-prompt` | The agent's `UserPromptSubmit` hook: re-injects the policies when the session's repo has changed |
 | `tracevault commit-push` | The git `post-commit` hook, in the background: sends the commit's metadata |
 | `tracevault otel-headers [--server-url <URL>]` | Claude Code's `otelHeadersHelper` (`init --claude-telemetry`): prints `{"Authorization": "Bearer …"}` for the OpenTelemetry export; exits 1 when not logged in, or logged in to another server than `--server-url` |
@@ -710,9 +710,22 @@ even when several settings files define it.
 | `PostToolUse` | all tools | `tracevault stream --event post-tool-use` |
 | `Notification` | all | `tracevault stream --event notification` |
 | `Stop` | all | `tracevault stream --event stop` |
+| `SessionEnd` | all | `tracevault stream --event session-end` |
 | `SubagentStop` | all | `tracevault stream --event subagent-stop` |
 | `SessionStart` | all | `tracevault session-start` |
 | `UserPromptSubmit` | all | `tracevault user-prompt` |
+
+**Session cost.** At exit, after `Stop`, Claude Code appends its own figure for the session's
+cost to the transcript (a `cost-state` line). `SessionEnd` sends the lines written since the last
+hook, that one included, as transcript lines only: `Stop` already ended the session on the server.
+If it could not (the hook failed or timed out, or the session ended before an upgrade installed
+it), `session-start` sends it later: for each session of the repo whose unsent lines hold a
+`cost-state`, it sends them as `SessionEnd` would have. It looks at sessions written in the last
+30 days, at most 10 per session start, and stops when the server does not take them. It does
+not run when `TRACEVAULT_PROJECT` or `TRACEVAULT_PROJECT_ATTRIBUTION` is set: they attribute what
+the current process sends, and an earlier session may have run with other values. For the same
+reason it sends a session only under the repo and project its own hooks sent under (recorded in
+`.tracevault/sessions/<session>/metadata.json`).
 
 **Subagents.** Claude Code writes each subagent's conversation to its own file,
 `<session>/subagents/agent-<id>.jsonl` next to the session transcript, and leaves the subagent's

@@ -661,6 +661,17 @@ pub fn tracevault_hooks() -> serde_json::Value {
                 "statusMessage": "TraceVault: finalizing session"
             }]
         }],
+        // Claude Code writes its `cost-state` line at exit, after `Stop`; this
+        // sends it (VIS-1108).
+        "SessionEnd": [{
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": "tracevault stream --event session-end",
+                "timeout": 10,
+                "statusMessage": "TraceVault: sending session cost"
+            }]
+        }],
         // Every hook above also sends new subagent transcript lines; this one
         // catches a background subagent that finishes after the last `Stop`.
         "SubagentStop": [{
@@ -1511,6 +1522,7 @@ mod tests {
             "PostToolUse",
             "Notification",
             "Stop",
+            "SessionEnd",
             "SubagentStop",
             "SessionStart",
             "UserPromptSubmit",
@@ -1562,6 +1574,7 @@ mod tests {
             "PostToolUse",
             "Notification",
             "Stop",
+            "SessionEnd",
             "SubagentStop",
             "SessionStart",
             "UserPromptSubmit",
@@ -1770,6 +1783,7 @@ mod tests {
             "PostToolUse",
             "Notification",
             "Stop",
+            "SessionEnd",
             "SubagentStop",
             "SessionStart",
             "UserPromptSubmit",
