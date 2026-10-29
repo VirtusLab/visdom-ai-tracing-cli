@@ -17,8 +17,10 @@
 //! Everything here is best-effort: it never fails the hook. Errors go to
 //! stderr, and a step that could not finish is retried by the next session.
 //!
-//! Per-repo work a later version needs to do once (VIS-1108's catch-up sweep)
-//! goes into [`upgrade_hook_location`], after the hooks are re-merged.
+//! Per-repo work a later version needs to do once goes into
+//! [`upgrade_hook_location`], after the hooks are re-merged. (VIS-1108's
+//! catch-up sweep is not once per version: `session-start` runs it on every
+//! session, see [`catch_up`](crate::commands::catch_up).)
 
 use crate::commands::claude_telemetry::{self, Environment, InstallOutcome, TelemetryState};
 use crate::install_state::{self, InstallState, RepoState};
@@ -183,7 +185,10 @@ fn upgrade_hook_location(state: &mut InstallState, location: &HookLocation, vers
             done = false;
         }
     }
-    // VIS-1108: the catch-up sweep of this repo's sessions runs here.
+    // VIS-1108's catch-up sweep, which backfills the `cost-state` of sessions
+    // that ended before this upgrade installed `SessionEnd`, is not here:
+    // `session-start` runs it on every session, right after this step (it
+    // needs the network and its own time budget).
     if done {
         state.repos.insert(
             location.key.clone(),
@@ -360,6 +365,10 @@ mod tests {
         {
             assert!(hooks[event].is_array(), "{event} installed");
         }
+        assert_eq!(
+            hooks["SessionEnd"][0]["hooks"][0]["command"], "tracevault stream --event session-end",
+            "an existing install gets the SessionEnd hook (VIS-1108)"
+        );
         assert!(hooks.get("PreCompact").is_none(), "retired event removed");
         assert!(
             hooks.to_string().contains("./my-own-hook.sh"),

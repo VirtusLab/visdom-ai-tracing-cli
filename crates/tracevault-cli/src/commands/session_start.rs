@@ -1,7 +1,7 @@
 //! `tracevault session-start` — the Claude Code `SessionStart` hook.
 //!
 //! Installed (sub-plan C) as the `SessionStart` hook for `init --global`. Runs
-//! on every session start/resume and does two things, both best-effort:
+//! on every session start/resume and does these things, all best-effort:
 //!
 //! 1. Exports `TRACEVAULT_SESSION_ID` into Claude Code's session env file (when
 //!    present) so agent-invoked `tracevault repo …` commands can find the
@@ -11,6 +11,10 @@
 //!    `auto_bind`) and, if one exists, injects that repo's policies as
 //!    `SessionStart` `additionalContext` — the reliable way to hand an agent
 //!    up-to-date policy text at the start of a session.
+//! 3. Once per CLI upgrade, refreshes the installed hooks and turns telemetry
+//!    on (`upgrade`, VIS-1109).
+//! 4. After its response is printed, sends the `cost-state` reports earlier
+//!    sessions of the repo left unsent (`catch_up`, VIS-1108).
 //!
 //! This hook must NEVER hard-fail: a failing `SessionStart` hook blocks
 //! Claude Code from starting the session. Every fallible step below is
@@ -78,7 +82,23 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Resolve the effective repo binding and, if warranted, inject its
     // policies. Shared with `user-prompt` (sub-plan C's UserPromptSubmit hook).
-    resolve_and_inject(&hook_event, notice).await
+    let injected = resolve_and_inject(&hook_event, notice).await;
+
+    // 5. Send the cost reports earlier sessions of this repo left unsent
+    // (VIS-1108). After the response is printed, so it never delays it.
+    run_catch_up(Path::new(&hook_event.cwd), &hook_event.session_id).await;
+    injected
+}
+
+/// [`catch_up::sweep`](crate::commands::catch_up::sweep) for the repo of a
+/// session in `cwd`. It must never fail the hook, so a panic in it is caught
+/// too (a spawned task's panic is returned, not propagated).
+async fn run_catch_up(cwd: &Path, session_id: &str) {
+    let project_root = crate::paths::resolve_project_root(cwd).root;
+    let sweep = crate::commands::catch_up::sweep(project_root, session_id.to_string());
+    if tokio::spawn(sweep).await.is_err() {
+        eprintln!("tracevault: the catch-up sweep failed unexpectedly");
+    }
 }
 
 /// [`upgrade::run`](crate::commands::upgrade::run) for a session in `cwd`.
