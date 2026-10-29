@@ -64,6 +64,7 @@ pub fn write_session_env(env_file: &Path, session_id: &str) -> std::io::Result<(
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let started = std::time::Instant::now();
     // 1. Read the hook event from stdin. A parse error must never fail the
     // hook — print the minimal allow response and return Ok.
     let Some(hook_event) = read_hook_event_or_allow() else {
@@ -85,17 +86,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let injected = resolve_and_inject(&hook_event, notice).await;
 
     // 5. Send the cost reports earlier sessions of this repo left unsent
-    // (VIS-1108). After the response is printed, so it never delays it.
-    run_catch_up(Path::new(&hook_event.cwd), &hook_event.session_id).await;
+    // (VIS-1108). After the response is printed, so it never delays it, and
+    // within what is left of the hook's timeout.
+    run_catch_up(Path::new(&hook_event.cwd), &hook_event.session_id, started).await;
     injected
 }
 
 /// [`catch_up::sweep`](crate::commands::catch_up::sweep) for the repo of a
-/// session in `cwd`. It must never fail the hook, so a panic in it is caught
-/// too (a spawned task's panic is returned, not propagated).
-async fn run_catch_up(cwd: &Path, session_id: &str) {
+/// session in `cwd`, in a hook that started at `started`. It must never fail
+/// the hook, so a panic in it is caught too (a spawned task's panic is
+/// returned, not propagated).
+async fn run_catch_up(cwd: &Path, session_id: &str, started: std::time::Instant) {
+    use crate::commands::catch_up;
     let project_root = crate::paths::resolve_project_root(cwd).root;
-    let sweep = crate::commands::catch_up::sweep(project_root, session_id.to_string());
+    let deadline = catch_up::deadline(started, std::time::Instant::now());
+    let sweep = catch_up::sweep(project_root, session_id.to_string(), deadline);
     if tokio::spawn(sweep).await.is_err() {
         eprintln!("tracevault: the catch-up sweep failed unexpectedly");
     }

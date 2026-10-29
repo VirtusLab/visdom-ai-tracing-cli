@@ -721,7 +721,9 @@ hook, that one included, as transcript lines only: `Stop` already ended the sess
 If it could not (the hook failed or timed out, or the session ended before an upgrade installed
 it), `session-start` sends it later: for each session of the repo whose unsent lines hold a
 `cost-state`, it sends them as `SessionEnd` would have. It looks at sessions written in the last
-30 days, at most 10 per session start, and stops when the server does not take them.
+30 days, at most 10 per session start, and stops when the server does not take them. It does
+not run when `TRACEVAULT_PROJECT` or `TRACEVAULT_PROJECT_ATTRIBUTION` is set: they attribute what
+the current process sends, and an earlier session may have run with other values.
 
 **Subagents.** Claude Code writes each subagent's conversation to its own file,
 `<session>/subagents/agent-<id>.jsonl` next to the session transcript, and leaves the subagent's

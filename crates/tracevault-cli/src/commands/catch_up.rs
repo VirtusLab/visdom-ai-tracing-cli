@@ -13,14 +13,19 @@
 //! Only main transcripts are read: subagent files never hold a `cost-state`.
 //!
 //! The sweep must never slow a session start much or fail it, so it is
-//! capped: transcripts written in the last [`MAX_AGE`], at most
-//! [`MAX_SESSIONS`] per run (most recent first), at most [`MAX_UNSENT_BYTES`]
-//! unsent per session, and nothing started after [`BUDGET`]. What a run
-//! leaves is picked up by the next session start, while it is within the
-//! caps. Errors go to stderr.
+//! capped: transcripts written in the last [`MAX_AGE`], the [`MAX_SCANNED`]
+//! most recent of them read, at most [`MAX_SESSIONS`] sent per run, at most
+//! [`MAX_UNSENT_BYTES`] unsent per session, and no file read or request
+//! started after its [`deadline`]. What a run leaves is picked up by the next
+//! session start, while it is within the caps. Errors go to stderr.
+//!
+//! It does not run when `TRACEVAULT_PROJECT` or
+//! `TRACEVAULT_PROJECT_ATTRIBUTION` is set: they attribute what this process
+//! sends, and an earlier session's process may have had other values.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::commands::stream::{self, SessionTarget};
 
@@ -31,14 +36,35 @@ pub const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Sessions sent per run, so one session start sends at most this many.
 pub const MAX_SESSIONS: usize = 10;
 
+/// Sessions with unsent lines read per run, most recent first. Most have no
+/// report (killed sessions, or sessions still running), and they stay
+/// unsent, so without this cap every session start would read them all.
+pub const MAX_SCANNED: usize = 50;
+
 /// A session with more unsent than this lost much more than its report
 /// (every hook of it failed), and reading it on every session start would
 /// cost too much; the sweep leaves it.
 pub const MAX_UNSENT_BYTES: u64 = 8 * 1024 * 1024;
 
-/// No request is started after this, counted from the start of the sweep.
-/// What is not sent by then is queued (see [`stream::stream_event`]).
+/// The sweep's own time budget, counted from its start.
 pub const BUDGET: Duration = Duration::from_secs(3);
+
+/// The latest the sweep may start anything, counted from the start of the
+/// `SessionStart` hook: its 10 s timeout, less a request's in-flight grace
+/// and a second for the rest. A hook killed at its timeout fails.
+const HOOK_LATEST: Duration = Duration::from_secs(10)
+    .saturating_sub(stream::IN_FLIGHT_GRACE)
+    .saturating_sub(Duration::from_secs(1));
+
+/// When a sweep starting `now`, in a hook that started at `hook_started`,
+/// must stop starting work: [`BUDGET`] from now, but never past
+/// [`HOOK_LATEST`] into the hook.
+pub fn deadline(hook_started: Instant, now: Instant) -> Instant {
+    (now + BUDGET).min(hook_started + HOOK_LATEST)
+}
+
+/// The cost-state line's type, as Claude Code writes it.
+const MARKER: &[u8] = br#""cost-state""#;
 
 /// A session the sweep sends the rest of.
 #[derive(Debug, PartialEq, Eq)]
@@ -52,14 +78,20 @@ pub struct Candidate {
 }
 
 /// The sessions under `project_root` whose unsent transcript lines hold a
-/// `cost-state`, most recently written first, within the caps. The current
-/// session is left out: its own hooks send its lines.
-pub fn candidates(project_root: &Path, current_session: &str, now: SystemTime) -> Vec<Candidate> {
+/// `cost-state`, most recently written first, within the caps; no transcript
+/// is read after `deadline`. The current session is left out: its own hooks
+/// send its lines.
+pub fn candidates(
+    project_root: &Path,
+    current_session: &str,
+    now: SystemTime,
+    deadline: Instant,
+) -> Vec<Candidate> {
     let sessions = project_root.join(".tracevault").join("sessions");
     let Ok(entries) = std::fs::read_dir(&sessions) else {
         return vec![];
     };
-    let mut unsent: Vec<(SystemTime, String, PathBuf, PathBuf)> = entries
+    let mut unsent: Vec<(SystemTime, String, PathBuf, PathBuf, u64)> = entries
         .flatten()
         .filter_map(|entry| {
             let session_id = entry.file_name().to_str()?.to_string();
@@ -82,15 +114,18 @@ pub fn candidates(project_root: &Path, current_session: &str, now: SystemTime) -
                 session_id,
                 session_dir,
                 transcript,
+                offset,
             ))
         })
         .collect();
     unsent.sort_by_key(|u| std::cmp::Reverse(u.0));
     unsent
         .into_iter()
-        .filter(|(_, _, dir, transcript)| unsent_has_cost_state(transcript, dir))
+        .take(MAX_SCANNED)
+        .take_while(|_| Instant::now() < deadline)
+        .filter(|(_, _, _, transcript, offset)| unsent_has_cost_state(transcript, *offset))
         .take(MAX_SESSIONS)
-        .map(|(_, session_id, session_dir, transcript)| Candidate {
+        .map(|(_, session_id, session_dir, transcript, _)| Candidate {
             worktree_top: worktree_top(&session_dir, project_root),
             session_id,
             session_dir,
@@ -100,12 +135,15 @@ pub fn candidates(project_root: &Path, current_session: &str, now: SystemTime) -
 }
 
 /// Send the rest of every [`candidates`] session of `project_root`, as its
-/// `SessionEnd` hook would. Stops at the first session the server did not
-/// take in full: the rest wait for the next session start.
-pub async fn sweep(project_root: PathBuf, current_session: String) {
-    let deadline = std::time::Instant::now() + BUDGET;
-    for c in candidates(&project_root, &current_session, SystemTime::now()) {
-        if std::time::Instant::now() >= deadline {
+/// `SessionEnd` hook would, starting nothing after `deadline`. Stops at the
+/// first session the server did not take in full: the rest wait for the
+/// next session start.
+pub async fn sweep(project_root: PathBuf, current_session: String, deadline: Instant) {
+    if env_sets_attribution(|name| std::env::var_os(name)) {
+        return;
+    }
+    for c in candidates(&project_root, &current_session, SystemTime::now(), deadline) {
+        if Instant::now() >= deadline {
             break;
         }
         let event = tracevault_protocol::hooks::HookEvent {
@@ -132,7 +170,7 @@ pub async fn sweep(project_root: PathBuf, current_session: String) {
             crate::agent::Agent::ClaudeCode,
             &target,
             deadline,
-            false,
+            stream::Sender::CatchUp,
         )
         .await;
         match sent {
@@ -167,15 +205,28 @@ fn stream_offset(session_dir: &Path) -> Option<u64> {
         .ok()
 }
 
-/// Whether the lines past the session's offset hold a `cost-state`.
-fn unsent_has_cost_state(transcript: &Path, session_dir: &Path) -> bool {
-    stream::read_new_transcript_lines(transcript, &session_dir.join(".stream_offset"))
-        .map(|(lines, _, _)| {
-            lines
-                .iter()
-                .any(|l| l.get("type").and_then(|t| t.as_str()) == Some("cost-state"))
-        })
-        .unwrap_or(false)
+/// Whether this process's environment attributes what it sends (see the
+/// module doc). `var` reads a variable: the environment, or a test's.
+fn env_sets_attribution(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    ["TRACEVAULT_PROJECT", "TRACEVAULT_PROJECT_ATTRIBUTION"]
+        .iter()
+        .any(|name| var(name).is_some_and(|v| !v.is_empty()))
+}
+
+/// Whether the lines past `offset` hold a `cost-state`. Only the lines that
+/// contain its type are parsed, so a long tail without one costs one read.
+fn unsent_has_cost_state(transcript: &Path, offset: u64) -> bool {
+    let mut unsent = Vec::new();
+    let read = std::fs::File::open(transcript).and_then(|mut f| {
+        f.seek(SeekFrom::Start(offset))?;
+        f.take(MAX_UNSENT_BYTES).read_to_end(&mut unsent)
+    });
+    read.is_ok()
+        && unsent
+            .split(|b| *b == b'\n')
+            .filter(|line| line.windows(MARKER.len()).any(|w| w == MARKER))
+            .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+            .any(|l| l.get("type").and_then(|t| t.as_str()) == Some("cost-state"))
 }
 
 /// The checkout the session ran in (its `origin` marker), while it exists.
@@ -234,11 +285,16 @@ mod tests {
         }
 
         fn ids(&self, current: &str, now: SystemTime) -> Vec<String> {
-            candidates(&self.root, current, now)
+            candidates(&self.root, current, now, later())
                 .into_iter()
                 .map(|c| c.session_id)
                 .collect()
         }
+    }
+
+    /// A deadline no test reaches.
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(60)
     }
 
     fn touch(path: &Path, modified: SystemTime) {
@@ -254,7 +310,7 @@ mod tests {
     fn an_unsent_cost_state_makes_a_candidate() {
         let r = repo();
         let transcript = r.session("s1", &[ASSISTANT], &[COST_STATE]);
-        let found = candidates(&r.root, "other", SystemTime::now());
+        let found = candidates(&r.root, "other", SystemTime::now(), later());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].session_id, "s1");
         assert_eq!(found[0].transcript, transcript);
@@ -371,7 +427,7 @@ mod tests {
         )
         .unwrap();
         fs::write(sessions.join("removed/origin"), "/nonexistent/worktree").unwrap();
-        let found = candidates(&r.root, "other", SystemTime::now());
+        let found = candidates(&r.root, "other", SystemTime::now(), later());
         let top = |id: &str| {
             found
                 .iter()
@@ -387,6 +443,67 @@ mod tests {
     #[test]
     fn no_sessions_dir_means_nothing_to_do() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(candidates(tmp.path(), "x", SystemTime::now()).is_empty());
+        assert!(candidates(tmp.path(), "x", SystemTime::now(), later()).is_empty());
+    }
+
+    #[test]
+    fn only_the_most_recent_unsent_sessions_are_read() {
+        let r = repo();
+        let now = SystemTime::now();
+        // The oldest holds a report, behind MAX_SCANNED newer sessions with
+        // unsent lines and none (killed, or running).
+        let reported = r.session("reported", &[], &[COST_STATE]);
+        touch(&reported, now - Duration::from_secs(10_000));
+        for i in 0..MAX_SCANNED {
+            let t = r.session(&format!("k{i:02}"), &[], &[ASSISTANT]);
+            touch(&t, now - Duration::from_secs(1000 - i as u64));
+        }
+        assert!(r.ids("other", now).is_empty());
+    }
+
+    #[test]
+    fn nothing_is_read_past_the_deadline() {
+        let r = repo();
+        r.session("s1", &[], &[COST_STATE]);
+        let found = candidates(&r.root, "other", SystemTime::now(), Instant::now());
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn the_cost_state_type_must_be_the_line_type() {
+        let r = repo();
+        // The marker inside text, e.g. a prompt quoting it.
+        r.session(
+            "quoted",
+            &[],
+            &[r#"{"type":"user","message":{"content":"what is \"cost-state\"?"}}"#],
+        );
+        assert!(r.ids("other", SystemTime::now()).is_empty());
+    }
+
+    #[test]
+    fn the_sweep_stays_inside_the_session_start_timeout() {
+        let started = Instant::now();
+        // Early in the hook: its own budget.
+        assert_eq!(deadline(started, started), started + BUDGET);
+        // Late in the hook (slow policy fetch): capped by the hook's start.
+        let late = started + Duration::from_secs(8);
+        assert_eq!(deadline(started, late), started + HOOK_LATEST);
+        assert!(HOOK_LATEST + stream::IN_FLIGHT_GRACE < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_process_scoped_project_stops_the_sweep() {
+        use std::ffi::OsString;
+        let env = |set: &'static str, value: &'static str| {
+            move |name: &str| (name == set).then(|| OsString::from(value))
+        };
+        assert!(env_sets_attribution(env("TRACEVAULT_PROJECT", "p")));
+        assert!(env_sets_attribution(env(
+            "TRACEVAULT_PROJECT_ATTRIBUTION",
+            "explicit"
+        )));
+        assert!(!env_sets_attribution(env("TRACEVAULT_PROJECT", "")));
+        assert!(!env_sets_attribution(|_: &str| None));
     }
 }

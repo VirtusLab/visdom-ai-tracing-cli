@@ -48,6 +48,12 @@ fn accept_with_deadline(listener: &TcpListener) -> Option<std::net::TcpStream> {
 /// captured; anything else (`session-start`'s policy and binding lookups)
 /// gets a 404.
 fn spawn_server() -> (String, mpsc::Receiver<StreamEventRequest>) {
+    spawn_server_with(false)
+}
+
+/// [`spawn_server`], but with `failing` every stream POST is captured and
+/// then answered with a 503.
+fn spawn_server_with(failing: bool) -> (String, mpsc::Receiver<StreamEventRequest>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
@@ -86,7 +92,8 @@ fn spawn_server() -> (String, mpsc::Receiver<StreamEventRequest>) {
             let mut body = vec![0u8; content_length];
             let _ = reader.read_exact(&mut body);
             let mut stream = reader.into_inner();
-            if !request_line.starts_with(&format!("POST /api/v1/repos/{REPO_ID}/stream ")) {
+            // Repo- or project-scoped.
+            if !(request_line.starts_with("POST /api/v1/") && request_line.contains("/stream")) {
                 let _ = stream.write_all(
                     b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 );
@@ -94,6 +101,12 @@ fn spawn_server() -> (String, mpsc::Receiver<StreamEventRequest>) {
             }
             if let Ok(req) = serde_json::from_slice(&body) {
                 let _ = tx.send(req);
+            }
+            if failing {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
             }
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
@@ -410,6 +423,10 @@ fn session_start_sends_what_an_earlier_session_end_left_unsent() {
     assert_eq!(sent[0].event_type, StreamEventType::Transcript);
     assert_eq!(sent[0].hook_event_name.as_deref(), Some("SessionEnd"));
     assert_eq!(types(&sent[0]), ["cost-state"]);
+    assert_eq!(
+        sent[0].billing_mode, None,
+        "this process's credentials say nothing about that session's"
+    );
     assert_eq!(fx.offset("ended"), Some(fx.transcript_len("ended")));
     assert_eq!(
         fx.offset("running"),
@@ -422,6 +439,83 @@ fn session_start_sends_what_an_earlier_session_end_left_unsent() {
     // Sent once: the next session start finds nothing to do.
     fx.session_start(&base, "another-session");
     assert!(captured(&rx).is_empty());
+}
+
+#[test]
+fn session_start_stops_at_the_first_session_the_server_refuses() {
+    let fx = Fixture::new();
+    let (base, rx) = spawn_server();
+    ended_session(&fx, &base, "older");
+    ended_session(&fx, &base, "newer");
+    let now = std::time::SystemTime::now();
+    for (session, age) in [("older", 120), ("newer", 60)] {
+        std::fs::File::options()
+            .write(true)
+            .open(fx.transcript(session))
+            .unwrap()
+            .set_modified(now - Duration::from_secs(age))
+            .unwrap();
+    }
+    captured(&rx);
+    let offsets = (fx.offset("older"), fx.offset("newer"));
+
+    let (failing, rx) = spawn_server_with(true);
+    fx.session_start(&failing, "new-session");
+
+    let tried = captured(&rx);
+    assert_eq!(tried.len(), 1, "the older session is not tried: {tried:?}");
+    assert_eq!(tried[0].session_id, "newer", "most recent first");
+    assert_eq!((fx.offset("older"), fx.offset("newer")), offsets);
+    let queued = fx
+        .session_dir("newer")
+        .join(format!("pending-{REPO_ID}.jsonl"));
+    assert!(
+        std::fs::read_to_string(queued)
+            .unwrap()
+            .contains("cost-state"),
+        "the refused part is queued"
+    );
+    assert!(!fx
+        .session_dir("older")
+        .join(format!("pending-{REPO_ID}.jsonl"))
+        .exists());
+}
+
+#[test]
+fn session_start_with_a_process_scoped_project_leaves_other_sessions_alone() {
+    let fx = Fixture::new();
+    let (base, rx) = spawn_server();
+    ended_session(&fx, &base, "ended");
+    captured(&rx);
+    let offset = fx.offset("ended");
+
+    let mut child = fx
+        .command(&base)
+        .env("TRACEVAULT_PROJECT", "22222222-2222-2222-2222-222222222222")
+        .arg("session-start")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            serde_json::json!({
+                "session_id": "new-session",
+                "cwd": fx.repo.to_string_lossy(),
+                "hook_event_name": "SessionStart",
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+
+    assert!(captured(&rx).is_empty());
+    assert_eq!(fx.offset("ended"), offset);
 }
 
 #[test]

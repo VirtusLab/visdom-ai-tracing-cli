@@ -1096,7 +1096,7 @@ const DELIVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 /// before it is given up and its part queued (the client's own timeout is
 /// 60 s, past the hook's). This bounds how long a hook holds a subagent
 /// file's lock: at most its budget plus this.
-const IN_FLIGHT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const IN_FLIGHT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long past its own delivery budget a final hook (`Stop`,
 /// `SubagentStop`) waits for a subagent file another hook is sending. A
@@ -1215,7 +1215,15 @@ pub async fn run_stream(
         session_dir,
         worktree_top,
     };
-    stream_event(hook_event, event_type, agent, &target, deadline, true).await?;
+    stream_event(
+        hook_event,
+        event_type,
+        agent,
+        &target,
+        deadline,
+        Sender::Hook,
+    )
+    .await?;
 
     // 12. Always print HookResponse::allow() to stdout
     let response = HookResponse::allow();
@@ -1249,19 +1257,32 @@ pub(crate) struct SessionTarget {
     pub worktree_top: String,
 }
 
-/// Send `hook_event` (and, with `subagents`, what the session's subagents
-/// wrote since the last hook) as `event_type`, queueing what is not
-/// accepted by `deadline`. Prints nothing: the hook's response is the
-/// caller's. Returns whether every request was accepted, i.e. nothing was
-/// left in the queue (an event nothing can be attributed to counts as
-/// accepted: it is not sent at all).
+/// Who sends a [`stream_event`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sender {
+    /// The session's own hook: it also sends the subagent transcripts, and
+    /// stamps the billing mode it detects.
+    Hook,
+    /// The catch-up sweep (`commands::catch_up`), on behalf of an earlier
+    /// session: main transcript only, and no billing mode, since this
+    /// process's credentials say nothing about that session's (the server
+    /// keeps the one it has).
+    CatchUp,
+}
+
+/// Send `hook_event` (and, from a hook, what the session's subagents wrote
+/// since the last hook) as `event_type`, queueing what is not accepted by
+/// `deadline`. Prints nothing: the hook's response is the caller's. Returns
+/// whether every request was accepted, i.e. nothing was left in the queue
+/// (an event nothing can be attributed to counts as accepted: it is not sent
+/// at all).
 pub(crate) async fn stream_event(
     mut hook_event: tracevault_protocol::hooks::HookEvent,
     event_type: &str,
     agent: crate::agent::Agent,
     target: &SessionTarget,
     deadline: std::time::Instant,
-    subagents: bool,
+    sender: Sender,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let SessionTarget {
         project_root,
@@ -1400,11 +1421,8 @@ pub(crate) async fn stream_event(
         flow_id: ctx_flow_id,
         labels: ctx_labels,
         params: ctx_params,
-        billing_mode: Some(crate::billing::detect_current(
-            agent,
-            hook_cwd,
-            &hook_event.transcript_path,
-        )),
+        billing_mode: (sender == Sender::Hook)
+            .then(|| crate::billing::detect_current(agent, hook_cwd, &hook_event.transcript_path)),
     };
 
     stamp_agent(&mut req, agent);
@@ -1578,7 +1596,7 @@ pub(crate) async fn stream_event(
     // out of the main file). Swept on every hook, not only on `SubagentStop`,
     // so a long-running or background subagent is sent while it runs, and
     // the final hooks read every file to its end.
-    if subagents && agent == crate::agent::Agent::ClaudeCode {
+    if sender == Sender::Hook && agent == crate::agent::Agent::ClaudeCode {
         deliver_subagent_transcripts(
             &client,
             &attribution,
