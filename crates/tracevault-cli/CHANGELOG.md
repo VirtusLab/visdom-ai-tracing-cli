@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.2](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.29.1...v0.29.2) - 2026-10-29
+
+### Added
+
+- *(session-start)* catch-up sweep for unsent cost-state reports
+- *(stream)* SessionEnd hook sends Claude Code's final cost-state
+- *(telemetry)* Claude Code telemetry on by default, opt-out, and auto-enable on upgrade
+
+### Fixed
+
+- *(catch-up)* leave the session id out of the sweep's error line
+- *(catch-up)* count only sessions sent toward the per-run cap
+- *(catch-up)* send only under the attribution the session recorded; bound discovery by the deadline
+- *(catch-up)* stay inside the SessionStart timeout, bound the scan, keep old sessions' attribution
+- *(telemetry)* record a pre-existing helper interval as the user's; clean up after a removed endpoint
+- *(telemetry)* opt-out ignores our inherited endpoint, keeps a user's interval; scan every hook file
+- *(telemetry)* lock opt-out against the upgrade step, guard default init, refresh worktree hooks
+
 ## [0.29.1](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.29.0...v0.29.1) - 2026-10-28
 
 ### Added
