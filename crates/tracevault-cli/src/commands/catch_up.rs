@@ -185,10 +185,7 @@ pub async fn sweep(project_root: PathBuf, current_session: String, deadline: Ins
             Ok(stream::Sent::Skipped) => {}
             Ok(stream::Sent::Queued) => break,
             Err(e) => {
-                eprintln!(
-                    "tracevault: cannot send the end of session {}: {e}",
-                    c.session_id
-                );
+                eprintln!("tracevault: cannot send the end of an earlier session: {e}");
                 break;
             }
         }
