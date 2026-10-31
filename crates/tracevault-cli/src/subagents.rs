@@ -113,6 +113,14 @@ pub fn read_new_lines(
     transcript: &Path,
     offset_path: &Path,
 ) -> io::Result<(Vec<serde_json::Value>, i64, i64)> {
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if offset_path.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid input: {}", offset_path.display())));
+    }
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if transcript.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid input: {}", transcript.display())));
+    }
     let start: i64 = match fs::read_to_string(offset_path) {
         Ok(content) => content
             .trim()

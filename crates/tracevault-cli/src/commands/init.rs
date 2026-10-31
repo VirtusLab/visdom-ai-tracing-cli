@@ -1320,6 +1320,16 @@ fn merge_hooks(
 /// A missing file holds none; one that cannot be read or parsed is an error
 /// (it may hold some).
 pub(crate) fn has_tracevault_hooks(path: &Path) -> io::Result<bool> {
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid input: {}", path.display()),
+        ));
+    }
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
