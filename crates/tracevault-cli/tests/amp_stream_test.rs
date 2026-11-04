@@ -69,6 +69,8 @@ struct Replay {
     stdout: String,
     stderr: String,
     calls: Vec<Call>,
+    /// `begin` / `end` lines of a `Slow` fake.
+    spans: Vec<String>,
 }
 
 impl Replay {
@@ -87,9 +89,13 @@ impl Replay {
 }
 
 /// What a fake `tracevault` on `PATH` does.
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum FakeTracevault {
     /// Log its arguments and stdin.
     Record,
+    /// Like `Record`, but slow: logs `begin` / `end` around a 50 ms sleep to
+    /// `$TV_LOG.spans`, so overlapping runs show.
+    Slow,
     /// Exit at once without reading stdin.
     ExitEarly,
     /// Not on `PATH` at all.
@@ -97,6 +103,11 @@ enum FakeTracevault {
 }
 
 fn replay(fixture: &str, fake: FakeTracevault) -> Option<Replay> {
+    replay_with(fixture, fake, false)
+}
+
+/// `concurrent`: deliver events without waiting for the previous handler.
+fn replay_with(fixture: &str, fake: FakeTracevault, concurrent: bool) -> Option<Replay> {
     let node = node()?;
     let tmp = tempfile::tempdir().unwrap();
     let plugin = tmp.path().join("plugin.mts");
@@ -108,6 +119,9 @@ fn replay(fixture: &str, fake: FakeTracevault) -> Option<Replay> {
         FakeTracevault::Record => {
             Some("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TV_LOG\"\ncat >> \"$TV_LOG\"\necho >> \"$TV_LOG\"\n")
         }
+        FakeTracevault::Slow => Some(
+            "#!/bin/sh\necho begin >> \"$TV_LOG.spans\"\nsleep 0.05\nprintf '%s\\n' \"$*\" >> \"$TV_LOG\"\ncat >> \"$TV_LOG\"\necho >> \"$TV_LOG\"\necho end >> \"$TV_LOG.spans\"\n",
+        ),
         FakeTracevault::ExitEarly => Some("#!/bin/sh\nexit 1\n"),
         FakeTracevault::Missing => None,
     };
@@ -126,8 +140,10 @@ fn replay(fixture: &str, fake: FakeTracevault) -> Option<Replay> {
         // `sh` for the fake; nothing that could hold a real `tracevault`.
         .env("PATH", format!("{}:/bin:/usr/bin", bin.display()))
         .env("TV_LOG", &log)
+        .env("REPLAY_CONCURRENT", if concurrent { "1" } else { "0" })
         .output()
         .unwrap();
+    let spans = std::fs::read_to_string(format!("{}.spans", log.display())).unwrap_or_default();
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     let calls = lines
@@ -142,6 +158,7 @@ fn replay(fixture: &str, fake: FakeTracevault) -> Option<Replay> {
         stdout: String::from_utf8(out.stdout).unwrap(),
         stderr: String::from_utf8(out.stderr).unwrap(),
         calls,
+        spans: spans.lines().map(str::to_string).collect(),
     })
 }
 
@@ -267,17 +284,42 @@ fn headless_turn_sends_every_tool_call_once_and_every_usage() {
     let names: Vec<&str> = final_records.iter().flat_map(tool_call_names).collect();
     assert_eq!(names, vec!["Task"]);
 
-    // The prompt went out on agent.start, not again on agent.end.
-    let prompts: Vec<&Value> = r
+    // The prompt went out on agent.start, and its text not again on
+    // agent.end; the context the spike's plugin appended to it on
+    // agent.start (a second text block, only in agent.end) did.
+    let prompt_text = fixture_lines(fixture)
+        .iter()
+        .find(|l| l["kind"] == "agent.start")
+        .unwrap()["data"]["event"]["message"]
+        .clone();
+    let texts: Vec<(&Value, &Value)> = r
         .records()
         .into_iter()
-        .filter(|rec| {
-            rec["message"]["role"] == "user" && blocks(&rec["message"], "text").count() > 0
-        })
+        .filter(|rec| rec["message"]["role"] == "user")
+        .flat_map(|rec| blocks(&rec["message"], "text").map(move |b| (&rec["event"], &b["text"])))
         .collect();
-    assert_eq!(prompts.len(), 1, "{prompts:?}");
-    assert_eq!(prompts[0]["event"], "agent.start");
-    assert_eq!(prompts[0]["message"]["id"], "M-0000000000000000000002");
+    let prompt_sends: Vec<&Value> = texts
+        .iter()
+        .filter(|(_, t)| **t == prompt_text)
+        .map(|(e, _)| *e)
+        .collect();
+    assert_eq!(prompt_sends, vec!["agent.start"], "{texts:?}");
+    let appended: Vec<&(&Value, &Value)> = texts
+        .iter()
+        .filter(|(_, t)| t.as_str().unwrap().contains("PURPLE-OTTER-42"))
+        .collect();
+    assert_eq!(appended.len(), 1, "{texts:?}");
+    assert_eq!(appended[0].0, "agent.end");
+    let prompt_records: Vec<&Value> = r
+        .records()
+        .into_iter()
+        .filter(|rec| rec["message"]["id"] == "M-0000000000000000000002")
+        .collect();
+    assert_eq!(
+        prompt_records.len(),
+        2,
+        "agent.start + the appended context"
+    );
 
     // No usage is lost: every assistant message is sent, with its usage.
     let sent_usage = usage_total(r.records().into_iter().map(|rec| rec["message"].clone()));
@@ -434,11 +476,15 @@ fn amp_keeps_working_without_tracevault() {
             "headless-continue.plugin.jsonl",
             "interactive-cancel-ctrlc.plugin.jsonl",
         ] {
-            let Some(r) = replay(fixture, fake_copy(&fake)) else {
+            let Some(r) = replay(fixture, fake) else {
                 return;
             };
             assert!(r.status.success(), "{fixture}: stderr: {}", r.stderr);
-            let handled = r.stdout.lines().count();
+            let handled = r
+                .stdout
+                .lines()
+                .filter(|l| !l.contains(r#""kind":"dispose""#))
+                .count();
             let delivered = fixture_lines(fixture)
                 .iter()
                 .filter(|l| {
@@ -455,19 +501,61 @@ fn amp_keeps_working_without_tracevault() {
                 })
                 .count();
             assert_eq!(handled, delivered, "{fixture}: a handler did not return");
-            if matches!(fake, FakeTracevault::Missing) {
+            if fake == FakeTracevault::Missing {
                 assert!(r.stderr.contains("spawn"), "{fixture}: {}", r.stderr);
             }
         }
     }
 }
 
-fn fake_copy(fake: &FakeTracevault) -> FakeTracevault {
-    match fake {
-        FakeTracevault::Record => FakeTracevault::Record,
-        FakeTracevault::ExitEarly => FakeTracevault::ExitEarly,
-        FakeTracevault::Missing => FakeTracevault::Missing,
+/// Events delivered without waiting for the previous handler, with a slow
+/// `tracevault`: one thread's runs still never overlap, they keep the event
+/// order, and onDispose waits until the queued ones have run.
+#[test]
+fn overlapping_events_are_sent_one_at_a_time_in_order() {
+    let fixture = "headless-multitool.plugin.jsonl";
+    let Some(sequential) = replay(fixture, FakeTracevault::Record) else {
+        return;
+    };
+    let Some(r) = replay_with(fixture, FakeTracevault::Slow, true) else {
+        return;
+    };
+    assert!(r.status.success(), "stderr: {}", r.stderr);
+
+    let expected: Vec<&str> = r.calls.iter().map(|_| "begin").collect();
+    assert_eq!(r.spans.len(), expected.len() * 2);
+    for pair in r.spans.chunks(2) {
+        assert_eq!(pair, ["begin", "end"], "runs overlapped: {:?}", r.spans);
     }
+
+    let payloads = |r: &Replay| -> Vec<(String, Value)> {
+        r.calls
+            .iter()
+            .map(|c| {
+                let mut p = c.payload.clone();
+                for rec in p["transcript_records"].as_array_mut().unwrap() {
+                    rec.as_object_mut().unwrap().remove("timestamp");
+                }
+                // Each replay runs in its own temp dir.
+                p.as_object_mut().unwrap().remove("cwd");
+                (c.args.clone(), p)
+            })
+            .collect()
+    };
+    assert_eq!(payloads(&r), payloads(&sequential));
+
+    let disposed: Vec<Value> = r
+        .stdout
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|v| v["kind"] == "dispose")
+        .collect();
+    assert_eq!(disposed.len(), 1);
+    assert_eq!(
+        disposed[0]["result"]["logged"].as_u64(),
+        Some(2 * r.calls.len() as u64),
+        "onDispose returned before the queued sends ran"
+    );
 }
 
 /// The real `tracevault stream` accepts what the plugin sends and keeps each

@@ -22,8 +22,9 @@
  *   `agent.start` and every tool call on `tool.result`, as they happen, and
  *   `agent.end` then sends only what was not sent yet: the assistant
  *   messages (text, thinking, usage) and the tools that fire no tool events
- *   (`Task`, `create_thread`, `wait_for_threads`, `read_thread`). Messages
- *   are deduplicated on their id, tool calls on `toolUseID`.
+ *   (`Task`, `create_thread`, `wait_for_threads`, `read_thread`), and any
+ *   context another plugin appended to the prompt. Tool calls are
+ *   deduplicated on `toolUseID`, the prompt's text on its message id.
  * - A `tool.result` whose `toolUseID` never shows up in the turn's messages is
  *   a call made by a `Task` subagent (it carries the parent's thread id). It
  *   is sent like any other.
@@ -71,18 +72,18 @@ export default function tracevault(amp: PluginAPI) {
 
 	/** Threads this plugin process has sent a SessionStart for. */
 	const started = new Set<string>()
-	/** Per thread: message ids and toolUseIDs sent during the current turn. */
-	const sent = new Map<string, Set<string>>()
+	/** Per thread: what the current turn has sent so far. */
+	const sent = new Map<string, Sent>()
 	/** Per toolUseID: when `tool.call` fired, the tool call's own timestamp. */
 	const callTimes = new Map<string, string>()
 
-	function sentFor(threadId: string): Set<string> {
-		let ids = sent.get(threadId)
-		if (!ids) {
-			ids = new Set()
-			sent.set(threadId, ids)
+	function sentFor(threadId: string): Sent {
+		let s = sent.get(threadId)
+		if (!s) {
+			s = { tools: new Set(), prompts: new Map() }
+			sent.set(threadId, s)
 		}
-		return ids
+		return s
 	}
 
 	function send(threadId: string, event: string, hookName: string, extra: Json, records: Json[]) {
@@ -128,7 +129,7 @@ export default function tracevault(amp: PluginAPI) {
 				id: event.id,
 				content: [{ type: 'text', text: event.message ?? '' }],
 			}
-			if (event.id != null) sentFor(threadId).add(String(event.id))
+			if (event.id != null) sentFor(threadId).prompts.set(String(event.id), event.message ?? '')
 			await send(threadId, 'user-prompt-submit', 'UserPromptSubmit', {}, [
 				envelope('agent.start', threadId, message, isoNow()),
 			])
@@ -153,7 +154,7 @@ export default function tracevault(amp: PluginAPI) {
 			const toolUseID = event?.toolUseID
 			if (!threadId || !toolUseID) return
 			void ensureStarted(threadId)
-			sentFor(threadId).add(toolUseID)
+			sentFor(threadId).tools.add(toolUseID)
 			const calledAt = callTimes.get(toolUseID) ?? isoNow()
 			callTimes.delete(toolUseID)
 			const result: Json = { type: 'tool_result', toolUseID, status: event.status }
@@ -187,8 +188,7 @@ export default function tracevault(amp: PluginAPI) {
 			const threadId = event?.thread?.id
 			if (!threadId) return
 			void ensureStarted(threadId)
-			const ids = sent.get(threadId) ?? new Set<string>()
-			const records = unsentMessages(event.messages, ids).map((m) =>
+			const records = unsentMessages(event.messages, sentFor(threadId)).map((m) =>
 				envelope('agent.end', threadId, m, typeof m.createdAt === 'string' ? m.createdAt : isoNow()),
 			)
 			// The turn is over: what it sent is no longer needed for dedup.
@@ -209,30 +209,47 @@ export default function tracevault(amp: PluginAPI) {
 		// `amp -x` ends with onDispose; let sends still in flight finish.
 		const pending = [...chains.values()]
 		if (pending.length === 0) return
-		await Promise.race([Promise.allSettled(pending), new Promise((r) => setTimeout(r, DISPOSE_WAIT_MS))])
+		let timer: ReturnType<typeof setTimeout> | undefined
+		await Promise.race([
+			Promise.allSettled(pending),
+			new Promise((r) => {
+				timer = setTimeout(r, DISPOSE_WAIT_MS)
+			}),
+		])
+		// A pending timer would keep the plugin process alive.
+		clearTimeout(timer)
 	})
 }
 
+/** What one thread's current turn has sent: tool calls by `toolUseID`, prompts by message id. */
+type Sent = { tools: Set<string>; prompts: Map<string, string> }
+
 /**
- * The turn's messages minus what this plugin already sent: the prompt (sent
- * on `agent.start`, matched by message id) and the tool calls and results
- * sent on `tool.result` (matched by `toolUseID`). An assistant message is
- * always kept, for its text, thinking and `usage`; any other message left
- * with no content is dropped.
+ * The turn's messages minus what this plugin already sent: the prompt's text
+ * (sent on `agent.start`) and the tool calls and results sent on
+ * `tool.result` (matched by `toolUseID`). The rest of the prompt's message is
+ * kept: Amp appends context a plugin adds on `agent.start` to it as further
+ * text blocks. An assistant message is always kept, for its text, thinking
+ * and `usage`; any other message left with no content is dropped.
  */
-function unsentMessages(messages: Json[] | undefined, sentIds: Set<string>): Json[] {
+function unsentMessages(messages: Json[] | undefined, sent: Sent): Json[] {
 	const out: Json[] = []
 	for (const m of Array.isArray(messages) ? messages : []) {
 		if (!m || typeof m !== 'object') continue
-		if (m.id != null && sentIds.has(String(m.id))) continue
 		if (!Array.isArray(m.content)) {
-			out.push(m)
+			if (!(m.id != null && sent.prompts.has(String(m.id)))) out.push(m)
 			continue
 		}
-		const content = m.content.filter(
-			(b: Json) =>
-				!(b?.type === 'tool_use' && sentIds.has(b.id)) && !(b?.type === 'tool_result' && sentIds.has(b.toolUseID)),
-		)
+		let prompt = m.id != null ? sent.prompts.get(String(m.id)) : undefined
+		const content = m.content.filter((b: Json) => {
+			if (prompt !== undefined && b?.type === 'text' && b.text === prompt) {
+				prompt = undefined // only the one block agent.start sent
+				return false
+			}
+			if (b?.type === 'tool_use') return !sent.tools.has(b.id)
+			if (b?.type === 'tool_result') return !sent.tools.has(b.toolUseID)
+			return true
+		})
 		if (content.length === 0 && m.role !== 'assistant') continue
 		out.push(content.length === m.content.length ? m : { ...m, content })
 	}

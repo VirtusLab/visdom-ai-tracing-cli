@@ -6,7 +6,12 @@
 // recorded order, one at a time, awaiting the handler as Amp does; a
 // `dispose` line runs the onDispose callbacks. A process that ends without
 // one (a killed terminal) just stops. Prints one JSON line per handler call:
-// `{kind, result}`, so the test can check what `tool.call` returned.
+// `{kind, result}`, so the test can check what `tool.call` returned, and
+// after onDispose `{kind: "dispose", result: {logged}}`: how many lines the
+// fake `tracevault` had written to `$TV_LOG` by then.
+//
+// With REPLAY_CONCURRENT=1, events are delivered without waiting for the
+// previous handler, so handlers (and the plugin's sends) overlap.
 import { readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
@@ -22,6 +27,7 @@ for (const line of lines) {
 	byPid.get(line.pid).push(line)
 }
 
+const CONCURRENT = process.env.REPLAY_CONCURRENT === '1'
 const EVENTS = new Set(['session.start', 'agent.start', 'tool.call', 'tool.result', 'agent.end'])
 
 for (const [pid, procLines] of byPid) {
@@ -42,14 +48,28 @@ for (const [pid, procLines] of byPid) {
 	}
 	const mod = await import(`${pathToFileURL(pluginPath)}?pid=${pid}`)
 	mod.default(amp)
+	const inFlight = []
 	for (const line of procLines) {
 		if (EVENTS.has(line.kind)) {
 			for (const handler of handlers.get(line.kind) ?? []) {
-				const result = await handler(line.data.event, {})
-				console.log(JSON.stringify({ kind: line.kind, result: result ?? null }))
+				const call = Promise.resolve(handler(line.data.event, {})).then((result) =>
+					console.log(JSON.stringify({ kind: line.kind, result: result ?? null })),
+				)
+				if (CONCURRENT) inFlight.push(call)
+				else await call
 			}
 		} else if (line.kind === 'dispose') {
 			for (const cb of disposers) await cb()
+			console.log(JSON.stringify({ kind: 'dispose', result: { logged: loggedLines() } }))
 		}
+	}
+	await Promise.all(inFlight)
+}
+
+function loggedLines() {
+	try {
+		return readFileSync(process.env.TV_LOG, 'utf8').split('\n').filter((l) => l).length
+	} catch {
+		return 0
 	}
 }
