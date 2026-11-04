@@ -957,12 +957,13 @@ fn amp_user_config_dir() -> Option<PathBuf> {
 }
 
 /// What `init --agent amp` prints after installing the plugin: headless runs
-/// need a flag, or Amp may start the turn before the plugin is listening.
+/// need a flag, or Amp may start the turn before the plugin is ready and
+/// skip its `agent.start` / `agent.end` hooks.
 pub fn amp_headless_notice() -> &'static str {
     "Amp loads the plugin in interactive sessions. For headless runs use \
-`amp -x --plugin-ready-timeout 30 ...`, so Amp waits for the plugin before the turn starts. \
-A headless run waits forever on an approval dialog (for example a file under a guarded path), \
-so allow what it needs up front."
+`amp -x \"<prompt>\" --plugin-ready-timeout 30`, so Amp waits for the plugin before the turn \
+starts. A headless run waits forever on an approval dialog (for example a file under a guarded \
+path), so allow what it needs up front."
 }
 
 /// Best-effort cleanup of the extension registration left behind by an OLDER

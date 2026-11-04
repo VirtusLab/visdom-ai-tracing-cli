@@ -310,7 +310,8 @@ configuration. If `tracevault` is missing or fails, the plugin logs it and Amp c
 - **Headless runs need `--plugin-ready-timeout`.** Without it `amp -x` may start the turn before
   plugins are ready and skip their `agent.start` / `agent.end` hooks, so the prompt, the
   assistant's messages and the token usage are not captured:
-  `amp -x --plugin-ready-timeout 30 "<prompt>"`.
+  `amp -x "<prompt>" --plugin-ready-timeout 30` (the prompt is the value of `-x`, so it comes
+  right after it).
 - **`amp -x` waits forever on an approval dialog**, for example when a tool writes under a
   guarded path. Allow what an unattended run needs beforehand.
 - **Policies name Amp's own tools.** A `tracevault check` policy matches tool names exactly, and
