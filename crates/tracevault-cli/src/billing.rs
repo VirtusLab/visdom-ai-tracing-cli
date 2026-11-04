@@ -72,7 +72,7 @@ pub fn detect(agent: Agent, probe: &Probe) -> BillingMode {
         Agent::Codex => codex(probe),
         // Neither exposes which provider/credential a session runs on in a
         // place the hook can read reliably.
-        Agent::Gsd | Agent::OpenCode => BillingMode::Unknown,
+        Agent::Gsd | Agent::OpenCode | Agent::Amp => BillingMode::Unknown,
     }
 }
 
@@ -1054,6 +1054,7 @@ mod tests {
             .home_file(".codex/auth.json", r#"{"auth_mode":"chatgpt"}"#)
             .env("ANTHROPIC_API_KEY", "sk");
         assert_eq!(f.detect(Agent::OpenCode), BillingMode::Unknown);
+        assert_eq!(f.detect(Agent::Amp), BillingMode::Unknown);
         assert_eq!(f.detect(Agent::Gsd), BillingMode::Unknown);
     }
 

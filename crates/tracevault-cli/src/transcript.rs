@@ -19,6 +19,10 @@ use std::path::Path;
 /// - Codex: `type: "response_item"` whose `payload` is a `custom_tool_call` or
 ///   `function_call` (named) or a `local_shell_call` (counted as `Bash`, the
 ///   name the server gives it)
+/// - Amp: `type: "amp_message"` (the envelope the bundled plugin wraps Amp's
+///   own thread messages in), an assistant `message.content[]` with blocks of
+///   `type: "tool_use"`. Names are Amp's own (`create_file`, `edit_file`,
+///   `shell_command`, `Task`, `create_thread`, ...).
 pub fn tool_call_names(entry: &serde_json::Value) -> Vec<&str> {
     fn str_at<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
         v.get(key).and_then(|v| v.as_str())
@@ -35,6 +39,11 @@ pub fn tool_call_names(entry: &serde_json::Value) -> Vec<&str> {
     };
     match str_at(entry, "type") {
         Some("assistant") => blocks_of_type("tool_use").collect(),
+        Some("amp_message")
+            if entry.get("message").and_then(|m| str_at(m, "role")) == Some("assistant") =>
+        {
+            blocks_of_type("tool_use").collect()
+        }
         Some("message")
             if entry.get("message").and_then(|m| str_at(m, "role")) == Some("assistant") =>
         {
@@ -98,6 +107,20 @@ mod tests {
     #[test]
     fn count_tool_calls_of_a_missing_file_is_empty() {
         assert!(count_tool_calls(Path::new("/nonexistent/t.jsonl")).is_empty());
+    }
+
+    #[test]
+    fn amp_tool_use_blocks_are_tool_calls() {
+        let assistant = serde_json::json!({"type":"amp_message","event":"agent.end","message":{"role":"assistant","content":[
+            {"type":"thinking","thinking":"..."},
+            {"type":"tool_use","id":"TU-1","name":"shell_command","input":{"command":"ls"}},
+            {"type":"tool_use","id":"TU-2","name":"Task","input":{}}
+        ]}});
+        assert_eq!(tool_call_names(&assistant), vec!["shell_command", "Task"]);
+        let result = serde_json::json!({"type":"amp_message","message":{"role":"user","content":[
+            {"type":"tool_result","toolUseID":"TU-1","status":"done","output":"x"}
+        ]}});
+        assert!(tool_call_names(&result).is_empty());
     }
 
     #[test]

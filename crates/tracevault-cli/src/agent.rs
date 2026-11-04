@@ -16,6 +16,8 @@ pub enum Agent {
     // `opencode` the server/CLI convention expects.
     #[value(name = "opencode")]
     OpenCode,
+    /// Amp (ampcode.com).
+    Amp,
 }
 
 impl Agent {
@@ -27,6 +29,7 @@ impl Agent {
             Agent::Codex => "codex",
             Agent::Gsd => "gsd",
             Agent::OpenCode => "opencode",
+            Agent::Amp => "amp",
         }
     }
 
@@ -38,6 +41,7 @@ impl Agent {
             Agent::Codex => 2,
             Agent::Gsd => 2,
             Agent::OpenCode => 2,
+            Agent::Amp => 2,
         }
     }
 
@@ -49,6 +53,7 @@ impl Agent {
             Agent::Codex => "Codex",
             Agent::Gsd => "GSD",
             Agent::OpenCode => "OpenCode",
+            Agent::Amp => "Amp",
         }
     }
 }
@@ -103,5 +108,14 @@ mod tests {
         assert_eq!(Agent::OpenCode.label(), "OpenCode");
         use clap::ValueEnum;
         assert_eq!(Agent::from_str("opencode", true).unwrap(), Agent::OpenCode);
+    }
+
+    #[test]
+    fn amp_agent_mapping() {
+        assert_eq!(Agent::Amp.tool_name(), "amp");
+        assert_eq!(Agent::Amp.protocol_version(), 2);
+        assert_eq!(Agent::Amp.label(), "Amp");
+        use clap::ValueEnum;
+        assert_eq!(Agent::from_str("amp", true).unwrap(), Agent::Amp);
     }
 }

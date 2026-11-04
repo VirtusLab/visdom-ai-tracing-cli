@@ -3,6 +3,8 @@ use tracevault_protocol::streaming::StreamEventRequest;
 
 // Adapter modules contain stubs for future stream command integration.
 #[allow(dead_code)]
+pub mod amp;
+#[allow(dead_code)]
 pub mod claude_code;
 #[allow(dead_code)]
 pub mod codex;
@@ -27,6 +29,7 @@ pub enum DetectedTool {
     Codex,
     Gsd,
     OpenCode,
+    Amp,
 }
 
 impl DetectedTool {
@@ -37,6 +40,7 @@ impl DetectedTool {
             DetectedTool::Codex => "codex",
             DetectedTool::Gsd => "gsd",
             DetectedTool::OpenCode => "opencode",
+            DetectedTool::Amp => "amp",
         }
     }
 
@@ -48,6 +52,7 @@ impl DetectedTool {
             DetectedTool::Codex => Box::new(codex::CodexAdapter),
             DetectedTool::Gsd => Box::new(gsd::GsdAdapter),
             DetectedTool::OpenCode => Box::new(opencode::OpenCodeAdapter),
+            DetectedTool::Amp => Box::new(amp::AmpAdapter),
         }
     }
 }
@@ -68,6 +73,9 @@ pub fn detect_tools(cwd: &Path) -> Vec<DetectedTool> {
     }
     if cwd.join(".opencode").exists() {
         tools.push(DetectedTool::OpenCode);
+    }
+    if cwd.join(".amp").exists() {
+        tools.push(DetectedTool::Amp);
     }
     tools
 }
@@ -143,5 +151,19 @@ mod tests {
     #[test]
     fn opencode_adapter_reports_opencode_tool_name() {
         assert_eq!(DetectedTool::OpenCode.adapter().tool_name(), "opencode");
+    }
+
+    #[test]
+    fn detect_tools_amp() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".amp")).unwrap();
+        let tools = detect_tools(dir.path());
+        assert!(tools.iter().any(|t| matches!(t, DetectedTool::Amp)));
+        assert_eq!(DetectedTool::Amp.name(), "amp");
+    }
+
+    #[test]
+    fn amp_adapter_reports_amp_tool_name() {
+        assert_eq!(DetectedTool::Amp.adapter().tool_name(), "amp");
     }
 }

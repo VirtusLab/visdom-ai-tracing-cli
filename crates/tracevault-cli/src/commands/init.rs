@@ -105,7 +105,10 @@ pub fn validate_init_flags(
 ) -> Result<(), String> {
     if matches!(
         agent,
-        crate::agent::Agent::Codex | crate::agent::Agent::Gsd | crate::agent::Agent::OpenCode
+        crate::agent::Agent::Codex
+            | crate::agent::Agent::Gsd
+            | crate::agent::Agent::OpenCode
+            | crate::agent::Agent::Amp
     ) && claude_settings_set
     {
         return Err("--claude-settings only applies to --agent claude-code".to_string());
@@ -201,6 +204,9 @@ pub async fn init_in_directory(
         // directory rather than just the plugin file, in case OpenCode
         // itself later writes other local state there.
         crate::agent::Agent::OpenCode => (None, ".opencode/".to_string()),
+        // Only the plugin's own directory: `.amp/` also holds the project's
+        // Amp settings, which a team may well commit.
+        crate::agent::Agent::Amp => (None, AMP_PLUGIN_GITIGNORE_ENTRY.to_string()),
     };
 
     // Create .tracevault/ directory
@@ -268,6 +274,11 @@ pub async fn init_in_directory(
         }
         crate::agent::Agent::OpenCode => {
             install_opencode_plugin(Some(project_root))?;
+        }
+        crate::agent::Agent::Amp => {
+            let path = install_amp_plugin(Some(project_root))?;
+            println!("Installed the TraceVault Amp plugin in {}", path.display());
+            println!("{}", amp_headless_notice());
         }
     }
 
@@ -898,6 +909,60 @@ fn write_opencode_plugin_files(plugins_dir: &Path) -> io::Result<()> {
     fs::create_dir_all(plugins_dir)?;
     fs::write(plugins_dir.join("tracevault.ts"), OPENCODE_PLUGIN_INDEX)?;
     Ok(())
+}
+
+/// TraceVault Amp plugin source, embedded from the checked-in assets and
+/// written verbatim by `install_amp_plugin`.
+pub const AMP_PLUGIN_INDEX: &str = include_str!("../../assets/amp-plugin/index.ts");
+
+/// Root `.gitignore` entry for the repo-local Amp plugin.
+const AMP_PLUGIN_GITIGNORE_ENTRY: &str = ".amp/plugins/tracevault/";
+
+/// Install the TraceVault Amp plugin as `tracevault/index.ts` in an Amp
+/// plugins directory: `<project_root>/.amp/plugins/` for a repo, or with
+/// `None` the user-level one Amp loads for every session,
+/// `$XDG_CONFIG_HOME/amp/plugins/` or `~/.config/amp/plugins/`. Amp uses
+/// that XDG path on every platform, so this does not use `dirs::config_dir`
+/// (which is `~/Library/Application Support` on macOS). Returns the path
+/// written. Fails loudly, like the other agents' installers: a swallowed
+/// error would report success with no plugin in place.
+pub fn install_amp_plugin(project_root: Option<&Path>) -> io::Result<PathBuf> {
+    let plugins_dir = match project_root {
+        Some(root) => root.join(".amp").join("plugins"),
+        None => amp_user_config_dir()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "could not determine the config directory for the Amp plugin install",
+                )
+            })?
+            .join("plugins"),
+    };
+    let plugin_dir = plugins_dir.join("tracevault");
+    fs::create_dir_all(&plugin_dir)?;
+    let path = plugin_dir.join("index.ts");
+    fs::write(&path, AMP_PLUGIN_INDEX)?;
+    Ok(path)
+}
+
+/// Amp's user config directory: `$XDG_CONFIG_HOME/amp` when that is set to
+/// an absolute path (the XDG spec says to ignore a relative one), otherwise
+/// `~/.config/amp`.
+fn amp_user_config_dir() -> Option<PathBuf> {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute());
+    xdg.or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .map(|c| c.join("amp"))
+}
+
+/// What `init --agent amp` prints after installing the plugin: headless runs
+/// need a flag, or Amp may start the turn before the plugin is listening.
+pub fn amp_headless_notice() -> &'static str {
+    "Amp loads the plugin in interactive sessions. For headless runs use \
+`amp -x --plugin-ready-timeout 30 ...`, so Amp waits for the plugin before the turn starts. \
+A headless run waits forever on an approval dialog (for example a file under a guarded path), \
+so allow what it needs up front."
 }
 
 /// Best-effort cleanup of the extension registration left behind by an OLDER

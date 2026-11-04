@@ -1100,3 +1100,108 @@ async fn init_refuses_to_overwrite_a_malformed_config() {
     );
     assert!(!tmp.path().join(".git/hooks/pre-push").exists());
 }
+
+/// `tracevault init --agent amp` (repo-local) installs the plugin as a
+/// directory plugin, `.amp/plugins/tracevault/index.ts`, and ignores only
+/// that directory: `.amp/` also holds project settings a team may commit.
+#[tokio::test]
+async fn init_amp_repo_local_installs_plugin_and_gitignores_its_dir() {
+    let tmp = tmp_git_repo();
+
+    tracevault_cli::commands::init::init_in_directory(
+        tmp.path(),
+        None,
+        None,
+        false,
+        Some(UserContext::Toggle(false)),
+        Agent::Amp,
+    )
+    .await
+    .unwrap();
+
+    let plugin_file = tmp.path().join(".amp/plugins/tracevault/index.ts");
+    assert_eq!(
+        fs::read_to_string(&plugin_file).unwrap(),
+        tracevault_cli::commands::init::AMP_PLUGIN_INDEX
+    );
+
+    let gitignore = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+    assert!(gitignore.contains(".tracevault/"));
+    assert!(
+        gitignore.lines().any(|l| l == ".amp/plugins/tracevault/"),
+        "amp plugin dir must be gitignored: {gitignore}"
+    );
+    assert!(
+        !gitignore.lines().any(|l| l == ".amp/"),
+        "all of .amp/ must not be ignored: {gitignore}"
+    );
+    // The git hooks are agent-agnostic and installed as for every agent.
+    assert!(tmp.path().join(".git/hooks/pre-push").exists());
+    assert!(tmp.path().join(".git/hooks/post-commit").exists());
+}
+
+#[test]
+fn init_amp_rejects_claude_settings() {
+    let err = tracevault_cli::commands::init::validate_init_flags(Agent::Amp, true).unwrap_err();
+    assert!(err.contains("--claude-settings"), "{err}");
+    assert!(tracevault_cli::commands::init::validate_init_flags(Agent::Amp, false).is_ok());
+}
+
+/// Run `tracevault init --global --agent amp` with `HOME` at `home` and
+/// `XDG_CONFIG_HOME` set to `xdg` (or unset).
+fn run_global_amp_init(home: &std::path::Path, xdg: Option<&str>) -> std::process::Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_tracevault"));
+    cmd.args(["init", "--global", "--agent", "amp"])
+        .env("HOME", home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("TRACEVAULT_API_KEY")
+        .env_remove("TRACEVAULT_SERVER_URL")
+        .current_dir(home)
+        .stdin(std::process::Stdio::null());
+    if let Some(xdg) = xdg {
+        cmd.env("XDG_CONFIG_HOME", xdg);
+    }
+    cmd.output().expect("failed to run tracevault binary")
+}
+
+#[cfg(unix)]
+#[test]
+fn init_global_amp_writes_to_xdg_config_home() {
+    let home = TempDir::new().unwrap();
+    let xdg = home.path().join("xdg");
+    let output = run_global_amp_init(home.path(), Some(xdg.to_str().unwrap()));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plugin = xdg.join("amp/plugins/tracevault/index.ts");
+    assert_eq!(
+        fs::read_to_string(&plugin).unwrap(),
+        tracevault_cli::commands::init::AMP_PLUGIN_INDEX
+    );
+    assert!(!home.path().join(".config/amp").exists());
+    assert!(stdout.contains(&plugin.display().to_string()), "{stdout}");
+    assert!(stdout.contains("ALL Amp sessions"), "{stdout}");
+    assert!(stdout.contains("--plugin-ready-timeout"), "{stdout}");
+}
+
+/// Without `XDG_CONFIG_HOME` (or with a relative one, which the XDG spec
+/// says to ignore), Amp reads `~/.config/amp/` on every platform.
+#[cfg(unix)]
+#[test]
+fn init_global_amp_defaults_to_dot_config() {
+    for xdg in [None, Some("relative/dir")] {
+        let home = TempDir::new().unwrap();
+        let output = run_global_amp_init(home.path(), xdg);
+        assert!(
+            output.status.success(),
+            "{xdg:?}: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let plugin = home.path().join(".config/amp/plugins/tracevault/index.ts");
+        assert!(plugin.exists(), "{xdg:?}: {} missing", plugin.display());
+    }
+}
