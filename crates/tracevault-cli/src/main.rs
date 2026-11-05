@@ -113,8 +113,8 @@ enum Cli {
     /// Show current session status
     Status {
         /// Session to inspect for the workspace binding; defaults to
-        /// $TRACEVAULT_SESSION_ID, else the most recent session that has a
-        /// workspace binding.
+        /// $TRACEVAULT_SESSION_ID (in Amp: $AMP_CURRENT_THREAD_ID), else the
+        /// most recent session that has a workspace binding.
         #[arg(long)]
         session_id: Option<String>,
     },
@@ -190,8 +190,9 @@ enum Cli {
     #[command(name = "verify-start")]
     VerifyStart {
         /// Explicit session ID to open the window for. When omitted, the
-        /// invoking session ($TRACEVAULT_SESSION_ID) is used if it has events in
-        /// this worktree, else the session is detected by worktree.
+        /// invoking session ($TRACEVAULT_SESSION_ID; in Amp: $AMP_CURRENT_THREAD_ID)
+        /// is used if it has events in this worktree, else the session is
+        /// detected by worktree.
         #[arg(long)]
         session_id: Option<String>,
     },
@@ -750,7 +751,7 @@ async fn main() {
             let project_root = crate::paths::resolve_project_root(&cwd).root;
             let effective = commands::status::effective_session_id(
                 session_id,
-                std::env::var("TRACEVAULT_SESSION_ID").ok(),
+                crate::session_state::env_session_id(),
             );
             let code =
                 commands::status::run_status(&project_root, &cwd, effective.as_deref()).await;
@@ -882,7 +883,7 @@ async fn main() {
         Cli::VerifyStart { session_id } => {
             let cwd = env::current_dir().expect("Cannot determine current directory");
             let project_root = crate::paths::resolve_project_root(&cwd).root;
-            let env_session_id = std::env::var("TRACEVAULT_SESSION_ID").ok();
+            let env_session_id = crate::session_state::env_session_id();
             if let Err(e) = commands::verification_phase::open_verification_phase(
                 &project_root,
                 &cwd,

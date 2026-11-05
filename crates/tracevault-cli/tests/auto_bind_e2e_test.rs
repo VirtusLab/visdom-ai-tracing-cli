@@ -225,6 +225,7 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_STATE_HOME", &self.state)
             .env_remove("TRACEVAULT_SESSION_ID")
+            .env_remove("AMP_CURRENT_THREAD_ID")
             .env_remove("TRACEVAULT_PROJECT")
             .env_remove("TRACEVAULT_PROJECT_ATTRIBUTION")
             .env_remove("CLAUDE_ENV_FILE")

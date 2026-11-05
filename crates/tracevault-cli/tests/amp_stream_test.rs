@@ -641,6 +641,7 @@ fn real_cli_keeps_amp_tool_calls_for_check() {
         .env_remove("TRACEVAULT_API_KEY")
         .env_remove("TRACEVAULT_SERVER_URL")
         .env_remove("TRACEVAULT_SESSION_ID")
+        .env_remove("AMP_CURRENT_THREAD_ID")
         .output()
         .unwrap();
     assert!(
