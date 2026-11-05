@@ -28,14 +28,23 @@ fn data_dir() -> PathBuf {
 
 /// A Node that runs `.mts` files with type stripping, or `None` (and the
 /// test is skipped) outside CI.
-fn node() -> Option<&'static str> {
-    let ok = Command::new("node")
-        .args(["--no-warnings", "--experimental-strip-types", "-e", "0"])
+///
+/// The path is absolute: the replays run with a `PATH` of their own, which
+/// need not hold Node (on CI it lives in the tool cache).
+fn node() -> Option<PathBuf> {
+    let found = Command::new("node")
+        .args([
+            "--no-warnings",
+            "--experimental-strip-types",
+            "-p",
+            "process.execPath",
+        ])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if ok {
-        return Some("node");
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
+    if let Some(path) = found {
+        return Some(path);
     }
     assert!(
         std::env::var_os("CI").is_none(),
