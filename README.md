@@ -322,8 +322,19 @@ configuration. If `tracevault` is missing or fails, the plugin logs it and Amp c
   command rejected by a permission rule, both succeed as far as Amp is concerned.
 - **A session never ends explicitly.** Amp has no session-end event, and a terminal that is
   killed mid-turn sends no end of turn either; what was sent before stays.
-- Agent policies are not injected into Amp sessions yet, and a `Task` subagent's tool calls are
-  recorded under the parent session without a link to the `Task` call.
+- **Agent policies are injected at the start of a thread** (its first turn in an Amp process,
+  through `tracevault session-start`), and again on a later turn only when the session's repo
+  changed (`tracevault user-prompt`), as with Claude Code. Amp hides the text in its UI, but
+  **unlike Claude Code it stores it in the thread**, as part of your message: anyone who opens
+  the thread on ampcode.com, and `amp threads export`, see the policy text. A `Task` subagent
+  runs inside its parent's turn and gets no injection of its own. If `tracevault` is missing,
+  fails or takes more than 10 s, the turn starts without policies.
+- **The session id in Amp's shell is the thread id.** The plugin cannot export
+  `TRACEVAULT_SESSION_ID` into Amp's shell, so `tracevault repo switch`, `repo status`,
+  `project switch`, `status` and `verify-start` fall back to `$AMP_CURRENT_THREAD_ID`, which Amp
+  sets there. No `--session-id` is needed.
+- A `Task` subagent's tool calls are recorded under the parent session without a link to the
+  `Task` call.
 
 **Codex hook trust — required once, or nothing is captured**
 
@@ -714,7 +725,7 @@ These are hidden from `--help`. `init` installs them; you never need to run them
 | Command | Run by |
 |---|---|
 | `tracevault stream --event <event> [--agent <agent>]` | The agent's hooks, on every captured event (`--agent` defaults to `claude-code`) |
-| `tracevault session-start` | The agent's `SessionStart` hook: binds an unbound session to the repo of its checkout's `origin` remote, injects the bound repo's policies; under Claude Code it also exports `TRACEVAULT_SESSION_ID` into the agent's shell. Once per CLI upgrade it also refreshes the hooks and turns telemetry on (see [telemetry](#tracevault-init--set-up-tracing-in-a-repo)). It then sends the session cost earlier sessions left unsent (see [session cost](#what-init-installs)) |
+| `tracevault session-start` | The agent's `SessionStart` hook: binds an unbound session to the repo of its checkout's `origin` remote, injects the bound repo's policies; under Claude Code it also exports `TRACEVAULT_SESSION_ID` into the agent's shell (Amp runs it from its plugin on a thread's first turn; its shell has `AMP_CURRENT_THREAD_ID` instead). Once per CLI upgrade it also refreshes the hooks and turns telemetry on (see [telemetry](#tracevault-init--set-up-tracing-in-a-repo)). It then sends the session cost earlier sessions left unsent (see [session cost](#what-init-installs)) |
 | `tracevault user-prompt` | The agent's `UserPromptSubmit` hook: re-injects the policies when the session's repo has changed |
 | `tracevault commit-push` | The git `post-commit` hook, in the background: sends the commit's metadata |
 | `tracevault otel-headers [--server-url <URL>]` | Claude Code's `otelHeadersHelper` (`init --claude-telemetry`): prints `{"Authorization": "Bearer …"}` for the OpenTelemetry export; exits 1 when not logged in, or logged in to another server than `--server-url` |

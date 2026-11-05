@@ -1186,6 +1186,7 @@ fn init_global_amp_writes_to_xdg_config_home() {
     assert!(stdout.contains(&plugin.display().to_string()), "{stdout}");
     assert!(stdout.contains("ALL Amp sessions"), "{stdout}");
     assert!(stdout.contains("--plugin-ready-timeout"), "{stdout}");
+    assert!(stdout.contains("stores them in the thread"), "{stdout}");
 }
 
 /// Without `XDG_CONFIG_HOME` (or with a relative one, which the XDG spec

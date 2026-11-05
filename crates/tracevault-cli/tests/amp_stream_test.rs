@@ -77,7 +77,10 @@ struct Replay {
     status: std::process::ExitStatus,
     stdout: String,
     stderr: String,
+    /// The `tracevault stream` runs.
     calls: Vec<Call>,
+    /// The `tracevault session-start` / `user-prompt` runs (policy lookups).
+    policy_calls: Vec<Call>,
     /// `begin` / `end` lines of a `Slow` fake.
     spans: Vec<String>,
 }
@@ -85,25 +88,40 @@ struct Replay {
 impl Replay {
     /// What each `tool.call` handler returned.
     fn tool_call_results(&self) -> Vec<Value> {
+        self.results("tool.call")
+    }
+    /// What each `agent.start` handler returned.
+    fn agent_start_results(&self) -> Vec<Value> {
+        self.results("agent.start")
+    }
+    fn results(&self, kind: &str) -> Vec<Value> {
         self.stdout
             .lines()
             .map(|l| serde_json::from_str::<Value>(l).unwrap())
-            .filter(|v| v["kind"] == "tool.call")
+            .filter(|v| v["kind"] == kind)
             .map(|v| v["result"].clone())
             .collect()
     }
     fn records(&self) -> Vec<&Value> {
         self.calls.iter().flat_map(|c| c.records()).collect()
     }
+    /// The subcommand of each policy lookup, in order.
+    fn policy_commands(&self) -> Vec<&str> {
+        self.policy_calls
+            .iter()
+            .map(|c| c.args.split_whitespace().next().unwrap())
+            .collect()
+    }
 }
 
 /// What a fake `tracevault` on `PATH` does.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum FakeTracevault {
-    /// Log its arguments and stdin.
+    /// Log its arguments and stdin; a policy lookup prints the answer the
+    /// test gave it (see [`replay_answering`]).
     Record,
-    /// Like `Record`, but slow: logs `begin` / `end` around a 50 ms sleep to
-    /// `$TV_LOG.spans`, so overlapping runs show.
+    /// Like `Record`, but `stream` runs are slow: they log `begin` / `end`
+    /// around a 50 ms sleep to `$TV_LOG.spans`, so overlapping runs show.
     Slow,
     /// Exit at once without reading stdin.
     ExitEarly,
@@ -119,9 +137,10 @@ fn replay(fixture: &str, fake: FakeTracevault) -> Option<Replay> {
     replay_with(fixture, fake, false, &[])
 }
 
-/// The plugin's timeouts in these tests (its defaults are 30 s and 10 s).
+/// The plugin's timeouts in these tests (its defaults are 30 s, 10 s, 10 s).
 const SPAWN_TIMEOUT_MS: &str = "1000";
 const DISPOSE_WAIT_MS: &str = "1000";
+const INJECT_TIMEOUT_MS: &str = "500";
 
 /// `concurrent`: deliver events without waiting for the previous handler.
 /// `env`: extra environment for the plugin.
@@ -131,6 +150,22 @@ fn replay_with(
     concurrent: bool,
     env: &[(&str, &str)],
 ) -> Option<Replay> {
+    replay_answering(fixture, fake, concurrent, env, &[])
+}
+
+/// Policy lookups' answers: `(command, n, stdout)`.
+type Answers<'a> = &'a [(&'a str, usize, &'a str)];
+
+/// [`replay_with`], where the fake's policy lookups answer: `(command, n,
+/// stdout)` makes the `n`th (from 1) `tracevault <command>` run print
+/// `stdout`. Other runs print nothing.
+fn replay_answering(
+    fixture: &str,
+    fake: FakeTracevault,
+    concurrent: bool,
+    env: &[(&str, &str)],
+    answers: Answers,
+) -> Option<Replay> {
     let node = node()?;
     let tmp = tempfile::tempdir().unwrap();
     let plugin = tmp.path().join("plugin.mts");
@@ -138,18 +173,38 @@ fn replay_with(
     let bin = tmp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let log = tmp.path().join("calls.log");
-    const RECORD: &str =
-        "printf '%s\\n' \"$*\" >> \"$TV_LOG\"\ncat >> \"$TV_LOG\"\necho >> \"$TV_LOG\"\n";
+    for (command, n, stdout) in answers {
+        std::fs::write(format!("{}.{command}.{n}", log.display()), stdout).unwrap();
+    }
+    // `stream` runs are logged to `$TV_LOG`, policy lookups to
+    // `$TV_LOG.policy`: the two run side by side, and their lines must not
+    // interleave.
+    const LOG_TO: &str = "case \"$1\" in stream) L=\"$TV_LOG\";; *) L=\"$TV_LOG.policy\";; esac\n";
+    const RECORD: &str = "printf '%s\\n' \"$*\" >> \"$L\"\ncat >> \"$L\"\necho >> \"$L\"\n";
+    // A policy lookup prints its `n`th answer, if the test gave one. With
+    // `$TV_LINGER` set it then keeps running that long, as `session-start`
+    // does while it sends earlier sessions' cost reports.
+    const ANSWER: &str = "case \"$1\" in session-start|user-prompt)\n\
+        n=$(( $(cat \"$TV_LOG.$1.n\" 2>/dev/null || echo 0) + 1 ))\n\
+        echo \"$n\" > \"$TV_LOG.$1.n\"\n\
+        if [ -f \"$TV_LOG.$1.$n\" ]; then cat \"$TV_LOG.$1.$n\"; fi\n\
+        if [ -n \"$TV_LINGER\" ]; then sleep \"$TV_LINGER\"; fi\n\
+        ;; esac\n";
     let script = match fake {
-        FakeTracevault::Record => Some(format!("#!/bin/sh\n{RECORD}")),
+        FakeTracevault::Record => Some(format!("#!/bin/sh\n{LOG_TO}{RECORD}{ANSWER}")),
         FakeTracevault::HangOn(word) => Some(format!(
-            "#!/bin/sh\ncase \"$*\" in *'{word}'*) exec sleep 30;; esac\n{RECORD}"
+            "#!/bin/sh\n{LOG_TO}case \"$*\" in *'{word}'*) exec sleep 30;; esac\n{RECORD}{ANSWER}"
         )),
         FakeTracevault::Fail => Some(
-            "#!/bin/sh\ncat > /dev/null\necho 'boom: corrupt .stream_offset' >&2\nexit 3\n".to_string(),
+            "#!/bin/sh\ncat > /dev/null\necho 'boom: corrupt .stream_offset' >&2\nexit 3\n"
+                .to_string(),
         ),
         FakeTracevault::Slow => Some(format!(
-            "#!/bin/sh\necho begin >> \"$TV_LOG.spans\"\nsleep 0.05\n{RECORD}echo end >> \"$TV_LOG.spans\"\n"
+            "#!/bin/sh\n{LOG_TO}\
+             if [ \"$1\" = stream ]; then echo begin >> \"$TV_LOG.spans\"; sleep 0.05; fi\n\
+             {RECORD}\
+             if [ \"$1\" = stream ]; then echo end >> \"$TV_LOG.spans\"; fi\n\
+             {ANSWER}"
         )),
         FakeTracevault::ExitEarly => Some("#!/bin/sh\nexit 1\n".to_string()),
         FakeTracevault::Missing => None,
@@ -172,24 +227,29 @@ fn replay_with(
         .env("REPLAY_CONCURRENT", if concurrent { "1" } else { "0" })
         .env("TRACEVAULT_AMP_SPAWN_TIMEOUT_MS", SPAWN_TIMEOUT_MS)
         .env("TRACEVAULT_AMP_DISPOSE_WAIT_MS", DISPOSE_WAIT_MS)
+        .env("TRACEVAULT_AMP_INJECT_TIMEOUT_MS", INJECT_TIMEOUT_MS)
+        .env_remove("TV_LINGER")
         .envs(env.iter().copied())
         .output()
         .unwrap();
     let spans = std::fs::read_to_string(format!("{}.spans", log.display())).unwrap_or_default();
-    let text = std::fs::read_to_string(&log).unwrap_or_default();
-    let lines: Vec<&str> = text.lines().collect();
-    let calls = lines
-        .chunks(2)
-        .map(|pair| Call {
-            args: pair[0].to_string(),
-            payload: serde_json::from_str(pair[1]).unwrap(),
-        })
-        .collect();
+    let read_calls = |path: &Path| -> Vec<Call> {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        lines
+            .chunks(2)
+            .map(|pair| Call {
+                args: pair[0].to_string(),
+                payload: serde_json::from_str(pair[1]).unwrap(),
+            })
+            .collect()
+    };
     Some(Replay {
         status: out.status,
         stdout: String::from_utf8(out.stdout).unwrap(),
         stderr: String::from_utf8(out.stderr).unwrap(),
-        calls,
+        calls: read_calls(&log),
+        policy_calls: read_calls(Path::new(&format!("{}.policy", log.display()))),
         spans: spans.lines().map(str::to_string).collect(),
     })
 }
@@ -649,6 +709,18 @@ fn real_cli_keeps_amp_tool_calls_for_check() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The real `tracevault session-start` reads the plugin's hook event and,
+    // with no server to ask, answers with nothing to inject.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("unreadable answer"), "{stderr}");
+    assert!(!stderr.contains("no answer after"), "{stderr}");
+    let agent_starts: Vec<Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|v| v["kind"] == "agent.start")
+        .map(|v| v["result"].clone())
+        .collect();
+    assert_eq!(agent_starts, vec![serde_json::json!({})]);
 
     let log = repo
         .path()
@@ -798,4 +870,243 @@ fn dispose_returns_at_its_deadline() {
     assert!((150..2000).contains(&ms), "onDispose took {ms} ms");
     assert!(!events(&r).contains(&"stop"));
     assert_eq!(disposed["logged"].as_u64(), Some(2 * r.calls.len() as u64));
+}
+
+// --- Agent policies (VIS-1199) ---
+
+/// A `session-start` / `user-prompt` answer that injects `context`.
+fn injecting(event: &str, context: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {"hookEventName": event, "additionalContext": context},
+        "suppressOutput": true,
+    })
+    .to_string()
+        + "\n"
+}
+
+/// What `session-start` / `user-prompt` print when there is nothing to inject.
+const ALLOW: &str = "{\"suppressOutput\":true}\n";
+
+/// `agent.start`'s return value that injects `context` hidden from the UI.
+fn hidden(context: &str) -> Value {
+    serde_json::json!({"message": {"content": context, "display": false}})
+}
+
+/// Two turns of one thread, in one Amp process.
+const TWO_TURNS: &str = "interactive-cancel-ctrlc.plugin.jsonl";
+
+fn agent_start_events(fixture: &str) -> Vec<Value> {
+    fixture_lines(fixture)
+        .into_iter()
+        .filter(|l| l["kind"] == "agent.start")
+        .map(|l| l["data"]["event"].clone())
+        .collect()
+}
+
+fn prompts_sent(r: &Replay) -> usize {
+    r.calls
+        .iter()
+        .filter(|c| c.event() == "user-prompt-submit")
+        .count()
+}
+
+/// The first turn of a thread runs `tracevault session-start` with an
+/// Amp-shaped hook event and returns its context hidden; a later turn runs
+/// `tracevault user-prompt`, which injects nothing while the repo stays the
+/// same.
+#[test]
+fn first_turn_injects_policies_and_same_repo_does_not_again() {
+    let first = injecting("SessionStart", "POLICY: no rm -rf");
+    let Some(r) = replay_answering(
+        TWO_TURNS,
+        FakeTracevault::Record,
+        false,
+        &[],
+        &[("session-start", 1, &first), ("user-prompt", 1, ALLOW)],
+    ) else {
+        return;
+    };
+    assert!(r.status.success(), "stderr: {}", r.stderr);
+    assert_eq!(
+        r.agent_start_results(),
+        vec![hidden("POLICY: no rm -rf"), serde_json::json!({})]
+    );
+    assert_eq!(r.policy_commands(), ["session-start", "user-prompt"]);
+
+    // The CLI reads both as hook events, with the thread id as the session id.
+    let starts = agent_start_events(TWO_TURNS);
+    let thread = starts[0]["thread"]["id"].as_str().unwrap();
+    for (call, hook) in r
+        .policy_calls
+        .iter()
+        .zip(["SessionStart", "UserPromptSubmit"])
+    {
+        let event =
+            tracevault_protocol::hooks::parse_hook_event(&call.payload.to_string()).unwrap();
+        assert_eq!(event.session_id, thread);
+        assert_eq!(event.hook_event_name, hook);
+        assert_eq!(event.transcript_path, "");
+        assert!(!event.cwd.is_empty());
+    }
+    assert_eq!(r.policy_calls[1].payload["prompt"], starts[1]["message"]);
+    // The prompts are still sent, once each.
+    assert_eq!(prompts_sent(&r), 2);
+}
+
+/// After the session's repo changed (`tracevault repo switch`), the next
+/// turn's `user-prompt` answers with the new repo's policies, and the plugin
+/// injects them.
+#[test]
+fn repo_change_injects_the_new_policies_on_the_next_turn() {
+    let first = injecting("SessionStart", "POLICY A");
+    let second = injecting("UserPromptSubmit", "POLICY B");
+    let Some(r) = replay_answering(
+        TWO_TURNS,
+        FakeTracevault::Record,
+        false,
+        &[],
+        &[("session-start", 1, &first), ("user-prompt", 1, &second)],
+    ) else {
+        return;
+    };
+    assert!(r.status.success(), "stderr: {}", r.stderr);
+    assert_eq!(
+        r.agent_start_results(),
+        vec![hidden("POLICY A"), hidden("POLICY B")]
+    );
+}
+
+/// No repo bound, or no policies: `session-start` prints no context and the
+/// turn gets nothing. A `systemMessage` meant for the user goes to the log.
+#[test]
+fn nothing_to_inject_returns_nothing() {
+    let notice = "{\"suppressOutput\":true,\"systemMessage\":\"repo is not registered\"}\n";
+    let Some(r) = replay_answering(
+        TWO_TURNS,
+        FakeTracevault::Record,
+        false,
+        &[],
+        &[("session-start", 1, notice)],
+    ) else {
+        return;
+    };
+    assert!(r.status.success(), "stderr: {}", r.stderr);
+    assert_eq!(
+        r.agent_start_results(),
+        vec![serde_json::json!({}), serde_json::json!({})]
+    );
+    assert!(
+        r.stderr
+            .contains("tracevault session-start: repo is not registered"),
+        "{}",
+        r.stderr
+    );
+}
+
+/// Only a thread's own turns get policies: a `Task` subagent runs inside its
+/// parent's turn and fires no `agent.start` of its own.
+#[test]
+fn subagents_get_no_injection_of_their_own() {
+    let fixture = "headless-multitool.plugin.jsonl";
+    let first = injecting("SessionStart", "POLICY");
+    let Some(r) = replay_answering(
+        fixture,
+        FakeTracevault::Record,
+        false,
+        &[],
+        &[("session-start", 1, &first)],
+    ) else {
+        return;
+    };
+    assert!(r.status.success(), "stderr: {}", r.stderr);
+    assert_eq!(agent_start_events(fixture).len(), 1);
+    assert_eq!(r.policy_commands(), ["session-start"]);
+    assert_eq!(r.agent_start_results(), vec![hidden("POLICY")]);
+}
+
+/// A missing, failing or babbling `tracevault` leaves the turn alone.
+#[test]
+fn failed_policy_lookup_injects_nothing() {
+    let cases: [(FakeTracevault, Answers); 4] = [
+        (FakeTracevault::Missing, &[]),
+        (FakeTracevault::ExitEarly, &[]),
+        (FakeTracevault::Fail, &[]),
+        (
+            FakeTracevault::Record,
+            &[
+                ("session-start", 1, "not json\n"),
+                ("user-prompt", 1, "{\"hookSpecificOutput\": 42}\n"),
+            ],
+        ),
+    ];
+    for (fake, answers) in cases {
+        let Some(r) = replay_answering(TWO_TURNS, fake, false, &[], answers) else {
+            return;
+        };
+        assert!(r.status.success(), "{fake:?}: stderr: {}", r.stderr);
+        assert_eq!(
+            r.agent_start_results(),
+            vec![serde_json::json!({}), serde_json::json!({})],
+            "{fake:?}"
+        );
+        let expected = match fake {
+            FakeTracevault::Fail => "tracevault session-start: exit 3: boom",
+            FakeTracevault::Record => "tracevault session-start: unreadable answer: not json",
+            _ => "spawn",
+        };
+        if fake != FakeTracevault::ExitEarly {
+            assert!(r.stderr.contains(expected), "{fake:?}: {}", r.stderr);
+        }
+    }
+}
+
+/// A `session-start` that does not answer in time: the turn goes on without
+/// policies after the inject timeout, its prompt is still sent, and the next
+/// turn's lookup works.
+#[test]
+fn hung_policy_lookup_times_out_and_the_turn_goes_on() {
+    let second = injecting("UserPromptSubmit", "POLICY B");
+    let Some(r) = replay_answering(
+        TWO_TURNS,
+        FakeTracevault::HangOn("session-start"),
+        false,
+        &[],
+        &[("user-prompt", 1, &second)],
+    ) else {
+        return;
+    };
+    assert!(r.status.success(), "stderr: {}", r.stderr);
+    assert_eq!(
+        r.agent_start_results(),
+        vec![serde_json::json!({}), hidden("POLICY B")]
+    );
+    assert!(
+        r.stderr.contains(&format!(
+            "tracevault session-start: no answer after {INJECT_TIMEOUT_MS} ms"
+        )),
+        "{}",
+        r.stderr
+    );
+    assert_eq!(prompts_sent(&r), 2);
+}
+
+/// `session-start` prints its answer and then sends earlier sessions' cost
+/// reports: the turn takes the answer without waiting for the exit.
+#[test]
+fn answer_is_used_before_the_lookup_exits() {
+    let first = injecting("SessionStart", "POLICY");
+    let Some(r) = replay_answering(
+        TWO_TURNS,
+        FakeTracevault::Record,
+        false,
+        // Longer than the inject timeout, shorter than the spawn timeout.
+        &[("TV_LINGER", "0.8")],
+        &[("session-start", 1, &first), ("user-prompt", 1, ALLOW)],
+    ) else {
+        return;
+    };
+    assert!(r.status.success(), "stderr: {}", r.stderr);
+    assert_eq!(r.agent_start_results()[0], hidden("POLICY"));
+    assert!(!r.stderr.contains("no answer after"), "{}", r.stderr);
+    assert!(!r.stderr.contains("killed"), "{}", r.stderr);
 }
