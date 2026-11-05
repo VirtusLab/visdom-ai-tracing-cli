@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.3](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.29.2...v0.29.3) - 2026-11-05
+
+### Added
+
+- *(amp)* inject agent policies into Amp threads
+- *(amp)* fall back to AMP_CURRENT_THREAD_ID for the session id
+- *(amp)* tracevault init --agent amp with a bundled Amp capture plugin
+
+### Fixed
+
+- *(amp)* bound agent.start's wait; keep a late policy answer for the next turn
+- *(amp)* log a failing tracevault run; test the spawn timeout and dispose deadline
+- *(amp)* keep context appended to the prompt; test overlapping events
+
+### Other
+
+- *(amp)* real CLI e2e for an Amp thread's policies and repo switch
+- *(amp)* run Node by its absolute path
+- *(amp)* the prompt is the value of amp -x, so it comes before --plugin-ready-timeout
+
 ## [0.29.2](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.29.1...v0.29.2) - 2026-10-29
 
 ### Added
