@@ -41,10 +41,21 @@ import { fileURLToPath } from 'node:url'
 
 export const description = 'TraceVault: sends this Amp session to TraceVault (tracevault stream --agent amp)'
 
-/** A `tracevault` run that takes longer than this is killed: it must never hold up Amp. */
-const SPAWN_TIMEOUT_MS = 30_000
+/**
+ * A `tracevault` run that takes longer than this is killed: it must never hold
+ * up Amp. The CLI gives up delivering after about 7 s and queues the rest.
+ */
+const SPAWN_TIMEOUT_MS = envMs('TRACEVAULT_AMP_SPAWN_TIMEOUT_MS', 30_000)
 /** How long `onDispose` waits for sends still in flight. */
-const DISPOSE_WAIT_MS = 10_000
+const DISPOSE_WAIT_MS = envMs('TRACEVAULT_AMP_DISPOSE_WAIT_MS', 10_000)
+/** How much of a failing run's stderr goes to the plugin log. */
+const STDERR_LIMIT = 2_000
+
+/** A positive number of milliseconds from the environment (for tests), else `fallback`. */
+function envMs(name: string, fallback: number): number {
+	const value = Number(process.env[name])
+	return Number.isFinite(value) && value > 0 ? value : fallback
+}
 
 type Json = any
 
@@ -288,10 +299,17 @@ function runTracevault(args: string[], stdinJson: unknown, cwd: string, log: (ms
 				resolve()
 			}
 		}
+		const what = `tracevault ${args.join(' ')}`
 		try {
-			const child = spawn('tracevault', args, { cwd, stdio: ['pipe', 'ignore', 'ignore'] })
+			const child = spawn('tracevault', args, { cwd, stdio: ['pipe', 'ignore', 'pipe'] })
+			// `tracevault stream` reports its errors on stderr and still exits 0,
+			// so keep the start of stderr for the log.
+			let stderr = ''
+			child.stderr?.on('data', (chunk) => {
+				if (stderr.length < STDERR_LIMIT) stderr += String(chunk)
+			})
 			const timer = setTimeout(() => {
-				log(`tracevault ${args.join(' ')}: no exit after ${SPAWN_TIMEOUT_MS} ms, killed`)
+				log(`${what}: no exit after ${SPAWN_TIMEOUT_MS} ms, killed`)
 				try {
 					child.kill()
 				} catch {
@@ -304,8 +322,11 @@ function runTracevault(args: string[], stdinJson: unknown, cwd: string, log: (ms
 				log(`spawn: ${String(e)}`)
 				finish()
 			})
-			child.on('close', () => {
+			child.on('close', (code, signal) => {
 				clearTimeout(timer)
+				const text = stderr.slice(0, STDERR_LIMIT).trim()
+				if (code !== 0 || signal) log(`${what}: exit ${signal ?? code}${text ? `: ${text}` : ''}`)
+				else if (text) log(`${what}: ${text}`)
 				finish()
 			})
 			// The stdin stream emits its own 'error' (EPIPE) when tracevault exits

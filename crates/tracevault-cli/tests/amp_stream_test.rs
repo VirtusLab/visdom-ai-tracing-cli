@@ -98,16 +98,30 @@ enum FakeTracevault {
     Slow,
     /// Exit at once without reading stdin.
     ExitEarly,
+    /// Read stdin, print an error on stderr and exit 3.
+    Fail,
+    /// Like `Record`, but never exit when the arguments contain this.
+    HangOn(&'static str),
     /// Not on `PATH` at all.
     Missing,
 }
 
 fn replay(fixture: &str, fake: FakeTracevault) -> Option<Replay> {
-    replay_with(fixture, fake, false)
+    replay_with(fixture, fake, false, &[])
 }
 
+/// The plugin's timeouts in these tests (its defaults are 30 s and 10 s).
+const SPAWN_TIMEOUT_MS: &str = "1000";
+const DISPOSE_WAIT_MS: &str = "1000";
+
 /// `concurrent`: deliver events without waiting for the previous handler.
-fn replay_with(fixture: &str, fake: FakeTracevault, concurrent: bool) -> Option<Replay> {
+/// `env`: extra environment for the plugin.
+fn replay_with(
+    fixture: &str,
+    fake: FakeTracevault,
+    concurrent: bool,
+    env: &[(&str, &str)],
+) -> Option<Replay> {
     let node = node()?;
     let tmp = tempfile::tempdir().unwrap();
     let plugin = tmp.path().join("plugin.mts");
@@ -115,14 +129,20 @@ fn replay_with(fixture: &str, fake: FakeTracevault, concurrent: bool) -> Option<
     let bin = tmp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let log = tmp.path().join("calls.log");
+    const RECORD: &str =
+        "printf '%s\\n' \"$*\" >> \"$TV_LOG\"\ncat >> \"$TV_LOG\"\necho >> \"$TV_LOG\"\n";
     let script = match fake {
-        FakeTracevault::Record => {
-            Some("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TV_LOG\"\ncat >> \"$TV_LOG\"\necho >> \"$TV_LOG\"\n")
-        }
-        FakeTracevault::Slow => Some(
-            "#!/bin/sh\necho begin >> \"$TV_LOG.spans\"\nsleep 0.05\nprintf '%s\\n' \"$*\" >> \"$TV_LOG\"\ncat >> \"$TV_LOG\"\necho >> \"$TV_LOG\"\necho end >> \"$TV_LOG.spans\"\n",
+        FakeTracevault::Record => Some(format!("#!/bin/sh\n{RECORD}")),
+        FakeTracevault::HangOn(word) => Some(format!(
+            "#!/bin/sh\ncase \"$*\" in *'{word}'*) exec sleep 30;; esac\n{RECORD}"
+        )),
+        FakeTracevault::Fail => Some(
+            "#!/bin/sh\ncat > /dev/null\necho 'boom: corrupt .stream_offset' >&2\nexit 3\n".to_string(),
         ),
-        FakeTracevault::ExitEarly => Some("#!/bin/sh\nexit 1\n"),
+        FakeTracevault::Slow => Some(format!(
+            "#!/bin/sh\necho begin >> \"$TV_LOG.spans\"\nsleep 0.05\n{RECORD}echo end >> \"$TV_LOG.spans\"\n"
+        )),
+        FakeTracevault::ExitEarly => Some("#!/bin/sh\nexit 1\n".to_string()),
         FakeTracevault::Missing => None,
     };
     if let Some(script) = script {
@@ -141,6 +161,9 @@ fn replay_with(fixture: &str, fake: FakeTracevault, concurrent: bool) -> Option<
         .env("PATH", format!("{}:/bin:/usr/bin", bin.display()))
         .env("TV_LOG", &log)
         .env("REPLAY_CONCURRENT", if concurrent { "1" } else { "0" })
+        .env("TRACEVAULT_AMP_SPAWN_TIMEOUT_MS", SPAWN_TIMEOUT_MS)
+        .env("TRACEVAULT_AMP_DISPOSE_WAIT_MS", DISPOSE_WAIT_MS)
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     let spans = std::fs::read_to_string(format!("{}.spans", log.display())).unwrap_or_default();
@@ -517,7 +540,7 @@ fn overlapping_events_are_sent_one_at_a_time_in_order() {
     let Some(sequential) = replay(fixture, FakeTracevault::Record) else {
         return;
     };
-    let Some(r) = replay_with(fixture, FakeTracevault::Slow, true) else {
+    let Some(r) = replay_with(fixture, FakeTracevault::Slow, true, &[]) else {
         return;
     };
     assert!(r.status.success(), "stderr: {}", r.stderr);
@@ -693,4 +716,76 @@ fn inline_tool_is_error_reads_amp_status() {
         Some(false)
     );
     assert_eq!(inline_tool_is_error(&[call]), None);
+}
+
+fn dispose_result(r: &Replay) -> Value {
+    r.stdout
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|v| v["kind"] == "dispose")
+        .expect("onDispose ran")["result"]
+        .clone()
+}
+
+/// `tracevault stream` reports its errors on stderr and exits 0, so a run's
+/// stderr and a non-zero exit go to the plugin log.
+#[test]
+fn failing_tracevault_is_logged() {
+    let Some(r) = replay("headless-multitool.plugin.jsonl", FakeTracevault::Fail) else {
+        return;
+    };
+    assert!(r.status.success(), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("tracevault stream --event notification --agent amp: exit 3: boom: corrupt .stream_offset"),
+        "{}",
+        r.stderr
+    );
+}
+
+/// A run that never exits is killed after the spawn timeout, and the
+/// thread's later sends still go out, in order.
+#[test]
+fn hung_run_is_killed_and_later_sends_go_on() {
+    let fixture = "headless-multitool.plugin.jsonl";
+    let Some(all) = replay(fixture, FakeTracevault::Record) else {
+        return;
+    };
+    let Some(r) = replay(fixture, FakeTracevault::HangOn("--event notification")) else {
+        return;
+    };
+    assert!(r.status.success(), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains(&format!(
+            "tracevault stream --event notification --agent amp: no exit after {SPAWN_TIMEOUT_MS} ms, killed"
+        )),
+        "{}",
+        r.stderr
+    );
+    let expected: Vec<&str> = events(&all).into_iter().skip(1).collect();
+    assert_eq!(events(&r), expected);
+}
+
+/// onDispose gives up on a send still running after its deadline, so a hung
+/// `tracevault` cannot hold up Amp's exit; what ran before is sent.
+#[test]
+fn dispose_returns_at_its_deadline() {
+    let Some(r) = replay_with(
+        "headless-multitool.plugin.jsonl",
+        FakeTracevault::HangOn("--event stop"),
+        true,
+        &[
+            ("TRACEVAULT_AMP_DISPOSE_WAIT_MS", "200"),
+            ("TRACEVAULT_AMP_SPAWN_TIMEOUT_MS", "3000"),
+        ],
+    ) else {
+        return;
+    };
+    assert!(r.status.success(), "stderr: {}", r.stderr);
+    let disposed = dispose_result(&r);
+    let ms = disposed["ms"].as_u64().unwrap();
+    // Well short of the 3 s it would take without the deadline.
+    assert!((150..2000).contains(&ms), "onDispose took {ms} ms");
+    assert!(!events(&r).contains(&"stop"));
+    assert_eq!(disposed["logged"].as_u64(), Some(2 * r.calls.len() as u64));
 }

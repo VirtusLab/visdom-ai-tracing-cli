@@ -7,8 +7,9 @@
 // `dispose` line runs the onDispose callbacks. A process that ends without
 // one (a killed terminal) just stops. Prints one JSON line per handler call:
 // `{kind, result}`, so the test can check what `tool.call` returned, and
-// after onDispose `{kind: "dispose", result: {logged}}`: how many lines the
-// fake `tracevault` had written to `$TV_LOG` by then.
+// after onDispose `{kind: "dispose", result: {logged, ms}}`: how many lines
+// the fake `tracevault` had written to `$TV_LOG` by then, and how long
+// onDispose took.
 //
 // With REPLAY_CONCURRENT=1, events are delivered without waiting for the
 // previous handler, so handlers (and the plugin's sends) overlap.
@@ -59,8 +60,10 @@ for (const [pid, procLines] of byPid) {
 				else await call
 			}
 		} else if (line.kind === 'dispose') {
+			const started = Date.now()
 			for (const cb of disposers) await cb()
-			console.log(JSON.stringify({ kind: 'dispose', result: { logged: loggedLines() } }))
+			const ms = Date.now() - started
+			console.log(JSON.stringify({ kind: 'dispose', result: { logged: loggedLines(), ms } }))
 		}
 	}
 	await Promise.all(inFlight)
