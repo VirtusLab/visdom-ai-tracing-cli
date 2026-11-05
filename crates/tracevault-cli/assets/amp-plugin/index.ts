@@ -144,12 +144,19 @@ export default function tracevault(amp: PluginAPI) {
 	 * sends earlier sessions' cost reports, so `onDispose` waits for these too.
 	 */
 	const policyRuns = new Set<Promise<void>>()
+	/**
+	 * Per thread: policies whose answer came after its turn had started
+	 * without them. The CLI has recorded them as injected by then, so it will
+	 * not offer them again; they go into the thread's next turn.
+	 */
+	const latePolicies = new Map<string, string>()
 
 	/**
 	 * The policies to inject into this turn of `threadId`, or `undefined`:
 	 * `tracevault session-start` on the thread's first turn in this process,
 	 * `tracevault user-prompt` (which answers only when the repo changed) on
-	 * later ones. Never rejects, and gives up after `INJECT_TIMEOUT_MS`.
+	 * later ones. Never rejects, and gives up after `INJECT_TIMEOUT_MS`; an
+	 * answer after that is kept in `latePolicies`.
 	 */
 	function policyContext(threadId: string, prompt: string): Promise<string | undefined> {
 		const first = !policiesStarted.has(threadId)
@@ -164,16 +171,23 @@ export default function tracevault(amp: PluginAPI) {
 		if (!first) payload.prompt = prompt
 		return new Promise((resolve) => {
 			let stdout = ''
-			let settled = false
+			let answered = false
+			let timedOut = false
 			const settle = (text: string | undefined) => {
-				if (settled) return
-				settled = true
+				if (answered) return
+				answered = true
 				clearTimeout(timer)
-				resolve(hookContext(text, command, log))
+				const context = hookContext(text, command, log)
+				if (!timedOut) resolve(context)
+				else if (context) {
+					log(`tracevault ${command}: answered late, policies go into the next turn`)
+					latePolicies.set(threadId, context)
+				}
 			}
 			const timer = setTimeout(() => {
 				log(`tracevault ${command}: no answer after ${INJECT_TIMEOUT_MS} ms, turn goes on without policies`)
-				settle(undefined)
+				timedOut = true
+				resolve(undefined)
 			}, INJECT_TIMEOUT_MS)
 			const run = runTracevault([command], payload, cwd, log, (chunk) => {
 				if (stdout.length < STDOUT_LIMIT) stdout += chunk
@@ -217,13 +231,17 @@ export default function tracevault(amp: PluginAPI) {
 				content: [{ type: 'text', text: prompt }],
 			}
 			if (event.id != null) sentFor(threadId).prompts.set(String(event.id), prompt)
-			const [context] = await Promise.all([
-				policyContext(threadId, prompt),
-				send(threadId, 'user-prompt-submit', 'UserPromptSubmit', {}, [
-					envelope('agent.start', threadId, message, isoNow()),
-				]),
+			const sending = send(threadId, 'user-prompt-submit', 'UserPromptSubmit', {}, [
+				envelope('agent.start', threadId, message, isoNow()),
 			])
-			policies = context
+			// The turn waits for the prompt's send only as long as for the
+			// policies: a slow `tracevault stream` must not hold it up (the send
+			// itself goes on in the thread's queue).
+			const [context] = await Promise.all([policyContext(threadId, prompt), within(sending, INJECT_TIMEOUT_MS)])
+			// Fresh policies win over late ones: they are for the repo now in use.
+			const late = latePolicies.get(threadId)
+			latePolicies.delete(threadId)
+			policies = context ?? late
 		} catch (e) {
 			log(`agent.start: ${String(e)}`)
 		}
@@ -350,6 +368,20 @@ function unsentMessages(messages: Json[] | undefined, sent: Sent): Json[] {
 
 function envelope(event: string, threadId: string, message: Json, timestamp: string): Json {
 	return { type: 'amp_message', event, thread_id: threadId, timestamp, message }
+}
+
+/** Resolves when `promise` settles or after `ms`, whichever is first; never rejects. */
+function within(promise: Promise<unknown>, ms: number): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined
+	return Promise.race([
+		promise.then(
+			() => {},
+			() => {},
+		),
+		new Promise<void>((r) => {
+			timer = setTimeout(r, ms)
+		}),
+	]).finally(() => clearTimeout(timer))
 }
 
 function isoNow(): string {

@@ -102,6 +102,15 @@ impl Replay {
             .map(|v| v["result"].clone())
             .collect()
     }
+    /// How long each `kind` handler took, in ms.
+    fn handler_ms(&self, kind: &str) -> Vec<u64> {
+        self.stdout
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|v| v["kind"] == kind)
+            .map(|v| v["ms"].as_u64().unwrap())
+            .collect()
+    }
     fn records(&self) -> Vec<&Value> {
         self.calls.iter().flat_map(|c| c.records()).collect()
     }
@@ -183,10 +192,12 @@ fn replay_answering(
     const RECORD: &str = "printf '%s\\n' \"$*\" >> \"$L\"\ncat >> \"$L\"\necho >> \"$L\"\n";
     // A policy lookup prints its `n`th answer, if the test gave one. With
     // `$TV_LINGER` set it then keeps running that long, as `session-start`
-    // does while it sends earlier sessions' cost reports.
+    // does while it sends earlier sessions' cost reports. The command named
+    // in `$TV_DELAY_CMD` waits `$TV_DELAY` before it answers.
     const ANSWER: &str = "case \"$1\" in session-start|user-prompt)\n\
         n=$(( $(cat \"$TV_LOG.$1.n\" 2>/dev/null || echo 0) + 1 ))\n\
         echo \"$n\" > \"$TV_LOG.$1.n\"\n\
+        if [ \"$1\" = \"$TV_DELAY_CMD\" ]; then sleep \"$TV_DELAY\"; fi\n\
         if [ -f \"$TV_LOG.$1.$n\" ]; then cat \"$TV_LOG.$1.$n\"; fi\n\
         if [ -n \"$TV_LINGER\" ]; then sleep \"$TV_LINGER\"; fi\n\
         ;; esac\n";
@@ -229,6 +240,7 @@ fn replay_answering(
         .env("TRACEVAULT_AMP_DISPOSE_WAIT_MS", DISPOSE_WAIT_MS)
         .env("TRACEVAULT_AMP_INJECT_TIMEOUT_MS", INJECT_TIMEOUT_MS)
         .env_remove("TV_LINGER")
+        .env_remove("TV_DELAY_CMD")
         .envs(env.iter().copied())
         .output()
         .unwrap();
@@ -1109,4 +1121,80 @@ fn answer_is_used_before_the_lookup_exits() {
     assert_eq!(r.agent_start_results()[0], hidden("POLICY"));
     assert!(!r.stderr.contains("no answer after"), "{}", r.stderr);
     assert!(!r.stderr.contains("killed"), "{}", r.stderr);
+}
+
+/// `session-start` answers after the turn gave up on it. The CLI has
+/// recorded those policies as injected, so `user-prompt` will not offer them
+/// again: the plugin injects them into the next turn instead.
+#[test]
+fn late_answer_goes_into_the_next_turn() {
+    let first = injecting("SessionStart", "POLICY LATE");
+    let Some(r) = replay_answering(
+        TWO_TURNS,
+        FakeTracevault::Record,
+        false,
+        // After the inject timeout, before the spawn timeout.
+        &[
+            ("TV_DELAY_CMD", "session-start"),
+            ("TV_DELAY", "0.7"),
+            // The next prompt comes after the late answer.
+            ("REPLAY_TURN_GAP_MS", "500"),
+        ],
+        &[("session-start", 1, &first), ("user-prompt", 1, ALLOW)],
+    ) else {
+        return;
+    };
+    assert!(r.status.success(), "stderr: {}", r.stderr);
+    assert_eq!(
+        r.agent_start_results(),
+        vec![serde_json::json!({}), hidden("POLICY LATE")]
+    );
+    assert!(r.stderr.contains("answered late"), "{}", r.stderr);
+}
+
+/// When `user-prompt` answers too, its policies (for the repo now in use)
+/// win over a late answer.
+#[test]
+fn fresh_policies_win_over_a_late_answer() {
+    let first = injecting("SessionStart", "POLICY LATE");
+    let second = injecting("UserPromptSubmit", "POLICY NEW");
+    let Some(r) = replay_answering(
+        TWO_TURNS,
+        FakeTracevault::Record,
+        false,
+        &[
+            ("TV_DELAY_CMD", "session-start"),
+            ("TV_DELAY", "0.7"),
+            ("REPLAY_TURN_GAP_MS", "500"),
+        ],
+        &[("session-start", 1, &first), ("user-prompt", 1, &second)],
+    ) else {
+        return;
+    };
+    assert!(r.status.success(), "stderr: {}", r.stderr);
+    assert_eq!(
+        r.agent_start_results(),
+        vec![serde_json::json!({}), hidden("POLICY NEW")]
+    );
+}
+
+/// A hung `tracevault stream` holds up the turn no longer than the inject
+/// timeout, though its own kill comes much later; the policies still arrive.
+#[test]
+fn slow_prompt_send_does_not_hold_up_the_turn() {
+    let first = injecting("SessionStart", "POLICY");
+    let Some(r) = replay_answering(
+        TWO_TURNS,
+        FakeTracevault::HangOn("--event user-prompt-submit"),
+        false,
+        &[("TRACEVAULT_AMP_SPAWN_TIMEOUT_MS", "3000")],
+        &[("session-start", 1, &first), ("user-prompt", 1, ALLOW)],
+    ) else {
+        return;
+    };
+    assert!(r.status.success(), "stderr: {}", r.stderr);
+    assert_eq!(r.agent_start_results()[0], hidden("POLICY"));
+    let ms = r.handler_ms("agent.start");
+    // The inject timeout is 500 ms; the hung send is killed after 3 s.
+    assert!(ms[0] < 1500, "agent.start took {ms:?} ms");
 }

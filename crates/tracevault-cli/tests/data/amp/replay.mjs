@@ -6,13 +6,16 @@
 // recorded order, one at a time, awaiting the handler as Amp does; a
 // `dispose` line runs the onDispose callbacks. A process that ends without
 // one (a killed terminal) just stops. Prints one JSON line per handler call:
-// `{kind, result}`, so the test can check what `tool.call` returned, and
+// `{kind, result, ms}`, so the test can check what `tool.call` and
+// `agent.start` returned and how long a handler took, and
 // after onDispose `{kind: "dispose", result: {logged, ms}}`: how many lines
 // the fake `tracevault` had written to `$TV_LOG` by then, and how long
 // onDispose took.
 //
 // With REPLAY_CONCURRENT=1, events are delivered without waiting for the
-// previous handler, so handlers (and the plugin's sends) overlap.
+// previous handler, so handlers (and the plugin's sends) overlap. With
+// REPLAY_TURN_GAP_MS, each process's later `agent.start`s come that long
+// after what precedes them, as a user's next prompt would.
 import { readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
@@ -29,6 +32,7 @@ for (const line of lines) {
 }
 
 const CONCURRENT = process.env.REPLAY_CONCURRENT === '1'
+const TURN_GAP_MS = Number(process.env.REPLAY_TURN_GAP_MS) || 0
 const EVENTS = new Set(['session.start', 'agent.start', 'tool.call', 'tool.result', 'agent.end'])
 
 for (const [pid, procLines] of byPid) {
@@ -50,11 +54,16 @@ for (const [pid, procLines] of byPid) {
 	const mod = await import(`${pathToFileURL(pluginPath)}?pid=${pid}`)
 	mod.default(amp)
 	const inFlight = []
+	let turns = 0
 	for (const line of procLines) {
+		if (line.kind === 'agent.start' && turns++ > 0 && TURN_GAP_MS > 0) {
+			await new Promise((r) => setTimeout(r, TURN_GAP_MS))
+		}
 		if (EVENTS.has(line.kind)) {
 			for (const handler of handlers.get(line.kind) ?? []) {
+				const called = Date.now()
 				const call = Promise.resolve(handler(line.data.event, {})).then((result) =>
-					console.log(JSON.stringify({ kind: line.kind, result: result ?? null })),
+					console.log(JSON.stringify({ kind: line.kind, result: result ?? null, ms: Date.now() - called })),
 				)
 				if (CONCURRENT) inFlight.push(call)
 				else await call
