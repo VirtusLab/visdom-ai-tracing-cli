@@ -35,13 +35,13 @@ pub enum RepoCmd {
         /// binding. Implied when no session id is available.
         #[arg(long)]
         user: bool,
-        /// Session to target; defaults to $TRACEVAULT_SESSION_ID.
+        /// Session to target; defaults to $TRACEVAULT_SESSION_ID (in Amp: $AMP_CURRENT_THREAD_ID).
         #[arg(long)]
         session_id: Option<String>,
     },
     /// Show the repo the current session is bound to.
     Status {
-        /// Session to target; defaults to $TRACEVAULT_SESSION_ID.
+        /// Session to target; defaults to $TRACEVAULT_SESSION_ID (in Amp: $AMP_CURRENT_THREAD_ID).
         #[arg(long)]
         session_id: Option<String>,
         /// One-off: resolve this checkout path instead of the session binding.
@@ -53,26 +53,25 @@ pub enum RepoCmd {
         /// Clear the user-level default instead of the session binding.
         #[arg(long)]
         user: bool,
-        /// Session to target; defaults to $TRACEVAULT_SESSION_ID.
+        /// Session to target; defaults to $TRACEVAULT_SESSION_ID (in Amp: $AMP_CURRENT_THREAD_ID).
         #[arg(long)]
         session_id: Option<String>,
     },
 }
 
 /// Resolve the current session id: the explicit flag wins, else
-/// `$TRACEVAULT_SESSION_ID` (set by the SessionStart hook of `init --global`).
+/// `$TRACEVAULT_SESSION_ID` (set by the SessionStart hook of `init --global`),
+/// else, in Amp's shell, `$AMP_CURRENT_THREAD_ID` (see
+/// [`crate::session_state::env_session_id`]).
 pub fn resolve_session_id(explicit: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(s) = explicit {
         return Ok(s.to_string());
     }
-    std::env::var("TRACEVAULT_SESSION_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            "no session id available: pass --session-id or set TRACEVAULT_SESSION_ID \
-             (installed by `tracevault init --global`)"
-                .into()
-        })
+    crate::session_state::env_session_id().ok_or_else(|| {
+        "no session id available: pass --session-id or set TRACEVAULT_SESSION_ID \
+         (installed by `tracevault init --global`; Amp sessions use $AMP_CURRENT_THREAD_ID)"
+            .into()
+    })
 }
 
 pub async fn run(
@@ -559,12 +558,30 @@ mod tests {
 
     #[test]
     fn resolve_session_id_errors_when_absent() {
-        // No explicit id and (in this test process) no env var set → error.
-        // Guard against a leaked env var from another test by checking the
-        // message only when the var is genuinely absent.
-        if std::env::var("TRACEVAULT_SESSION_ID").is_err() {
-            assert!(resolve_session_id(None).is_err());
-        }
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.remove("TRACEVAULT_SESSION_ID");
+        guard.remove("AMP_CURRENT_THREAD_ID");
+        assert!(resolve_session_id(None).is_err());
+    }
+
+    /// In Amp's shell the plugin cannot export `TRACEVAULT_SESSION_ID`, but
+    /// Amp sets `AMP_CURRENT_THREAD_ID`, and the thread id is the session id
+    /// (VIS-1199), so `repo switch` / `status` find the session unaided.
+    #[test]
+    fn resolve_session_id_falls_back_to_the_amp_thread() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.remove("TRACEVAULT_SESSION_ID");
+        guard.set("AMP_CURRENT_THREAD_ID", "T-0123-abcd");
+        assert_eq!(resolve_session_id(None).unwrap(), "T-0123-abcd");
+        // The explicit flag and TRACEVAULT_SESSION_ID still win.
+        assert_eq!(resolve_session_id(Some("sess-x")).unwrap(), "sess-x");
+        guard.set("TRACEVAULT_SESSION_ID", "sess-env");
+        assert_eq!(resolve_session_id(None).unwrap(), "sess-env");
+        // An empty TRACEVAULT_SESSION_ID counts as unset.
+        guard.set("TRACEVAULT_SESSION_ID", "");
+        assert_eq!(resolve_session_id(None).unwrap(), "T-0123-abcd");
     }
 
     #[test]

@@ -122,6 +122,31 @@ pub fn sessions_dir() -> Option<PathBuf> {
     Some(base.join("tracevault").join("sessions"))
 }
 
+/// The session of the agent that runs this command, from its environment:
+/// `$TRACEVAULT_SESSION_ID` (exported by the Claude Code / Codex SessionStart
+/// hook), else `$AMP_CURRENT_THREAD_ID`.
+///
+/// Amp's plugin cannot export a variable into Amp's shell (it runs in a
+/// separate process), but that shell has the current thread id, and the Amp
+/// plugin uses the thread id as the TraceVault session id (VIS-1199). Empty
+/// values count as unset.
+pub fn env_session_id() -> Option<String> {
+    session_id_from_env(
+        std::env::var("TRACEVAULT_SESSION_ID").ok(),
+        std::env::var("AMP_CURRENT_THREAD_ID").ok(),
+    )
+}
+
+/// [`env_session_id`] on given values: `tracevault` wins, then `amp_thread`.
+pub fn session_id_from_env(
+    tracevault: Option<String>,
+    amp_thread: Option<String>,
+) -> Option<String> {
+    tracevault
+        .filter(|s| !s.is_empty())
+        .or_else(|| amp_thread.filter(|s| !s.is_empty()))
+}
+
 /// A session id is used to build the state file path, so it must be a safe
 /// filename token — no path separators or `..` that could escape the sessions
 /// directory. Claude Code session ids are UUIDs, which satisfy this.
@@ -197,6 +222,18 @@ pub fn save_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_session_id_prefers_tracevault_then_amp_thread() {
+        let id = |tv: Option<&str>, amp: Option<&str>| {
+            session_id_from_env(tv.map(String::from), amp.map(String::from))
+        };
+        assert_eq!(id(Some("sess"), Some("T-1")).as_deref(), Some("sess"));
+        assert_eq!(id(None, Some("T-1")).as_deref(), Some("T-1"));
+        assert_eq!(id(Some(""), Some("T-1")).as_deref(), Some("T-1"));
+        assert_eq!(id(Some(""), Some("")), None);
+        assert_eq!(id(None, None), None);
+    }
 
     fn binding(id: &str) -> RepoBinding {
         RepoBinding {

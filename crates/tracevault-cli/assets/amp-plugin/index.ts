@@ -31,9 +31,26 @@
  * - `session.start` fires again on `amp threads continue`; the CLI treats a
  *   repeated SessionStart like a resumed session.
  *
+ * Agent policies (VIS-1199): `agent.start` may return a message, which Amp
+ * appends hidden to the user's turn. On the first `agent.start` of a thread
+ * in this process the plugin runs `tracevault session-start` (which also binds
+ * the session to the checkout's repo), on later ones `tracevault user-prompt`
+ * (which answers only when the session's repo changed), and returns their
+ * `hookSpecificOutput.additionalContext` with `display: false`. `session.start`
+ * cannot inject: Amp ignores what it returns. Amp stores the injected text in
+ * the thread, as a second text block of the user's message, so anyone who
+ * opens the thread on ampcode.com or exports it sees it. A `Task` subagent
+ * runs inside its parent's turn and fires no `agent.start`, so it gets no
+ * injection of its own.
+ *
+ * The plugin cannot export `TRACEVAULT_SESSION_ID` into Amp's shell (it runs
+ * in another process); the CLI falls back to the shell's
+ * `AMP_CURRENT_THREAD_ID`, the thread id this plugin uses as the session id.
+ *
  * Nothing here may break the Amp session: a missing or failing `tracevault`
- * is logged and ignored, sends are serialised per thread, and `tool.call`
- * always allows the call.
+ * is logged and ignored, sends are serialised per thread, the policy lookup
+ * is bounded by a timeout after which the turn goes on without policies, and
+ * `tool.call` always allows the call.
  */
 import type { PluginAPI } from '@ampcode/plugin'
 import { spawn } from 'node:child_process'
@@ -48,8 +65,15 @@ export const description = 'TraceVault: sends this Amp session to TraceVault (tr
 const SPAWN_TIMEOUT_MS = envMs('TRACEVAULT_AMP_SPAWN_TIMEOUT_MS', 30_000)
 /** How long `onDispose` waits for sends still in flight. */
 const DISPOSE_WAIT_MS = envMs('TRACEVAULT_AMP_DISPOSE_WAIT_MS', 10_000)
+/**
+ * How long `agent.start` waits for the policies before the turn goes on
+ * without them. The CLI keeps its own network work under 8 s.
+ */
+const INJECT_TIMEOUT_MS = envMs('TRACEVAULT_AMP_INJECT_TIMEOUT_MS', 10_000)
 /** How much of a failing run's stderr goes to the plugin log. */
 const STDERR_LIMIT = 2_000
+/** How much of a policy run's stdout is read; the CLI caps the context at 10k characters. */
+const STDOUT_LIMIT = 1_000_000
 
 /** A positive number of milliseconds from the environment (for tests), else `fallback`. */
 function envMs(name: string, fallback: number): number {
@@ -113,6 +137,70 @@ export default function tracevault(amp: PluginAPI) {
 		return enqueue(threadId, () => runTracevault(['stream', '--event', event, '--agent', 'amp'], payload, cwd, log))
 	}
 
+	/** Threads this plugin process has run `tracevault session-start` for. */
+	const policiesStarted = new Set<string>()
+	/**
+	 * Policy runs not finished yet. `session-start` answers first and then
+	 * sends earlier sessions' cost reports, so `onDispose` waits for these too.
+	 */
+	const policyRuns = new Set<Promise<void>>()
+	/**
+	 * Per thread: policies whose answer came after its turn had started
+	 * without them. The CLI has recorded them as injected by then, so it will
+	 * not offer them again; they go into the thread's next turn.
+	 */
+	const latePolicies = new Map<string, string>()
+
+	/**
+	 * The policies to inject into this turn of `threadId`, or `undefined`:
+	 * `tracevault session-start` on the thread's first turn in this process,
+	 * `tracevault user-prompt` (which answers only when the repo changed) on
+	 * later ones. Never rejects, and gives up after `INJECT_TIMEOUT_MS`; an
+	 * answer after that is kept in `latePolicies`.
+	 */
+	function policyContext(threadId: string, prompt: string): Promise<string | undefined> {
+		const first = !policiesStarted.has(threadId)
+		policiesStarted.add(threadId)
+		const [command, hookName] = first ? ['session-start', 'SessionStart'] : ['user-prompt', 'UserPromptSubmit']
+		const payload: Json = {
+			session_id: threadId,
+			transcript_path: '',
+			cwd,
+			hook_event_name: hookName,
+		}
+		if (!first) payload.prompt = prompt
+		return new Promise((resolve) => {
+			let stdout = ''
+			let answered = false
+			let timedOut = false
+			const settle = (text: string | undefined) => {
+				if (answered) return
+				answered = true
+				clearTimeout(timer)
+				const context = hookContext(text, command, log)
+				if (!timedOut) resolve(context)
+				else if (context) {
+					log(`tracevault ${command}: answered late, policies go into the next turn`)
+					latePolicies.set(threadId, context)
+				}
+			}
+			const timer = setTimeout(() => {
+				log(`tracevault ${command}: no answer after ${INJECT_TIMEOUT_MS} ms, turn goes on without policies`)
+				timedOut = true
+				resolve(undefined)
+			}, INJECT_TIMEOUT_MS)
+			const run = runTracevault([command], payload, cwd, log, (chunk) => {
+				if (stdout.length < STDOUT_LIMIT) stdout += chunk
+				// The answer is one JSON line; what the command does after it
+				// (the cost reports) need not hold up the turn.
+				const end = stdout.indexOf('\n')
+				if (end >= 0) settle(stdout.slice(0, end))
+			}).then(() => settle(stdout))
+			policyRuns.add(run)
+			run.finally(() => policyRuns.delete(run))
+		})
+	}
+
 	/** Send a SessionStart once per thread per process, before anything else of that thread. */
 	function ensureStarted(threadId: string): Promise<void> {
 		if (started.has(threadId)) return Promise.resolve()
@@ -130,24 +218,35 @@ export default function tracevault(amp: PluginAPI) {
 	})
 
 	amp.on('agent.start', async (event) => {
+		let policies: string | undefined
 		try {
 			const threadId = event?.thread?.id
 			if (!threadId) return {}
 			// A plugin that loaded late may see the turn before any session.start.
 			void ensureStarted(threadId)
+			const prompt = event.message ?? ''
 			const message = {
 				role: 'user',
 				id: event.id,
-				content: [{ type: 'text', text: event.message ?? '' }],
+				content: [{ type: 'text', text: prompt }],
 			}
-			if (event.id != null) sentFor(threadId).prompts.set(String(event.id), event.message ?? '')
-			await send(threadId, 'user-prompt-submit', 'UserPromptSubmit', {}, [
+			if (event.id != null) sentFor(threadId).prompts.set(String(event.id), prompt)
+			const sending = send(threadId, 'user-prompt-submit', 'UserPromptSubmit', {}, [
 				envelope('agent.start', threadId, message, isoNow()),
 			])
+			// The turn waits for the prompt's send only as long as for the
+			// policies: a slow `tracevault stream` must not hold it up (the send
+			// itself goes on in the thread's queue).
+			const [context] = await Promise.all([policyContext(threadId, prompt), within(sending, INJECT_TIMEOUT_MS)])
+			// Fresh policies win over late ones: they are for the repo now in use.
+			const late = latePolicies.get(threadId)
+			latePolicies.delete(threadId)
+			policies = context ?? late
 		} catch (e) {
 			log(`agent.start: ${String(e)}`)
 		}
-		return {}
+		// Hidden in Amp's UI, but stored in the thread (see the top of this file).
+		return policies ? { message: { content: policies, display: false } } : {}
 	})
 
 	amp.on('tool.call', async (event) => {
@@ -218,7 +317,7 @@ export default function tracevault(amp: PluginAPI) {
 
 	amp.onDispose(async () => {
 		// `amp -x` ends with onDispose; let sends still in flight finish.
-		const pending = [...chains.values()]
+		const pending = [...chains.values(), ...policyRuns]
 		if (pending.length === 0) return
 		let timer: ReturnType<typeof setTimeout> | undefined
 		await Promise.race([
@@ -271,6 +370,20 @@ function envelope(event: string, threadId: string, message: Json, timestamp: str
 	return { type: 'amp_message', event, thread_id: threadId, timestamp, message }
 }
 
+/** Resolves when `promise` settles or after `ms`, whichever is first; never rejects. */
+function within(promise: Promise<unknown>, ms: number): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined
+	return Promise.race([
+		promise.then(
+			() => {},
+			() => {},
+		),
+		new Promise<void>((r) => {
+			timer = setTimeout(r, ms)
+		}),
+	]).finally(() => clearTimeout(timer))
+}
+
 function isoNow(): string {
 	return new Date().toISOString()
 }
@@ -287,10 +400,39 @@ function workspaceDir(amp: PluginAPI): string {
 }
 
 /**
- * Run `tracevault <args>` with `stdinJson` on stdin. Always resolves: a
- * missing binary, a broken pipe, a crash or a hang only gets logged.
+ * The `additionalContext` of a Claude Code-style hook answer
+ * (`{hookSpecificOutput: {additionalContext}}`), or `undefined` when there is
+ * none or `text` is not such an answer. A `systemMessage` (a notice meant for
+ * the user, such as "this repo is not registered") goes to the plugin log:
+ * a plugin has no place to show it.
  */
-function runTracevault(args: string[], stdinJson: unknown, cwd: string, log: (msg: string) => void): Promise<void> {
+function hookContext(text: string | undefined, command: string, log: (msg: string) => void): string | undefined {
+	if (!text?.trim()) return undefined
+	try {
+		const answer = JSON.parse(text)
+		if (typeof answer?.systemMessage === 'string' && answer.systemMessage) {
+			log(`tracevault ${command}: ${answer.systemMessage}`)
+		}
+		const context = answer?.hookSpecificOutput?.additionalContext
+		return typeof context === 'string' && context.trim() ? context : undefined
+	} catch {
+		log(`tracevault ${command}: unreadable answer: ${text.slice(0, 200)}`)
+		return undefined
+	}
+}
+
+/**
+ * Run `tracevault <args>` with `stdinJson` on stdin. Always resolves: a
+ * missing binary, a broken pipe, a crash or a hang only gets logged. Its
+ * stdout goes to `onStdout` when given, else nowhere.
+ */
+function runTracevault(
+	args: string[],
+	stdinJson: unknown,
+	cwd: string,
+	log: (msg: string) => void,
+	onStdout?: (chunk: string) => void,
+): Promise<void> {
 	return new Promise((resolve) => {
 		let done = false
 		const finish = () => {
@@ -301,7 +443,15 @@ function runTracevault(args: string[], stdinJson: unknown, cwd: string, log: (ms
 		}
 		const what = `tracevault ${args.join(' ')}`
 		try {
-			const child = spawn('tracevault', args, { cwd, stdio: ['pipe', 'ignore', 'pipe'] })
+			const child = spawn('tracevault', args, { cwd, stdio: ['pipe', onStdout ? 'pipe' : 'ignore', 'pipe'] })
+			child.stdout?.setEncoding('utf8')
+			child.stdout?.on('data', (chunk) => {
+				try {
+					onStdout?.(String(chunk))
+				} catch (e) {
+					log(`${what}: ${String(e)}`)
+				}
+			})
 			// `tracevault stream` reports its errors on stderr and still exits 0,
 			// so keep the start of stderr for the log.
 			let stderr = ''

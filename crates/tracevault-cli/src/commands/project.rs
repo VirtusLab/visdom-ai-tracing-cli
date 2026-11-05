@@ -26,7 +26,7 @@ pub enum ProjectCmd {
         /// isn't tied to any one checkout).
         #[arg(long)]
         user: bool,
-        /// Session to target; defaults to $TRACEVAULT_SESSION_ID.
+        /// Session to target; defaults to $TRACEVAULT_SESSION_ID (in Amp: $AMP_CURRENT_THREAD_ID).
         #[arg(long)]
         session_id: Option<String>,
         /// Who owns attribution. `explicit` stamps the named project
@@ -43,7 +43,7 @@ pub enum ProjectCmd {
     },
     /// Show the project the current session is attributed to.
     Status {
-        /// Session to target; defaults to $TRACEVAULT_SESSION_ID.
+        /// Session to target; defaults to $TRACEVAULT_SESSION_ID (in Amp: $AMP_CURRENT_THREAD_ID).
         #[arg(long)]
         session_id: Option<String>,
         /// What-if, display only: resolve this project name and feed it in at
@@ -1739,6 +1739,7 @@ mod tests {
         // that test and any other test in the crate touching the same vars.
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.remove("TRACEVAULT_SESSION_ID");
+        _guard.remove("AMP_CURRENT_THREAD_ID");
         _guard.set("XDG_CONFIG_HOME", tmp.path());
         _guard.set("TRACEVAULT_SERVER_URL", &base);
         _guard.set("TRACEVAULT_API_KEY", "tok");
@@ -2000,6 +2001,7 @@ mod tests {
         _guard.set("XDG_CONFIG_HOME", tmp.path());
         _guard.set("HOME", tmp.path());
         _guard.remove("TRACEVAULT_SESSION_ID");
+        _guard.remove("AMP_CURRENT_THREAD_ID");
         // `status_effective` takes `TRACEVAULT_PROJECT` at a rung ABOVE the
         // "nothing is bound" state this test asserts, and an env-sourced
         // binding also triggers an extra `list_projects` call this mock does
@@ -2061,6 +2063,7 @@ mod tests {
         _guard.set("HOME", tmp.path());
         _guard.set("XDG_STATE_HOME", tmp.path().join("state"));
         _guard.remove("TRACEVAULT_SESSION_ID");
+        _guard.remove("AMP_CURRENT_THREAD_ID");
         // Both would change which project is effective / which mode is
         // reported, and the env binding would also trigger a `list_projects`
         // call this one-shot mock does not stage.
@@ -2114,6 +2117,7 @@ mod tests {
         _guard.set("TRACEVAULT_PROJECT", uuid);
         _guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
         _guard.remove("TRACEVAULT_SESSION_ID");
+        _guard.remove("AMP_CURRENT_THREAD_ID");
 
         let report = status_report(None, None, tmp.path(), tmp.path()).await;
         assert_eq!(

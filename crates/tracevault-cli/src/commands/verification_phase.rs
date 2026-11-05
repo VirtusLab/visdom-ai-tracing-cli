@@ -18,8 +18,9 @@ use crate::config::TracevaultConfig;
 ///   sibling linked worktree `cwd` differs from `project_root`, so both are
 ///   needed.
 /// `explicit_session_id` — when Some, targets that session directly.
-/// `env_session_id` — `$TRACEVAULT_SESSION_ID`, the session that invoked this
-///   command (exported by the SessionStart hook). Used when no flag is given
+/// `env_session_id` — `$TRACEVAULT_SESSION_ID` (in Amp: `$AMP_CURRENT_THREAD_ID`),
+///   the session that invoked this command (exported by the SessionStart hook,
+///   or set by Amp). Used when no flag is given
 ///   and that session has recorded events in this worktree, so an agent never
 ///   needs `--session-id` just because other sessions share the worktree.
 ///   Otherwise the session is auto-detected by `origin` marker, falling back
@@ -96,7 +97,7 @@ pub async fn open_verification_phase(
                 return Err(format!(
                     "Multiple sessions belong to this worktree ({worktree_top}): {}. \
                      Pass --session-id to select one, or run verify-start from the agent \
-                     session itself (it reads $TRACEVAULT_SESSION_ID).",
+                     session itself (it reads $TRACEVAULT_SESSION_ID, or $AMP_CURRENT_THREAD_ID in Amp).",
                     ids.join(", ")
                 ));
             }
@@ -211,8 +212,8 @@ pub async fn open_verification_phase(
     Ok(())
 }
 
-/// The invoking session (`$TRACEVAULT_SESSION_ID`), if it has a session
-/// directory here whose `origin` marker does not name another worktree. `None`
+/// The invoking session (`$TRACEVAULT_SESSION_ID`, in Amp `$AMP_CURRENT_THREAD_ID`),
+/// if it has a session directory here whose `origin` marker does not name another worktree. `None`
 /// sends the caller to the usual auto-detection — e.g. when the session has
 /// not streamed an event in this repo yet, or last streamed from a sibling
 /// worktree, where the explicit-flag path would refuse it.

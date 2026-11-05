@@ -1456,7 +1456,8 @@ fn normalize_remote(url: &str) -> String {
 // --- Entry point ---
 
 /// Resolve the session id for `status`: an explicit `--session-id` wins, else
-/// `$TRACEVAULT_SESSION_ID`; empty strings are ignored (fall through).
+/// the environment's ([`crate::session_state::env_session_id`]); empty strings
+/// are ignored (fall through).
 pub fn effective_session_id(arg: Option<String>, env: Option<String>) -> Option<String> {
     arg.filter(|s| !s.is_empty())
         .or_else(|| env.filter(|s| !s.is_empty()))

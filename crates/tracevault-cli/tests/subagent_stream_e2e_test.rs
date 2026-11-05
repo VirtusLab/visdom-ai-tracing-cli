@@ -207,6 +207,7 @@ impl Fixture {
             .env("TRACEVAULT_SERVER_URL", base)
             .env("TRACEVAULT_API_KEY", "tvk_test")
             .env_remove("TRACEVAULT_SESSION_ID")
+            .env_remove("AMP_CURRENT_THREAD_ID")
             .env_remove("TRACEVAULT_PROJECT")
             .env_remove("TRACEVAULT_PROJECT_ATTRIBUTION");
         cmd
