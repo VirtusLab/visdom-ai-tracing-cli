@@ -1105,11 +1105,22 @@ pub fn resolve_transcript_source(
 /// Derive the event-level tool-error flag from inline transcript records.
 /// OpenCode tool events carry no `tool_use_id`, so `extract_is_error_from_transcript`
 /// can't run; instead the plugin forwards a `toolResult` record whose `isError`
-/// signals the outcome. Returns `Some(true|false)` for the first `toolResult`
-/// record found, or `None` when there is none (non-tool events).
+/// signals the outcome. Amp's records (`type: "amp_message"`) carry Amp's own
+/// `tool_result` block instead, whose `status` is `"error"` only for a tool
+/// that failed: a permission rejection and a non-zero `exitCode` are both
+/// `"done"`, as Amp reports them. Returns `Some(true|false)` for the first
+/// tool result found, or `None` when there is none (non-tool events).
 pub fn inline_tool_is_error(lines: &[serde_json::Value]) -> Option<bool> {
     lines.iter().find_map(|line| {
         let msg = line.get("message")?;
+        if line.get("type").and_then(|v| v.as_str()) == Some("amp_message") {
+            return msg
+                .get("content")?
+                .as_array()?
+                .iter()
+                .find(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_result"))
+                .map(|b| b.get("status").and_then(|v| v.as_str()) == Some("error"));
+        }
         if msg.get("role").and_then(|v| v.as_str()) == Some("toolResult") {
             Some(
                 msg.get("isError")

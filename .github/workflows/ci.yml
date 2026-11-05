@@ -21,6 +21,12 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # tests/amp_stream_test.rs runs the bundled Amp plugin (TypeScript) on
+      # Node's type stripping, which needs Node >= 22.18.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Format check

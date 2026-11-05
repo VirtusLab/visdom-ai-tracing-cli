@@ -57,8 +57,10 @@ enum Cli {
         /// this machine, instead of initializing the current repo: Claude Code
         /// hooks into ~/.claude/ (settings.json + CLAUDE.md), Codex hooks into
         /// ~/.codex/ (hooks.json + AGENTS.md), the GSD extension via
-        /// `gsd install` (global), or the OpenCode plugin into the user config
-        /// dir's opencode/plugins/. Does not require git. Also writes a
+        /// `gsd install` (global), the OpenCode plugin into the user config
+        /// dir's opencode/plugins/, or the Amp plugin into
+        /// $XDG_CONFIG_HOME/amp/plugins/ (~/.config/amp/plugins/ when unset).
+        /// Does not require git. Also writes a
         /// user-level context config (honoring --no-user-context /
         /// --user-context). Conflicts with the per-repo-only flags
         /// --server-url, --claude-settings and --no-gitignore.
@@ -71,7 +73,8 @@ enum Cli {
         /// hooks (.claude/settings.json or settings.local.json); `codex` writes
         /// .codex/hooks.json; `gsd` (alias `gsd2`) registers the GSD extension
         /// with `gsd install -l`; `opencode` writes
-        /// .opencode/plugins/tracevault.ts. With --global, the user-level
+        /// .opencode/plugins/tracevault.ts; `amp` writes
+        /// .amp/plugins/tracevault/index.ts. With --global, the user-level
         /// equivalents instead.
         #[arg(long, value_enum, default_value = "claude-code")]
         agent: crate::agent::Agent,
@@ -661,6 +664,30 @@ async fn main() {
                         finish_global_user_context(no_user_context, user_context);
                         return;
                     }
+                    crate::agent::Agent::Amp => {
+                        // Amp loads system plugins from its user config dir
+                        // for every session, so a global install writes
+                        // there directly.
+                        match commands::init::install_amp_plugin(None) {
+                            Ok(path) => {
+                                println!(
+                                    "Installed the TraceVault Amp plugin in {}",
+                                    path.display()
+                                );
+                                println!(
+                                    "This applies to ALL Amp sessions on this machine, not just this repo."
+                                );
+                                println!("{}", commands::init::amp_headless_notice());
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+
+                        finish_global_user_context(no_user_context, user_context);
+                        return;
+                    }
                 }
             }
 
@@ -1046,6 +1073,9 @@ mod tests {
             ".opencode/plugins/tracevault.ts",
             "~/.codex/",
             "OpenCode plugin",
+            ".amp/plugins/tracevault/index.ts",
+            "$XDG_CONFIG_HOME/amp/plugins/",
+            "~/.config/amp/plugins/",
             "--server-url, --claude-settings and --no-gitignore",
         ] {
             assert!(

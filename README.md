@@ -275,6 +275,7 @@ install hooks for (default `claude-code`):
 | `tracevault init --agent codex` | `.codex/hooks.json` hooks | OpenAI Codex CLI |
 | `tracevault init --agent gsd` (alias `gsd2`) | the TraceVault extension, written to `gsd-extension/` in the TraceVault config directory and registered for this repo with `gsd install -l` | GSD (pi) |
 | `tracevault init --agent opencode` | `.opencode/plugins/tracevault.ts` plugin | OpenCode |
+| `tracevault init --agent amp` | `.amp/plugins/tracevault/index.ts` plugin | Amp ([ampcode.com](https://ampcode.com)); see **Amp** below |
 
 All of them wire the same capture pipeline: the agent's hooks invoke `tracevault`, which
 streams the session (transcript, tokens, cost, file changes) to the server tagged with the
@@ -294,6 +295,35 @@ for themselves. Pass `--no-gitignore` if you want to commit the hook file.
 
 `--server-url <URL>` stores a server URL in `.tracevault/config.toml`; it is only needed when
 the URL does not come from `tracevault login` or `TRACEVAULT_SERVER_URL`.
+
+**Amp**
+
+Amp has no shell hooks, only plugins, so `init --agent amp` installs a plugin
+(`.amp/plugins/tracevault/index.ts`; with `--global`, `$XDG_CONFIG_HOME/amp/plugins/` or
+`~/.config/amp/plugins/`). It runs `tracevault stream --agent amp` for each prompt and each tool
+result as they happen, and at the end of each turn for what Amp reports only then: the
+assistant's messages and token usage, and tools that fire no tool events (`Task`,
+`create_thread`, `wait_for_threads`, `read_thread`). Each tool call is sent once. Only
+`.amp/plugins/tracevault/` is added to `.gitignore`: the rest of `.amp/` is Amp's own project
+configuration. If `tracevault` is missing or fails, the plugin logs it and Amp carries on.
+
+- **Headless runs need `--plugin-ready-timeout`.** Without it `amp -x` may start the turn before
+  plugins are ready and skip their `agent.start` / `agent.end` hooks, so the prompt, the
+  assistant's messages and the token usage are not captured:
+  `amp -x "<prompt>" --plugin-ready-timeout 30` (the prompt is the value of `-x`, so it comes
+  right after it).
+- **`amp -x` waits forever on an approval dialog**, for example when a tool writes under a
+  guarded path. Allow what an unattended run needs beforehand.
+- **Policies name Amp's own tools.** A `tracevault check` policy matches tool names exactly, and
+  Amp's (in its default `medium` mode) are `create_file`, `edit_file`, `shell_command`, `Task` and
+  `create_thread` (also `wait_for_threads`, `read_thread`), not Claude Code's `Write`, `Edit` or
+  `Bash`. Amp has no read tool: the model reads files with `shell_command`. A tool counts as
+  failed only when Amp reports `status: "error"`: a command with a non-zero exit code, and a
+  command rejected by a permission rule, both succeed as far as Amp is concerned.
+- **A session never ends explicitly.** Amp has no session-end event, and a terminal that is
+  killed mid-turn sends no end of turn either; what was sent before stays.
+- Agent policies are not injected into Amp sessions yet, and a `Task` subagent's tool calls are
+  recorded under the parent session without a link to the `Task` call.
 
 **Codex hook trust — required once, or nothing is captured**
 
@@ -319,10 +349,12 @@ tracevault init --global                    # ~/.claude/settings.json + ~/.claud
 tracevault init --global --agent codex      # ~/.codex/hooks.json  + ~/.codex/AGENTS.md
 tracevault init --global --agent gsd        # GSD extension for all GSD sessions
 tracevault init --global --agent opencode   # <config dir>/opencode/plugins/tracevault.ts
+tracevault init --global --agent amp        # $XDG_CONFIG_HOME/amp/plugins/tracevault/index.ts
 ```
 
 `<config dir>` is the platform config directory: `~/.config` on Linux (`$XDG_CONFIG_HOME` if
-set), `~/Library/Application Support` on macOS. It does not need a git repository. It also writes the user-level `config.toml` in the
+set), `~/Library/Application Support` on macOS. Amp reads `$XDG_CONFIG_HOME/amp/`, or
+`~/.config/amp/` when that is unset, on every platform, and the Amp plugin goes there. It does not need a git repository. It also writes the user-level `config.toml` in the
 TraceVault config directory, which enables the user context layer (see below) for repos that
 do not configure it themselves; `--no-user-context` and `--user-context <path>` apply to it.
 `--global` cannot be combined with `--server-url`, `--claude-settings` or `--no-gitignore`.
@@ -587,7 +619,7 @@ every session on the machine instead.
 
 | Flag | Meaning |
 |---|---|
-| `--agent <claude-code\|codex\|gsd\|opencode>` | Which agent to install hooks for (default `claude-code`; `gsd2` is an alias of `gsd`) |
+| `--agent <claude-code\|codex\|gsd\|opencode\|amp>` | Which agent to install hooks for (default `claude-code`; `gsd2` is an alias of `gsd`) |
 | `--claude-settings <shared\|local>` | Claude Code only: `.claude/settings.json` or `.claude/settings.local.json`. Omitted: asks in a terminal, otherwise `shared` |
 | `--no-gitignore` | Do not add `.tracevault/` and the hook file to the root `.gitignore` |
 | `--server-url <URL>` | Register the repo with this server during this `init` (instead of the URL from the environment or your login), and store it in `.tracevault/config.toml`, where later commands treat it as the lowest-precedence source (see [credentials](#tracevault-login--sign-in-humans)) |
@@ -742,6 +774,10 @@ older one cannot tell subagent lines from the main transcript's.
 **Codex** (`.codex/hooks.json`; with `--global`, `~/.codex/hooks.json`): `SessionStart` and
 `UserPromptSubmit` as above, plus `PostToolUse` and `Stop` streamed with `--agent codex`. There
 is deliberately no `PreToolUse` hook for Codex.
+
+**Amp** (`.amp/plugins/tracevault/index.ts`; with `--global`,
+`$XDG_CONFIG_HOME/amp/plugins/tracevault/index.ts` or `~/.config/amp/plugins/tracevault/index.ts`):
+a plugin, rewritten in full by every `init`. See **Amp** under [`tracevault init`](#tracevault-init--set-up-tracing-in-a-repo).
 
 **Claude Code telemetry** (unless `--no-claude-telemetry`, a no at the prompt, or an earlier
 opt-out; always `~/.claude/settings.json`): the `env` entries and `otelHeadersHelper` shown

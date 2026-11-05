@@ -854,6 +854,30 @@ mod tests {
         assert_eq!(data.total_tool_calls, Some(2));
     }
 
+    /// Amp's plugin sends Amp's own messages in an `amp_message` envelope;
+    /// policies name Amp's tools exactly (`shell_command`, `Task`, ...).
+    #[test]
+    fn counts_tool_calls_from_amp_inline_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool_event = [
+            serde_json::json!({"type":"amp_message","event":"tool.result","message":{"role":"assistant","content":[{"type":"tool_use","id":"TU-1","name":"shell_command","input":{"command":"ls"}}]}}),
+            serde_json::json!({"type":"amp_message","event":"tool.result","message":{"role":"user","content":[{"type":"tool_result","toolUseID":"TU-1","status":"done","output":{"output":"","exitCode":1}}]}}),
+        ];
+        let turn_end = [
+            serde_json::json!({"type":"amp_message","event":"agent.end","message":{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"tool_use","id":"TU-2","name":"Task","input":{}}],"usage":{"inputTokens":1}}}),
+        ];
+
+        crate::commands::stream::record_transcript_path(tmp.path(), "").unwrap();
+        crate::commands::stream::record_inline_tool_calls(tmp.path(), &tool_event).unwrap();
+        crate::commands::stream::record_inline_tool_calls(tmp.path(), &turn_end).unwrap();
+        let data = collect_session_data(tmp.path()).unwrap();
+        assert_eq!(
+            data.tool_calls,
+            Some(serde_json::json!({"shell_command": 1, "Task": 1}))
+        );
+        assert_eq!(data.total_tool_calls, Some(2));
+    }
+
     #[test]
     fn connectivity_message_suggests_login_on_401() {
         let m = connectivity_message("Stream failed (401 Unauthorized): bad token");
