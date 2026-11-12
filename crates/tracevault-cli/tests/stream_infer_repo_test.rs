@@ -292,6 +292,22 @@ fn an_umbrella_session_attributes_child_checkout_events_to_the_child_repo() {
     assert!(reqs[3].starts_with(&to_repo), "{reqs:?}");
     let state = fx.state_file();
     assert!(!state.contains("[active]"), "never bound: {state}");
+    // `check` / `verify-start` in the child find the session by this record.
+    let worktrees = std::fs::read_to_string(
+        fx.umbrella
+            .join(".tracevault")
+            .join("sessions")
+            .join(SESSION_ID)
+            .join("worktrees"),
+    )
+    .unwrap_or_default();
+    let child_top = std::fs::canonicalize(&fx.child).unwrap();
+    assert!(
+        worktrees
+            .lines()
+            .any(|l| Path::new(l) == child_top.as_path()),
+        "worktrees: {worktrees:?}"
+    );
 
     // Event 2: the child again — from the cache, no lookup.
     fx.append_transcript(2);

@@ -172,10 +172,30 @@ pub(crate) async fn infer_in(
         retry_after,
         repo: repo.clone(),
     };
+    let mut found = None;
     let _ = crate::session_state::update_in(sessions_dir, session_id, |state| {
-        state.inferred_repos.insert(checkout.to_string(), entry);
+        found = commit(state, checkout, entry);
     });
-    repo
+    found.or(repo)
+}
+
+/// Record `entry` for `checkout`, unless a parallel hook already resolved
+/// the same checkout to a repo of the same project: a found repo is never
+/// replaced by a later miss or failed lookup. Returns that kept repo, which
+/// the event then goes by. Pure.
+fn commit(state: &mut SessionState, checkout: &str, entry: InferredRepo) -> Option<RepoBinding> {
+    let kept = state
+        .inferred_repos
+        .get(checkout)
+        .filter(|e| e.project_id == entry.project_id)
+        .and_then(|e| e.repo.clone());
+    match (kept, &entry.repo) {
+        (Some(kept), None) => Some(kept),
+        _ => {
+            state.inferred_repos.insert(checkout.to_string(), entry);
+            None
+        }
+    }
 }
 
 /// [`infer_in`] for the session state in its usual place.
@@ -500,6 +520,42 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// A lookup that fails after a parallel hook resolved the same checkout
+    /// keeps — and uses — the resolved repo.
+    #[test]
+    fn a_miss_or_failure_never_replaces_a_resolved_repo() {
+        let resolved = RepoBinding {
+            repo_id: REPO.into(),
+            git_url: None,
+            remote_id: None,
+            codebase_name: None,
+            updated_at: "t".into(),
+        };
+        let entry = |project: &str, repo: Option<RepoBinding>| InferredRepo {
+            project_id: project.into(),
+            retry_after: repo.is_none().then(|| "2999-01-01T00:00:00Z".into()),
+            repo,
+        };
+        let mut state = SessionState::default();
+        assert_eq!(
+            commit(&mut state, "/c", entry(PROJECT, Some(resolved.clone()))),
+            None
+        );
+        // A parallel hook's failed lookup lands later: the repo stays, and
+        // that hook's event goes by it.
+        assert_eq!(
+            commit(&mut state, "/c", entry(PROJECT, None)),
+            Some(resolved.clone())
+        );
+        assert_eq!(state.inferred_repos["/c"].repo, Some(resolved.clone()));
+        // A miss for ANOTHER project replaces it: the entry is per project.
+        assert_eq!(commit(&mut state, "/c", entry(OTHER_PROJECT, None)), None);
+        assert_eq!(state.inferred_repos["/c"].project_id, OTHER_PROJECT);
+        // A miss over a miss just refreshes it.
+        assert_eq!(commit(&mut state, "/d", entry(PROJECT, None)), None);
+        assert_eq!(commit(&mut state, "/d", entry(PROJECT, None)), None);
     }
 
     /// Parallel hooks recording different checkouts keep each other's entry.
