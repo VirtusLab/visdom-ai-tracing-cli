@@ -1406,6 +1406,11 @@ pub async fn run_stream(
     // against on the read side.
     let worktree_top = crate::paths::worktree_toplevel(hook_cwd);
     let _ = fs::write(session_dir.join("origin"), &worktree_top);
+    // An anchored session also lists every worktree it ran in, so `check` and
+    // `verify-start` there find it after it moved on (VIS-1257).
+    if storage_root.is_some() {
+        let _ = crate::session_state::record_worktree(&session_dir, &worktree_top);
+    }
 
     // Record where the transcript lives: `tracevault check` counts the
     // session's tool calls from it, and finds it only through metadata.json.

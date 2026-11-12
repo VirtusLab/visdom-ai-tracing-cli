@@ -125,12 +125,91 @@ pub struct SessionState {
     pub storage_root: Option<String>,
 }
 
-/// The session's recorded [`SessionState::storage_root`], if it still holds
-/// a `.tracevault/` directory (one removed since falls back to resolving from
-/// `cwd`, rather than recreating it).
+/// The session's recorded [`SessionState::storage_root`], if that directory
+/// still exists. Its `.tracevault/` may not exist yet: a git root is recorded
+/// whether or not it has one, and the stream hook creates it on first use,
+/// exactly as it would for an event whose `cwd` resolved there.
 pub fn storage_root(state: &SessionState) -> Option<PathBuf> {
     let root = PathBuf::from(state.storage_root.as_deref()?);
-    root.join(".tracevault").is_dir().then_some(root)
+    root.is_dir().then_some(root)
+}
+
+/// Inside an anchored session dir: every worktree toplevel the session ran
+/// an event in, one per line. The `origin` marker names only the latest, and
+/// `check` / `verify-start` in a checkout must still find a session that
+/// worked there and then moved on — as they did when the session kept a
+/// second dir in that checkout.
+pub const WORKTREES_FILE: &str = "worktrees";
+
+/// Add `worktree_top` to `session_dir`'s [`WORKTREES_FILE`] unless listed.
+pub fn record_worktree(session_dir: &std::path::Path, worktree_top: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = session_dir.join(WORKTREES_FILE);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if existing.lines().any(|l| l == worktree_top) {
+            return Ok(());
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(f, "{worktree_top}")
+}
+
+/// Whether the session in `session_dir` ran an event in `worktree_top`: its
+/// `origin` marker names it, or its [`WORKTREES_FILE`] lists it.
+pub fn ran_in(session_dir: &std::path::Path, worktree_top: &str) -> bool {
+    let names = |file: &str, all_lines: bool| {
+        std::fs::read_to_string(session_dir.join(file))
+            .map(|s| {
+                if all_lines {
+                    s.lines().any(|l| l == worktree_top)
+                } else {
+                    s.trim() == worktree_top
+                }
+            })
+            .unwrap_or(false)
+    };
+    names("origin", false) || names(WORKTREES_FILE, true)
+}
+
+/// The dirs of sessions anchored OUTSIDE `local_sessions_dir` (see
+/// [`SessionState::storage_root`]) that ran an event in `worktree_top`, read
+/// from the per-session state files in `state_dir`. A session started in an
+/// umbrella dir keeps its dir there, so the checkout it worked in has to look
+/// it up this way. Sorted; unreadable entries are skipped.
+pub fn anchored_session_dirs_in(
+    state_dir: &std::path::Path,
+    local_sessions_dir: &std::path::Path,
+    worktree_top: &str,
+) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(state_dir) else {
+        return vec![];
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name();
+            let id = name.to_str()?.strip_suffix(".toml")?.to_string();
+            let root = storage_root(&load_in(state_dir, &id))?;
+            let dir = root.join(".tracevault").join("sessions").join(&id);
+            (dir.parent() != Some(local_sessions_dir) && dir.is_dir() && ran_in(&dir, worktree_top))
+                .then_some(dir)
+        })
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// [`anchored_session_dirs_in`] the user's state dir.
+pub fn anchored_session_dirs(
+    local_sessions_dir: &std::path::Path,
+    worktree_top: &str,
+) -> Vec<PathBuf> {
+    sessions_dir()
+        .map(|d| anchored_session_dirs_in(&d, local_sessions_dir, worktree_top))
+        .unwrap_or_default()
 }
 
 /// `<root>/.tracevault/sessions/<session_id>` for `session_id`, where `root`
@@ -422,17 +501,67 @@ mod tests {
     }
 
     #[test]
-    fn storage_root_needs_its_tracevault_dir() {
+    fn storage_root_needs_the_dir_but_not_its_tracevault() {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = SessionState {
             storage_root: Some(tmp.path().to_string_lossy().into_owned()),
             ..Default::default()
         };
-        assert_eq!(storage_root(&s), None, "no .tracevault/ there");
-        std::fs::create_dir(tmp.path().join(".tracevault")).unwrap();
         assert_eq!(storage_root(&s), Some(tmp.path().to_path_buf()));
+        s.storage_root = Some(tmp.path().join("gone").to_string_lossy().into_owned());
+        assert_eq!(storage_root(&s), None);
         s.storage_root = None;
         assert_eq!(storage_root(&s), None);
+    }
+
+    #[test]
+    fn record_worktree_lists_each_worktree_once_and_ran_in_reads_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        assert!(!ran_in(d, "/wt/a"));
+        record_worktree(d, "/wt/a").unwrap();
+        record_worktree(d, "/wt/b").unwrap();
+        record_worktree(d, "/wt/a").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.join(WORKTREES_FILE)).unwrap(),
+            "/wt/a\n/wt/b\n"
+        );
+        assert!(ran_in(d, "/wt/a") && ran_in(d, "/wt/b"));
+        assert!(!ran_in(d, "/wt"), "whole lines only");
+        std::fs::write(d.join("origin"), "/wt/c").unwrap();
+        assert!(ran_in(d, "/wt/c"));
+    }
+
+    #[test]
+    fn anchored_session_dirs_finds_sessions_kept_elsewhere_that_ran_here() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let umbrella = tmp.path().join("umbrella");
+        let repo = tmp.path().join("umbrella/repo");
+        let local = repo.join(".tracevault/sessions");
+        let anchor = |id: &str, root: &std::path::Path, ran: Option<&str>| {
+            let st = SessionState {
+                storage_root: Some(root.to_string_lossy().into_owned()),
+                ..Default::default()
+            };
+            save_in(&state, id, &st).unwrap();
+            let dir = root.join(".tracevault/sessions").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(wt) = ran {
+                record_worktree(&dir, wt).unwrap();
+            }
+            dir
+        };
+        let worked_here = anchor("here", &umbrella, Some("/repo"));
+        anchor("elsewhere", &umbrella, Some("/other"));
+        anchor("local", &repo, Some("/repo"));
+        save_in(&state, "unanchored", &SessionState::default()).unwrap();
+
+        assert_eq!(
+            anchored_session_dirs_in(&state, &local, "/repo"),
+            vec![worked_here]
+        );
+        assert!(anchored_session_dirs_in(&tmp.path().join("none"), &local, "/repo").is_empty());
     }
 
     #[test]

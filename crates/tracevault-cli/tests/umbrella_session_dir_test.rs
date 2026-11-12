@@ -350,3 +350,80 @@ fn a_session_started_outside_any_tracevault_dir_is_not_anchored() {
     assert!(fx.session_dir(&fx.child).join(".stream_offset").is_file());
     assert!(!outside.join(".tracevault").exists());
 }
+
+fn git_init(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["config", "user.name", "Test"],
+        vec!["commit", "-q", "--allow-empty", "-m", "init"],
+    ] {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(&args)
+            .status()
+            .expect("git failed to run")
+            .success();
+        assert!(ok, "git {args:?} must succeed");
+    }
+}
+
+/// A session started in a git repo with no `.tracevault/` yet keeps its dir
+/// there too: the first event, from another repo, creates it at the start.
+#[test]
+fn a_session_started_in_a_repo_without_tracevault_is_anchored_there() {
+    let fx = Fixture::new();
+    let (base, rx) = spawn_server();
+    let plain = fx.umbrella.join("plain");
+    git_init(&plain);
+    fx.session_start(&base, &plain, "startup");
+
+    fx.assistant(1);
+    fx.tool_use(&base, &fx.child);
+    fx.assistant(2);
+    fx.tool_use(&base, &plain);
+
+    assert_eq!(sent_lines(&rx), vec![1, 2]);
+    assert!(fx.session_dir(&plain).join(".stream_offset").is_file());
+    assert!(!fx.session_dir(&fx.child).exists());
+}
+
+/// `verify-start` run in the child repo, from a terminal outside the agent
+/// (no `$TRACEVAULT_SESSION_ID`), finds the session kept in the umbrella dir
+/// that worked there — even after it moved back to the umbrella — and opens
+/// the window under the repo its events went to.
+#[test]
+fn verify_start_in_the_child_repo_finds_the_umbrella_session() {
+    let fx = Fixture::new();
+    let (base, rx) = spawn_server();
+    fx.session_start(&base, &fx.umbrella, "startup");
+    walk(&fx, &base);
+    let _ = rx.try_iter().count();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tracevault"))
+        .current_dir(&fx.child)
+        .env("HOME", &fx.home)
+        .env("XDG_CONFIG_HOME", fx.home.join(".config"))
+        .env("XDG_STATE_HOME", &fx.state)
+        .env("TRACEVAULT_SERVER_URL", &base)
+        .env("TRACEVAULT_API_KEY", "tvk_test")
+        .env_remove("TRACEVAULT_SESSION_ID")
+        .env_remove("AMP_CURRENT_THREAD_ID")
+        .env_remove("TRACEVAULT_PROJECT")
+        .env_remove("TRACEVAULT_PROJECT_ATTRIBUTION")
+        .arg("verify-start")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let sent: Vec<StreamEventRequest> = rx.try_iter().collect();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        sent[0].event_type,
+        tracevault_protocol::streaming::StreamEventType::VerificationPhaseStart
+    );
+    assert_eq!(sent[0].session_id, SESSION_ID);
+}
