@@ -176,7 +176,7 @@ pub async fn init_in_directory(
     let (resolved_url, resolved_credential) =
         crate::credentials::resolve_credentials_quiet(project_root)
             .map_err(|e| io::Error::other(e.to_string()))?;
-    let effective_url = server_url.map(String::from).or(resolved_url);
+    let effective_url = server_url.map(String::from).or(resolved_url.clone());
     if resolved_credential.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -190,8 +190,20 @@ pub async fn init_in_directory(
     // `config.save` below.
     let mut existing_config = existing_config;
     if let (Some(cfg), Some(url)) = (existing_config.as_mut(), effective_url.as_deref()) {
-        let client = ApiClient::with_credential(url, resolved_credential.clone());
-        migrate_config_in_init(cfg, &client).await?;
+        if cfg.default_project.is_some() {
+            // The credential was resolved for `resolved_url`; the lookup must
+            // not hand it to a different `--server-url`.
+            match credential_url_mismatch(resolved_url.as_deref(), server_url) {
+                Some(msg) => eprintln!(
+                    "Warning: not migrating default_project: {msg}. Run `tracevault sync` \
+                     once logged in to that server."
+                ),
+                None => {
+                    let client = ApiClient::with_credential(url, resolved_credential.clone());
+                    migrate_config_in_init(cfg, &client).await?;
+                }
+            }
+        }
     }
 
     // Resolve the hook-file gitignore entry per agent. Claude has a
@@ -397,6 +409,53 @@ async fn migrate_config_in_init(
     }
 }
 
+/// `init --global`'s step of the `default_project` migration (VIS-1256: it
+/// runs in `init` in any mode). A global install has no project config of its
+/// own, so it migrates the config the hooks would read from the current
+/// directory (`resolve_project_root`), if that config still carries a legacy
+/// `default_project`. Runs before anything is installed: an unknown or
+/// ambiguous name is an error; no login or an unreachable server is a warning
+/// (the legacy key stays for a later `sync`).
+pub async fn migrate_cwd_config(cwd: &Path) -> Result<(), io::Error> {
+    let root = crate::paths::resolve_project_root(cwd).root;
+    let Ok(Some(mut config)) = TracevaultConfig::try_load(&root) else {
+        return Ok(());
+    };
+    if config.default_project.is_none() {
+        return Ok(());
+    }
+    let Ok((Some(url), credential @ Some(_))) =
+        crate::credentials::resolve_credentials_quiet(&root)
+    else {
+        eprintln!(
+            "Warning: {} has a legacy default_project that needs a login to migrate; run \
+             `tracevault sync` there once logged in.",
+            TracevaultConfig::config_path(&root).display()
+        );
+        return Ok(());
+    };
+    let client = ApiClient::with_credential(&url, credential);
+    migrate_config_in_init(&mut config, &client).await?;
+    if config.default_project.is_none() {
+        config.save(&root)?;
+    }
+    Ok(())
+}
+
+/// `Some(reason)` when an explicit `--server-url` names a different
+/// TraceVault instance than the one the credential was resolved for: a
+/// lookup there would hand that instance's token or key to another host.
+/// `None` when there is no explicit URL, no resolved one, or both agree.
+fn credential_url_mismatch(resolved: Option<&str>, explicit: Option<&str>) -> Option<String> {
+    let (resolved, explicit) = (resolved?, explicit?);
+    (!crate::credentials::same_server(resolved, explicit)).then(|| {
+        format!(
+            "the credential in use is for {resolved}, not --server-url {explicit}; log in \
+             there first (`tracevault login --server-url {explicit}`) or omit --server-url"
+        )
+    })
+}
+
 /// What `init --workspace` bound.
 #[derive(Debug)]
 pub struct WorkspaceInit {
@@ -459,6 +518,11 @@ pub async fn init_workspace(
 
     let (resolved_url, credential) = crate::credentials::resolve_credentials_quiet(dir)
         .map_err(|e| io::Error::other(e.to_string()))?;
+    // The credential was resolved for `resolved_url`: never hand it to a
+    // different `--server-url`.
+    if let Some(msg) = credential_url_mismatch(resolved_url.as_deref(), server_url) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+    }
     let url = server_url.map(String::from).or(resolved_url);
     let (Some(url), Some(_)) = (url.as_deref(), credential.as_ref()) else {
         return Err(io::Error::new(
@@ -1357,9 +1421,33 @@ with `tracevault init --workspace`, sessions are recorded to that project withou
 `repo switch` there is optional: it only adds the repo and its policies.
 ";
 
+/// `content` with the managed block that starts at byte `start` (its
+/// [`GLOBAL_CLAUDE_MD_MARKER`]) replaced by the current
+/// [`GLOBAL_CLAUDE_MD_BLOCK`]. Every version of the block is one run of
+/// non-blank lines, so it ends at the first blank line after the marker (or
+/// at the end of the file); nothing outside that span changes.
+fn replace_managed_block(content: &str, start: usize) -> String {
+    let rest = &content[start..];
+    let mut end = rest.len();
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            end = offset;
+            break;
+        }
+        offset += line.len();
+    }
+    let mut out = String::with_capacity(content.len() + GLOBAL_CLAUDE_MD_BLOCK.len());
+    out.push_str(&content[..start]);
+    out.push_str(GLOBAL_CLAUDE_MD_BLOCK);
+    out.push_str(&rest[end..]);
+    out
+}
+
 /// Append the workspace-mode instruction block to `md_path` (creating it if
 /// absent), idempotently — guarded by [`GLOBAL_CLAUDE_MD_MARKER`], so a re-run
-/// never duplicates it and any existing user content is preserved. Shared by
+/// never duplicates it and any existing user content is preserved. A block an
+/// earlier version installed is replaced with the current text in place. Shared by
 /// the Claude global install (`CLAUDE.md`) and the Codex global install
 /// (`AGENTS.md`).
 fn append_workspace_md(md_path: &Path) -> io::Result<()> {
@@ -1378,7 +1466,13 @@ fn append_workspace_md(md_path: &Path) -> io::Result<()> {
     } else {
         String::new()
     };
-    if existing.contains(GLOBAL_CLAUDE_MD_MARKER) {
+    if let Some(start) = existing.find(GLOBAL_CLAUDE_MD_MARKER) {
+        // An earlier install's block: bring it to the current text in place
+        // (VIS-1256 changed it), leaving everything around it untouched.
+        let replaced = replace_managed_block(&existing, start);
+        if replaced != existing {
+            fs::write(md_path, replaced)?;
+        }
         return Ok(());
     }
     let mut content = existing;
@@ -3148,6 +3242,96 @@ mod tests {
             cfg.user_context,
             Some(crate::config::UserContext::Toggle(false))
         ));
+    }
+
+    /// An older install's workspace-mode block is replaced in place with the
+    /// current text; content before and after it is kept, and a re-run is a
+    /// no-op.
+    #[test]
+    fn append_workspace_md_upgrades_an_older_block_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let md = tmp.path().join("CLAUDE.md");
+        let old = "# Mine\nkeep me\n\n<!-- tracevault:workspace-mode -->\n## TraceVault (workspace mode)\nold line one\nold line two\n\n## After\nalso keep\n";
+        fs::write(&md, old).unwrap();
+
+        append_workspace_md(&md).unwrap();
+        let got = fs::read_to_string(&md).unwrap();
+        assert_eq!(
+            got,
+            format!("# Mine\nkeep me\n\n{GLOBAL_CLAUDE_MD_BLOCK}\n## After\nalso keep\n")
+        );
+        append_workspace_md(&md).unwrap();
+        assert_eq!(fs::read_to_string(&md).unwrap(), got);
+
+        // A block that runs to the end of the file.
+        fs::write(&md, "x\n\n<!-- tracevault:workspace-mode -->\n## T\nold").unwrap();
+        append_workspace_md(&md).unwrap();
+        assert_eq!(
+            fs::read_to_string(&md).unwrap(),
+            format!("x\n\n{GLOBAL_CLAUDE_MD_BLOCK}")
+        );
+    }
+
+    /// `--server-url` naming another instance than the credential's never
+    /// gets that credential: `init --workspace` refuses before any request.
+    #[tokio::test]
+    async fn init_workspace_refuses_a_server_url_the_credential_is_not_for() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, rx) = crate::test_helpers::spawn_seq(vec![http_response("200 OK", "[]")]);
+        fs::create_dir_all(tmp.path().join(".tracevault")).unwrap();
+        fs::write(
+            tmp.path().join(".tracevault/config.toml"),
+            "server_url = \"http://other.example.invalid\"\napi_key = \"tvk_x\"\n",
+        )
+        .unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.remove("TRACEVAULT_API_KEY");
+        _guard.remove("TRACEVAULT_SERVER_URL");
+
+        let err = init_workspace(tmp.path(), "visdom", Some(&base))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not --server-url"), "{err}");
+        assert_eq!(rx.try_iter().count(), 0, "no request may be sent");
+    }
+
+    #[test]
+    fn credential_url_mismatch_only_for_a_different_explicit_server() {
+        assert!(credential_url_mismatch(Some("https://a/"), Some("https://a")).is_none());
+        assert!(credential_url_mismatch(None, Some("https://b")).is_none());
+        assert!(credential_url_mismatch(Some("https://a"), None).is_none());
+        assert!(credential_url_mismatch(Some("https://a"), Some("https://b")).is_some());
+    }
+
+    /// `init --global` migrates the current directory's legacy
+    /// `default_project` (VIS-1256: `init` in any mode).
+    #[tokio::test]
+    async fn migrate_cwd_config_migrates_the_dirs_config() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("umbrella");
+        fs::create_dir_all(dir.join(".tracevault")).unwrap();
+        let (base, _rx) = crate::test_helpers::spawn_seq(vec![http_response(
+            "200 OK",
+            &format!(r#"[{{"id":"{PROJECT}","name":"visdom"}}]"#),
+        )]);
+        fs::write(
+            dir.join(".tracevault/config.toml"),
+            format!("server_url = \"{base}\"\napi_key = \"tvk_x\"\ndefault_project = \"visdom\"\n"),
+        )
+        .unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        _guard.remove("TRACEVAULT_API_KEY");
+        _guard.remove("TRACEVAULT_SERVER_URL");
+
+        migrate_cwd_config(&dir).await.unwrap();
+
+        let cfg = crate::config::TracevaultConfig::load(&dir).unwrap();
+        assert_eq!(cfg.project_id.as_deref(), Some(PROJECT));
+        assert_eq!(cfg.default_project, None);
     }
 
     /// Unknown and ambiguous names fail with nothing written.

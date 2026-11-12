@@ -615,6 +615,14 @@ async fn main() {
                 std::process::exit(1);
             }
             if global {
+                // VIS-1256: `init` migrates a legacy `default_project` in any
+                // mode — here, in the config the current directory's hooks
+                // read — before anything is installed.
+                let cwd = env::current_dir().expect("Cannot determine current directory");
+                if let Err(e) = commands::init::migrate_cwd_config(&cwd).await {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
                 // Explicit match (not `matches!(.., Codex)` + fallthrough) so a
                 // future agent variant can't silently fall through to the Claude
                 // Code branch and report success while installing nothing for it.

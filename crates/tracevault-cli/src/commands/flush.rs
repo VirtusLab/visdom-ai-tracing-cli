@@ -980,6 +980,58 @@ mod send_tests {
         );
     }
 
+    /// VIS-1256: a queue under a workspace directory recovers the workspace
+    /// tier (`.tracevault/config.toml` `project_id` at the session dir's
+    /// root) exactly as the live send did, and drains a repo queue to the
+    /// project-scoped endpoint carrying the repo id. A session dir outside
+    /// the `<root>/.tracevault/sessions/<id>` layout has no config tier.
+    #[tokio::test]
+    async fn queue_binding_recovers_the_workspace_project_from_the_session_dir() {
+        let _env_lock = lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut guard = EnvVarGuard::new();
+        guard.set("XDG_STATE_HOME", tmp.path().join("state"));
+        guard.set("XDG_CONFIG_HOME", tmp.path().join("config"));
+        guard.set("HOME", tmp.path());
+        guard.remove("TRACEVAULT_PROJECT");
+        guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let pid = uuid::Uuid::from_u128(0x1256);
+        let root = tmp.path().join("umbrella");
+        let session_dir = root.join(".tracevault/sessions/flush-workspace");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            root.join(".tracevault/config.toml"),
+            format!("project_id = \"{pid}\"\nproject_name = \"visdom\"\n"),
+        )
+        .unwrap();
+
+        let binding = queue_capture_binding(&session_dir).expect("workspace tier recovered");
+        assert_eq!(binding.project_id, pid.to_string());
+
+        let repo: uuid::Uuid = REPO.parse().unwrap();
+        let target = QueueTarget::Repo(REPO.to_string());
+        let force = queue_attribution_force(&target, Some(&binding));
+        let (base, rx) = spawn_seq(vec![ok()]);
+        let client = ApiClient::new(&base, Some("tok"));
+        let got = send_queued_event(&client, &target, Some(pid), force, &event(1)).await;
+        assert!(matches!(got, QueuedSend::Sent), "{got:?}");
+        let captured = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
+        assert!(
+            captured.starts_with(&format!("POST /api/v1/projects/{pid}/stream")),
+            "got: {captured}"
+        );
+        assert!(
+            captured.contains(&repo.to_string()),
+            "repo id carried: {captured}"
+        );
+
+        // Not under `.tracevault/sessions/`: no config tier.
+        let stray = tmp.path().join("elsewhere/flush-workspace");
+        fs::create_dir_all(&stray).unwrap();
+        assert_eq!(session_dir_config_project(&stray), None);
+    }
+
     /// The flush-path echo of the "does a force leak onto a different
     /// project" bug, now over the WHOLE precedence chain rather than the
     /// user default alone: a live force on the binding that currently

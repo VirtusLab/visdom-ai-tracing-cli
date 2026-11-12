@@ -118,10 +118,11 @@ the machine are not affected. `init --workspace` works outside git, creates `.tr
 there if needed, looks the project name up on the server **once** (an unknown or ambiguous name
 is an error and writes nothing), and writes its id to `.tracevault/config.toml` as `project_id`
 (with `project_name` for display). It binds no repo and installs no hooks: pair it with
-`init --global`. A session's own `project switch` still overrides it, and a checkout below it
-that has its own `tracevault init` is bound by that checkout's config. Running `tracevault repo
-switch <path>` when the agent moves into a checkout is optional here: it adds the repo, but the
-session is recorded to the workspace project either way.
+`init --global`. A session's own `project switch` still overrides it. A session started inside
+a git checkout below it is not covered: it follows that checkout (its own `tracevault init`, or
+the automatic binding to its repo, whose project the server deduces). Running `tracevault repo
+switch <path>` when an agent started in the workspace moves into a checkout is optional: it adds
+the repo, but the session is recorded to the workspace project either way.
 
 ### Check the result
 
