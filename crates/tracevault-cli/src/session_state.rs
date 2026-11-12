@@ -123,6 +123,26 @@ pub struct SessionState {
     /// keep resolving from each event's `cwd`. Read through [`storage_root`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_root: Option<String>,
+    /// What each checkout this session touched resolves to for a project-only
+    /// session's events (VIS-1258), keyed by the checkout's git toplevel, so
+    /// the server is asked once per checkout and not once per event. Read and
+    /// written only through `crate::inferred_repo`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub inferred_repos: std::collections::BTreeMap<String, InferredRepo>,
+}
+
+/// One [`SessionState::inferred_repos`] entry: the repo a checkout resolved to
+/// within `project_id`, or none. A `None` repo is remembered only until
+/// `retry_after` (RFC3339), so a checkout registered or added to the project
+/// later is picked up without asking on every event. A found repo has no
+/// expiry: it is a fact about the server that changes only by a re-register.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InferredRepo {
+    pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<RepoBinding>,
 }
 
 /// The session's recorded [`SessionState::storage_root`], if that directory

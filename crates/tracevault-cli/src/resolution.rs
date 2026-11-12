@@ -330,17 +330,50 @@ pub async fn resolve_path_to_binding(
     let Some(codebase) = resolve_path_to_codebase(path, client).await? else {
         return Ok(None);
     };
+    Ok(pick_binding(&codebase, path))
+}
+
+/// The repo of `codebase` that [`resolve_path_to_binding`] binds the checkout
+/// at `path` to: the only one, else the one the checkout's own config names,
+/// else the lowest id. `None` only when the codebase has no live repo.
+fn pick_binding(codebase: &ResolvedCodebase, path: &Path) -> Option<RepoBinding> {
     let preferred: Vec<uuid::Uuid> = checkout_config_repo_id(path).into_iter().collect();
     let repo_id = match codebase.choose(&preferred) {
         RepoChoice::Only(id) | RepoChoice::Preferred(id, _) => id,
-        RepoChoice::Ambiguous => codebase
-            .repos
-            .iter()
-            .map(|r| r.id)
-            .min()
-            .expect("resolve_path_to_codebase never returns an empty repo list"),
+        RepoChoice::Ambiguous => codebase.repos.iter().map(|r| r.id).min()?,
     };
-    Ok(Some(codebase.binding(repo_id)))
+    Some(codebase.binding(repo_id))
+}
+
+/// [`resolve_path_to_binding`] among the repos of project `project_id` only
+/// (VIS-1258): the checkout's codebase, narrowed to the repos the project
+/// holds, then picked the same way. `Ok(None)` when the checkout has no origin
+/// remote, the server has no codebase for it, or none of that codebase's live
+/// repos belongs to the project — a repo outside the project is never
+/// returned, since a send declaring the project with it is refused.
+pub async fn resolve_path_to_project_binding(
+    path: &Path,
+    project_id: uuid::Uuid,
+    client: &ApiClient,
+) -> Result<Option<RepoBinding>, Box<dyn std::error::Error>> {
+    let Some(git_url) = git_remote_url(path) else {
+        return Ok(None);
+    };
+    let Some(mut codebase) = resolve_url_to_codebase(&git_url, client).await? else {
+        return Ok(None);
+    };
+    if codebase.repos.is_empty() {
+        return Ok(None);
+    }
+    let in_project: std::collections::HashSet<uuid::Uuid> = client
+        .get_project(project_id)
+        .await?
+        .repos
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    codebase.repos.retain(|r| in_project.contains(&r.id));
+    Ok(pick_binding(&codebase, path))
 }
 
 /// Inputs for the effective-binding precedence chain. `repo_flag` and `bound`
@@ -643,6 +676,10 @@ pub async fn resolve_effective_project(
 ///
 /// A binding whose `repo_id` is not a UUID resolves to `None`, as it does for
 /// the hook (`stream::attribution_for` never sends to it).
+///
+/// A project-only session's events in that worktree went to the repo the
+/// hook inferred for it (VIS-1258), read from the session's cache as the hook
+/// reads it.
 pub(crate) fn recorded_session_binding(
     session_dir: &Path,
     here: &str,
@@ -657,14 +694,18 @@ pub(crate) fn recorded_session_binding(
             .ok()
             .map(|s| s.trim().to_string())
     };
-    effective_binding(ResolveInputs {
+    let binding = effective_binding(ResolveInputs {
         repo_flag: None,
         session: state,
         worktree_path: worktree.as_deref(),
         bound,
         user_default,
     })
-    .map(|(b, _)| b)
+    .map(|(b, _)| b);
+    match binding {
+        Some(b) => Some(b),
+        None => crate::inferred_repo::recorded_repo(state, worktree.as_deref()?),
+    }
     .filter(|b| crate::commands::stream::binding_repo_id_is_valid(&b.repo_id))
 }
 
@@ -943,6 +984,50 @@ mod tests {
             std::fs::write(dir.path().join("origin"), o).unwrap();
         }
         dir
+    }
+
+    /// VIS-1258: `check` and `verify-start` in a checkout where a project-only
+    /// session's events were sent with an inferred repo find that repo — in
+    /// the checkout the session ran in (`worktrees`), not just its latest.
+    #[test]
+    fn recorded_session_binding_finds_the_repo_inferred_for_the_worktree() {
+        let dir = session_dir_with_origin(Some("/umbrella"));
+        std::fs::write(
+            dir.path().join(crate::session_state::WORKTREES_FILE),
+            "/umbrella\n/umbrella/child\n",
+        )
+        .unwrap();
+        let pid = uuid::Uuid::from_u128(0x1258);
+        let mut state = SessionState {
+            active_project: Some(ProjectBinding {
+                project_id: pid.to_string(),
+                project_name: "p".into(),
+                updated_at: "t".into(),
+                forced_until: None,
+            }),
+            ..Default::default()
+        };
+        state.inferred_repos.insert(
+            "/umbrella/child".into(),
+            crate::session_state::InferredRepo {
+                project_id: pid.to_string(),
+                retry_after: None,
+                repo: Some(binding(REPO_B)),
+            },
+        );
+
+        let here = recorded_session_binding(dir.path(), "/umbrella/child", &state, None, None);
+        assert_eq!(here.map(|b| b.repo_id).as_deref(), Some(REPO_B));
+        // Elsewhere nothing was inferred, and a bound tier still wins.
+        assert!(recorded_session_binding(dir.path(), "/other", &state, None, None).is_none());
+        let bound = recorded_session_binding(
+            dir.path(),
+            "/umbrella/child",
+            &state,
+            Some(binding(REPO_A)),
+            None,
+        );
+        assert_eq!(bound.map(|b| b.repo_id).as_deref(), Some(REPO_A));
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod config;
 mod context;
 mod credentials;
 mod hooks;
+mod inferred_repo;
 mod install_state;
 mod oidc;
 mod paths;

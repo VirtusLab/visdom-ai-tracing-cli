@@ -170,8 +170,11 @@ pub async fn resolve_and_inject(
     let project_root = crate::paths::resolve_project_root(hook_cwd).root;
     let session = crate::session_state::load(&hook_event.session_id);
     let worktree = crate::paths::worktree_toplevel(hook_cwd);
-    let bound =
-        crate::config::TracevaultConfig::load(&project_root).and_then(|c| binding_from_config(&c));
+    let config = crate::config::TracevaultConfig::load(&project_root);
+    let bound = config.as_ref().and_then(binding_from_config);
+    let config_project = config
+        .as_ref()
+        .and_then(crate::resolution::project_from_config);
     let user_default = crate::user_default::load();
     let mut binding = effective_binding(ResolveInputs {
         repo_flag: None,
@@ -183,21 +186,48 @@ pub async fn resolve_and_inject(
     .map(|(b, _)| b);
 
     // Nothing binds the session: bind it to the repo of the checkout it runs
-    // in, if the server knows that checkout's remote (VIS-1048).
+    // in, if the server knows that checkout's remote (VIS-1048). A session
+    // bound to a project is not bound to a repo at all: the repo of the
+    // checkout it is in now is inferred, within the project, for its policies
+    // here as for its events (VIS-1258) — a binding stored now would pin the
+    // rest of the session to this checkout's repo wherever it goes next.
     let mut notice = notice;
     if binding.is_none() {
         if let Ok((Some(server_url), credential)) =
             crate::credentials::resolve_credentials_quiet(&project_root)
         {
             let client = ApiClient::with_credential(&server_url, credential);
-            let auto =
-                crate::auto_bind::bind_session(&hook_event.session_id, hook_cwd, &client, deadline)
+            let project = crate::commands::stream::capture_project(
+                &session,
+                Some(&worktree),
+                config_project,
+            );
+            match crate::commands::stream::inference_project(None, project) {
+                Some(pid) => {
+                    binding = crate::inferred_repo::infer(
+                        &hook_event.session_id,
+                        &worktree,
+                        pid,
+                        &client,
+                        deadline,
+                    )
                     .await;
-            binding = auto.binding;
-            notice = match (notice, auto.notice) {
-                (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
-                (a, b) => a.or(b),
-            };
+                }
+                None => {
+                    let auto = crate::auto_bind::bind_session(
+                        &hook_event.session_id,
+                        hook_cwd,
+                        &client,
+                        deadline,
+                    )
+                    .await;
+                    binding = auto.binding;
+                    notice = match (notice, auto.notice) {
+                        (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+                        (a, b) => a.or(b),
+                    };
+                }
+            }
         }
     }
 
