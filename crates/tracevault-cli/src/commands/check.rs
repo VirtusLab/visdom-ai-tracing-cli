@@ -339,7 +339,9 @@ pub fn select_worktree_sessions(
 ) -> (Vec<std::path::PathBuf>, bool) {
     let belongs = |dir: &std::path::Path| -> bool {
         match fs::read_to_string(dir.join("origin")) {
-            Ok(s) => s.trim() == worktree_top, // marked: keep only if mine
+            // Marked: keep only if mine — the latest event ran here, or an
+            // anchored session lists this worktree as one it ran in (VIS-1257).
+            Ok(s) => s.trim() == worktree_top || crate::session_state::ran_in(dir, worktree_top),
             // Only a genuinely-absent marker counts as unmarked/legacy (keep).
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
             // Marker present but unreadable (permissions/IO): we can't prove it's
@@ -564,6 +566,7 @@ pub async fn check_policies(
             let state = crate::session_state::load(&data.session_id);
             let streamed_to = crate::resolution::recorded_session_binding(
                 session_dir,
+                &worktree_top,
                 &state,
                 bound.clone(),
                 user_default.clone(),
@@ -708,6 +711,23 @@ fn is_server_error(lower: &str) -> bool {
 mod worktree_tests {
     use super::{add_external_session, select_worktree_sessions};
     use std::path::PathBuf;
+
+    /// A session kept here that ran here and moved to another repo: its
+    /// `origin` names the other repo, its worktree list names this one.
+    #[test]
+    fn keeps_a_session_that_ran_here_before_moving_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let moved = seed(tmp.path(), "moved", Some("/wt/b"));
+        crate::session_state::record_worktree(&moved, "/wt/a").unwrap();
+        crate::session_state::record_worktree(&moved, "/wt/b").unwrap();
+        let mine = seed(tmp.path(), "mine", Some("/wt/a"));
+        let other = seed(tmp.path(), "other", Some("/wt/b"));
+        let (mut kept, fell_back) =
+            select_worktree_sessions(vec![moved.clone(), mine.clone(), other], "/wt/a");
+        kept.sort();
+        assert_eq!(kept, vec![mine, moved]);
+        assert!(!fell_back);
+    }
 
     #[test]
     fn adds_an_external_session_only_when_it_lives_elsewhere() {

@@ -195,6 +195,7 @@ pub async fn open_verification_phase(
     let state = crate::session_state::load(&session_id);
     let binding = crate::resolution::recorded_session_binding(
         &session_dir_of(&session_id),
+        &worktree_top,
         &state,
         config
             .as_ref()
@@ -257,7 +258,7 @@ fn find_latest_session(sessions_dir: &Path, worktree_top: &str) -> Option<PathBu
     entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
-        .filter(|e| origin_match(&e.path(), worktree_top) != OriginMatch::Mismatch)
+        .filter(|e| belongs_here(&e.path(), worktree_top))
         .max_by_key(|e| {
             e.metadata()
                 .and_then(|m| m.modified())
@@ -286,8 +287,9 @@ fn origin_match(session_dir: &Path, worktree_top: &str) -> OriginMatch {
     }
 }
 
-/// Return all session directories under `sessions_dir` whose `origin` marker
-/// file matches `worktree_top` (exact string match after trimming).
+/// Return all session directories under `sessions_dir` that ran in
+/// `worktree_top`: their `origin` marker matches it (exact string match after
+/// trimming), or their worktree list names it.
 fn find_sessions_by_origin(sessions_dir: &Path, worktree_top: &str) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(sessions_dir) else {
         return vec![];
@@ -295,12 +297,9 @@ fn find_sessions_by_origin(sessions_dir: &Path, worktree_top: &str) -> Vec<PathB
     entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
-        .filter(|e| {
-            let origin_file = e.path().join("origin");
-            fs::read_to_string(&origin_file)
-                .map(|s| s.trim() == worktree_top)
-                .unwrap_or(false)
-        })
+        // `ran_in`: the `origin` marker names it, or an anchored session
+        // lists it among the worktrees it ran in (VIS-1257).
+        .filter(|e| crate::session_state::ran_in(&e.path(), worktree_top))
         .map(|e| e.path())
         .collect()
 }

@@ -47,6 +47,13 @@ fn accept_with_deadline(listener: &TcpListener) -> Option<std::net::TcpStream> {
 /// POST is answered as accepted and its body captured; anything else
 /// (`session-start`'s policy and binding lookups) gets a 404.
 fn spawn_server() -> (String, mpsc::Receiver<StreamEventRequest>) {
+    spawn_server_refusing(0)
+}
+
+/// [`spawn_server`], but the first `refuse` stream POSTs get a 503 and are
+/// not captured: the server never stored them.
+fn spawn_server_refusing(refuse: usize) -> (String, mpsc::Receiver<StreamEventRequest>) {
+    let mut refuse = refuse;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
@@ -88,6 +95,13 @@ fn spawn_server() -> (String, mpsc::Receiver<StreamEventRequest>) {
             if !(request_line.starts_with("POST /api/v1/") && request_line.contains("/stream")) {
                 let _ = stream.write_all(
                     b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
+            if refuse > 0 {
+                refuse -= 1;
+                let _ = stream.write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 );
                 continue;
             }
@@ -255,6 +269,22 @@ fn sent_lines(rx: &mpsc::Receiver<StreamEventRequest>) -> Vec<u64> {
     rx.try_iter()
         .flat_map(|r| r.transcript_lines.unwrap_or_default())
         .filter_map(|l| l["n"].as_u64())
+        .collect()
+}
+
+/// Every transcript line the server received, as `(transcript byte offset of
+/// its batch, n)` — the server's chunk index derives from the offset, so a
+/// repeated pair is a duplicate it drops, and a line under two offsets would
+/// be stored twice.
+fn sent_chunks(rx: &mpsc::Receiver<StreamEventRequest>) -> Vec<(i64, u64)> {
+    rx.try_iter()
+        .flat_map(|r| {
+            let offset = r.transcript_offset.unwrap_or(-1);
+            r.transcript_lines
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(move |l| Some((offset, l["n"].as_u64()?)))
+        })
         .collect()
 }
 
@@ -426,4 +456,43 @@ fn verify_start_in_the_child_repo_finds_the_umbrella_session() {
         tracevault_protocol::streaming::StreamEventType::VerificationPhaseStart
     );
     assert_eq!(sent[0].session_id, SESSION_ID);
+}
+
+/// What a refused send queued in the umbrella is delivered by the next event,
+/// from the child repo: the queue is in the one session dir, so nothing is
+/// lost, sent twice, or left behind.
+#[test]
+fn a_queue_left_in_the_umbrella_is_drained_from_the_child_repo() {
+    let fx = Fixture::new();
+    let (base, rx) = spawn_server_refusing(1);
+    fx.session_start(&base, &fx.umbrella, "startup");
+
+    fx.assistant(1);
+    fx.tool_use(&base, &fx.umbrella);
+    let pending = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with("pending"))
+    };
+    assert!(
+        pending(&fx.session_dir(&fx.umbrella)),
+        "the refused send is queued"
+    );
+
+    fx.assistant(2);
+    fx.tool_use(&base, &fx.child);
+
+    // A refused send does not advance `.stream_offset`, so the next event
+    // re-reads line 1 as well as draining the queued copy: the same chunk
+    // twice, which the server dedupes. Nothing is lost or re-chunked.
+    let mut chunks = sent_chunks(&rx);
+    chunks.sort();
+    chunks.dedup();
+    assert_eq!(chunks, vec![(0, 1), (0, 2)]);
+    assert!(
+        !pending(&fx.session_dir(&fx.umbrella)),
+        "the queue is drained"
+    );
+    assert!(!fx.session_dir(&fx.child).exists());
 }
