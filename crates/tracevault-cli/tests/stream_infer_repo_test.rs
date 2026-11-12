@@ -340,6 +340,132 @@ fn a_child_repo_outside_the_project_stays_project_only() {
     assert!(reqs[0].starts_with(&bare), "{reqs:?}");
 }
 
+fn unavailable() -> String {
+    http("503 Service Unavailable", r#"{"error":"down"}"#)
+}
+
+/// The queued events of `queue` (a `pending-*.jsonl` in the session dir).
+fn queued(fx: &Fixture, queue: &str) -> usize {
+    std::fs::read_to_string(
+        fx.umbrella
+            .join(".tracevault")
+            .join("sessions")
+            .join(SESSION_ID)
+            .join(queue),
+    )
+    .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+    .unwrap_or(0)
+}
+
+/// A project-only event buffered after a failed send keeps its target: the
+/// next event, inferred to the child repo, does not take it over; the next
+/// project-only event delivers it, project-only.
+#[test]
+fn a_buffered_project_only_event_is_not_reattributed_to_an_inferred_repo() {
+    let fx = Fixture::new();
+    let pid = fx.pid;
+    let to_repo = format!("POST /api/v1/projects/{pid}/stream?repo_id={REPO_ID} ");
+    let bare = format!("POST /api/v1/projects/{pid}/stream ");
+    let project_queue = format!("pending-project-{pid}.jsonl");
+    let no_file = serde_json::json!({ "command": "ls" });
+
+    // 1: project-only (the umbrella dir is no checkout), server down → queued.
+    fx.append_transcript(1);
+    let (base, rx) = spawn_server(vec![unavailable(), accepted()]);
+    fx.run_hook(&base, no_file.clone());
+    let reqs: Vec<String> = rx.try_iter().collect();
+    assert_eq!(reqs.len(), 1, "{reqs:?}");
+    assert!(reqs[0].starts_with(&bare), "{reqs:?}");
+    assert_eq!(queued(&fx, &project_queue), 1);
+
+    // 2: an Edit in the child — sent with its repo; the queue stays.
+    fx.append_transcript(2);
+    let (base, rx) = spawn_server(vec![
+        resolved(),
+        remote_detail(),
+        project(&[REPO_ID]),
+        accepted(),
+        accepted(),
+    ]);
+    fx.run_hook(&base, edit(&fx.child.join("src/main.rs")));
+    let reqs: Vec<String> = rx.try_iter().collect();
+    assert_eq!(reqs.len(), 4, "lookup + this event only: {reqs:?}");
+    assert!(reqs[3].starts_with(&to_repo), "{reqs:?}");
+    assert_eq!(queued(&fx, &project_queue), 1, "not adopted");
+
+    // 3: project-only again — the queued event goes first, still project-only.
+    fx.append_transcript(3);
+    let (base, rx) = spawn_server(vec![accepted(), accepted(), accepted()]);
+    fx.run_hook(&base, no_file);
+    let reqs: Vec<String> = rx.try_iter().collect();
+    assert_eq!(reqs.len(), 2, "{reqs:?}");
+    assert!(reqs.iter().all(|r| r.starts_with(&bare)), "{reqs:?}");
+    assert_eq!(queued(&fx, &project_queue), 0);
+}
+
+/// An event buffered for one inferred repo stays in that repo's queue when
+/// the next event goes to another checkout's repo, and is delivered to its
+/// own repo by the next event there.
+#[test]
+fn a_buffered_event_stays_with_its_inferred_repo() {
+    let fx = Fixture::new();
+    let pid = fx.pid;
+    let other = fx.umbrella.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q"]);
+    git(
+        &other,
+        &["remote", "add", "origin", "git@github.com:org/other.git"],
+    );
+    let other_detail = http(
+        "200 OK",
+        &format!(
+            r#"{{"name":"other","normalized_url":"github.com/org/other","clone_status":"ready","repos":[{{"id":"{OTHER_REPO_ID}","name":"other"}}]}}"#
+        ),
+    );
+    let to_repo = format!("POST /api/v1/projects/{pid}/stream?repo_id={REPO_ID} ");
+    let to_other = format!("POST /api/v1/projects/{pid}/stream?repo_id={OTHER_REPO_ID} ");
+    let both = [REPO_ID, OTHER_REPO_ID];
+
+    // 1: child's repo, server down → queued for that repo.
+    fx.append_transcript(1);
+    let (base, rx) = spawn_server(vec![
+        resolved(),
+        remote_detail(),
+        project(&both),
+        unavailable(),
+        accepted(),
+    ]);
+    fx.run_hook(&base, edit(&fx.child.join("a.rs")));
+    let reqs: Vec<String> = rx.try_iter().collect();
+    assert_eq!(reqs.len(), 4, "{reqs:?}");
+    assert_eq!(queued(&fx, &format!("pending-{REPO_ID}.jsonl")), 1);
+
+    // 2: the other checkout's repo — its own send only.
+    fx.append_transcript(2);
+    let (base, rx) = spawn_server(vec![
+        resolved(),
+        other_detail,
+        project(&both),
+        accepted(),
+        accepted(),
+    ]);
+    fx.run_hook(&base, edit(&other.join("b.rs")));
+    let reqs: Vec<String> = rx.try_iter().collect();
+    assert_eq!(reqs.len(), 4, "{reqs:?}");
+    assert!(reqs[3].starts_with(&to_other), "{reqs:?}");
+    assert_eq!(queued(&fx, &format!("pending-{REPO_ID}.jsonl")), 1);
+
+    // 3: back in the child (cached) — the queued event goes first, to its repo.
+    fx.append_transcript(3);
+    let (base, rx) = spawn_server(vec![accepted(), accepted(), accepted()]);
+    fx.run_hook(&base, edit(&fx.child.join("a.rs")));
+    let reqs: Vec<String> = rx.try_iter().collect();
+    assert_eq!(reqs.len(), 2, "{reqs:?}");
+    assert!(reqs.iter().all(|r| r.starts_with(&to_repo)), "{reqs:?}");
+    assert_eq!(queued(&fx, &format!("pending-{REPO_ID}.jsonl")), 0);
+}
+
 /// An explicit repo binding wins: nothing is looked up, nothing inferred.
 #[test]
 fn an_explicit_repo_binding_is_never_overridden() {

@@ -1805,24 +1805,25 @@ pub(crate) async fn stream_event(
         if let Some(client) = &client {
             match inference_project(None, capture_pid) {
                 Some(pid) => {
-                    let checkout = crate::inferred_repo::event_checkout(
+                    if let Some(checkout) = crate::inferred_repo::event_checkout(
                         hook_cwd,
                         hook_event.tool_input.as_ref(),
                         worktree_top,
-                    );
-                    inferred = crate::inferred_repo::infer(
-                        &hook_event.session_id,
-                        &checkout,
-                        pid,
-                        client,
-                        deadline,
-                    )
-                    .await;
-                    // `check` and `verify-start` in a checkout find the
-                    // session by the worktrees it ran in; a file tool's
-                    // checkout is one even while the shell is elsewhere.
-                    if inferred.is_some() && checkout != *worktree_top {
-                        let _ = crate::session_state::record_worktree(session_dir, &checkout);
+                    ) {
+                        inferred = crate::inferred_repo::infer(
+                            &hook_event.session_id,
+                            &checkout,
+                            pid,
+                            client,
+                            deadline,
+                        )
+                        .await;
+                        // `check` and `verify-start` in a checkout find the
+                        // session by the worktrees it ran in; a file tool's
+                        // checkout is one even while the shell is elsewhere.
+                        if inferred.is_some() && checkout != *worktree_top {
+                            let _ = crate::session_state::record_worktree(session_dir, &checkout);
+                        }
                     }
                 }
                 None => {
@@ -1883,8 +1884,20 @@ pub(crate) async fn stream_event(
     // supersedes is first merged into the target's own queue (ahead of it:
     // its events are older), then drained like any queue — whatever is not
     // delivered now is re-queued into `pending_path`.
+    // Only a BOUND repo adopts: a `repo switch` moves the whole session to
+    // the repo. A repo inferred for this one event (VIS-1258) does not —
+    // the queued project-only events touched other checkouts, or none, and
+    // keep their own target until a project-only event or `flush` sends them.
+    // Their transcript lines, not yet counted as sent, are re-read by this
+    // event too, so those lines can reach both server rows; the tool events
+    // themselves are never re-attributed.
     let pending_path = pending_path_for(session_dir, &attribution);
-    if let Some(adopted) = adopted_project_queue(session_dir, &attribution) {
+    let adopted = if inferred.is_some() && binding.is_none() {
+        None
+    } else {
+        adopted_project_queue(session_dir, &attribution)
+    };
+    if let Some(adopted) = adopted {
         adopt_queue(&adopted, &pending_path)?;
     }
     let pending_events = drain_pending(&pending_path)?;

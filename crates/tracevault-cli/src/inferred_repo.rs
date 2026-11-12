@@ -47,18 +47,21 @@ const FILE_KEYS: [&str; 2] = ["file_path", "notebook_path"];
 
 /// The checkout an event works in: the git toplevel of the file a file tool
 /// names in `tool_input` (relative paths are taken from `cwd`), else
-/// `worktree_top`, the toplevel of the event's `cwd`. A named file outside
-/// any git checkout also gives `worktree_top`.
+/// `worktree_top`, the toplevel of the event's `cwd`. `None` when the named
+/// file is in no git checkout: the event touches no repo — even if the shell
+/// sits in one — and stays project-only.
 pub(crate) fn event_checkout(
     cwd: &Path,
     tool_input: Option<&serde_json::Value>,
     worktree_top: &str,
-) -> String {
-    tool_input
+) -> Option<String> {
+    let file = tool_input
         .and_then(|input| FILE_KEYS.iter().find_map(|k| input.get(*k)?.as_str()))
-        .filter(|p| !p.is_empty())
-        .and_then(|p| git_toplevel_of(&cwd.join(p)))
-        .unwrap_or_else(|| worktree_top.to_string())
+        .filter(|p| !p.is_empty());
+    match file {
+        Some(p) => git_toplevel_of(&cwd.join(p)),
+        None => Some(worktree_top.to_string()),
+    }
 }
 
 /// The canonical git toplevel of the checkout holding `path` (a file or
@@ -161,18 +164,17 @@ pub(crate) async fn infer_in(
     let retry_after = ttl.map(|ttl| {
         (chrono::Utc::now() + chrono::Duration::from_std(ttl).unwrap_or_default()).to_rfc3339()
     });
-    // Reload before writing: the session's other hooks write this file too.
-    let mut state = crate::session_state::load_from(sessions_dir, session_id);
-    state.inferred_repos.insert(
-        checkout.to_string(),
-        InferredRepo {
-            project_id: project.to_string(),
-            retry_after,
-            repo: repo.clone(),
-        },
-    );
-    // Best-effort: an unsaved entry only means the next event asks again.
-    let _ = crate::session_state::save_to(sessions_dir, session_id, &state);
+    // Under the state lock: the session's parallel hooks record other
+    // checkouts in the same file. Best-effort: an unsaved entry only means
+    // the next event asks again.
+    let entry = InferredRepo {
+        project_id: project.to_string(),
+        retry_after,
+        repo: repo.clone(),
+    };
+    let _ = crate::session_state::update_in(sessions_dir, session_id, |state| {
+        state.inferred_repos.insert(checkout.to_string(), entry);
+    });
     repo
 }
 
@@ -470,28 +472,67 @@ mod tests {
             ("notebook_path", "child/nb.ipynb".to_string()),
         ] {
             assert_eq!(
-                event_checkout(umbrella.path(), Some(&input(key, &path)), cwd_top),
-                child_top,
+                event_checkout(umbrella.path(), Some(&input(key, &path)), cwd_top).as_deref(),
+                Some(child_top.as_str()),
                 "{key}={path}"
             );
         }
-        // No file named, or one outside git: the cwd's checkout.
-        assert_eq!(event_checkout(umbrella.path(), None, cwd_top), cwd_top);
+        // No file named: the cwd's checkout.
+        assert_eq!(
+            event_checkout(umbrella.path(), None, cwd_top).as_deref(),
+            Some(cwd_top)
+        );
         assert_eq!(
             event_checkout(
                 umbrella.path(),
                 Some(&serde_json::json!({"command": "ls"})),
                 cwd_top
-            ),
-            cwd_top
+            )
+            .as_deref(),
+            Some(cwd_top)
         );
+        // A named file outside git touches no checkout — not the cwd's either.
         assert_eq!(
             event_checkout(
                 umbrella.path(),
                 Some(&input("file_path", "notes.txt")),
                 cwd_top
             ),
-            cwd_top
+            None
         );
+    }
+
+    /// Parallel hooks recording different checkouts keep each other's entry.
+    #[test]
+    fn concurrent_cache_writes_keep_every_entry() {
+        let sessions = tempfile::tempdir().unwrap();
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let dir = sessions.path().to_path_buf();
+                std::thread::spawn(move || {
+                    crate::session_state::update_in(&dir, SESSION, |state| {
+                        state.inferred_repos.insert(
+                            format!("/checkout/{i}"),
+                            InferredRepo {
+                                project_id: PROJECT.into(),
+                                retry_after: Some("2999-01-01T00:00:00Z".into()),
+                                repo: None,
+                            },
+                        );
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let state = crate::session_state::load_from(sessions.path(), SESSION);
+        assert_eq!(state.inferred_repos.len(), 16);
+        let stray = std::fs::read_dir(sessions.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!stray, "no temp file left behind");
     }
 }
