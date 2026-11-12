@@ -281,7 +281,10 @@ fn a_session_that_cds_into_a_child_repo_keeps_one_session_dir() {
         vec![1, 2, 3],
         "every transcript line is sent exactly once, in order"
     );
-    assert!(fx.session_dir(&fx.umbrella).join(".stream_offset").is_file());
+    assert!(fx
+        .session_dir(&fx.umbrella)
+        .join(".stream_offset")
+        .is_file());
     assert!(
         !fx.session_dir(&fx.child).exists(),
         "the child repo must not get a second session dir"
@@ -322,7 +325,10 @@ fn a_session_without_a_recorded_start_keeps_resolving_from_cwd() {
 
     walk(&fx, &base);
 
-    assert!(fx.session_dir(&fx.umbrella).join(".stream_offset").is_file());
+    assert!(fx
+        .session_dir(&fx.umbrella)
+        .join(".stream_offset")
+        .is_file());
     assert!(fx.session_dir(&fx.child).join(".stream_offset").is_file());
 }
 

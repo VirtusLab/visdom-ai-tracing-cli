@@ -361,6 +361,28 @@ pub fn select_worktree_sessions(
     }
 }
 
+/// Add the invoking session's dir (`$TRACEVAULT_SESSION_ID`: the agent session
+/// running this `git push`) when it lives outside `sessions_dir`.
+///
+/// A session keeps its dir in the `.tracevault/` it STARTED in (VIS-1257), so
+/// one started in an umbrella directory that then works in this checkout has
+/// no dir here. It is the session pushing, so it is checked regardless of its
+/// `origin` marker, which names wherever its last event ran. A dir inside
+/// `sessions_dir` was already considered by the worktree selection above.
+fn add_invoking_session(
+    selected: &mut Vec<std::path::PathBuf>,
+    sessions_dir: &Path,
+    invoking_dir: Option<std::path::PathBuf>,
+) {
+    let Some(dir) = invoking_dir else { return };
+    if dir.parent() == Some(sessions_dir) || !dir.is_dir() || dir.join(".pushed").exists() {
+        return;
+    }
+    if !selected.contains(&dir) {
+        selected.push(dir);
+    }
+}
+
 /// The server repo a push is checked under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PushedRepo {
@@ -503,13 +525,20 @@ pub async fn check_policies(
     // Filter to the worktree that is actually pushing, so a push is not
     // evaluated against sessions belonging to other worktrees.
     let worktree_top = crate::paths::worktree_toplevel(cwd);
-    let (selected_dirs, fell_back) = select_worktree_sessions(unpushed_dirs, &worktree_top);
+    let (mut selected_dirs, fell_back) = select_worktree_sessions(unpushed_dirs, &worktree_top);
     if fell_back {
         eprintln!(
             "Warning: no unpushed session matched this worktree by origin marker — \
              checking all unpushed sessions to avoid skipping policy enforcement."
         );
     }
+    add_invoking_session(
+        &mut selected_dirs,
+        &sessions_dir,
+        crate::session_state::env_session_id()
+            .filter(|id| crate::session_state::is_safe_session_id(id))
+            .map(|id| crate::session_state::session_dir(project_root, &id)),
+    );
 
     // Where each session's events actually went, resolved as the stream hook
     // resolves it — only to warn when that is not the pushed repo. A
@@ -674,7 +703,35 @@ fn is_server_error(lower: &str) -> bool {
 
 #[cfg(test)]
 mod worktree_tests {
-    use super::select_worktree_sessions;
+    use super::{add_invoking_session, select_worktree_sessions};
+
+    #[test]
+    fn adds_the_invoking_session_only_when_it_lives_elsewhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let here = tmp.path().join("repo/.tracevault/sessions");
+        let local = seed(&here, "local", Some("/wt/b"));
+        let elsewhere = seed(
+            &tmp.path().join("umbrella/.tracevault/sessions"),
+            "s",
+            Some("/u"),
+        );
+
+        let mut selected = vec![];
+        add_invoking_session(&mut selected, &here, Some(local));
+        assert!(
+            selected.is_empty(),
+            "a local dir is the worktree filter's call"
+        );
+
+        add_invoking_session(&mut selected, &here, Some(elsewhere.clone()));
+        add_invoking_session(&mut selected, &here, Some(elsewhere.clone()));
+        assert_eq!(selected, vec![elsewhere.clone()]);
+
+        let mut selected = vec![];
+        add_invoking_session(&mut selected, &here, Some(tmp.path().join("missing")));
+        add_invoking_session(&mut selected, &here, None);
+        assert!(selected.is_empty());
+    }
     use std::path::PathBuf;
 
     fn seed(tmp: &std::path::Path, id: &str, origin: Option<&str>) -> PathBuf {

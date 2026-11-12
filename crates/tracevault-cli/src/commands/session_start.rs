@@ -77,6 +77,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _ = write_session_env(Path::new(&env_file), &hook_event.session_id);
     }
 
+    // 2b. Anchor the session dir to where the session started (VIS-1257),
+    // before anything below can bind the session and save its state.
+    if let Some(dir) = crate::session_state::sessions_dir() {
+        let _ = record_storage_root(&dir, Path::new(&hook_event.cwd), &hook_event.session_id);
+    }
+
     // 3. Once per CLI upgrade: refresh this repo's hooks and turn telemetry
     // on (VIS-1109). Its notice is shown with whatever step 4 prints.
     let notice = run_upgrade_step(Path::new(&hook_event.cwd));
@@ -90,6 +96,24 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // within what is left of the hook's timeout.
     run_catch_up(Path::new(&hook_event.cwd), &hook_event.session_id, started).await;
     injected
+}
+
+/// Record the `.tracevault/` root `cwd` resolves to as the session's storage
+/// root (see [`crate::session_state::SessionState::storage_root`]) — unless
+/// nothing resolves there: a [`Fallback`](crate::paths::ProjectRootSource::Fallback)
+/// root would put a stray `.tracevault/` in, say, the home directory and keep
+/// the session out of the repo it then works in, so that session keeps
+/// resolving per event. Best-effort; returns whether it wrote.
+fn record_storage_root(
+    sessions_dir: &Path,
+    cwd: &Path,
+    session_id: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let resolved = crate::paths::resolve_project_root(cwd);
+    if resolved.source == crate::paths::ProjectRootSource::Fallback {
+        return Ok(false);
+    }
+    crate::session_state::record_storage_root(sessions_dir, session_id, &resolved.root)
 }
 
 /// [`catch_up::sweep`](crate::commands::catch_up::sweep) for the repo of a
@@ -130,6 +154,31 @@ fn run_upgrade_step(cwd: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_storage_root_skips_a_fallback_root() {
+        let state = tempfile::tempdir().unwrap();
+        let nowhere = tempfile::tempdir().unwrap();
+        assert!(!record_storage_root(state.path(), nowhere.path(), "sess-1").unwrap());
+        assert_eq!(
+            crate::session_state::load_from(state.path(), "sess-1").storage_root,
+            None
+        );
+    }
+
+    #[test]
+    fn record_storage_root_records_an_ancestor_tracevault_dir() {
+        let state = tempfile::tempdir().unwrap();
+        let umbrella = tempfile::tempdir().unwrap();
+        std::fs::create_dir(umbrella.path().join(".tracevault")).unwrap();
+        let sub = umbrella.path().join("notes");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(record_storage_root(state.path(), &sub, "sess-1").unwrap());
+        assert_eq!(
+            crate::session_state::load_from(state.path(), "sess-1").storage_root,
+            Some(umbrella.path().to_string_lossy().into_owned())
+        );
+    }
 
     #[test]
     fn write_session_env_appends_export_line() {

@@ -112,6 +112,53 @@ pub struct SessionState {
     /// again from its checkout's remote on the next hook event.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_bind_off: bool,
+    /// The directory holding the `.tracevault/` this session keeps its
+    /// session dir (`.stream_offset`, pending queues, `origin`) in, recorded
+    /// once by the `SessionStart` hook from where the session started
+    /// (VIS-1257). Claude Code's hook `cwd` follows the shell's `cd`, so
+    /// resolving it per event split a session that moved from an umbrella
+    /// dir into a child repo across two session dirs, each re-sending the
+    /// transcript from its own offset. Absent for sessions started before
+    /// this was recorded, and for agents without a `SessionStart` hook: those
+    /// keep resolving from each event's `cwd`. Read through [`storage_root`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_root: Option<String>,
+}
+
+/// The session's recorded [`SessionState::storage_root`], if it still holds
+/// a `.tracevault/` directory (one removed since falls back to resolving from
+/// `cwd`, rather than recreating it).
+pub fn storage_root(state: &SessionState) -> Option<PathBuf> {
+    let root = PathBuf::from(state.storage_root.as_deref()?);
+    root.join(".tracevault").is_dir().then_some(root)
+}
+
+/// `<root>/.tracevault/sessions/<session_id>` for `session_id`, where `root`
+/// is the session's recorded [`storage_root`], else `fallback_root` (the root
+/// resolved from the caller's working directory). Every reader and writer of
+/// a session dir goes through this, so a session is found where its hook
+/// keeps it.
+pub fn session_dir(fallback_root: &std::path::Path, session_id: &str) -> PathBuf {
+    let root = storage_root(&load(session_id)).unwrap_or_else(|| fallback_root.to_path_buf());
+    root.join(".tracevault").join("sessions").join(session_id)
+}
+
+/// Record `root` as the session's [`SessionState::storage_root`] unless one
+/// is already recorded: `SessionStart` fires again on resume, `/clear` and
+/// compaction, from wherever the shell has moved, and the session dir must
+/// not move with it. Returns whether it wrote.
+pub fn record_storage_root(
+    sessions_dir: &std::path::Path,
+    session_id: &str,
+    root: &std::path::Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut state = load_in(sessions_dir, session_id);
+    if state.storage_root.is_some() {
+        return Ok(false);
+    }
+    state.storage_root = Some(root.to_string_lossy().into_owned());
+    save_in(sessions_dir, session_id, &state)?;
+    Ok(true)
 }
 
 /// `$XDG_STATE_HOME/tracevault/sessions` or `~/.local/state/tracevault/sessions`.
@@ -348,6 +395,52 @@ mod tests {
             !leftover,
             "temp file should be renamed away, not left behind"
         );
+    }
+
+    #[test]
+    fn record_storage_root_is_first_write_wins_and_keeps_other_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = SessionState {
+            active: Some(binding("r1")),
+            ..Default::default()
+        };
+        save_in(tmp.path(), "sess-1", &s).unwrap();
+
+        assert!(
+            record_storage_root(tmp.path(), "sess-1", std::path::Path::new("/umbrella")).unwrap()
+        );
+        assert!(!record_storage_root(
+            tmp.path(),
+            "sess-1",
+            std::path::Path::new("/umbrella/child")
+        )
+        .unwrap());
+
+        let loaded = load_in(tmp.path(), "sess-1");
+        assert_eq!(loaded.storage_root.as_deref(), Some("/umbrella"));
+        assert_eq!(loaded.active, s.active);
+    }
+
+    #[test]
+    fn storage_root_needs_its_tracevault_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = SessionState {
+            storage_root: Some(tmp.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        assert_eq!(storage_root(&s), None, "no .tracevault/ there");
+        std::fs::create_dir(tmp.path().join(".tracevault")).unwrap();
+        assert_eq!(storage_root(&s), Some(tmp.path().to_path_buf()));
+        s.storage_root = None;
+        assert_eq!(storage_root(&s), None);
+    }
+
+    #[test]
+    fn old_state_files_load_without_a_storage_root() {
+        let st: SessionState =
+            toml::from_str("[active]\nrepo_id = \"r1\"\nupdated_at = \"t\"\n").unwrap();
+        assert_eq!(st.storage_root, None);
+        assert!(!toml::to_string(&st).unwrap().contains("storage_root"));
     }
 
     #[test]

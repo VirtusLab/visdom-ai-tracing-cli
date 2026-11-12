@@ -43,16 +43,22 @@ pub async fn open_verification_phase(
 
     let sessions_dir = project_root.join(".tracevault").join("sessions");
     let worktree_top = crate::paths::worktree_toplevel(cwd);
+    // A session's own dir may live in the `.tracevault/` it started in, not
+    // this checkout's (VIS-1257).
+    let session_dir_of = |id: &str| crate::session_state::session_dir(project_root, id);
     let invoking = explicit_session_id
         .is_none()
-        .then(|| invoking_session(&sessions_dir, &worktree_top, env_session_id))
+        .then(|| invoking_session(&session_dir_of, &worktree_top, env_session_id))
         .flatten();
 
     let session_id = if let Some(id) = invoking {
         id
     } else if let Some(id) = explicit_session_id {
         // Verify the session directory exists when an explicit ID is given.
-        let dir = sessions_dir.join(id);
+        if !crate::session_state::is_safe_session_id(id) {
+            return Err(format!("Invalid session ID: {id:?}"));
+        }
+        let dir = session_dir_of(id);
         if !dir.is_dir() {
             return Err(format!(
                 "Session directory not found: {}. Check the session ID.",
@@ -182,7 +188,7 @@ pub async fn open_verification_phase(
     // open a window no tool event of this session ever reaches.
     let state = crate::session_state::load(&session_id);
     let binding = crate::resolution::recorded_session_binding(
-        &sessions_dir.join(&session_id),
+        &session_dir_of(&session_id),
         &state,
         config
             .as_ref()
@@ -218,12 +224,12 @@ pub async fn open_verification_phase(
 /// not streamed an event in this repo yet, or last streamed from a sibling
 /// worktree, where the explicit-flag path would refuse it.
 fn invoking_session(
-    sessions_dir: &Path,
+    session_dir_of: &dyn Fn(&str) -> PathBuf,
     worktree_top: &str,
     env_session_id: Option<&str>,
 ) -> Option<String> {
     let id = env_session_id.filter(|s| crate::session_state::is_safe_session_id(s))?;
-    let dir = sessions_dir.join(id);
+    let dir = session_dir_of(id);
     (dir.is_dir() && origin_match(&dir, worktree_top) != OriginMatch::Mismatch)
         .then(|| id.to_string())
 }
@@ -777,19 +783,28 @@ mod tests {
         make_session_dir(&sessions, "elsewhere", Some("/wt/b"));
 
         assert_eq!(
-            invoking_session(&sessions, "/wt/a", Some("here")).as_deref(),
+            invoking_session(&|id| sessions.join(id), "/wt/a", Some("here")).as_deref(),
             Some("here")
         );
         assert_eq!(
-            invoking_session(&sessions, "/wt/a", Some("legacy")).as_deref(),
+            invoking_session(&|id| sessions.join(id), "/wt/a", Some("legacy")).as_deref(),
             Some("legacy")
         );
         assert_eq!(
-            invoking_session(&sessions, "/wt/a", Some("elsewhere")),
+            invoking_session(&|id| sessions.join(id), "/wt/a", Some("elsewhere")),
             None
         );
-        assert_eq!(invoking_session(&sessions, "/wt/a", Some("missing")), None);
-        assert_eq!(invoking_session(&sessions, "/wt/a", Some("../here")), None);
-        assert_eq!(invoking_session(&sessions, "/wt/a", None), None);
+        assert_eq!(
+            invoking_session(&|id| sessions.join(id), "/wt/a", Some("missing")),
+            None
+        );
+        assert_eq!(
+            invoking_session(&|id| sessions.join(id), "/wt/a", Some("../here")),
+            None
+        );
+        assert_eq!(
+            invoking_session(&|id| sessions.join(id), "/wt/a", None),
+            None
+        );
     }
 }
