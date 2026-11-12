@@ -458,6 +458,16 @@ async fn status(
 
     let user_default = crate::user_default::load();
 
+    // What ingest does for this session, through the hook's own gate (no
+    // `--path` override: the hook has none). Without it a project-only
+    // session reads as "not bound" here although its events ship (VIS-1255).
+    let recording = crate::commands::stream::recording_attribution_for(
+        &session,
+        &worktree,
+        bound.clone(),
+        user_default.clone(),
+    );
+
     let effective = effective_binding(ResolveInputs {
         repo_flag,
         session: &session,
@@ -468,6 +478,10 @@ async fn status(
     println!(
         "{}",
         format_status(effective.as_ref().map(|(b, s)| (b, *s)))
+    );
+    println!(
+        "{}",
+        crate::commands::stream::recording_line(recording.as_ref())
     );
 
     // Surface which codebase the effective binding belongs to, with live clone

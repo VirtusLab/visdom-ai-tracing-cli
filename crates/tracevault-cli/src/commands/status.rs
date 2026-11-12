@@ -1034,15 +1034,12 @@ fn recording_attribution(
     let worktree = crate::paths::worktree_toplevel(cwd);
     let bound = config.and_then(crate::resolution::binding_from_config);
     let user_default_repo = crate::user_default::load();
-    let stream_binding = crate::commands::stream::resolve_stream_binding(
+    let attribution = crate::commands::stream::recording_attribution_for(
         &session,
         &worktree,
         bound,
         user_default_repo,
     );
-    let capture_pid = crate::commands::stream::capture_project(&session, Some(&worktree));
-    let attribution =
-        crate::commands::stream::attribution_for(stream_binding.as_ref(), capture_pid);
     (attribution, worktree)
 }
 
