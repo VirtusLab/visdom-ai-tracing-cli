@@ -445,8 +445,17 @@ pub async fn migrate_cwd_config(cwd: &Path) -> Result<(), io::Error> {
 /// `Some(reason)` when an explicit `--server-url` names a different
 /// TraceVault instance than the one the credential was resolved for: a
 /// lookup there would hand that instance's token or key to another host.
-/// `None` when there is no explicit URL, no resolved one, or both agree.
+/// `None` when there is no explicit URL, no resolved one, or both agree —
+/// and when the key comes from `TRACEVAULT_API_KEY`: like
+/// `credentials::resolve_credentials`, a key named on this invocation is a
+/// deliberate pairing with the URL named next to it, not a stored login.
 fn credential_url_mismatch(resolved: Option<&str>, explicit: Option<&str>) -> Option<String> {
+    let env_key = std::env::var("TRACEVAULT_API_KEY")
+        .ok()
+        .is_some_and(|k| !k.trim().is_empty());
+    if env_key {
+        return None;
+    }
     let (resolved, explicit) = (resolved?, explicit?);
     (!crate::credentials::same_server(resolved, explicit)).then(|| {
         format!(
@@ -3317,12 +3326,18 @@ mod tests {
         assert_eq!(rx.try_iter().count(), 0, "no request may be sent");
     }
 
-    #[test]
-    fn credential_url_mismatch_only_for_a_different_explicit_server() {
+    #[tokio::test]
+    async fn credential_url_mismatch_only_for_a_different_explicit_server() {
+        let _env_lock = crate::test_helpers::lock_env_mutation().await;
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.remove("TRACEVAULT_API_KEY");
         assert!(credential_url_mismatch(Some("https://a/"), Some("https://a")).is_none());
         assert!(credential_url_mismatch(None, Some("https://b")).is_none());
         assert!(credential_url_mismatch(Some("https://a"), None).is_none());
         assert!(credential_url_mismatch(Some("https://a"), Some("https://b")).is_some());
+        // An explicitly supplied key is paired with the explicit URL.
+        _guard.set("TRACEVAULT_API_KEY", "tvk_for_b");
+        assert!(credential_url_mismatch(Some("https://a"), Some("https://b")).is_none());
     }
 
     /// `init --global` migrates the current directory's legacy

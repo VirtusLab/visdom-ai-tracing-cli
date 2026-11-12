@@ -1248,3 +1248,59 @@ fn init_global_amp_defaults_to_dot_config() {
         assert!(plugin.exists(), "{xdg:?}: {} missing", plugin.display());
     }
 }
+
+/// VIS-1256 command wiring: `init --workspace --project <name>` through the
+/// real binary binds a non-git directory (exit 0); an unknown name exits 1
+/// with nothing written; the flags require each other and conflict with
+/// `--global`.
+#[test]
+fn init_workspace_cli_binds_errors_and_requires_both_flags() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    let base = spawn_projects_server();
+    write_repo_config(
+        dir.path(),
+        &format!("api_key = \"tvk_test\"\nserver_url = \"{base}\"\n"),
+    );
+    let output = run_init_isolated(
+        dir.path(),
+        home.path(),
+        &["--workspace", "--project", "payments"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cfg = tracevault_cli::config::TracevaultConfig::load(dir.path()).unwrap();
+    assert_eq!(
+        cfg.project_id.as_deref(),
+        Some("00000000-0000-4000-8000-0000000000aa")
+    );
+    assert_eq!(cfg.repo_id, None);
+
+    let other = TempDir::new().unwrap();
+    let base = spawn_projects_server();
+    let content = format!("api_key = \"tvk_test\"\nserver_url = \"{base}\"\n");
+    write_repo_config(other.path(), &content);
+    let output = run_init_isolated(
+        other.path(),
+        home.path(),
+        &["--workspace", "--project", "nope"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("'nope' not found"), "stderr: {stderr}");
+    assert_eq!(read_repo_config(other.path()), content);
+
+    for args in [&["--workspace"][..], &["--project", "payments"][..]] {
+        let output = run_init_isolated(other.path(), home.path(), args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: clap usage error");
+    }
+    let output = run_init_isolated(
+        other.path(),
+        home.path(),
+        &["--workspace", "--project", "payments", "--global"],
+    );
+    assert_eq!(output.status.code(), Some(2), "--global conflicts");
+}
