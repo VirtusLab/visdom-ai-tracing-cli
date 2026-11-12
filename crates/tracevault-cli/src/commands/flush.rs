@@ -181,18 +181,31 @@ fn queue_capture_binding(session_dir: &Path) -> Option<crate::session_state::Pro
     let worktree = fs::read_to_string(session_dir.join("origin"))
         .ok()
         .map(|s| s.trim().to_string());
-    crate::commands::stream::capture_binding(
-        &session,
-        worktree.as_deref(),
-        session_dir_config_project(session_dir),
-    )
+    let config_project = match worktree.as_deref() {
+        Some(origin) if !origin.is_empty() => origin_config_project(Path::new(origin)),
+        _ => session_dir_config_project(session_dir),
+    };
+    crate::commands::stream::capture_binding(&session, worktree.as_deref(), config_project)
+}
+
+/// The workspace project tier the stream hook read for the event whose
+/// worktree it recorded in `origin`: the hook loads the config at
+/// `resolve_project_root(event cwd)`, and `origin` is that cwd's worktree
+/// toplevel (the cwd itself outside git), which resolves to the same root.
+/// Preferred over the session dir's own root because a session's dir is
+/// anchored where it STARTED (VIS-1257) — an umbrella — while a later event
+/// may have come from a checkout below it, whose config the hook read instead.
+fn origin_config_project(origin: &Path) -> Option<crate::session_state::ProjectBinding> {
+    let root = crate::paths::resolve_project_root(origin).root;
+    crate::config::TracevaultConfig::load(&root)
+        .as_ref()
+        .and_then(crate::resolution::project_from_config)
 }
 
 /// The workspace project tier (`.tracevault/config.toml` `project_id`) of the
 /// project root a session directory lives under
-/// (`<root>/.tracevault/sessions/<id>`): the config the stream hook read when
-/// it queued these events, so a flushed event resolves the same tier the live
-/// send did. `None` when the layout does not match or the config has none.
+/// (`<root>/.tracevault/sessions/<id>`), for a session dir with no `origin`
+/// marker. `None` when the layout does not match or the config has none.
 fn session_dir_config_project(session_dir: &Path) -> Option<crate::session_state::ProjectBinding> {
     let sessions = session_dir.parent()?;
     let tv_dir = sessions.parent()?;
@@ -1030,6 +1043,31 @@ mod send_tests {
         let stray = tmp.path().join("elsewhere/flush-workspace");
         fs::create_dir_all(&stray).unwrap();
         assert_eq!(session_dir_config_project(&stray), None);
+
+        // The dir is anchored at the umbrella (VIS-1257) but the last event
+        // came from a checkout below it, recorded in `origin`: the hook read
+        // THAT checkout's config (no project_id), so flush must too.
+        let child = root.join("child");
+        fs::create_dir_all(&child).unwrap();
+        crate::test_helpers::init_git_repo(&child);
+        fs::write(
+            session_dir.join("origin"),
+            crate::paths::worktree_toplevel(&child),
+        )
+        .unwrap();
+        assert_eq!(queue_capture_binding(&session_dir), None);
+        // ...and from a non-git sub-directory it is the umbrella's again.
+        let notes = root.join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(
+            session_dir.join("origin"),
+            crate::paths::worktree_toplevel(&notes),
+        )
+        .unwrap();
+        assert_eq!(
+            queue_capture_binding(&session_dir).map(|b| b.project_id),
+            Some(pid.to_string())
+        );
     }
 
     /// The flush-path echo of the "does a force leak onto a different
