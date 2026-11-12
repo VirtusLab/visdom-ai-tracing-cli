@@ -3898,7 +3898,7 @@ mod tests {
         let repo = "22222222-2222-2222-2222-222222222222";
         let state = inferring_session(pid, "/umbrella/child", repo);
 
-        let here = recording_attribution_for(&state, "/umbrella/child", None, None);
+        let here = recording_attribution_for(&state, "/umbrella/child", None, None, None);
         assert_eq!(
             here.attribution,
             Some(Attribution::Repo {
@@ -3913,7 +3913,7 @@ mod tests {
             "{line}"
         );
 
-        let elsewhere = recording_attribution_for(&state, "/umbrella", None, None);
+        let elsewhere = recording_attribution_for(&state, "/umbrella", None, None, None);
         assert_eq!(
             elsewhere.attribution,
             Some(Attribution::ProjectOnly { project_id: pid })
@@ -3927,7 +3927,7 @@ mod tests {
         // A bound repo is reported as bound, not inferred.
         let bound = repo_binding("11111111-1111-1111-1111-111111111111");
         let explicit =
-            recording_attribution_for(&state, "/umbrella/child", Some(bound.clone()), None);
+            recording_attribution_for(&state, "/umbrella/child", Some(bound.clone()), None, None);
         assert_eq!(
             explicit.attribution,
             Some(Attribution::Repo {
@@ -3936,6 +3936,20 @@ mod tests {
             })
         );
         assert_eq!(explicit.inferred_from, None);
+
+        // The project may come from the workspace config tier (VIS-1256)
+        // instead of the session: inference applies all the same.
+        let mut from_config = state.clone();
+        from_config.active_project = None;
+        let workspace = crate::session_state::ProjectBinding {
+            project_id: pid.to_string(),
+            project_name: String::new(),
+            updated_at: String::new(),
+            forced_until: None,
+        };
+        let via_config =
+            recording_attribution_for(&from_config, "/umbrella/child", None, None, Some(workspace));
+        assert_eq!(via_config.inferred_from.as_deref(), Some("/umbrella/child"));
     }
 
     #[test]

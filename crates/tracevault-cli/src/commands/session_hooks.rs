@@ -197,11 +197,8 @@ pub async fn resolve_and_inject(
             crate::credentials::resolve_credentials_quiet(&project_root)
         {
             let client = ApiClient::with_credential(&server_url, credential);
-            let project = crate::commands::stream::capture_project(
-                &session,
-                Some(&worktree),
-                config_project,
-            );
+            let project =
+                crate::commands::stream::capture_project(&session, Some(&worktree), config_project);
             match crate::commands::stream::inference_project(None, project) {
                 Some(pid) => {
                     binding = crate::inferred_repo::infer(

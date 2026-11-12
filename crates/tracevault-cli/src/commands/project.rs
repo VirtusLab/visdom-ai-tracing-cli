@@ -725,15 +725,17 @@ async fn status_report(
     let bound_repo = config
         .as_ref()
         .and_then(crate::resolution::binding_from_config);
-    report.lines.push(crate::commands::stream::recording_line_for(
-        &crate::commands::stream::recording_attribution_for(
-            &session,
-            &worktree,
-            bound_repo,
-            crate::user_default::load(),
-            config_project,
-        ),
-    ));
+    report
+        .lines
+        .push(crate::commands::stream::recording_line_for(
+            &crate::commands::stream::recording_attribution_for(
+                &session,
+                &worktree,
+                bound_repo,
+                crate::user_default::load(),
+                config_project,
+            ),
+        ));
 
     if let (Some(client), Some(url)) = (client.as_ref(), git_url.as_deref()) {
         // Best-effort and informational: an ambiguous or failed deduction is
