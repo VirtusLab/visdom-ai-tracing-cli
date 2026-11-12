@@ -218,8 +218,33 @@ impl Fixture {
             "hook_event_name": "PostToolUse",
             "tool_name": "Bash",
         });
+        self.run_hook_event(base, "claude-code", event)
+    }
+
+    /// The OpenCode (fileless) shape: records arrive inline on the event and
+    /// cannot be re-read, and `.stream_offset` is a record counter that
+    /// advances even when the event is queued.
+    fn run_inline_hook(&self, base: &str, ns: std::ops::RangeInclusive<u32>) {
+        let records: Vec<_> = ns.map(|n| serde_json::json!({ "n": n })).collect();
+        let event = serde_json::json!({
+            "session_id": SESSION_ID,
+            "transcript_path": "",
+            "transcript_records": records,
+            "cwd": self.umbrella.to_string_lossy(),
+            "hook_event_name": "PostToolUse",
+            "tool_name": "bash",
+        });
+        self.run_hook_event(base, "opencode", event);
+    }
+
+    fn run_hook_event(
+        &self,
+        base: &str,
+        agent: &str,
+        event: serde_json::Value,
+    ) -> (i32, String, String) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_tracevault"))
-            .args(["stream", "--event", "post-tool-use"])
+            .args(["stream", "--event", "post-tool-use", "--agent", agent])
             .current_dir(&self.umbrella)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
@@ -458,6 +483,46 @@ fn adopted_queue_migrates_to_the_repo_queue_on_failure() {
     assert_eq!(q.len(), 2, "adopted event + live event: {q:?}");
     assert_eq!(line_ns(&q[0]), vec![1], "older (adopted) event first");
     assert_eq!(line_ns(&q[1]), vec![1, 2]);
+}
+
+/// Codex R1.3: inline (OpenCode) records queued project-only exist ONLY in
+/// the queue — the record counter already advanced past them. After a repo
+/// switch they must reach the repo target exactly once, with their original
+/// offset, ahead of the live records.
+#[test]
+fn inline_records_queued_project_only_survive_a_repo_switch_exactly_once() {
+    let fx = Fixture::new();
+    let pid = uuid::Uuid::from_u128(0x1A1);
+    fx.write_session_state(pid, false);
+
+    // Offline, project-only: records 1-2 queued, counter advances to 2.
+    let (base, rx) = spawn_server(vec![unavailable(), accepted()]);
+    fx.run_inline_hook(&base, 1..=2);
+    assert_eq!(captured(&rx).len(), 1);
+    let q = queued(&fx.project_queue(pid));
+    assert_eq!(q.len(), 1);
+    assert_eq!(line_ns(&q[0]), vec![1, 2]);
+    assert_eq!(q[0].transcript_offset, Some(0));
+    assert_eq!(fx.offset(), Some(2), "the inline counter advances on queue");
+
+    // Repo bound; records 3-4 arrive live.
+    fx.write_session_state(pid, true);
+    let (base, rx) = spawn_server(vec![accepted(), accepted(), accepted()]);
+    fx.run_inline_hook(&base, 3..=4);
+    let reqs = captured(&rx);
+    assert_eq!(reqs.len(), 2, "adopted queue + live: {reqs:?}");
+    let repo_path = format!("POST /api/v1/projects/{pid}/stream?repo_id={REPO_ID} ");
+    assert!(
+        reqs.iter().all(|r| r.line.starts_with(&repo_path)),
+        "{reqs:?}"
+    );
+    assert_eq!(line_ns(&reqs[0].body), vec![1, 2]);
+    assert_eq!(reqs[0].body.transcript_offset, Some(0), "original offset");
+    assert_eq!(line_ns(&reqs[1].body), vec![3, 4]);
+    assert_eq!(reqs[1].body.transcript_offset, Some(2));
+    assert!(queued(&fx.project_queue(pid)).is_empty());
+    assert!(queued(&fx.repo_queue()).is_empty());
+    assert_eq!(fx.offset(), Some(4));
 }
 
 /// Neither a repo nor a project: the hook no-ops, sends nothing, queues

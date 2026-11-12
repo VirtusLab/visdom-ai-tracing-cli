@@ -207,6 +207,37 @@ pub fn append_pending(pending_path: &Path, json: &str) -> Result<(), io::Error> 
     Ok(())
 }
 
+/// Move the queue at `from` into the queue at `into`, ahead of what `into`
+/// already holds (`from`'s events are older), without a window in which a
+/// failure loses either: the merged file is written beside `into` and
+/// renamed over it, and only then is `from` removed. Any error before the
+/// rename leaves both files as they were — this matters because queued
+/// inline records and tool payloads cannot be re-read from a transcript.
+/// A failure to remove `from` after the rename leaves its events in both
+/// files; they are then sent twice to the SAME target, where the server
+/// dedupes them (`chunk_index`, `event_uuid`).
+fn adopt_queue(from: &Path, into: &Path) -> Result<(), io::Error> {
+    let adopted = match fs::read_to_string(from) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let existing = match fs::read_to_string(into) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let mut merged = adopted;
+    if !merged.is_empty() && !merged.ends_with('\n') {
+        merged.push('\n');
+    }
+    merged.push_str(&existing);
+    let tmp = into.with_extension("jsonl.adopting");
+    fs::write(&tmp, merged)?;
+    fs::rename(&tmp, into)?;
+    fs::remove_file(from)
+}
+
 pub fn drain_pending(pending_path: &Path) -> Result<Vec<String>, io::Error> {
     if !pending_path.exists() {
         return Ok(vec![]);
@@ -320,6 +351,15 @@ fn pending_path_for(session_dir: &Path, attribution: &Attribution) -> std::path:
 /// project, so this refines where the events land within it instead of
 /// re-attributing them. A `Repo` with a different or no project keeps the
 /// per-target isolation [`Attribution::pending_file_name`] exists for.
+///
+/// What this cannot prevent (server-side, needs a row merge there): lines
+/// the repo-less row ALREADY stored before the switch while `.stream_offset`
+/// did not advance — a multi-part batch whose first parts were accepted and
+/// a later one failed, or an accepted request whose response was lost. The
+/// re-read after the switch sends those to the repo row too. The client
+/// cannot tell which of them the other row holds, and advancing the offset
+/// per accepted part would move every later line's `chunk_index` (it is
+/// based on the read's start offset) and break dedupe within one row.
 fn adopted_project_queue(
     session_dir: &Path,
     attribution: &Attribution,
@@ -1689,15 +1729,14 @@ pub(crate) async fn stream_event(
     let client = client.ok_or("server_url not configured")?;
 
     // 9. Try drain pending queue and send. A project-only queue this target
-    // supersedes is drained first: its events are older (written before the
-    // repo bound), and whatever is not delivered now is re-queued below into
-    // `pending_path`, so it migrates to the current target's queue.
+    // supersedes is first merged into the target's own queue (ahead of it:
+    // its events are older), then drained like any queue — whatever is not
+    // delivered now is re-queued into `pending_path`.
     let pending_path = pending_path_for(session_dir, &attribution);
-    let mut pending_events = match adopted_project_queue(session_dir, &attribution) {
-        Some(adopted) => drain_pending(&adopted)?,
-        None => Vec::new(),
-    };
-    pending_events.extend(drain_pending(&pending_path)?);
+    if let Some(adopted) = adopted_project_queue(session_dir, &attribution) {
+        adopt_queue(&adopted, &pending_path)?;
+    }
+    let pending_events = drain_pending(&pending_path)?;
 
     let mut send_failed = false;
     // Spans the whole invocation (pending-flush loop + live send below) so a
@@ -3608,6 +3647,44 @@ mod tests {
         );
         let none = recording_line(None);
         assert!(none.starts_with("recording: nothing"), "{none}");
+    }
+
+    #[test]
+    fn adopt_queue_puts_the_older_queue_first_and_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("pending-project-x.jsonl");
+        let into = dir.path().join("pending-r.jsonl");
+        std::fs::write(&from, "a1\na2").unwrap(); // no trailing newline
+        std::fs::write(&into, "r1\n").unwrap();
+        adopt_queue(&from, &into).unwrap();
+        assert!(!from.exists());
+        assert_eq!(drain_pending(&into).unwrap(), vec!["a1", "a2", "r1"]);
+        assert!(
+            !dir.path().join("pending-r.jsonl.adopting").exists(),
+            "no temp file left behind"
+        );
+    }
+
+    #[test]
+    fn adopt_queue_without_a_source_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let into = dir.path().join("pending-r.jsonl");
+        std::fs::write(&into, "r1\n").unwrap();
+        adopt_queue(&dir.path().join("absent.jsonl"), &into).unwrap();
+        assert_eq!(drain_pending(&into).unwrap(), vec!["r1"]);
+    }
+
+    /// Codex R1.2: an unreadable target queue must not cost the adopted one —
+    /// inline records and tool payloads exist nowhere else.
+    #[test]
+    fn adopt_queue_failure_leaves_the_source_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("pending-project-x.jsonl");
+        let into = dir.path().join("pending-r.jsonl");
+        std::fs::write(&from, "a1\n").unwrap();
+        std::fs::create_dir(&into).unwrap(); // reading it fails
+        assert!(adopt_queue(&from, &into).is_err());
+        assert_eq!(std::fs::read_to_string(&from).unwrap(), "a1\n");
     }
 
     #[test]
