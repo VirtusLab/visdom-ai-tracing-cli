@@ -373,6 +373,35 @@ fn queued(fx: &Fixture, queue: &str) -> usize {
     .unwrap_or(0)
 }
 
+/// A refused send with an inferred repo is an error (VIS-316): the event is
+/// buffered for that repo, and nothing is re-sent project-only or to the
+/// repo-scoped endpoint.
+#[test]
+fn a_refused_inferred_send_is_buffered_not_redirected() {
+    let fx = Fixture::new();
+    let pid = fx.pid;
+    let to_repo = format!("POST /api/v1/projects/{pid}/stream?repo_id={REPO_ID} ");
+
+    fx.append_transcript(1);
+    let (base, rx) = spawn_server(vec![
+        resolved(),
+        remote_detail(),
+        project(&[REPO_ID]),
+        http("403 Forbidden", r#"{"error":"forbidden"}"#),
+        accepted(),
+    ]);
+    let stderr = fx.run_hook(&base, edit(&fx.child.join("src/main.rs")));
+    let reqs: Vec<String> = rx.try_iter().collect();
+    assert_eq!(reqs.len(), 4, "no fallback request: {reqs:?}");
+    assert!(reqs[3].starts_with(&to_repo), "{reqs:?}");
+    assert!(
+        stderr.contains("error"),
+        "the refusal is reported: {stderr}"
+    );
+    assert_eq!(queued(&fx, &format!("pending-{REPO_ID}.jsonl")), 1);
+    assert_eq!(queued(&fx, &format!("pending-project-{pid}.jsonl")), 0);
+}
+
 /// A project-only event buffered after a failed send keeps its target: the
 /// next event, inferred to the child repo, does not take it over; the next
 /// project-only event delivers it, project-only.

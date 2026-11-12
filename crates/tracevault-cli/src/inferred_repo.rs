@@ -42,8 +42,11 @@ pub const FAILURE_TTL: Duration = Duration::from_secs(2 * 60);
 /// Cap on one checkout's lookup, inside the hook's own budget.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The keys of `tool_input` that name the file a tool works on.
-const FILE_KEYS: [&str; 2] = ["file_path", "notebook_path"];
+/// The keys of `tool_input` that name the file a tool works on, first match
+/// wins: Claude Code's `file_path` / `notebook_path`, OpenCode's `filePath`
+/// (its plugin forwards the raw tool arguments), and the `path` GSD/pi file
+/// tools — and Claude Code's `Grep`/`Glob`, naming a directory — use.
+const FILE_KEYS: [&str; 4] = ["file_path", "notebook_path", "filePath", "path"];
 
 /// The checkout an event works in: the git toplevel of the file a file tool
 /// names in `tool_input` (relative paths are taken from `cwd`), else
@@ -490,6 +493,8 @@ mod tests {
             ),
             ("file_path", "child/src/new.rs".to_string()),
             ("notebook_path", "child/nb.ipynb".to_string()),
+            ("filePath", "child/src/opencode.rs".to_string()),
+            ("path", "child/src".to_string()),
         ] {
             assert_eq!(
                 event_checkout(umbrella.path(), Some(&input(key, &path)), cwd_top).as_deref(),
