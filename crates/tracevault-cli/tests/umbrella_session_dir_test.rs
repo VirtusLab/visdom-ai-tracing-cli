@@ -46,13 +46,13 @@ fn accept_with_deadline(listener: &TcpListener) -> Option<std::net::TcpStream> {
 /// Accept every request until none arrives for `ACCEPT_DEADLINE`. A stream
 /// POST is answered as accepted and its body captured; anything else
 /// (`session-start`'s policy and binding lookups) gets a 404.
-fn spawn_server() -> (String, mpsc::Receiver<StreamEventRequest>) {
+fn spawn_server() -> (String, mpsc::Receiver<(String, StreamEventRequest)>) {
     spawn_server_refusing(0)
 }
 
 /// [`spawn_server`], but the first `refuse` stream POSTs get a 503 and are
 /// not captured: the server never stored them.
-fn spawn_server_refusing(refuse: usize) -> (String, mpsc::Receiver<StreamEventRequest>) {
+fn spawn_server_refusing(refuse: usize) -> (String, mpsc::Receiver<(String, StreamEventRequest)>) {
     let mut refuse = refuse;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -106,7 +106,7 @@ fn spawn_server_refusing(refuse: usize) -> (String, mpsc::Receiver<StreamEventRe
                 continue;
             }
             if let Ok(req) = serde_json::from_slice(&body) {
-                let _ = tx.send(req);
+                let _ = tx.send((request_line.clone(), req));
             }
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
@@ -265,8 +265,9 @@ impl Fixture {
 }
 
 /// The `n` of every transcript line the server received, in order.
-fn sent_lines(rx: &mpsc::Receiver<StreamEventRequest>) -> Vec<u64> {
+fn sent_lines(rx: &mpsc::Receiver<(String, StreamEventRequest)>) -> Vec<u64> {
     rx.try_iter()
+        .map(|(_, r)| r)
         .flat_map(|r| r.transcript_lines.unwrap_or_default())
         .filter_map(|l| l["n"].as_u64())
         .collect()
@@ -276,8 +277,9 @@ fn sent_lines(rx: &mpsc::Receiver<StreamEventRequest>) -> Vec<u64> {
 /// its batch, n)` — the server's chunk index derives from the offset, so a
 /// repeated pair is a duplicate it drops, and a line under two offsets would
 /// be stored twice.
-fn sent_chunks(rx: &mpsc::Receiver<StreamEventRequest>) -> Vec<(i64, u64)> {
+fn sent_chunks(rx: &mpsc::Receiver<(String, StreamEventRequest)>) -> Vec<(i64, u64)> {
     rx.try_iter()
+        .map(|(_, r)| r)
         .flat_map(|r| {
             let offset = r.transcript_offset.unwrap_or(-1);
             r.transcript_lines
@@ -449,7 +451,7 @@ fn verify_start_in_the_child_repo_finds_the_umbrella_session() {
         .unwrap();
     assert!(out.status.success(), "{out:?}");
 
-    let sent: Vec<StreamEventRequest> = rx.try_iter().collect();
+    let sent: Vec<StreamEventRequest> = rx.try_iter().map(|(_, r)| r).collect();
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(
         sent[0].event_type,
@@ -493,6 +495,55 @@ fn a_queue_left_in_the_umbrella_is_drained_from_the_child_repo() {
     assert!(
         !pending(&fx.session_dir(&fx.umbrella)),
         "the queue is drained"
+    );
+    assert!(!fx.session_dir(&fx.child).exists());
+}
+
+/// Only the storage is anchored: which repo an event goes to still follows
+/// the event's `cwd`, through that checkout's `.tracevault/config.toml`.
+#[test]
+fn events_keep_routing_by_the_config_of_their_cwd() {
+    const UMBRELLA_REPO: &str = "22222222-2222-2222-2222-222222222222";
+    let fx = Fixture::new();
+    // Not bound with `repo switch`: each checkout's config decides.
+    std::fs::remove_file(
+        fx.state
+            .join("tracevault/sessions")
+            .join(format!("{SESSION_ID}.toml")),
+    )
+    .unwrap();
+    std::fs::write(
+        fx.umbrella.join(".tracevault/config.toml"),
+        format!("repo_id = \"{UMBRELLA_REPO}\"\n"),
+    )
+    .unwrap();
+    let (base, rx) = spawn_server();
+    fx.session_start(&base, &fx.umbrella, "startup");
+    let _ = rx.try_iter().count();
+
+    fx.assistant(1);
+    fx.tool_use(&base, &fx.child);
+    fx.assistant(2);
+    fx.tool_use(&base, &fx.umbrella);
+
+    let sent: Vec<(String, StreamEventRequest)> = rx.try_iter().collect();
+    let routed: Vec<(bool, bool, Vec<u64>)> = sent
+        .iter()
+        .map(|(line, r)| {
+            let lines = r
+                .transcript_lines
+                .clone()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|l| l["n"].as_u64())
+                .collect();
+            (line.contains(REPO_ID), line.contains(UMBRELLA_REPO), lines)
+        })
+        .collect();
+    assert_eq!(
+        routed,
+        vec![(true, false, vec![1]), (false, true, vec![2])],
+        "the child event goes to the child's repo, the umbrella event to the umbrella's: {sent:?}"
     );
     assert!(!fx.session_dir(&fx.child).exists());
 }

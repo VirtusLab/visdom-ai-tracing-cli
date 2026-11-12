@@ -124,7 +124,8 @@ async fn run_catch_up(cwd: &Path, session_id: &str, started: std::time::Instant)
     use crate::commands::catch_up;
     let project_root = crate::paths::resolve_project_root(cwd).root;
     let deadline = catch_up::deadline(started, std::time::Instant::now());
-    let sweep = catch_up::sweep(project_root, session_id.to_string(), deadline);
+    let worktree = crate::paths::worktree_toplevel(cwd);
+    let sweep = catch_up::sweep(project_root, worktree, session_id.to_string(), deadline);
     if tokio::spawn(sweep).await.is_err() {
         eprintln!("tracevault: the catch-up sweep failed unexpectedly");
     }
