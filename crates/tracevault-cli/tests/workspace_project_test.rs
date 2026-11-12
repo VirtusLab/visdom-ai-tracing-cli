@@ -218,6 +218,48 @@ fn workspace_project_id_records_sessions_from_the_dir_and_below() {
     }
 }
 
+/// With the server down, a workspace event is queued per project; a later
+/// `tracevault flush` from the workspace finds the queue, recovers the
+/// workspace tier and delivers it to the same project endpoint.
+#[test]
+fn queued_workspace_event_is_delivered_by_flush() {
+    let fx = Fixture::new(&workspace_config());
+    let bare = format!("POST /api/v1/projects/{WORKSPACE_PID}/stream ");
+    let down = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string();
+
+    let (base, rx) = spawn_server(vec![down, accepted()]);
+    let stderr = fx.run_hook(&fx.umbrella, &base);
+    let reqs: Vec<String> = rx.try_iter().collect();
+    assert_eq!(reqs.len(), 1, "{reqs:?}\nstderr:\n{stderr}");
+    let queue = fx
+        .umbrella
+        .join(".tracevault/sessions")
+        .join(SESSION_ID)
+        .join(format!("pending-project-{WORKSPACE_PID}.jsonl"));
+    assert!(queue.exists(), "queued per project; stderr:\n{stderr}");
+
+    let (base, rx) = spawn_server(vec![accepted(), accepted()]);
+    let out = Command::new(env!("CARGO_BIN_EXE_tracevault"))
+        .arg("flush")
+        .current_dir(&fx.umbrella)
+        .env("HOME", &fx.home)
+        .env("XDG_CONFIG_HOME", fx.home.join(".config"))
+        .env("XDG_STATE_HOME", &fx.state)
+        .env("TRACEVAULT_SERVER_URL", &base)
+        .env("TRACEVAULT_API_KEY", "tvk_test")
+        .env_remove("TRACEVAULT_PROJECT")
+        .env_remove("TRACEVAULT_PROJECT_ATTRIBUTION")
+        .env("GIT_CEILING_DIRECTORIES", &fx.root)
+        .output()
+        .unwrap();
+    let flush_stderr = String::from_utf8_lossy(&out.stderr);
+    let reqs: Vec<String> = rx.try_iter().collect();
+    assert_eq!(reqs.len(), 1, "{reqs:?}\nflush stderr:\n{flush_stderr}");
+    assert!(reqs[0].starts_with(&bare), "{reqs:?}");
+    let left = std::fs::read_to_string(&queue).unwrap_or_default();
+    assert!(left.trim().is_empty(), "queue drained: {left}");
+}
+
 /// A session's own `project switch` outranks the workspace config.
 #[test]
 fn session_project_switch_outranks_the_workspace_config() {

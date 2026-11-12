@@ -85,6 +85,16 @@ pub async fn resolve_project_by_name(
         .map_err(ResolveNameError::Name)
 }
 
+/// Whether the config carries a `project_id` the capture path would use (a
+/// UUID). Only such an id is authoritative over a legacy `default_project`:
+/// a garbage one must not cost the name that can repair it.
+fn has_valid_project_id(config: &TracevaultConfig) -> bool {
+    crate::resolution::project_from_config(config)
+        .as_ref()
+        .and_then(crate::resolution::capture_project_id)
+        .is_some()
+}
+
 /// What [`migrate_default_project`] did to the in-memory config.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Migration {
@@ -114,7 +124,7 @@ pub async fn migrate_default_project(
     let Some(name) = config.default_project.clone() else {
         return Ok(Migration::NotNeeded);
     };
-    if crate::resolution::project_from_config(config).is_some() {
+    if has_valid_project_id(config) {
         config.default_project = None;
         return Ok(Migration::DroppedLegacy { name });
     }
@@ -156,19 +166,17 @@ pub fn migration_report(migration: &Migration) -> Option<String> {
 /// status must match ingest). `None` when the config has no legacy key.
 pub fn legacy_default_project_notice(config: &TracevaultConfig) -> Option<String> {
     let name = config.default_project.as_deref()?;
-    Some(
-        if crate::resolution::project_from_config(config).is_some() {
-            format!(
-                "default_project \"{name}\" in .tracevault/config.toml is ignored (its project_id \
+    Some(if has_valid_project_id(config) {
+        format!(
+            "default_project \"{name}\" in .tracevault/config.toml is ignored (its project_id \
              wins); run `tracevault sync` to remove it"
-            )
-        } else {
-            format!(
-                "default_project \"{name}\" is not used for capture until migrated; run \
+        )
+    } else {
+        format!(
+            "default_project \"{name}\" is not used for capture until migrated; run \
              `tracevault sync`"
-            )
-        },
-    )
+        )
+    })
 }
 
 #[cfg(test)]
@@ -276,6 +284,35 @@ mod tests {
         assert_eq!(got, Migration::DroppedLegacy { name: "old".into() });
         assert_eq!(cfg.default_project, None);
         assert_eq!(cfg.project_name.as_deref(), Some("visdom"));
+    }
+
+    /// A non-UUID `project_id` is not authoritative: the name is migrated
+    /// over it instead of being dropped.
+    #[tokio::test]
+    async fn migrate_with_an_invalid_project_id_resolves_the_name() {
+        let (base, _rx) = spawn_seq(vec![http_json("200 OK", LIST)]);
+        let client = ApiClient::with_credential(&base, None);
+        let mut cfg = TracevaultConfig {
+            default_project: Some("visdom".into()),
+            project_id: Some("not-a-uuid".into()),
+            ..Default::default()
+        };
+        let got = migrate_default_project(&mut cfg, &client).await.unwrap();
+        assert!(matches!(got, Migration::Migrated { .. }), "{got:?}");
+        assert_eq!(
+            cfg.project_id.as_deref(),
+            Some("00000000-0000-4000-8000-0000000000aa")
+        );
+        assert_eq!(cfg.default_project, None);
+        // and status calls it unmigrated, not shadowed, until then
+        let unmigrated = TracevaultConfig {
+            default_project: Some("visdom".into()),
+            project_id: Some("not-a-uuid".into()),
+            ..Default::default()
+        };
+        assert!(legacy_default_project_notice(&unmigrated)
+            .unwrap()
+            .contains("until migrated"));
     }
 
     #[tokio::test]

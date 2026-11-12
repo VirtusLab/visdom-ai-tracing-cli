@@ -1421,27 +1421,43 @@ with `tracevault init --workspace`, sessions are recorded to that project withou
 `repo switch` there is optional: it only adds the repo and its policies.
 ";
 
-/// `content` with the managed block that starts at byte `start` (its
-/// [`GLOBAL_CLAUDE_MD_MARKER`]) replaced by the current
-/// [`GLOBAL_CLAUDE_MD_BLOCK`]. Every version of the block is one run of
-/// non-blank lines, so it ends at the first blank line after the marker (or
-/// at the end of the file); nothing outside that span changes.
-fn replace_managed_block(content: &str, start: usize) -> String {
-    let rest = &content[start..];
-    let mut end = rest.len();
-    let mut offset = 0;
-    for line in rest.split_inclusive('\n') {
-        if line.trim().is_empty() {
-            end = offset;
-            break;
-        }
-        offset += line.len();
+/// Every earlier text of [`GLOBAL_CLAUDE_MD_BLOCK`] an install may have
+/// written, oldest first. Only an exact match is upgraded: the block has no
+/// end marker, so anything else after the start marker may be the user's.
+const PREVIOUS_GLOBAL_CLAUDE_MD_BLOCKS: &[&str] = &[
+    "\
+<!-- tracevault:workspace-mode -->
+## TraceVault (workspace mode)
+You may be running detached from any single repository. Before working on a repo, run
+`tracevault repo switch <path>` to bind tracing and fetch that repo's policies; treat its
+output as binding. Use `--path <path>` on `tracevault repo status` for a one-off. Repos must
+already be registered with TraceVault.
+",
+    "\
+<!-- tracevault:workspace-mode -->
+## TraceVault (workspace mode)
+A session started in a registered repo's checkout is bound to that repo automatically. To work
+on a different repo, run `tracevault repo switch <path>` to bind tracing and fetch that repo's
+policies; treat its output as binding. Use `--path <path>` on `tracevault repo status` for a
+one-off. Repos must already be registered with TraceVault.
+",
+];
+
+/// `content` with an earlier install's block (an exact
+/// [`PREVIOUS_GLOBAL_CLAUDE_MD_BLOCKS`] text) replaced by the current
+/// [`GLOBAL_CLAUDE_MD_BLOCK`]. A block that matches none of them — the
+/// current one, or one the user edited — is left exactly as it is.
+fn replace_managed_block(content: &str) -> String {
+    if content.contains(GLOBAL_CLAUDE_MD_BLOCK) {
+        return content.to_string();
     }
-    let mut out = String::with_capacity(content.len() + GLOBAL_CLAUDE_MD_BLOCK.len());
-    out.push_str(&content[..start]);
-    out.push_str(GLOBAL_CLAUDE_MD_BLOCK);
-    out.push_str(&rest[end..]);
-    out
+    PREVIOUS_GLOBAL_CLAUDE_MD_BLOCKS
+        .iter()
+        .find(|old| content.contains(*old))
+        .map_or_else(
+            || content.to_string(),
+            |old| content.replacen(old, GLOBAL_CLAUDE_MD_BLOCK, 1),
+        )
 }
 
 /// Append the workspace-mode instruction block to `md_path` (creating it if
@@ -1466,10 +1482,10 @@ fn append_workspace_md(md_path: &Path) -> io::Result<()> {
     } else {
         String::new()
     };
-    if let Some(start) = existing.find(GLOBAL_CLAUDE_MD_MARKER) {
+    if existing.contains(GLOBAL_CLAUDE_MD_MARKER) {
         // An earlier install's block: bring it to the current text in place
         // (VIS-1256 changed it), leaving everything around it untouched.
-        let replaced = replace_managed_block(&existing, start);
+        let replaced = replace_managed_block(&existing);
         if replaced != existing {
             fs::write(md_path, replaced)?;
         }
@@ -3251,25 +3267,29 @@ mod tests {
     fn append_workspace_md_upgrades_an_older_block_in_place() {
         let tmp = tempfile::tempdir().unwrap();
         let md = tmp.path().join("CLAUDE.md");
-        let old = "# Mine\nkeep me\n\n<!-- tracevault:workspace-mode -->\n## TraceVault (workspace mode)\nold line one\nold line two\n\n## After\nalso keep\n";
-        fs::write(&md, old).unwrap();
+        for old in PREVIOUS_GLOBAL_CLAUDE_MD_BLOCKS {
+            // User text right after the block, with no blank line between.
+            fs::write(
+                &md,
+                format!("# Mine\nkeep me\n\n{old}## After\nalso keep\n"),
+            )
+            .unwrap();
 
-        append_workspace_md(&md).unwrap();
-        let got = fs::read_to_string(&md).unwrap();
-        assert_eq!(
-            got,
-            format!("# Mine\nkeep me\n\n{GLOBAL_CLAUDE_MD_BLOCK}\n## After\nalso keep\n")
-        );
-        append_workspace_md(&md).unwrap();
-        assert_eq!(fs::read_to_string(&md).unwrap(), got);
+            append_workspace_md(&md).unwrap();
+            let got = fs::read_to_string(&md).unwrap();
+            assert_eq!(
+                got,
+                format!("# Mine\nkeep me\n\n{GLOBAL_CLAUDE_MD_BLOCK}## After\nalso keep\n")
+            );
+            append_workspace_md(&md).unwrap();
+            assert_eq!(fs::read_to_string(&md).unwrap(), got);
+        }
 
-        // A block that runs to the end of the file.
-        fs::write(&md, "x\n\n<!-- tracevault:workspace-mode -->\n## T\nold").unwrap();
+        // A block the user edited is never touched.
+        let edited = "x\n\n<!-- tracevault:workspace-mode -->\n## T\nmy own words\n";
+        fs::write(&md, edited).unwrap();
         append_workspace_md(&md).unwrap();
-        assert_eq!(
-            fs::read_to_string(&md).unwrap(),
-            format!("x\n\n{GLOBAL_CLAUDE_MD_BLOCK}")
-        );
+        assert_eq!(fs::read_to_string(&md).unwrap(), edited);
     }
 
     /// `--server-url` naming another instance than the credential's never
