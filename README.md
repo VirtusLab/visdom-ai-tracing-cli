@@ -860,6 +860,27 @@ It installs the `x86_64-unknown-linux-gnu` build, so it needs an x86_64 Linux ru
 supports `push`, `pull_request` and `pull_request_target` events and fails on any other. On
 the push that creates a branch it verifies only the head commit.
 
+## Releasing
+
+Releases are automated with [release-plz](https://release-plz.dev) by
+`.github/workflows/release-plz.yml`, which runs on every push to `main`:
+
+1. It opens (or updates) a release PR that bumps versions and the changelog.
+2. Merging that release PR publishes the crates, creates the tags and GitHub releases, and, when
+   `tracevault-cli` was released, starts `release-binaries.yml` for the binaries and the
+   Homebrew formula.
+
+GitHub sometimes does not fire the `push` event after a squash merge. If a merge to `main`
+produced no "Release-plz" run (check `gh run list --workflow release-plz.yml`), start one by
+hand:
+
+```sh
+gh workflow run release-plz.yml --ref main
+```
+
+or use **Run workflow** on the workflow's page in the Actions tab. Runs are serialised, so a
+manual run that overlaps an automatic one waits for it instead of colliding.
+
 ## License
 
 Proprietary. The source is public, but the CLI is licensed only for use with a Visdom AI
