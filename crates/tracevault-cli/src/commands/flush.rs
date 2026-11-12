@@ -181,7 +181,28 @@ fn queue_capture_binding(session_dir: &Path) -> Option<crate::session_state::Pro
     let worktree = fs::read_to_string(session_dir.join("origin"))
         .ok()
         .map(|s| s.trim().to_string());
-    crate::commands::stream::capture_binding(&session, worktree.as_deref())
+    crate::commands::stream::capture_binding(
+        &session,
+        worktree.as_deref(),
+        session_dir_config_project(session_dir),
+    )
+}
+
+/// The workspace project tier (`.tracevault/config.toml` `project_id`) of the
+/// project root a session directory lives under
+/// (`<root>/.tracevault/sessions/<id>`): the config the stream hook read when
+/// it queued these events, so a flushed event resolves the same tier the live
+/// send did. `None` when the layout does not match or the config has none.
+fn session_dir_config_project(session_dir: &Path) -> Option<crate::session_state::ProjectBinding> {
+    let sessions = session_dir.parent()?;
+    let tv_dir = sessions.parent()?;
+    if sessions.file_name()? != "sessions" || tv_dir.file_name()? != ".tracevault" {
+        return None;
+    }
+    let root = tv_dir.parent()?;
+    crate::config::TracevaultConfig::load(root)
+        .as_ref()
+        .and_then(crate::resolution::project_from_config)
 }
 
 /// Send one queued event to the endpoint its queue and the session's capture

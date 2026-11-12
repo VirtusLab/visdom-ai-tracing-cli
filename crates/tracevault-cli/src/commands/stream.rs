@@ -580,14 +580,16 @@ pub(crate) fn attribution_force(
 /// The capture-time project BINDING for a stream event: a thin wrapper over
 /// the shared chain [`crate::resolution::capture_project_binding`] (subagent
 /// worktree override -> `TRACEVAULT_PROJECT` -> session `active_project` ->
-/// user-level default; no `--project` flag on the hook path), with a binding
-/// whose stored id is not a UUID dropped exactly as
-/// [`crate::resolution::capture_project_id`] drops it. Local only — no
-/// network (the hook fires per event in a short-lived process), which is why
-/// repo config `default_project` (a name) is not a tier and why
-/// `TRACEVAULT_PROJECT` is honoured in its UUID form only.
-/// `commands::project::status` calls the same shared chain, so it reports
-/// exactly what this returns.
+/// workspace `.tracevault/config.toml` `project_id` -> user-level default; no
+/// `--project` flag on the hook path), with a binding whose stored id is not a
+/// UUID dropped exactly as [`crate::resolution::capture_project_id`] drops it.
+/// Local only — no network (the hook fires per event in a short-lived
+/// process), which is why the config tier is its `project_id` (a UUID, via
+/// [`crate::resolution::project_from_config`]) and never the legacy
+/// `default_project` name, and why `TRACEVAULT_PROJECT` is honoured in its
+/// UUID form only. `config_project` is that config tier, read by the caller
+/// from the config it already loaded. `commands::project::status` calls the
+/// same shared chain, so it reports exactly what this returns.
 ///
 /// Returns the full [`crate::session_state::ProjectBinding`], not just its
 /// id: `forced_until` travels with whichever binding actually wins this
@@ -599,6 +601,7 @@ pub(crate) fn attribution_force(
 pub(crate) fn capture_binding(
     session: &crate::session_state::SessionState,
     worktree_path: Option<&str>,
+    config_project: Option<crate::session_state::ProjectBinding>,
 ) -> Option<crate::session_state::ProjectBinding> {
     use crate::resolution::{capture_project_binding, capture_project_id, CaptureProjectInputs};
     let (binding, _) = capture_project_binding(&CaptureProjectInputs {
@@ -606,6 +609,7 @@ pub(crate) fn capture_binding(
         env_project: env_project_binding(),
         session,
         worktree_path,
+        config_project,
         user_default: crate::user_project_default::load(),
     })?;
     // Defensive: a corrupted/hand-edited binding whose id isn't a real UUID
@@ -628,8 +632,9 @@ pub(crate) fn capture_binding(
 pub(crate) fn capture_project(
     session: &crate::session_state::SessionState,
     worktree_path: Option<&str>,
+    config_project: Option<crate::session_state::ProjectBinding>,
 ) -> Option<uuid::Uuid> {
-    capture_binding(session, worktree_path)
+    capture_binding(session, worktree_path, config_project)
         .as_ref()
         .and_then(crate::resolution::capture_project_id)
 }
@@ -646,11 +651,12 @@ pub(crate) fn recording_attribution_for(
     worktree: &str,
     bound: Option<crate::session_state::RepoBinding>,
     user_default_repo: Option<crate::session_state::RepoBinding>,
+    config_project: Option<crate::session_state::ProjectBinding>,
 ) -> Option<Attribution> {
     let stream_binding = resolve_stream_binding(session, worktree, bound, user_default_repo);
     attribution_for(
         stream_binding.as_ref(),
-        capture_project(session, Some(worktree)),
+        capture_project(session, Some(worktree), config_project),
     )
 }
 
@@ -1709,7 +1715,15 @@ pub(crate) async fn stream_event(
     // reads its `forced_until`, and this is the binding that actually decided
     // the target project, so it's the only one whose force is allowed to
     // apply (see `attribution_mode`'s doc comment).
-    let capture_binding = capture_binding(&session, Some(worktree_top.as_str()));
+    // The workspace tier comes from the config already loaded above: a
+    // `project_id` (UUID) only, never the legacy `default_project` name, so
+    // this costs no network call (VIS-1256).
+    let config_project = config
+        .as_ref()
+        .ok()
+        .and_then(|opt| opt.as_ref())
+        .and_then(crate::resolution::project_from_config);
+    let capture_binding = capture_binding(&session, Some(worktree_top.as_str()), config_project);
     let capture_pid = capture_binding
         .as_ref()
         .and_then(crate::resolution::capture_project_id);
@@ -2618,27 +2632,30 @@ mod tests {
             active_project: Some(pb(&u(2).to_string())),
             ..Default::default()
         };
-        assert_eq!(capture_project(&s, Some("/wt")), Some(u(2)));
+        assert_eq!(capture_project(&s, Some("/wt"), None), Some(u(2)));
         // subagent worktree beats session
         let mut s = s;
         s.subagent_projects
             .insert("/wt".into(), pb(&u(1).to_string()));
-        assert_eq!(capture_project(&s, Some("/wt")), Some(u(1)));
+        assert_eq!(capture_project(&s, Some("/wt"), None), Some(u(1)));
         // no worktree match -> session active
-        assert_eq!(capture_project(&s, Some("/other")), Some(u(2)));
+        assert_eq!(capture_project(&s, Some("/other"), None), Some(u(2)));
         // empty session, no user_project.toml in the isolated config dir -> None
-        assert_eq!(capture_project(&SessionState::default(), None), None);
+        assert_eq!(capture_project(&SessionState::default(), None, None), None);
         // malformed stored id -> None (defensive)
         let bad = SessionState {
             active_project: Some(pb("not-a-uuid")),
             ..Default::default()
         };
-        assert_eq!(capture_project(&bad, None), None);
+        assert_eq!(capture_project(&bad, None, None), None);
         // a valid user_project.toml in the isolated config dir is the last tier
         let path = crate::user_project_default::default_project_path().unwrap();
         assert!(path.starts_with(tmp.path()), "not isolated: {path:?}");
         crate::user_project_default::save(&pb(&u(3).to_string())).unwrap();
-        assert_eq!(capture_project(&SessionState::default(), None), Some(u(3)));
+        assert_eq!(
+            capture_project(&SessionState::default(), None, None),
+            Some(u(3))
+        );
     }
 
     /// The full binding — not just its id — survives `capture_binding`: this
@@ -2668,7 +2685,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let got = capture_binding(&s, Some("/wt")).expect("session-active binding resolves");
+        let got = capture_binding(&s, Some("/wt"), None).expect("session-active binding resolves");
         assert_eq!(got.forced_until, Some(future));
     }
 
@@ -2849,7 +2866,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let capture_binding = capture_binding(&session, None);
+        let capture_binding = capture_binding(&session, None, None);
 
         let resp = ok_stream_response();
         let (base, rx) = spawn_once_capturing_request(Box::leak(resp.into_boxed_str()));
@@ -2910,7 +2927,7 @@ mod tests {
         let project_b = uuid::Uuid::from_u128(2);
         _guard.set("TRACEVAULT_PROJECT", project_b.to_string());
 
-        let capture_binding = capture_binding(&SessionState::default(), None);
+        let capture_binding = capture_binding(&SessionState::default(), None, None);
         assert_eq!(
             capture_binding.as_ref().map(|b| b.project_id.as_str()),
             Some(project_b.to_string()).as_deref(),
@@ -3104,7 +3121,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let capture_binding = capture_binding(&session, None);
+        let capture_binding = capture_binding(&session, None, None);
         let capture_pid = capture_binding
             .as_ref()
             .and_then(crate::resolution::capture_project_id);
@@ -3169,7 +3186,7 @@ mod tests {
         _guard.set("XDG_CONFIG_HOME", tmp.path());
         _guard.remove("TRACEVAULT_PROJECT");
 
-        let capture_binding = capture_binding(&SessionState::default(), None);
+        let capture_binding = capture_binding(&SessionState::default(), None, None);
         assert_eq!(capture_binding, None);
 
         let resp = ok_stream_response();

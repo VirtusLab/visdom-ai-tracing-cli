@@ -93,6 +93,28 @@ enum Cli {
         /// `init` nor a CLI upgrade turns it back on.
         #[arg(long)]
         no_claude_telemetry: bool,
+        /// Bind this directory to one project, for every session started
+        /// under it (an umbrella folder of checkouts, for example): resolves
+        /// --project once on the server and writes its id to
+        /// .tracevault/config.toml here (created if missing). Works outside
+        /// git; installs no hooks (use --global for those) and binds no repo.
+        #[arg(
+            long,
+            requires = "project",
+            conflicts_with_all = [
+                "global",
+                "claude_settings",
+                "no_gitignore",
+                "no_user_context",
+                "user_context",
+                "claude_telemetry",
+                "no_claude_telemetry",
+            ]
+        )]
+        workspace: bool,
+        /// The project name for --workspace.
+        #[arg(long, requires = "workspace")]
+        project: Option<String>,
     },
     /// Claude Code telemetry (cost over OpenTelemetry, on by default): `on`,
     /// `off` (remembered across upgrades) or `status`.
@@ -543,7 +565,39 @@ async fn main() {
             agent,
             claude_telemetry,
             no_claude_telemetry,
+            workspace,
+            project,
         } => {
+            if workspace {
+                let cwd = env::current_dir().expect("Cannot determine current directory");
+                // `requires = "project"` guarantees it.
+                let name = project.expect("--workspace requires --project");
+                match commands::init::init_workspace(&cwd, &name, server_url.as_deref()).await {
+                    Ok(bound) => {
+                        println!(
+                            "Workspace {} bound to project {} (id: {})",
+                            cwd.display(),
+                            bound.project_name,
+                            bound.project_id
+                        );
+                        println!("Wrote {}", bound.config_path.display());
+                        println!(
+                            "Every session started under this directory is recorded to that \
+                             project unless it runs `tracevault project switch` or binds a repo \
+                             with its own configuration."
+                        );
+                        println!(
+                            "No hooks were installed: if this machine has no global install yet, \
+                             run `tracevault init --global`."
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
             if (claude_telemetry || no_claude_telemetry) && agent != crate::agent::Agent::ClaudeCode
             {
                 eprintln!(
@@ -827,6 +881,7 @@ async fn main() {
             let project_root = crate::paths::resolve_project_root(&cwd).root;
             if let Err(e) = commands::sync::sync_repo(&project_root).await {
                 eprintln!("Sync error: {e}");
+                std::process::exit(1);
             }
         }
         Cli::Stats => {

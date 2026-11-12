@@ -8,6 +8,7 @@ pub mod flush;
 pub mod init;
 pub mod login;
 pub mod logout;
+pub mod migrate;
 pub mod project;
 pub mod proxy;
 pub mod repo;

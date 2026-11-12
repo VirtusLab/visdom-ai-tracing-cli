@@ -452,9 +452,11 @@ async fn status(
         }
     };
     let worktree = crate::paths::worktree_toplevel(cwd);
-    let bound = crate::config::TracevaultConfig::load(project_root)
+    let config = crate::config::TracevaultConfig::load(project_root);
+    let bound = config.as_ref().and_then(binding_from_config);
+    let config_project = config
         .as_ref()
-        .and_then(binding_from_config);
+        .and_then(crate::resolution::project_from_config);
 
     // A --path override on status resolves live (needs the server).
     let repo_flag = resolve_repo_flag(repo_flag_path, project_root).await;
@@ -469,6 +471,7 @@ async fn status(
         &worktree,
         bound.clone(),
         user_default.clone(),
+        config_project,
     );
 
     let effective = effective_binding(ResolveInputs {

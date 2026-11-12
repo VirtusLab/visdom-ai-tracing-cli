@@ -63,6 +63,10 @@ persist the opt-out explicitly.
 - `tracevault repo status [--path <path>]` — show the session's effective repo binding and which
   precedence tier it came from.
 - `tracevault repo reset` — clear the session's workspace binding.
+- `tracevault init --workspace --project <name>` — bind a directory (typically an umbrella
+  folder of checkouts, not itself a repo) to a project: every session started under it is
+  recorded to that project with no per-session step. Writes `project_id` to
+  `.tracevault/config.toml` there; no repo, no hooks.
 
 **Session identity** — these commands resolve the session via `--session-id` or the
 `TRACEVAULT_SESSION_ID` environment variable (set by `tracevault init --global`).

@@ -28,10 +28,26 @@ pub struct TracevaultConfig {
     /// extra network round-trip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codebase_name: Option<String>,
-    /// Client-side default project **name** for this repo (no server counterpart).
-    /// Resolution precedence rung 3; resolved to an id at use time.
+    /// LEGACY: a project **name**. Never written by this CLI any more (VIS-1256)
+    /// and never used for capture — resolving a name would cost a network call
+    /// per hook event. It is read only so `init` and `sync` can migrate it to
+    /// [`project_id`](Self::project_id) + [`project_name`](Self::project_name)
+    /// (see `commands::migrate`), and so `project status` can flag a config
+    /// that has not been migrated yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_project: Option<String>,
+    /// The project every session under this directory is attributed to (a
+    /// server UUID), written by `tracevault init --workspace --project <name>`
+    /// or by the `default_project` migration. The `workspace` tier of the
+    /// capture chain (`resolution::capture_project_binding`): below a
+    /// session's own `project switch`, above the user-level default. Read
+    /// locally, so the per-event hook needs no network call for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Display-only name of [`project_id`](Self::project_id), recorded when
+    /// it was resolved. Never used to resolve anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
 }
 
 fn default_agent() -> String {
@@ -49,6 +65,8 @@ impl Default for TracevaultConfig {
             remote_id: None,
             codebase_name: None,
             default_project: None,
+            project_id: None,
+            project_name: None,
         }
     }
 }
@@ -255,6 +273,8 @@ impl TracevaultConfig {
         "remote_id",
         "codebase_name",
         "default_project",
+        "project_id",
+        "project_name",
     ];
 
     /// Write this config to `project_root`'s `config.toml`. Unlike a plain
@@ -354,6 +374,8 @@ mod tests {
             remote_id: None,
             codebase_name: None,
             default_project: None,
+            project_id: None,
+            project_name: None,
         };
         let toml = cfg.to_toml();
         assert!(toml.contains("agent = \"claude-code\""));
@@ -472,6 +494,8 @@ mod tests {
             remote_id: None,
             codebase_name: None,
             default_project: None,
+            project_id: None,
+            project_name: None,
         };
         let toml = cfg.to_toml();
         assert!(toml.contains("agent = \"claude-code\""));
@@ -696,6 +720,8 @@ mod tests {
             remote_id: Some("rm".into()),
             codebase_name: Some("cb".into()),
             default_project: Some("p".into()),
+            project_id: Some("00000000-0000-4000-8000-000000000001".into()),
+            project_name: Some("p".into()),
         };
         let mut keys: Vec<String> = toml::Table::try_from(&cfg)
             .unwrap()
