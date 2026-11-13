@@ -8,25 +8,21 @@ permissions:
 on:
   push:
     branches: [main]
-  # Backup trigger: GitHub's push event sometimes does not fire after a
-  # squash merge. Catch the merge via pull_request_target so release-plz
-  # still runs.
-  pull_request_target:
-    types: [closed]
-    branches: [main]
+  # Manual fallback: GitHub's push event sometimes does not fire after a
+  # squash merge. If a merge to main produced no Release-plz run, start one
+  # with `gh workflow run release-plz.yml --ref main` (see README "Releasing").
+  # (A pull_request_target backup trigger used to cover this; GitHub blocks
+  # that event by default in public repos from 2026-12-02.)
   workflow_dispatch:
 
 jobs:
   release-plz-release:
     name: Release-plz release
-    if: >-
-      github.event_name != 'pull_request_target' ||
-      github.event.pull_request.merged == true
     runs-on: ubuntu-latest
-    # A release merge fires BOTH `push` and `pull_request_target: closed`.
-    # Without this guard the release job runs twice concurrently and the two
-    # attempts collide on `cargo publish` / tag creation ("Reference already
-    # exists"), the job fails, and the binary+brew trigger below never runs.
+    # Never run two releases at once: overlapping runs (e.g. a push run and a
+    # manual dispatch) collide on `cargo publish` / tag creation ("Reference
+    # already exists"), the job fails, and the binary+brew trigger below never
+    # runs. Queue instead of cancelling so no release is dropped.
     concurrency:
       group: release-plz-release-main
       cancel-in-progress: false
@@ -67,9 +63,6 @@ jobs:
 
   release-plz-pr:
     name: Release-plz PR
-    if: >-
-      github.event_name != 'pull_request_target' ||
-      github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     concurrency:
       group: release-plz-pr-main
