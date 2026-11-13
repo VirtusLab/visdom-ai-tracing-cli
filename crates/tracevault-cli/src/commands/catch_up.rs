@@ -85,29 +85,42 @@ pub struct Candidate {
 /// `cost-state`, most recently written first, within the caps; no transcript
 /// is read after `deadline`. The current session is left out: its own hooks
 /// send its lines.
+#[cfg(test)]
 pub fn candidates(
     project_root: &Path,
     current_session: &str,
     now: SystemTime,
     deadline: Instant,
 ) -> Vec<Candidate> {
+    candidates_with(project_root, vec![], current_session, now, deadline)
+}
+
+/// [`candidates`], also considering `external` session dirs: sessions that
+/// ran in this checkout but keep their dir in the `.tracevault/` they started
+/// in, e.g. an umbrella dir (VIS-1257).
+pub fn candidates_with(
+    project_root: &Path,
+    external: Vec<PathBuf>,
+    current_session: &str,
+    now: SystemTime,
+    deadline: Instant,
+) -> Vec<Candidate> {
     let sessions = project_root.join(".tracevault").join("sessions");
-    let Ok(entries) = std::fs::read_dir(&sessions) else {
-        return vec![];
-    };
+    let local = std::fs::read_dir(&sessions).into_iter().flatten();
     // `.tracevault/sessions` is never pruned: even listing it is bounded by
     // the deadline.
-    let mut unsent: Vec<(SystemTime, String, PathBuf, PathBuf, u64)> = entries
+    let mut unsent: Vec<(SystemTime, String, PathBuf, PathBuf, u64)> = local
         .take_while(|_| Instant::now() < deadline)
         .flatten()
-        .filter_map(|entry| {
-            let session_id = entry.file_name().to_str()?.to_string();
+        .map(|entry| entry.path())
+        .chain(external)
+        .filter_map(|session_dir| {
+            let session_id = session_dir.file_name()?.to_str()?.to_string();
             if session_id == current_session
                 || !crate::session_state::is_safe_session_id(&session_id)
             {
                 return None;
             }
-            let session_dir = entry.path();
             let transcript = transcript_path(&session_dir)?;
             let offset = stream_offset(&session_dir)?;
             let meta = std::fs::metadata(&transcript).ok()?;
@@ -144,12 +157,30 @@ pub fn candidates(
 /// `SessionEnd` hook would, starting nothing after `deadline`, until
 /// [`MAX_SESSIONS`] are sent. Stops at the first session the server did not
 /// take in full: the rest wait for the next session start.
-pub async fn sweep(project_root: PathBuf, current_session: String, deadline: Instant) {
+///
+/// `worktree` is the checkout the new session starts in: sessions anchored
+/// elsewhere that ran in it are swept too (VIS-1257).
+pub async fn sweep(
+    project_root: PathBuf,
+    worktree: String,
+    current_session: String,
+    deadline: Instant,
+) {
     if env_sets_attribution(|name| std::env::var_os(name)) {
         return;
     }
+    let external = crate::session_state::anchored_session_dirs(
+        &project_root.join(".tracevault").join("sessions"),
+        &worktree,
+    );
     let mut sent_sessions = 0;
-    for c in candidates(&project_root, &current_session, SystemTime::now(), deadline) {
+    for c in candidates_with(
+        &project_root,
+        external,
+        &current_session,
+        SystemTime::now(),
+        deadline,
+    ) {
         if sent_sessions >= MAX_SESSIONS || Instant::now() >= deadline {
             break;
         }
@@ -446,6 +477,35 @@ mod tests {
         };
         assert_eq!(top("here"), worktree.to_string_lossy());
         assert_eq!(top("removed"), r.root.to_string_lossy());
+    }
+
+    #[test]
+    fn an_external_session_dir_is_a_candidate_too() {
+        let r = repo();
+        let umbrella = repo();
+        umbrella.session("anchored", &[ASSISTANT], &[COST_STATE]);
+        let external = umbrella.root.join(".tracevault/sessions/anchored");
+        let found = candidates_with(
+            &r.root,
+            vec![external.clone()],
+            "other",
+            SystemTime::now(),
+            later(),
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].session_id, "anchored");
+        assert_eq!(found[0].session_dir, external);
+        assert!(
+            candidates_with(
+                &r.root,
+                vec![external],
+                "anchored",
+                SystemTime::now(),
+                later()
+            )
+            .is_empty(),
+            "the current session is still left to its own hooks"
+        );
     }
 
     #[test]

@@ -43,23 +43,29 @@ pub async fn open_verification_phase(
 
     let sessions_dir = project_root.join(".tracevault").join("sessions");
     let worktree_top = crate::paths::worktree_toplevel(cwd);
+    // A session's own dir may live in the `.tracevault/` it started in, not
+    // this checkout's (VIS-1257).
+    let session_dir_of = |id: &str| crate::session_state::session_dir(project_root, id);
     let invoking = explicit_session_id
         .is_none()
-        .then(|| invoking_session(&sessions_dir, &worktree_top, env_session_id))
+        .then(|| invoking_session(&session_dir_of, &worktree_top, env_session_id))
         .flatten();
 
     let session_id = if let Some(id) = invoking {
         id
     } else if let Some(id) = explicit_session_id {
         // Verify the session directory exists when an explicit ID is given.
-        let dir = sessions_dir.join(id);
+        if !crate::session_state::is_safe_session_id(id) {
+            return Err(format!("Invalid session ID: {id:?}"));
+        }
+        let dir = session_dir_of(id);
         if !dir.is_dir() {
             return Err(format!(
                 "Session directory not found: {}. Check the session ID.",
                 dir.display()
             ));
         }
-        if origin_match(&dir, &worktree_top) == OriginMatch::Mismatch {
+        if !belongs_here(&dir, &worktree_top) {
             return Err(format!(
                 "Session {id} belongs to a different worktree (origin != {worktree_top}). \
                  Run verify-start from that worktree, or omit --session-id."
@@ -81,7 +87,13 @@ pub async fn open_verification_phase(
         // Use `cwd` (the actual invocation directory), not `project_root`
         // (the primary root), so that in a sibling worktree we correctly
         // compare against the sibling's toplevel, not the primary's.
-        let matching = find_sessions_by_origin(&sessions_dir, &worktree_top);
+        // Plus sessions kept in the `.tracevault/` they started in (an
+        // umbrella dir) that ran here (VIS-1257).
+        let mut matching = find_sessions_by_origin(&sessions_dir, &worktree_top);
+        matching.extend(crate::session_state::anchored_session_dirs(
+            &sessions_dir,
+            &worktree_top,
+        ));
 
         match matching.len() {
             1 => matching[0]
@@ -182,7 +194,8 @@ pub async fn open_verification_phase(
     // open a window no tool event of this session ever reaches.
     let state = crate::session_state::load(&session_id);
     let binding = crate::resolution::recorded_session_binding(
-        &sessions_dir.join(&session_id),
+        &session_dir_of(&session_id),
+        &worktree_top,
         &state,
         config
             .as_ref()
@@ -218,14 +231,21 @@ pub async fn open_verification_phase(
 /// not streamed an event in this repo yet, or last streamed from a sibling
 /// worktree, where the explicit-flag path would refuse it.
 fn invoking_session(
-    sessions_dir: &Path,
+    session_dir_of: &dyn Fn(&str) -> PathBuf,
     worktree_top: &str,
     env_session_id: Option<&str>,
 ) -> Option<String> {
     let id = env_session_id.filter(|s| crate::session_state::is_safe_session_id(s))?;
-    let dir = sessions_dir.join(id);
-    (dir.is_dir() && origin_match(&dir, worktree_top) != OriginMatch::Mismatch)
-        .then(|| id.to_string())
+    let dir = session_dir_of(id);
+    (dir.is_dir() && belongs_here(&dir, worktree_top)).then(|| id.to_string())
+}
+
+/// A session dir's `origin` marker does not name another worktree — or it
+/// does, but the session also ran in this one: an anchored session's marker
+/// names only where its latest event ran (VIS-1257).
+fn belongs_here(dir: &Path, worktree_top: &str) -> bool {
+    origin_match(dir, worktree_top) != OriginMatch::Mismatch
+        || crate::session_state::ran_in(dir, worktree_top)
 }
 
 /// Return the most recently modified session directory under `sessions_dir`.
@@ -238,7 +258,7 @@ fn find_latest_session(sessions_dir: &Path, worktree_top: &str) -> Option<PathBu
     entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
-        .filter(|e| origin_match(&e.path(), worktree_top) != OriginMatch::Mismatch)
+        .filter(|e| belongs_here(&e.path(), worktree_top))
         .max_by_key(|e| {
             e.metadata()
                 .and_then(|m| m.modified())
@@ -267,8 +287,9 @@ fn origin_match(session_dir: &Path, worktree_top: &str) -> OriginMatch {
     }
 }
 
-/// Return all session directories under `sessions_dir` whose `origin` marker
-/// file matches `worktree_top` (exact string match after trimming).
+/// Return all session directories under `sessions_dir` that ran in
+/// `worktree_top`: their `origin` marker matches it (exact string match after
+/// trimming), or their worktree list names it.
 fn find_sessions_by_origin(sessions_dir: &Path, worktree_top: &str) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(sessions_dir) else {
         return vec![];
@@ -276,12 +297,9 @@ fn find_sessions_by_origin(sessions_dir: &Path, worktree_top: &str) -> Vec<PathB
     entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
-        .filter(|e| {
-            let origin_file = e.path().join("origin");
-            fs::read_to_string(&origin_file)
-                .map(|s| s.trim() == worktree_top)
-                .unwrap_or(false)
-        })
+        // `ran_in`: the `origin` marker names it, or an anchored session
+        // lists it among the worktrees it ran in (VIS-1257).
+        .filter(|e| crate::session_state::ran_in(&e.path(), worktree_top))
         .map(|e| e.path())
         .collect()
 }
@@ -777,19 +795,34 @@ mod tests {
         make_session_dir(&sessions, "elsewhere", Some("/wt/b"));
 
         assert_eq!(
-            invoking_session(&sessions, "/wt/a", Some("here")).as_deref(),
+            invoking_session(&|id| sessions.join(id), "/wt/a", Some("here")).as_deref(),
             Some("here")
         );
         assert_eq!(
-            invoking_session(&sessions, "/wt/a", Some("legacy")).as_deref(),
+            invoking_session(&|id| sessions.join(id), "/wt/a", Some("legacy")).as_deref(),
             Some("legacy")
         );
         assert_eq!(
-            invoking_session(&sessions, "/wt/a", Some("elsewhere")),
+            invoking_session(&|id| sessions.join(id), "/wt/a", Some("elsewhere")),
             None
         );
-        assert_eq!(invoking_session(&sessions, "/wt/a", Some("missing")), None);
-        assert_eq!(invoking_session(&sessions, "/wt/a", Some("../here")), None);
-        assert_eq!(invoking_session(&sessions, "/wt/a", None), None);
+        assert_eq!(
+            invoking_session(&|id| sessions.join(id), "/wt/a", Some("missing")),
+            None
+        );
+        // An anchored session that ran here and moved on (VIS-1257).
+        crate::session_state::record_worktree(&sessions.join("elsewhere"), "/wt/a").unwrap();
+        assert_eq!(
+            invoking_session(&|id| sessions.join(id), "/wt/a", Some("elsewhere")).as_deref(),
+            Some("elsewhere")
+        );
+        assert_eq!(
+            invoking_session(&|id| sessions.join(id), "/wt/a", Some("../here")),
+            None
+        );
+        assert_eq!(
+            invoking_session(&|id| sessions.join(id), "/wt/a", None),
+            None
+        );
     }
 }

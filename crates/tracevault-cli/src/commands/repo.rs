@@ -179,8 +179,11 @@ fn apply_switch(state: &mut SessionState, binding: RepoBinding) {
 /// cleared: the hooks would otherwise bind the session again from its
 /// checkout's remote on the next event. Pure.
 fn apply_reset(state: &mut SessionState) {
+    // Bindings only: where the session keeps its dir is not a binding, and
+    // dropping it would split the session again (VIS-1257).
     *state = SessionState {
         auto_bind_off: true,
+        storage_root: state.storage_root.take(),
         ..SessionState::default()
     };
 }
@@ -683,6 +686,7 @@ mod tests {
         let mut state = SessionState {
             active: Some(binding("r")),
             subagents: std::collections::HashMap::from([("/wt/a".to_string(), binding("r2"))]),
+            storage_root: Some("/umbrella".into()),
             ..Default::default()
         };
         apply_reset(&mut state);
@@ -690,6 +694,7 @@ mod tests {
             state,
             SessionState {
                 auto_bind_off: true,
+                storage_root: Some("/umbrella".into()),
                 ..SessionState::default()
             }
         );

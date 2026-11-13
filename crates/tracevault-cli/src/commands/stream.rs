@@ -1358,9 +1358,24 @@ pub async fn run_stream(
     // just below runs BEFORE the config/credentials check and can itself
     // `?`-exit early — that remains graceful because `main.rs` catches all
     // `Err` from `run_stream` and exits 0 without blocking the tool.
+    //
+    // The session DIR is anchored to where the session started when
+    // `session-start` recorded that (VIS-1257): the hook's `cwd` follows the
+    // shell's `cd`, and a dir resolved per event would split the session's
+    // `.stream_offset` and queues across two `.tracevault/`s. Config and
+    // credentials still come from the event's `cwd` (`project_root`).
     let hook_cwd = Path::new(&hook_event.cwd);
-    let (resolved, session_dir) = resolve_session_paths(hook_cwd, &hook_event.session_id);
-    if resolved.source == crate::paths::ProjectRootSource::Fallback {
+    let (resolved, cwd_session_dir) = resolve_session_paths(hook_cwd, &hook_event.session_id);
+    let storage_root =
+        crate::session_state::storage_root(&crate::session_state::load(&hook_event.session_id));
+    let session_dir = match &storage_root {
+        Some(root) => root
+            .join(".tracevault")
+            .join("sessions")
+            .join(&hook_event.session_id),
+        None => cwd_session_dir,
+    };
+    if storage_root.is_none() && resolved.source == crate::paths::ProjectRootSource::Fallback {
         // Neither git nor an ancestor `.tracevault/` resolved a project root, so
         // we are about to create a fresh `.tracevault/` at the hook's working
         // directory — which is how stray per-subdirectory `.tracevault/` dirs
@@ -1382,7 +1397,8 @@ pub async fn run_stream(
     // one. `tracevault init` writes this for the root dir, but runtime-created
     // dirs would otherwise have no .gitignore and leak sessions into commits.
     // Best-effort: never fail the hook on this.
-    let _ = crate::config::TracevaultConfig::ensure_gitignore(&project_root.join(".tracevault"));
+    let storage = storage_root.as_ref().unwrap_or(&project_root);
+    let _ = crate::config::TracevaultConfig::ensure_gitignore(&storage.join(".tracevault"));
 
     // Write origin marker so verify-start can disambiguate sessions by worktree.
     // Best-effort: never fail the hook on marker errors. Uses the shared
@@ -1390,6 +1406,11 @@ pub async fn run_stream(
     // against on the read side.
     let worktree_top = crate::paths::worktree_toplevel(hook_cwd);
     let _ = fs::write(session_dir.join("origin"), &worktree_top);
+    // An anchored session also lists every worktree it ran in, so `check` and
+    // `verify-start` there find it after it moved on (VIS-1257).
+    if storage_root.is_some() {
+        let _ = crate::session_state::record_worktree(&session_dir, &worktree_top);
+    }
 
     // Record where the transcript lives: `tracevault check` counts the
     // session's tool calls from it, and finds it only through metadata.json.

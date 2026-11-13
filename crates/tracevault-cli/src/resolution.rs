@@ -613,17 +613,27 @@ pub async fn resolve_effective_project(
 /// worktree toplevel the hook recorded in its `origin` marker. `bound` and
 /// `user_default` are the lower tiers the hook also consults.
 ///
+/// `here` is the caller's worktree toplevel. When the session ran an event
+/// there (see [`crate::session_state::ran_in`]) the override is keyed by it:
+/// an anchored session's `origin` names only where its LATEST event ran, and
+/// its events in `here` were resolved with `here` (VIS-1257).
+///
 /// A binding whose `repo_id` is not a UUID resolves to `None`, as it does for
 /// the hook (`stream::attribution_for` never sends to it).
 pub(crate) fn recorded_session_binding(
     session_dir: &Path,
+    here: &str,
     state: &SessionState,
     bound: Option<RepoBinding>,
     user_default: Option<RepoBinding>,
 ) -> Option<RepoBinding> {
-    let worktree = std::fs::read_to_string(session_dir.join("origin"))
-        .ok()
-        .map(|s| s.trim().to_string());
+    let worktree = if crate::session_state::ran_in(session_dir, here) {
+        Some(here.to_string())
+    } else {
+        std::fs::read_to_string(session_dir.join("origin"))
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
     effective_binding(ResolveInputs {
         repo_flag: None,
         session: state,
@@ -900,7 +910,7 @@ mod tests {
             ..Default::default()
         };
         let got =
-            recorded_session_binding(dir.path(), &state, Some(binding(REPO_B)), None).unwrap();
+            recorded_session_binding(dir.path(), "", &state, Some(binding(REPO_B)), None).unwrap();
         assert_eq!(got.repo_id, REPO_A);
     }
 
@@ -914,7 +924,7 @@ mod tests {
             ..Default::default()
         };
         state.subagents.insert("/wt/sub".into(), binding(REPO_C));
-        let got = recorded_session_binding(dir.path(), &state, None, None).unwrap();
+        let got = recorded_session_binding(dir.path(), "", &state, None, None).unwrap();
         assert_eq!(got.repo_id, REPO_C);
     }
 
@@ -924,6 +934,7 @@ mod tests {
         let state = SessionState::default();
         let got = recorded_session_binding(
             dir.path(),
+            "",
             &state,
             Some(binding(REPO_B)),
             Some(binding(REPO_C)),
@@ -931,9 +942,31 @@ mod tests {
         .unwrap();
         assert_eq!(got.repo_id, REPO_B);
         let got =
-            recorded_session_binding(dir.path(), &state, None, Some(binding(REPO_C))).unwrap();
+            recorded_session_binding(dir.path(), "", &state, None, Some(binding(REPO_C))).unwrap();
         assert_eq!(got.repo_id, REPO_C);
-        assert!(recorded_session_binding(dir.path(), &state, None, None).is_none());
+        assert!(recorded_session_binding(dir.path(), "", &state, None, None).is_none());
+    }
+
+    /// An anchored session that ran in a subagent's worktree and then moved
+    /// on: from that worktree, its override applies (VIS-1257).
+    #[test]
+    fn recorded_session_binding_keys_the_override_by_a_worktree_the_session_ran_in() {
+        let dir = session_dir_with_origin(Some("/umbrella"));
+        crate::session_state::record_worktree(dir.path(), "/wt/sub").unwrap();
+        crate::session_state::record_worktree(dir.path(), "/umbrella").unwrap();
+        let mut state = SessionState {
+            active: Some(binding(REPO_A)),
+            ..Default::default()
+        };
+        state.subagents.insert("/wt/sub".into(), binding(REPO_C));
+        let got = |here| recorded_session_binding(dir.path(), here, &state, None, None);
+        assert_eq!(got("/wt/sub").unwrap().repo_id, REPO_C);
+        assert_eq!(got("/umbrella").unwrap().repo_id, REPO_A);
+        assert_eq!(
+            got("/never").unwrap().repo_id,
+            REPO_A,
+            "falls back to origin"
+        );
     }
 
     #[test]
@@ -943,7 +976,7 @@ mod tests {
             active: Some(binding("../escape")),
             ..Default::default()
         };
-        assert!(recorded_session_binding(dir.path(), &state, None, None).is_none());
+        assert!(recorded_session_binding(dir.path(), "", &state, None, None).is_none());
     }
 
     /// The same session must resolve to the same repo on the hook side and on
@@ -964,7 +997,7 @@ mod tests {
                 None,
             );
             let recorded =
-                recorded_session_binding(dir.path(), &state, Some(binding(REPO_B)), None);
+                recorded_session_binding(dir.path(), "", &state, Some(binding(REPO_B)), None);
             assert_eq!(
                 hook.map(|b| b.repo_id),
                 recorded.map(|b| b.repo_id),

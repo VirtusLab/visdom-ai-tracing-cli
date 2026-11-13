@@ -339,7 +339,9 @@ pub fn select_worktree_sessions(
 ) -> (Vec<std::path::PathBuf>, bool) {
     let belongs = |dir: &std::path::Path| -> bool {
         match fs::read_to_string(dir.join("origin")) {
-            Ok(s) => s.trim() == worktree_top, // marked: keep only if mine
+            // Marked: keep only if mine — the latest event ran here, or an
+            // anchored session lists this worktree as one it ran in (VIS-1257).
+            Ok(s) => s.trim() == worktree_top || crate::session_state::ran_in(dir, worktree_top),
             // Only a genuinely-absent marker counts as unmarked/legacy (keep).
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
             // Marker present but unreadable (permissions/IO): we can't prove it's
@@ -358,6 +360,49 @@ pub fn select_worktree_sessions(
         (session_dirs, true)
     } else {
         (filtered, false)
+    }
+}
+
+/// [`select_worktree_sessions`] over the local dirs, plus the `external` ones
+/// (already known to belong to this worktree). The fall-back to every local
+/// session applies only when neither matched: an external session is a match.
+fn select_with_external(
+    local: Vec<std::path::PathBuf>,
+    external: Vec<std::path::PathBuf>,
+    worktree_top: &str,
+) -> Vec<std::path::PathBuf> {
+    let (mut selected, fell_back) = select_worktree_sessions(local, worktree_top);
+    if fell_back {
+        if external.is_empty() {
+            eprintln!(
+                "Warning: no unpushed session matched this worktree by origin marker — \
+                 checking all unpushed sessions to avoid skipping policy enforcement."
+            );
+        } else {
+            selected.clear();
+        }
+    }
+    selected.extend(external);
+    selected
+}
+
+/// Add a session dir that lives outside `sessions_dir` to the sessions a
+/// push is checked against, unless it is gone, pushed, or already there.
+///
+/// A session keeps its dir in the `.tracevault/` it STARTED in (VIS-1257), so
+/// one started in an umbrella directory that then works in this checkout has
+/// no dir here. A dir inside `sessions_dir` was already considered by the
+/// worktree selection, and its verdict stands.
+fn add_external_session(
+    selected: &mut Vec<std::path::PathBuf>,
+    sessions_dir: &Path,
+    dir: std::path::PathBuf,
+) {
+    if dir.parent() == Some(sessions_dir) || !dir.is_dir() || dir.join(".pushed").exists() {
+        return;
+    }
+    if !selected.contains(&dir) {
+        selected.push(dir);
     }
 }
 
@@ -503,13 +548,22 @@ pub async fn check_policies(
     // Filter to the worktree that is actually pushing, so a push is not
     // evaluated against sessions belonging to other worktrees.
     let worktree_top = crate::paths::worktree_toplevel(cwd);
-    let (selected_dirs, fell_back) = select_worktree_sessions(unpushed_dirs, &worktree_top);
-    if fell_back {
-        eprintln!(
-            "Warning: no unpushed session matched this worktree by origin marker — \
-             checking all unpushed sessions to avoid skipping policy enforcement."
-        );
+    //
+    // Sessions that keep their dir in the `.tracevault/` they started in (an
+    // umbrella dir, VIS-1257) and worked in this worktree, plus the session
+    // running this push, wherever its dir is, belong to it too — found
+    // first, so they count before falling back to every local session.
+    let invoking = crate::session_state::env_session_id()
+        .filter(|id| crate::session_state::is_safe_session_id(id))
+        .map(|id| crate::session_state::session_dir(project_root, &id));
+    let mut external = Vec::new();
+    for dir in crate::session_state::anchored_session_dirs(&sessions_dir, &worktree_top)
+        .into_iter()
+        .chain(invoking)
+    {
+        add_external_session(&mut external, &sessions_dir, dir);
     }
+    let selected_dirs = select_with_external(unpushed_dirs, external, &worktree_top);
 
     // Where each session's events actually went, resolved as the stream hook
     // resolves it — only to warn when that is not the pushed repo. A
@@ -532,6 +586,7 @@ pub async fn check_policies(
             let state = crate::session_state::load(&data.session_id);
             let streamed_to = crate::resolution::recorded_session_binding(
                 session_dir,
+                &worktree_top,
                 &state,
                 bound.clone(),
                 user_default.clone(),
@@ -674,8 +729,73 @@ fn is_server_error(lower: &str) -> bool {
 
 #[cfg(test)]
 mod worktree_tests {
-    use super::select_worktree_sessions;
+    use super::{add_external_session, select_with_external, select_worktree_sessions};
+
+    #[test]
+    fn an_external_match_stops_the_fall_back_to_every_local_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other = seed(tmp.path(), "other", Some("/wt/b"));
+        let ext = tmp.path().join("umbrella-session");
+        assert_eq!(
+            select_with_external(vec![other.clone()], vec![ext.clone()], "/wt/a"),
+            vec![ext.clone()]
+        );
+        assert_eq!(
+            select_with_external(vec![other.clone()], vec![], "/wt/a"),
+            vec![other.clone()],
+            "no match at all still checks everything"
+        );
+        let mine = seed(tmp.path(), "mine", Some("/wt/a"));
+        assert_eq!(
+            select_with_external(vec![mine.clone(), other], vec![ext.clone()], "/wt/a"),
+            vec![mine, ext]
+        );
+    }
     use std::path::PathBuf;
+
+    /// A session kept here that ran here and moved to another repo: its
+    /// `origin` names the other repo, its worktree list names this one.
+    #[test]
+    fn keeps_a_session_that_ran_here_before_moving_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let moved = seed(tmp.path(), "moved", Some("/wt/b"));
+        crate::session_state::record_worktree(&moved, "/wt/a").unwrap();
+        crate::session_state::record_worktree(&moved, "/wt/b").unwrap();
+        let mine = seed(tmp.path(), "mine", Some("/wt/a"));
+        let other = seed(tmp.path(), "other", Some("/wt/b"));
+        let (mut kept, fell_back) =
+            select_worktree_sessions(vec![moved.clone(), mine.clone(), other], "/wt/a");
+        kept.sort();
+        assert_eq!(kept, vec![mine, moved]);
+        assert!(!fell_back);
+    }
+
+    #[test]
+    fn adds_an_external_session_only_when_it_lives_elsewhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let here = tmp.path().join("repo/.tracevault/sessions");
+        let local = seed(&here, "local", Some("/wt/b"));
+        let elsewhere = seed(
+            &tmp.path().join("umbrella/.tracevault/sessions"),
+            "s",
+            Some("/u"),
+        );
+        let pushed = seed(&tmp.path().join("umbrella/.tracevault/sessions"), "p", None);
+        std::fs::write(pushed.join(".pushed"), "").unwrap();
+
+        let mut selected = vec![];
+        add_external_session(&mut selected, &here, local);
+        assert!(
+            selected.is_empty(),
+            "a local dir is the worktree filter's call"
+        );
+
+        add_external_session(&mut selected, &here, elsewhere.clone());
+        add_external_session(&mut selected, &here, elsewhere.clone());
+        add_external_session(&mut selected, &here, tmp.path().join("missing"));
+        add_external_session(&mut selected, &here, pushed);
+        assert_eq!(selected, vec![elsewhere]);
+    }
 
     fn seed(tmp: &std::path::Path, id: &str, origin: Option<&str>) -> PathBuf {
         let d = tmp.join(id);
