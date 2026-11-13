@@ -123,6 +123,26 @@ pub struct SessionState {
     /// keep resolving from each event's `cwd`. Read through [`storage_root`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_root: Option<String>,
+    /// What each checkout this session touched resolves to for a project-only
+    /// session's events (VIS-1258), keyed by the checkout's git toplevel, so
+    /// the server is asked once per checkout and not once per event. Read and
+    /// written only through `crate::inferred_repo`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub inferred_repos: std::collections::BTreeMap<String, InferredRepo>,
+}
+
+/// One [`SessionState::inferred_repos`] entry: the repo a checkout resolved to
+/// within `project_id`, or none. A `None` repo is remembered only until
+/// `retry_after` (RFC3339), so a checkout registered or added to the project
+/// later is picked up without asking on every event. A found repo has no
+/// expiry: it is a fact about the server that changes only by a re-register.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InferredRepo {
+    pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<RepoBinding>,
 }
 
 /// The session's recorded [`SessionState::storage_root`], if that directory
@@ -309,10 +329,41 @@ fn save_in(
     let final_path = state_path_in(sessions_dir, session_id);
     // Write to a temp file in the same dir, then atomically rename over the
     // target so a crash or a concurrent reader never sees a partial/empty file.
-    let tmp_path = sessions_dir.join(format!("{session_id}.toml.tmp"));
+    // The temp name is unique per write: a session's parallel hooks save
+    // concurrently, and a shared name let one writer rename the other's
+    // half-written file into place.
+    let tmp_path = sessions_dir.join(format!("{session_id}.toml.{}.tmp", uuid::Uuid::now_v7()));
     std::fs::write(&tmp_path, toml::to_string(state)?)?;
-    std::fs::rename(&tmp_path, &final_path)?;
+    std::fs::rename(&tmp_path, &final_path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp_path);
+    })?;
     Ok(())
+}
+
+/// Load, change and save a session's state while holding an exclusive lock
+/// on `<session_id>.lock` beside it, so the session's parallel hooks — each
+/// recording what it looked up — do not overwrite each other's changes. The
+/// lock is advisory: writers that do not take it (the interactive `switch`
+/// commands) are as before. The OS releases it when the holder exits.
+pub fn update_in(
+    sessions_dir: &std::path::Path,
+    session_id: &str,
+    change: impl FnOnce(&mut SessionState),
+) -> Result<SessionState, Box<dyn std::error::Error>> {
+    if !is_safe_session_id(session_id) {
+        return Err(format!("invalid session id: {session_id:?}").into());
+    }
+    std::fs::create_dir_all(sessions_dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(sessions_dir.join(format!("{session_id}.lock")))?;
+    lock.lock()?;
+    let mut state = load_in(sessions_dir, session_id);
+    change(&mut state);
+    save_in(sessions_dir, session_id, &state)?;
+    Ok(state)
 }
 
 /// Load a session's state, returning the default (empty) state if the file is
@@ -337,6 +388,8 @@ pub fn load_from(sessions_dir: &std::path::Path, session_id: &str) -> SessionSta
 }
 
 /// [`save`] into an explicit sessions dir — the write half of [`load_from`].
+/// Hooks write through the locking [`update_in`] instead.
+#[cfg(test)]
 pub fn save_to(
     sessions_dir: &std::path::Path,
     session_id: &str,

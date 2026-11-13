@@ -326,6 +326,49 @@ pub(crate) fn attribution_for(
     }
 }
 
+/// The project a session's event may infer its repo within (VIS-1258): the
+/// capture-time `project`, but only when no repo binding resolved from any
+/// tier. A binding — even one [`attribution_for`] cannot use — is the
+/// session's explicit choice, which inference never overrides.
+pub(crate) fn inference_project(
+    binding: Option<&crate::session_state::RepoBinding>,
+    project: Option<uuid::Uuid>,
+) -> Option<uuid::Uuid> {
+    match binding {
+        Some(_) => None,
+        None => project,
+    }
+}
+
+/// [`attribution_for`] with the repo inferred for the event's checkout
+/// (`crate::inferred_repo`), which applies only where [`inference_project`]
+/// allows it. Ingest and `status` both go through this, so `status` reports
+/// what the hook sends.
+pub(crate) fn attribution_with_inference(
+    binding: Option<&crate::session_state::RepoBinding>,
+    project: Option<uuid::Uuid>,
+    inferred: Option<&crate::session_state::RepoBinding>,
+) -> Option<Attribution> {
+    match (inference_project(binding, project), inferred) {
+        (Some(pid), Some(repo)) if binding_repo_id_is_valid(&repo.repo_id) => {
+            Some(Attribution::Repo {
+                repo_id: repo.repo_id.clone(),
+                project: Some(pid),
+            })
+        }
+        _ => attribution_for(binding, project),
+    }
+}
+
+/// What a session's events are sent under, as `status` reports it: the
+/// [`Attribution`], and the checkout its repo was inferred from when it was
+/// (VIS-1258) rather than bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Recording {
+    pub attribution: Option<Attribution>,
+    pub inferred_from: Option<String>,
+}
+
 /// Offline-queue path for an attribution target.
 fn pending_path_for(session_dir: &Path, attribution: &Attribution) -> std::path::PathBuf {
     session_dir.join(attribution.pending_file_name())
@@ -646,22 +689,57 @@ pub(crate) fn capture_project(
 /// (VIS-158, VIS-316) — in particular a repo-less, project-only session
 /// (VIS-1255), which `repo status` alone would show as "not bound" and
 /// `project status` alone as merely "bound to project X".
+///
+/// A project-only session's repo inferred for `worktree` (VIS-1258) is read
+/// from the session's cache — what the hook sends under there — and is
+/// labelled as inferred. A checkout the hook has not looked up yet reads as
+/// project-only until the session's first event there.
 pub(crate) fn recording_attribution_for(
     session: &crate::session_state::SessionState,
     worktree: &str,
     bound: Option<crate::session_state::RepoBinding>,
     user_default_repo: Option<crate::session_state::RepoBinding>,
     config_project: Option<crate::session_state::ProjectBinding>,
-) -> Option<Attribution> {
+) -> Recording {
     let stream_binding = resolve_stream_binding(session, worktree, bound, user_default_repo);
-    attribution_for(
-        stream_binding.as_ref(),
-        capture_project(session, Some(worktree), config_project),
-    )
+    let project = capture_project(session, Some(worktree), config_project);
+    let inferred = inference_project(stream_binding.as_ref(), project)
+        .and_then(|pid| crate::inferred_repo::cached_repo(session, worktree, pid));
+    let attribution =
+        attribution_with_inference(stream_binding.as_ref(), project, inferred.as_ref());
+    let inferred_from = match (&attribution, &inferred) {
+        (Some(Attribution::Repo { repo_id, .. }), Some(repo)) if *repo_id == repo.repo_id => {
+            Some(worktree.to_string())
+        }
+        _ => None,
+    };
+    Recording {
+        attribution,
+        inferred_from,
+    }
 }
 
-/// One `recording:` line describing an [`Attribution`] for `repo status` and
+/// One `recording:` line describing a [`Recording`] for `repo status` and
 /// `project status`. Pure, so the wording is asserted directly.
+pub(crate) fn recording_line_for(recording: &Recording) -> String {
+    if let (
+        Some(Attribution::Repo {
+            repo_id,
+            project: Some(pid),
+        }),
+        Some(checkout),
+    ) = (&recording.attribution, &recording.inferred_from)
+    {
+        return format!(
+            "recording: repo {repo_id} in project {pid} — inferred from the checkout {checkout} \
+             (no repo is bound; events in other checkouts go to their own repo in the project, \
+             or to the project only)"
+        );
+    }
+    recording_line(recording.attribution.as_ref())
+}
+
+/// The `recording:` line for an [`Attribution`] that was not inferred. Pure.
 pub(crate) fn recording_line(attribution: Option<&Attribution>) -> String {
     match attribution {
         Some(Attribution::Repo {
@@ -1688,29 +1766,12 @@ pub(crate) async fn stream_event(
         .and_then(crate::resolution::binding_from_config);
     let user_default = crate::user_default::load();
     let mut binding = resolve_stream_binding(&session, worktree_top, bound, user_default);
-    // The client is built here, not at step 8, because an unbound session may
-    // need it first: bind it from its checkout's remote, as the SessionStart
-    // hook does — this covers agents without that hook and a SessionStart
-    // whose lookup failed (VIS-1048). One lookup per remote per session.
-    let client = server_url
-        .as_deref()
-        .map(|url| crate::api_client::ApiClient::with_credential(url, credential));
-    if binding.is_none() {
-        if let Some(client) = &client {
-            let auto =
-                crate::auto_bind::bind_session(&hook_event.session_id, hook_cwd, client, deadline)
-                    .await;
-            if let Some(notice) = auto.notice {
-                eprintln!("{notice}");
-            }
-            binding = auto.binding;
-        }
-    }
     // Explicit local project binding (if any) overrides server-side repo
     // deduction. Computed BEFORE the attribution gate below, reusing the
     // already-loaded session + worktree used just above for the repo-binding
     // resolution: a repo-less session is attributable by project alone, so the
-    // project must be known before deciding whether this event can be sent.
+    // project must be known before deciding whether this event can be sent —
+    // and, when no repo binds, whether to infer a repo or to auto-bind one.
     // The full binding (not just its id) is resolved: `attribution_mode`
     // reads its `forced_until`, and this is the binding that actually decided
     // the target project, so it's the only one whose force is allowed to
@@ -1727,6 +1788,60 @@ pub(crate) async fn stream_event(
     let capture_pid = capture_binding
         .as_ref()
         .and_then(crate::resolution::capture_project_id);
+    // The client is built here, not at step 8, because an unbound session may
+    // need it first. A project-only session infers this event's repo from the
+    // checkout it touches (VIS-1258): per event, within the project, never
+    // stored as the session's binding — so a session working across several
+    // child checkouts of an umbrella dir is attributed to each in turn. Any
+    // other unbound session is bound from its checkout's remote, as the
+    // SessionStart hook does — this covers agents without that hook and a
+    // SessionStart whose lookup failed (VIS-1048). Either way one lookup per
+    // checkout per session.
+    let client = server_url
+        .as_deref()
+        .map(|url| crate::api_client::ApiClient::with_credential(url, credential));
+    let mut inferred = None;
+    if binding.is_none() {
+        if let Some(client) = &client {
+            match inference_project(None, capture_pid) {
+                Some(pid) => {
+                    if let Some(checkout) = crate::inferred_repo::event_checkout(
+                        hook_cwd,
+                        hook_event.tool_input.as_ref(),
+                        worktree_top,
+                    ) {
+                        inferred = crate::inferred_repo::infer(
+                            &hook_event.session_id,
+                            &checkout,
+                            pid,
+                            client,
+                            deadline,
+                        )
+                        .await;
+                        // `check` and `verify-start` in a checkout find the
+                        // session by the worktrees it ran in; a file tool's
+                        // checkout is one even while the shell is elsewhere.
+                        if inferred.is_some() && checkout != *worktree_top {
+                            let _ = crate::session_state::record_worktree(session_dir, &checkout);
+                        }
+                    }
+                }
+                None => {
+                    let auto = crate::auto_bind::bind_session(
+                        &hook_event.session_id,
+                        hook_cwd,
+                        client,
+                        deadline,
+                    )
+                    .await;
+                    if let Some(notice) = auto.notice {
+                        eprintln!("{notice}");
+                    }
+                    binding = auto.binding;
+                }
+            }
+        }
+    }
     // Resolved once per invocation, not per event — the binding is invariant
     // across the pending-flush loop and the live send below, while the
     // evaluation costs an env read and an RFC3339 parse. `commands::flush`
@@ -1742,7 +1857,9 @@ pub(crate) async fn stream_event(
     // `attribution_for` rather than dropping the event.)
     // Graceful no-op, exactly like the hook's normal success path. Do NOT
     // error: a failing hook would block the tool.
-    let Some(attribution) = attribution_for(binding.as_ref(), capture_pid) else {
+    let Some(attribution) =
+        attribution_with_inference(binding.as_ref(), capture_pid, inferred.as_ref())
+    else {
         return Ok(Sent::Skipped);
     };
     // A hook records what it sends under, for a later catch-up of this
@@ -1767,8 +1884,20 @@ pub(crate) async fn stream_event(
     // supersedes is first merged into the target's own queue (ahead of it:
     // its events are older), then drained like any queue — whatever is not
     // delivered now is re-queued into `pending_path`.
+    // Only a BOUND repo adopts: a `repo switch` moves the whole session to
+    // the repo. A repo inferred for this one event (VIS-1258) does not —
+    // the queued project-only events touched other checkouts, or none, and
+    // keep their own target until a project-only event or `flush` sends them.
+    // Their transcript lines, not yet counted as sent, are re-read by this
+    // event too, so those lines can reach both server rows; the tool events
+    // themselves are never re-attributed.
     let pending_path = pending_path_for(session_dir, &attribution);
-    if let Some(adopted) = adopted_project_queue(session_dir, &attribution) {
+    let adopted = if inferred.is_some() && binding.is_none() {
+        None
+    } else {
+        adopted_project_queue(session_dir, &attribution)
+    };
+    if let Some(adopted) = adopted {
         adopt_queue(&adopted, &pending_path)?;
     }
     let pending_events = drain_pending(&pending_path)?;
@@ -3685,6 +3814,142 @@ mod tests {
         );
         let none = recording_line(None);
         assert!(none.starts_with("recording: nothing"), "{none}");
+    }
+
+    fn repo_binding(id: &str) -> crate::session_state::RepoBinding {
+        crate::session_state::RepoBinding {
+            repo_id: id.into(),
+            git_url: None,
+            remote_id: None,
+            codebase_name: None,
+            updated_at: "t".into(),
+        }
+    }
+
+    /// A project-only session whose hook cached a repo for `checkout`.
+    fn inferring_session(
+        pid: uuid::Uuid,
+        checkout: &str,
+        repo: &str,
+    ) -> crate::session_state::SessionState {
+        let mut state = crate::session_state::SessionState {
+            active_project: Some(crate::session_state::ProjectBinding {
+                project_id: pid.to_string(),
+                project_name: "p".into(),
+                updated_at: "t".into(),
+                forced_until: None,
+            }),
+            ..Default::default()
+        };
+        state.inferred_repos.insert(
+            checkout.into(),
+            crate::session_state::InferredRepo {
+                project_id: pid.to_string(),
+                retry_after: None,
+                repo: Some(repo_binding(repo)),
+            },
+        );
+        state
+    }
+
+    /// VIS-1258: an inferred repo applies only with no repo binding and a
+    /// project, and is sent within that project.
+    #[test]
+    fn attribution_with_inference_never_overrides_a_binding() {
+        let pid = uuid::Uuid::from_u128(0x1258);
+        let bound = repo_binding("11111111-1111-1111-1111-111111111111");
+        let inferred = repo_binding("22222222-2222-2222-2222-222222222222");
+        let repo = |id: &str| Attribution::Repo {
+            repo_id: id.into(),
+            project: Some(pid),
+        };
+
+        assert_eq!(
+            attribution_with_inference(None, Some(pid), Some(&inferred)),
+            Some(repo(&inferred.repo_id))
+        );
+        assert_eq!(
+            attribution_with_inference(Some(&bound), Some(pid), Some(&inferred)),
+            Some(repo(&bound.repo_id))
+        );
+        // A corrupt binding is still the session's choice: project-only, as
+        // before, never the inferred repo.
+        let corrupt = repo_binding("not-a-uuid");
+        assert_eq!(
+            attribution_with_inference(Some(&corrupt), Some(pid), Some(&inferred)),
+            Some(Attribution::ProjectOnly { project_id: pid })
+        );
+        // No project: nothing to infer within.
+        assert_eq!(
+            attribution_with_inference(None, None, Some(&inferred)),
+            None
+        );
+        assert_eq!(
+            attribution_with_inference(None, Some(pid), Some(&corrupt)),
+            Some(Attribution::ProjectOnly { project_id: pid })
+        );
+    }
+
+    /// `status` reports the cached inferred repo for its checkout, labelled as
+    /// inferred; another checkout reads as project-only.
+    #[test]
+    fn recording_attribution_labels_an_inferred_repo() {
+        let pid = uuid::Uuid::from_u128(0x1258);
+        let repo = "22222222-2222-2222-2222-222222222222";
+        let state = inferring_session(pid, "/umbrella/child", repo);
+
+        let here = recording_attribution_for(&state, "/umbrella/child", None, None, None);
+        assert_eq!(
+            here.attribution,
+            Some(Attribution::Repo {
+                repo_id: repo.into(),
+                project: Some(pid)
+            })
+        );
+        assert_eq!(here.inferred_from.as_deref(), Some("/umbrella/child"));
+        let line = recording_line_for(&here);
+        assert!(
+            line.contains(repo) && line.contains("inferred from the checkout /umbrella/child"),
+            "{line}"
+        );
+
+        let elsewhere = recording_attribution_for(&state, "/umbrella", None, None, None);
+        assert_eq!(
+            elsewhere.attribution,
+            Some(Attribution::ProjectOnly { project_id: pid })
+        );
+        assert_eq!(elsewhere.inferred_from, None);
+        assert_eq!(
+            recording_line_for(&elsewhere),
+            recording_line(elsewhere.attribution.as_ref())
+        );
+
+        // A bound repo is reported as bound, not inferred.
+        let bound = repo_binding("11111111-1111-1111-1111-111111111111");
+        let explicit =
+            recording_attribution_for(&state, "/umbrella/child", Some(bound.clone()), None, None);
+        assert_eq!(
+            explicit.attribution,
+            Some(Attribution::Repo {
+                repo_id: bound.repo_id,
+                project: Some(pid)
+            })
+        );
+        assert_eq!(explicit.inferred_from, None);
+
+        // The project may come from the workspace config tier (VIS-1256)
+        // instead of the session: inference applies all the same.
+        let mut from_config = state.clone();
+        from_config.active_project = None;
+        let workspace = crate::session_state::ProjectBinding {
+            project_id: pid.to_string(),
+            project_name: String::new(),
+            updated_at: String::new(),
+            forced_until: None,
+        };
+        let via_config =
+            recording_attribution_for(&from_config, "/umbrella/child", None, None, Some(workspace));
+        assert_eq!(via_config.inferred_from.as_deref(), Some("/umbrella/child"));
     }
 
     #[test]

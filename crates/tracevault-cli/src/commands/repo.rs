@@ -487,7 +487,7 @@ async fn status(
     );
     println!(
         "{}",
-        crate::commands::stream::recording_line(recording.as_ref())
+        crate::commands::stream::recording_line_for(&recording)
     );
 
     // Surface which codebase the effective binding belongs to, with live clone

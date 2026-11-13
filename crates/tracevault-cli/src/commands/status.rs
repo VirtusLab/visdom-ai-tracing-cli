@@ -1015,12 +1015,25 @@ fn checkout_recording_check(
 /// test calling it directly rather than re-deriving the key by hand, is what
 /// makes `recording_attribution_finds_subagent_override_via_linked_worktree_cwd`
 /// able to catch a regression back to a primary-root path.
+#[cfg(test)]
 fn recording_attribution(
     sessions_dir: Option<&Path>,
     session_id: Option<&str>,
     cwd: &Path,
     config: Option<&TracevaultConfig>,
 ) -> (Option<crate::commands::stream::Attribution>, String) {
+    let (recording, worktree) = recording_for(sessions_dir, session_id, cwd, config);
+    (recording.attribution, worktree)
+}
+
+/// [`recording_attribution`] with whether its repo was inferred from the
+/// checkout (VIS-1258) rather than bound — what `run_status` reports.
+fn recording_for(
+    sessions_dir: Option<&Path>,
+    session_id: Option<&str>,
+    cwd: &Path,
+    config: Option<&TracevaultConfig>,
+) -> (crate::commands::stream::Recording, String) {
     let session = match (sessions_dir, session_id) {
         (Some(dir), Some(id)) => crate::session_state::load_from(dir, id),
         _ => crate::session_state::SessionState::default(),
@@ -1028,14 +1041,39 @@ fn recording_attribution(
     let worktree = crate::paths::worktree_toplevel(cwd);
     let bound = config.and_then(crate::resolution::binding_from_config);
     let user_default_repo = crate::user_default::load();
-    let attribution = crate::commands::stream::recording_attribution_for(
+    let recording = crate::commands::stream::recording_attribution_for(
         &session,
         &worktree,
         bound,
         user_default_repo,
         config.and_then(crate::resolution::project_from_config),
     );
-    (attribution, worktree)
+    (recording, worktree)
+}
+
+/// The `Recording` line for a named session whose repo is inferred from this
+/// checkout (VIS-1258), so `status` says it is inferred and not bound.
+/// `None` when the repo is not inferred.
+fn inferred_recording_check(recording: &crate::commands::stream::Recording) -> Option<Check> {
+    use crate::commands::stream::Attribution;
+    let (
+        Some(Attribution::Repo {
+            repo_id,
+            project: Some(pid),
+        }),
+        Some(checkout),
+    ) = (&recording.attribution, &recording.inferred_from)
+    else {
+        return None;
+    };
+    Some(Check::ok(
+        "Recording",
+        format!(
+            "repo {repo_id} (inferred from the checkout {checkout}) in project {pid} — no repo \
+             is bound, so each event is sent to the repo of the checkout it touches when that \
+             repo is in the project, else to the project only"
+        ),
+    ))
 }
 
 /// The project axis's client-backed resolution: `TRACEVAULT_PROJECT` (UUID
@@ -1507,8 +1545,9 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
     // composition, including the worktree-key derivation, lives there rather
     // than inline here. Its worktree key is reused below for the project
     // display resolution, which needs the same value.
-    let (attribution, worktree) =
-        recording_attribution(sessions_dir.as_deref(), session_id, cwd, config.as_ref());
+    let (recording, worktree) =
+        recording_for(sessions_dir.as_deref(), session_id, cwd, config.as_ref());
+    let attribution = recording.attribution.clone();
 
     // The project axis for DISPLAY needs its own full `SessionState` (more
     // than `workspace_binding_check_in`'s bare `RepoBinding`, e.g.
@@ -1574,7 +1613,10 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
 
     let mut attribution_v = Vec::new();
     match session_id {
-        Some(_) => attribution_v.extend(recording_check(session_id, attribution.as_ref())),
+        Some(_) => attribution_v.extend(
+            recording_check(session_id, attribution.as_ref())
+                .or_else(|| inferred_recording_check(&recording)),
+        ),
         // No session named: `attribution` was resolved with an empty session,
         // i.e. exactly what the hook sees for a new session in this checkout.
         None => attribution_v.push(checkout_recording_check(

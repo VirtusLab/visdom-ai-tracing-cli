@@ -419,3 +419,50 @@ fn an_explicit_repo_switch_binding_is_never_overridden() {
         vec![format!("POST /api/v1/repos/{switched}/stream HTTP/1.1")]
     );
 }
+
+/// VIS-1258: a session bound to a project is not bound to its checkout's
+/// repo. `session-start` infers the repo within the project — its policies
+/// are injected — but stores no binding, and the events that follow carry
+/// the repo per event, from the session's cache.
+#[test]
+fn a_project_session_infers_the_repo_instead_of_binding_it() {
+    let fx = Fixture::new("git@github.com:org/repo.git");
+    let pid = uuid::Uuid::from_u128(0x1258);
+    let sessions = fx.state.join("tracevault").join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{SESSION_ID}.toml")),
+        format!(
+            "[active_project]\nproject_id = \"{pid}\"\nproject_name = \"p\"\nupdated_at = \"\"\n"
+        ),
+    )
+    .unwrap();
+    let project = http("200 OK", &format!(r#"{{"repos":[{{"id":"{REPO_ID}"}}]}}"#));
+
+    let (base, rx) = spawn_server(vec![resolved(), detail(), project, policies(), accepted()]);
+    let (code, stdout, stderr) = fx.session_start(&base);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let requests: Vec<String> = rx.try_iter().collect();
+    assert_eq!(requests.len(), 4, "lookup + policies: {requests:?}");
+    assert!(
+        requests[2].starts_with(&format!("GET /api/v1/projects/{pid} ")),
+        "{requests:?}"
+    );
+    assert!(stdout.contains("POLICY TEXT"), "stdout: {stdout}");
+    assert!(
+        !fx.session_state().contains("[active]"),
+        "inferred, not bound: {}",
+        fx.session_state()
+    );
+
+    let (base, rx) = spawn_server(vec![accepted(), accepted()]);
+    let (code, _, stderr) = fx.stream(&base);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let requests: Vec<String> = rx.try_iter().collect();
+    assert_eq!(
+        requests,
+        vec![format!(
+            "POST /api/v1/projects/{pid}/stream?repo_id={REPO_ID} HTTP/1.1"
+        )]
+    );
+}

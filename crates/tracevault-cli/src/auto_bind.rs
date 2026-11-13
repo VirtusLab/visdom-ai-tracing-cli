@@ -117,36 +117,52 @@ pub(crate) async fn bind_session_in(
         Ok(Ok(lookup)) => lookup,
         Ok(Err(_)) | Err(_) => return AutoBind::default(),
     };
-    // Reload after the lookup: a `repo switch` or `repo reset` that ran
-    // meanwhile, or a concurrent hook that already recorded this remote,
-    // wins over this lookup's result.
-    let mut state = crate::session_state::load_from(sessions_dir, session_id);
-    if !wants_lookup(&state, &git_url) {
-        return AutoBind {
-            binding: state.active,
-            notice: None,
-        };
-    }
-    let result = match lookup {
-        Lookup::Bound(binding) => {
-            state.active = Some(binding.clone());
-            AutoBind {
-                binding: Some(binding),
+    // Reload after the lookup, under the state lock: a `repo switch` or
+    // `repo reset` that ran meanwhile, or a concurrent hook that already
+    // recorded this remote, wins over this lookup's result.
+    let mut result = None;
+    let _ = crate::session_state::update_in(sessions_dir, session_id, |state| {
+        if !wants_lookup(state, &git_url) {
+            result = Some(AutoBind {
+                binding: state.active.clone(),
                 notice: None,
-            }
+            });
+            return;
         }
-        Lookup::Unregistered(notice) | Lookup::Ambiguous(notice) => {
-            state.auto_bind_checked.push(git_url);
-            AutoBind {
-                binding: None,
-                notice: Some(notice),
+        result = Some(match &lookup {
+            Lookup::Bound(binding) => {
+                state.active = Some(binding.clone());
+                AutoBind {
+                    binding: Some(binding.clone()),
+                    notice: None,
+                }
             }
-        }
-    };
+            Lookup::Unregistered(notice) | Lookup::Ambiguous(notice) => {
+                state.auto_bind_checked.push(git_url.clone());
+                AutoBind {
+                    binding: None,
+                    notice: Some(notice.clone()),
+                }
+            }
+        });
+    });
     // Best-effort: an unsaved binding still attributes this event, and the
     // next hook simply looks it up again.
-    let _ = crate::session_state::save_to(sessions_dir, session_id, &state);
-    result
+    match result {
+        Some(result) => result,
+        // The state could not even be locked: this event still goes by the
+        // lookup.
+        None => match lookup {
+            Lookup::Bound(binding) => AutoBind {
+                binding: Some(binding),
+                notice: None,
+            },
+            Lookup::Unregistered(notice) | Lookup::Ambiguous(notice) => AutoBind {
+                binding: None,
+                notice: Some(notice),
+            },
+        },
+    }
 }
 
 /// [`bind_session_in`] for the session state in its usual place.
