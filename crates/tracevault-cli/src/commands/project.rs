@@ -715,6 +715,22 @@ async fn status_report(
     if let Some((b, _)) = effective.as_ref() {
         report.lines.extend(attribution_report(b));
     }
+    // Where this session's events actually go, through the hook's own gate
+    // (no `--project` override: the hook has none) — so a repo-less session
+    // is reported as recording project-only, exactly as ingest sends it
+    // (VIS-1255), and an unbound one as recording nothing.
+    let bound_repo = crate::config::TracevaultConfig::load(project_root)
+        .as_ref()
+        .and_then(crate::resolution::binding_from_config);
+    report.lines.push(crate::commands::stream::recording_line(
+        crate::commands::stream::recording_attribution_for(
+            &session,
+            &worktree,
+            bound_repo,
+            crate::user_default::load(),
+        )
+        .as_ref(),
+    ));
 
     if let (Some(client), Some(url)) = (client.as_ref(), git_url.as_deref()) {
         // Best-effort and informational: an ambiguous or failed deduction is
@@ -2021,6 +2037,7 @@ mod tests {
             report.lines,
             vec![
                 format_status(None),
+                crate::commands::stream::recording_line(None),
                 format_deduction(false, Ok(ResolveProjectOutcome::Ambiguous), None),
             ],
             "the ambiguous deduction is reported on its own line"
@@ -2086,6 +2103,13 @@ mod tests {
                 "project: project-b via user default (project switch --user)".to_string(),
                 "attribution mode: derived (TraceVault checks repo/project membership)"
                     .to_string(),
+                // No repo binds this checkout (no config, no session), so
+                // ingest sends repo-less to B — and status says so (VIS-1255).
+                crate::commands::stream::recording_line(Some(
+                    &crate::commands::stream::Attribution::ProjectOnly {
+                        project_id: uuid::Uuid::from_u128(0xB),
+                    }
+                )),
                 format!(
                     "server deduction for this repo: {deduced_a} (not used: the local binding above wins)"
                 ),
@@ -2242,6 +2266,11 @@ mod tests {
             vec![
                 format!("project: {uuid} via TRACEVAULT_PROJECT (environment)"),
                 "attribution mode: explicit (this caller owns attribution; membership is not checked)".to_string(),
+                crate::commands::stream::recording_line(Some(
+                    &crate::commands::stream::Attribution::ProjectOnly {
+                        project_id: uuid::Uuid::parse_str(uuid).unwrap(),
+                    }
+                )),
             ],
             "the EFFECTIVE mode must reflect TRACEVAULT_PROJECT_ATTRIBUTION even when \
              the winning binding has no force of its own, and the lapse line must NOT \

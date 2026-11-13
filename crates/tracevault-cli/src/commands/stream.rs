@@ -207,6 +207,37 @@ pub fn append_pending(pending_path: &Path, json: &str) -> Result<(), io::Error> 
     Ok(())
 }
 
+/// Move the queue at `from` into the queue at `into`, ahead of what `into`
+/// already holds (`from`'s events are older), without a window in which a
+/// failure loses either: the merged file is written beside `into` and
+/// renamed over it, and only then is `from` removed. Any error before the
+/// rename leaves both files as they were — this matters because queued
+/// inline records and tool payloads cannot be re-read from a transcript.
+/// A failure to remove `from` after the rename leaves its events in both
+/// files; they are then sent twice to the SAME target, where the server
+/// dedupes them (`chunk_index`, `event_uuid`).
+fn adopt_queue(from: &Path, into: &Path) -> Result<(), io::Error> {
+    let adopted = match fs::read_to_string(from) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let existing = match fs::read_to_string(into) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let mut merged = adopted;
+    if !merged.is_empty() && !merged.ends_with('\n') {
+        merged.push('\n');
+    }
+    merged.push_str(&existing);
+    let tmp = into.with_extension("jsonl.adopting");
+    fs::write(&tmp, merged)?;
+    fs::rename(&tmp, into)?;
+    fs::remove_file(from)
+}
+
 pub fn drain_pending(pending_path: &Path) -> Result<Vec<String>, io::Error> {
     if !pending_path.exists() {
         return Ok(vec![]);
@@ -298,6 +329,53 @@ pub(crate) fn attribution_for(
 /// Offline-queue path for an attribution target.
 fn pending_path_for(session_dir: &Path, attribution: &Attribution) -> std::path::PathBuf {
     session_dir.join(attribution.pending_file_name())
+}
+
+/// The project-only queue a repo-scoped target takes over (VIS-1255), if any.
+///
+/// A session that started repo-less (umbrella dir, project bound) and then
+/// gained a repo (`repo switch` mid-session) moves from `ProjectOnly { pid }`
+/// to `Repo { project: Some(pid) }`. Events queued before the switch sit in
+/// `pending-project-<pid>.jsonl`, which the repo target never reads. Left
+/// there, they are either stranded or — via `tracevault flush` — delivered to
+/// the server's repo-less session row, while the same transcript lines (the
+/// offset did not advance for them) are re-read and sent to the repo row:
+/// the same lines stored twice. The server keys a session by
+/// `(repo_id, session_id)` when a repo is present and by
+/// `(project_id, session_id) WHERE repo_id IS NULL` otherwise, and dedupes
+/// lines per row, so the client must not split them. Draining the queue
+/// under the current target puts them on the row the re-read lines go to,
+/// where `chunk_index` dedupes them.
+///
+/// Only the SAME project is adopted: the repo send still declares that
+/// project, so this refines where the events land within it instead of
+/// re-attributing them. A `Repo` with a different or no project keeps the
+/// per-target isolation [`Attribution::pending_file_name`] exists for.
+///
+/// What this cannot prevent (server-side, needs a row merge there): lines
+/// the repo-less row ALREADY stored before the switch while `.stream_offset`
+/// did not advance — a multi-part batch whose first parts were accepted and
+/// a later one failed, or an accepted request whose response was lost. The
+/// re-read after the switch sends those to the repo row too. The client
+/// cannot tell which of them the other row holds, and advancing the offset
+/// per accepted part would move every later line's `chunk_index` (it is
+/// based on the read's start offset) and break dedupe within one row.
+fn adopted_project_queue(
+    session_dir: &Path,
+    attribution: &Attribution,
+) -> Option<std::path::PathBuf> {
+    match attribution {
+        Attribution::Repo {
+            project: Some(project_id),
+            ..
+        } => Some(pending_path_for(
+            session_dir,
+            &Attribution::ProjectOnly {
+                project_id: *project_id,
+            },
+        )),
+        _ => None,
+    }
 }
 
 /// Resolve the project root and session directory for a stream hook invocation.
@@ -556,15 +634,85 @@ pub(crate) fn capture_project(
         .and_then(crate::resolution::capture_project_id)
 }
 
-/// The one-line warning printed when a repo-less event is dropped as
-/// permanently undeliverable. Pure, so the wording is asserted directly.
-fn undeliverable_warning(pid: uuid::Uuid) -> String {
-    format!(
-        "tracevault: warning: project {pid} does not resolve (400/404/409); this session has no \
-         repo binding, so there is nothing to attribute these events to and they are being \
-         DROPPED rather than queued. Run `tracevault project switch <name>` to bind a project \
-         that exists."
+/// The hook's attribution gate for an already-loaded session: the same
+/// `resolve_stream_binding` -> `capture_project` -> `attribution_for` chain
+/// `stream_event` runs, minus the network auto-bind. Shared by `status`,
+/// `repo status` and `project status` so all three report what ingest does
+/// (VIS-158, VIS-316) — in particular a repo-less, project-only session
+/// (VIS-1255), which `repo status` alone would show as "not bound" and
+/// `project status` alone as merely "bound to project X".
+pub(crate) fn recording_attribution_for(
+    session: &crate::session_state::SessionState,
+    worktree: &str,
+    bound: Option<crate::session_state::RepoBinding>,
+    user_default_repo: Option<crate::session_state::RepoBinding>,
+) -> Option<Attribution> {
+    let stream_binding = resolve_stream_binding(session, worktree, bound, user_default_repo);
+    attribution_for(
+        stream_binding.as_ref(),
+        capture_project(session, Some(worktree)),
     )
+}
+
+/// One `recording:` line describing an [`Attribution`] for `repo status` and
+/// `project status`. Pure, so the wording is asserted directly.
+pub(crate) fn recording_line(attribution: Option<&Attribution>) -> String {
+    match attribution {
+        Some(Attribution::Repo {
+            repo_id,
+            project: None,
+        }) => format!("recording: repo {repo_id} (the server deduces the project from the repo)"),
+        Some(Attribution::Repo {
+            repo_id,
+            project: Some(pid),
+        }) => format!("recording: repo {repo_id} in project {pid}"),
+        Some(Attribution::ProjectOnly { project_id }) => format!(
+            "recording: project {project_id} only — no repo is bound, so events are sent \
+             without one (`tracevault repo switch <path>` adds the repo)"
+        ),
+        None => "recording: nothing — neither a repo nor a project is bound, so this \
+                 session's events are not sent"
+            .to_string(),
+    }
+}
+
+/// The one-line error printed when the server refuses a REPO-LESS
+/// (project-only) send. The repo-scoped [`refused_error`] says the project
+/// "does not apply to this repo", which is wrong when there is no repo, and
+/// its remedy names only `project switch` — while for a repo-less session
+/// `repo switch` is the other way out. Pure, so the wording is asserted
+/// directly. The `explicit`-force clause is shared with [`refused_error`]:
+/// the force gate refuses with the same 403 on either route.
+///
+/// VIS-1255: the event is QUEUED, not dropped (VIS-316: a deterministic 4xx
+/// on a project-scoped send is an error that goes through the normal buffer
+/// path). Dropping advanced `.stream_offset`, so the session's transcript
+/// was lost with only a stderr line nobody reads in a hook.
+pub(crate) fn refused_project_only_error(
+    pid: uuid::Uuid,
+    kind: &ClientErrorKind,
+    force: AttributionForce,
+) -> String {
+    let base = match kind {
+        ClientErrorKind::Forbidden => format!(
+            "tracevault: error: the server refused this repo-less session's event for project \
+             {pid} (403). Either this account has no access to that project (no `Operator` \
+             role on it) — run `tracevault project switch <name>` (add `--user` if the binding \
+             is the machine-wide default in `user_project.toml`) — or it has no `tracevault` \
+             grant in Control Plane at all, which an administrator must grant. The session has \
+             no repo binding, so the event was not sent anywhere else; it has been queued and \
+             will be retried with the next event."
+        ),
+        ClientErrorKind::Scoping => format!(
+            "tracevault: error: project {pid} does not resolve on the server (400/404/409: it \
+             does not exist, or this account cannot see it). The session has no repo binding, \
+             so the event was not sent anywhere else; it has been queued and will be retried \
+             with the next event. Run `tracevault project switch <name>` (add `--user` if the \
+             binding is the machine-wide default in `user_project.toml`) to bind a project that \
+             exists, or `tracevault repo switch <path>` to record this session to a repo."
+        ),
+    };
+    with_force_clause(base, kind, force)
 }
 
 /// True when a stream-send error's rendered message carries a `(4xx ...)`
@@ -653,6 +801,13 @@ pub(crate) fn refused_error(
              machine-wide default in `user_project.toml`) to update it."
         ),
     };
+    with_force_clause(base, kind, force)
+}
+
+/// Append the "the refusal may be of the FORCE itself" clause to a refusal
+/// line when the send declared `explicit` and the refusal is a 403. Shared by
+/// [`refused_error`] and [`refused_project_only_error`].
+fn with_force_clause(base: String, kind: &ClientErrorKind, force: AttributionForce) -> String {
     if force.mode() == crate::api_client::AttributionMode::Explicit
         && matches!(kind, ClientErrorKind::Forbidden)
     {
@@ -731,15 +886,13 @@ pub(crate) fn deterministic_client_error_kind(
 /// `Repo` with no project goes to the repo-scoped endpoint (the server
 /// deduces the project); `Repo` with a project goes to the project-scoped
 /// endpoint carrying `repo_id`; `ProjectOnly` goes to the project-scoped
-/// endpoint with no `repo_id` at all. Having no fallback endpoint, it decides
-/// instead between buffering and dropping: a `Scoping` 4xx (the project does
-/// not resolve) can never succeed on retry — the offline queue is keyed by
-/// that same project id — so it warns and returns `Ok(None)`, while a 403 or
-/// any transient error propagates to be buffered. See the arm itself for why
-/// the two differ.
-///
-/// `Ok(None)` therefore means "deliberately dropped, do not queue": callers
-/// must treat it like a success for offset/queue purposes, not like an error.
+/// endpoint with no `repo_id` at all. A deterministic refusal there (VIS-1255,
+/// per VIS-316) prints [`refused_project_only_error`] once and propagates as
+/// `Err`, exactly like the repo+project refusal below: the caller buffers it
+/// in `pending-project-<pid>.jsonl`. It used to be dropped as "undeliverable",
+/// which advanced `.stream_offset` and so lost the session's transcript on a
+/// refusal that a later `project switch`/`repo switch` or role grant could
+/// have fixed.
 ///
 /// When the attribution carries BOTH a repo and a project, the project was
 /// explicitly declared (by binding or by `project switch`), so the server's
@@ -760,9 +913,7 @@ pub(crate) fn deterministic_client_error_kind(
 /// pending-flush loop only `break`s on `Err`, so without this flag a stale,
 /// refused binding would print the refusal line once per buffered event
 /// before the loop breaks. Gating on `*warned` caps stderr at one line per
-/// invocation. The repo-less drop warning shares the flag for the same
-/// reason: draining a queue of undeliverable events would otherwise print one
-/// line per buffered event.
+/// invocation. The repo-less refusal shares the flag for the same reason.
 ///
 /// `force` is the invocation's attribution force — [`attribution_force`]
 /// applied to the capture binding. Its [`AttributionForce::mode`] goes on
@@ -780,48 +931,34 @@ async fn send_stream_event(
     force: AttributionForce,
     req: &StreamEventRequest,
     warned: &mut bool,
-) -> Result<Option<tracevault_protocol::streaming::StreamEventResponse>, Box<dyn std::error::Error>>
-{
+) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn std::error::Error>> {
     let (repo_id, capture_pid) = match attribution {
-        // Repo-less: there is no repo-scoped endpoint to fall back TO, so the
-        // only choice is buffer-for-retry vs. drop, and that turns on whether
-        // a retry could EVER succeed.
-        //
-        // `Scoping` (400/404/409) means the project itself does not resolve.
-        // The offline queue is keyed by that same project id
-        // (`pending-project-<uuid>.jsonl`), so re-binding to a project that
-        // does exist writes to a DIFFERENT file and these events are never
-        // retried under the corrected binding — they would accumulate forever,
-        // one per tool call, each hook fire re-reading and re-appending the
-        // whole queue. Warn and drop instead: undeliverable is undeliverable,
-        // and a growing queue only hides it.
-        //
-        // `Forbidden` (403) is deliberately NOT dropped. It can mean the
-        // account has no `tracevault` grant at all, which an administrator can
-        // grant — after which the buffered events do deliver. Same for any
-        // transient error. Both propagate so the caller queues them.
+        // Repo-less: there is no repo-scoped endpoint to fall back TO. A
+        // deterministic refusal is an error (VIS-316) that goes through the
+        // normal buffer path like any other — printed once, then `Err` so the
+        // caller queues it in `pending-project-<pid>.jsonl` and leaves
+        // `.stream_offset` where it is. Nothing is ever dropped here: a
+        // refused project can be fixed by `project switch`, by `repo switch`
+        // (whose repo-scoped send adopts this queue when the project is the
+        // same, see `adopted_project_queue`), or by a role grant.
         Attribution::ProjectOnly { project_id } => {
             let attempt = client
                 .stream_event_for_project(*project_id, None, force.mode(), req)
                 .await;
-            return match attempt {
-                Ok(r) => Ok(Some(r)),
-                Err(e) => match deterministic_client_error_kind(e.as_ref()) {
-                    Some(ClientErrorKind::Scoping) => {
-                        if !*warned {
-                            eprintln!("{}", undeliverable_warning(*project_id));
-                            *warned = true;
-                        }
-                        Ok(None)
+            if let Err(e) = &attempt {
+                if let Some(kind) = deterministic_client_error_kind(e.as_ref()) {
+                    if !*warned {
+                        eprintln!("{}", refused_project_only_error(*project_id, &kind, force));
+                        *warned = true;
                     }
-                    _ => Err(e),
-                },
-            };
+                }
+            }
+            return attempt;
         }
         Attribution::Repo { repo_id, project } => (repo_id.as_str(), *project),
     };
     match capture_pid {
-        None => client.stream_event(repo_id, req).await.map(Some),
+        None => client.stream_event(repo_id, req).await,
         Some(pid) => {
             let attempt = client
                 .stream_event_for_project(pid, Some(repo_id), force.mode(), req)
@@ -831,7 +968,7 @@ async fn send_stream_event(
                 Err(e) => deterministic_client_error_kind(e.as_ref()),
             };
             match (attempt, kind) {
-                (Ok(r), _) => Ok(Some(r)),
+                (Ok(r), _) => Ok(r),
                 (Err(e), Some(kind)) => {
                     if !*warned {
                         // Since Keycloak, a 403 has a SECOND and now more common
@@ -1591,8 +1728,14 @@ pub(crate) async fn stream_event(
     // 8. The ApiClient (built above)
     let client = client.ok_or("server_url not configured")?;
 
-    // 9. Try drain pending queue and send
+    // 9. Try drain pending queue and send. A project-only queue this target
+    // supersedes is first merged into the target's own queue (ahead of it:
+    // its events are older), then drained like any queue — whatever is not
+    // delivered now is re-queued into `pending_path`.
     let pending_path = pending_path_for(session_dir, &attribution);
+    if let Some(adopted) = adopted_project_queue(session_dir, &attribution) {
+        adopt_queue(&adopted, &pending_path)?;
+    }
     let pending_events = drain_pending(&pending_path)?;
 
     let mut send_failed = false;
@@ -2702,10 +2845,7 @@ mod tests {
         )
         .await
         .expect("send_stream_event must succeed");
-        assert_eq!(
-            got.expect("a successful send returns a response").status,
-            "accepted"
-        );
+        assert_eq!(got.status, "accepted");
 
         let captured = rx
             .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
@@ -2967,10 +3107,7 @@ mod tests {
         )
         .await
         .expect("send_stream_event must succeed");
-        assert_eq!(
-            got.expect("a successful send returns a response").status,
-            "accepted"
-        );
+        assert_eq!(got.status, "accepted");
 
         let line = rx
             .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
@@ -3032,10 +3169,7 @@ mod tests {
         )
         .await
         .expect("send_stream_event must succeed");
-        assert_eq!(
-            got.expect("a successful send returns a response").status,
-            "accepted"
-        );
+        assert_eq!(got.status, "accepted");
 
         let line = rx
             .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
@@ -3365,10 +3499,7 @@ mod tests {
         )
         .await
         .expect("a repo-less project send must succeed");
-        assert_eq!(
-            got.expect("a successful send returns a response").status,
-            "accepted"
-        );
+        assert_eq!(got.status, "accepted");
 
         let line = rx
             .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
@@ -3388,14 +3519,14 @@ mod tests {
         );
     }
 
-    /// A `Scoping` 4xx is permanently undeliverable for a repo-less session:
-    /// the queue is keyed by the very project id the server says does not
-    /// resolve, so a corrected binding writes to a different file and these
-    /// events would never be retried — they would just accumulate, one per
-    /// tool call. They must be DROPPED (`Ok(None)`), loudly, and must not
-    /// trigger a second, impossible request.
+    /// VIS-1255 / VIS-316: a `Scoping` 4xx on a repo-less send is an ERROR
+    /// that goes through the normal buffer path — `Err`, so the caller queues
+    /// it in `pending-project-<pid>.jsonl` and `.stream_offset` stays put.
+    /// It used to be dropped as `Ok(None)`, which advanced the offset and so
+    /// lost the transcript lines for good. Exactly one request: there is no
+    /// endpoint to fall back to, and none may be tried.
     #[tokio::test]
-    async fn send_stream_event_project_only_drops_on_scoping_4xx() {
+    async fn send_stream_event_project_only_buffers_on_scoping_4xx() {
         let body = "no such project";
         let resp_404 = format!(
             "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -3417,7 +3548,7 @@ mod tests {
         let pid = uuid::Uuid::from_u128(12);
 
         let mut warned = false;
-        let got = send_stream_event(
+        let err = send_stream_event(
             &client,
             &Attribution::ProjectOnly { project_id: pid },
             attribution_force(None),
@@ -3425,26 +3556,167 @@ mod tests {
             &mut warned,
         )
         .await
-        .expect("an undeliverable repo-less event is dropped, not surfaced as Err");
-        assert!(
-            got.is_none(),
-            "Ok(None) signals the deliberate drop; Some(_) would read as a real send"
+        .expect_err("a refused repo-less send must propagate so the caller buffers it");
+        assert_eq!(
+            deterministic_client_error_kind(err.as_ref()),
+            Some(ClientErrorKind::Scoping),
+            "the original 404 must propagate unchanged, got: {err}"
         );
-        assert!(
-            warned,
-            "dropping data silently is the failure mode to avoid"
-        );
+        assert!(warned, "the refusal is printed (once per invocation)");
 
         let first = rx
             .recv_timeout(SEND_STREAM_EVENT_RECV_TIMEOUT)
             .expect("no request captured");
         assert!(
-            first.contains(&format!("/projects/{pid}/stream")),
-            "must hit the project-scoped endpoint, got: {first}"
+            first.starts_with(&format!("POST /api/v1/projects/{pid}/stream ")),
+            "must hit the bare project-scoped endpoint, got: {first}"
         );
         assert!(
             rx.recv_timeout(Duration::from_millis(500)).is_err(),
             "a repo-less send must make exactly one request — no fallback exists"
+        );
+    }
+
+    /// The repo-less refusal must not borrow the repo-scoped wording ("does
+    /// not apply to this repo"), must say the event was queued (not dropped),
+    /// and must name `repo switch` as a way out for a `Scoping` refusal.
+    #[test]
+    fn refused_project_only_error_wording() {
+        let pid = uuid::Uuid::from_u128(0x55);
+        let scoping =
+            refused_project_only_error(pid, &ClientErrorKind::Scoping, AttributionForce::default());
+        assert!(scoping.starts_with("tracevault: error:"), "{scoping}");
+        assert!(scoping.contains(&pid.to_string()), "{scoping}");
+        assert!(scoping.contains("queued"), "{scoping}");
+        assert!(!scoping.contains("DROPPED"), "{scoping}");
+        assert!(!scoping.contains("this repo"), "{scoping}");
+        assert!(scoping.contains("tracevault repo switch"), "{scoping}");
+
+        let forbidden = refused_project_only_error(
+            pid,
+            &ClientErrorKind::Forbidden,
+            AttributionForce::default(),
+        );
+        assert!(forbidden.contains("(403)"), "{forbidden}");
+        assert!(forbidden.contains("queued"), "{forbidden}");
+        assert!(!forbidden.contains("FORCE"), "derived send: {forbidden}");
+
+        let forced = AttributionForce {
+            env: true,
+            binding: false,
+        };
+        let explicit = refused_project_only_error(pid, &ClientErrorKind::Forbidden, forced);
+        assert!(
+            explicit.contains("FORCE itself"),
+            "an explicit 403 must name the force, like the repo-scoped line: {explicit}"
+        );
+        assert!(
+            !refused_project_only_error(pid, &ClientErrorKind::Scoping, forced)
+                .contains("FORCE itself"),
+            "a Scoping refusal never ran the force gate"
+        );
+    }
+
+    /// `adopted_project_queue`: only `Repo { project: Some(pid) }` adopts, and
+    /// only `pending-project-<pid>.jsonl` for that same pid.
+    #[test]
+    fn recording_line_names_each_attribution_shape() {
+        let pid = uuid::Uuid::from_u128(0x99);
+        let repo = "11111111-1111-1111-1111-111111111111".to_string();
+        let only = recording_line(Some(&Attribution::ProjectOnly { project_id: pid }));
+        assert!(only.starts_with("recording: project "), "{only}");
+        assert!(
+            only.contains(&pid.to_string()) && only.contains("no repo"),
+            "{only}"
+        );
+        let both = recording_line(Some(&Attribution::Repo {
+            repo_id: repo.clone(),
+            project: Some(pid),
+        }));
+        assert!(
+            both.contains(&repo) && both.contains(&pid.to_string()),
+            "{both}"
+        );
+        let deduced = recording_line(Some(&Attribution::Repo {
+            repo_id: repo.clone(),
+            project: None,
+        }));
+        assert!(
+            deduced.contains(&repo) && deduced.contains("deduces"),
+            "{deduced}"
+        );
+        let none = recording_line(None);
+        assert!(none.starts_with("recording: nothing"), "{none}");
+    }
+
+    #[test]
+    fn adopt_queue_puts_the_older_queue_first_and_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("pending-project-x.jsonl");
+        let into = dir.path().join("pending-r.jsonl");
+        std::fs::write(&from, "a1\na2").unwrap(); // no trailing newline
+        std::fs::write(&into, "r1\n").unwrap();
+        adopt_queue(&from, &into).unwrap();
+        assert!(!from.exists());
+        assert_eq!(drain_pending(&into).unwrap(), vec!["a1", "a2", "r1"]);
+        assert!(
+            !dir.path().join("pending-r.jsonl.adopting").exists(),
+            "no temp file left behind"
+        );
+    }
+
+    #[test]
+    fn adopt_queue_without_a_source_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let into = dir.path().join("pending-r.jsonl");
+        std::fs::write(&into, "r1\n").unwrap();
+        adopt_queue(&dir.path().join("absent.jsonl"), &into).unwrap();
+        assert_eq!(drain_pending(&into).unwrap(), vec!["r1"]);
+    }
+
+    /// Codex R1.2: an unreadable target queue must not cost the adopted one —
+    /// inline records and tool payloads exist nowhere else.
+    #[test]
+    fn adopt_queue_failure_leaves_the_source_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("pending-project-x.jsonl");
+        let into = dir.path().join("pending-r.jsonl");
+        std::fs::write(&from, "a1\n").unwrap();
+        std::fs::create_dir(&into).unwrap(); // reading it fails
+        assert!(adopt_queue(&from, &into).is_err());
+        assert_eq!(std::fs::read_to_string(&from).unwrap(), "a1\n");
+    }
+
+    #[test]
+    fn adopted_project_queue_only_for_the_same_project() {
+        let dir = Path::new("/tmp/sess");
+        let pid = uuid::Uuid::from_u128(0x77);
+        let repo_id = "11111111-1111-1111-1111-111111111111".to_string();
+        assert_eq!(
+            adopted_project_queue(
+                dir,
+                &Attribution::Repo {
+                    repo_id: repo_id.clone(),
+                    project: Some(pid),
+                }
+            ),
+            Some(dir.join(format!("pending-project-{pid}.jsonl")))
+        );
+        assert_eq!(
+            adopted_project_queue(
+                dir,
+                &Attribution::Repo {
+                    repo_id,
+                    project: None,
+                }
+            ),
+            None,
+            "with no declared project the server deduces one; adopting would re-attribute"
+        );
+        assert_eq!(
+            adopted_project_queue(dir, &Attribution::ProjectOnly { project_id: pid }),
+            None,
+            "a project-only target already drains its own queue"
         );
     }
 
