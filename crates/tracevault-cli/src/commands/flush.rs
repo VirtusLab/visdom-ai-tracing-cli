@@ -181,7 +181,41 @@ fn queue_capture_binding(session_dir: &Path) -> Option<crate::session_state::Pro
     let worktree = fs::read_to_string(session_dir.join("origin"))
         .ok()
         .map(|s| s.trim().to_string());
-    crate::commands::stream::capture_binding(&session, worktree.as_deref())
+    let config_project = match worktree.as_deref() {
+        Some(origin) if !origin.is_empty() => origin_config_project(Path::new(origin)),
+        _ => session_dir_config_project(session_dir),
+    };
+    crate::commands::stream::capture_binding(&session, worktree.as_deref(), config_project)
+}
+
+/// The workspace project tier the stream hook read for the event whose
+/// worktree it recorded in `origin`: the hook loads the config at
+/// `resolve_project_root(event cwd)`, and `origin` is that cwd's worktree
+/// toplevel (the cwd itself outside git), which resolves to the same root.
+/// Preferred over the session dir's own root because a session's dir is
+/// anchored where it STARTED (VIS-1257) — an umbrella — while a later event
+/// may have come from a checkout below it, whose config the hook read instead.
+fn origin_config_project(origin: &Path) -> Option<crate::session_state::ProjectBinding> {
+    let root = crate::paths::resolve_project_root(origin).root;
+    crate::config::TracevaultConfig::load(&root)
+        .as_ref()
+        .and_then(crate::resolution::project_from_config)
+}
+
+/// The workspace project tier (`.tracevault/config.toml` `project_id`) of the
+/// project root a session directory lives under
+/// (`<root>/.tracevault/sessions/<id>`), for a session dir with no `origin`
+/// marker. `None` when the layout does not match or the config has none.
+fn session_dir_config_project(session_dir: &Path) -> Option<crate::session_state::ProjectBinding> {
+    let sessions = session_dir.parent()?;
+    let tv_dir = sessions.parent()?;
+    if sessions.file_name()? != "sessions" || tv_dir.file_name()? != ".tracevault" {
+        return None;
+    }
+    let root = tv_dir.parent()?;
+    crate::config::TracevaultConfig::load(root)
+        .as_ref()
+        .and_then(crate::resolution::project_from_config)
 }
 
 /// Send one queued event to the endpoint its queue and the session's capture
@@ -956,6 +990,83 @@ mod send_tests {
                 .to_lowercase()
                 .contains("x-tracevault-project-attribution: explicit"),
             "got: {captured}"
+        );
+    }
+
+    /// VIS-1256: a queue under a workspace directory recovers the workspace
+    /// tier (`.tracevault/config.toml` `project_id` at the session dir's
+    /// root) exactly as the live send did, and drains a repo queue to the
+    /// project-scoped endpoint carrying the repo id. A session dir outside
+    /// the `<root>/.tracevault/sessions/<id>` layout has no config tier.
+    #[tokio::test]
+    async fn queue_binding_recovers_the_workspace_project_from_the_session_dir() {
+        let _env_lock = lock_env_mutation().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut guard = EnvVarGuard::new();
+        guard.set("XDG_STATE_HOME", tmp.path().join("state"));
+        guard.set("XDG_CONFIG_HOME", tmp.path().join("config"));
+        guard.set("HOME", tmp.path());
+        guard.remove("TRACEVAULT_PROJECT");
+        guard.remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+
+        let pid = uuid::Uuid::from_u128(0x1256);
+        let root = tmp.path().join("umbrella");
+        let session_dir = root.join(".tracevault/sessions/flush-workspace");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            root.join(".tracevault/config.toml"),
+            format!("project_id = \"{pid}\"\nproject_name = \"visdom\"\n"),
+        )
+        .unwrap();
+
+        let binding = queue_capture_binding(&session_dir).expect("workspace tier recovered");
+        assert_eq!(binding.project_id, pid.to_string());
+
+        let repo: uuid::Uuid = REPO.parse().unwrap();
+        let target = QueueTarget::Repo(REPO.to_string());
+        let force = queue_attribution_force(&target, Some(&binding));
+        let (base, rx) = spawn_seq(vec![ok()]);
+        let client = ApiClient::new(&base, Some("tok"));
+        let got = send_queued_event(&client, &target, Some(pid), force, &event(1)).await;
+        assert!(matches!(got, QueuedSend::Sent), "{got:?}");
+        let captured = rx.recv_timeout(RECV_TIMEOUT).expect("no request captured");
+        assert!(
+            captured.starts_with(&format!("POST /api/v1/projects/{pid}/stream")),
+            "got: {captured}"
+        );
+        assert!(
+            captured.contains(&repo.to_string()),
+            "repo id carried: {captured}"
+        );
+
+        // Not under `.tracevault/sessions/`: no config tier.
+        let stray = tmp.path().join("elsewhere/flush-workspace");
+        fs::create_dir_all(&stray).unwrap();
+        assert_eq!(session_dir_config_project(&stray), None);
+
+        // The dir is anchored at the umbrella (VIS-1257) but the last event
+        // came from a checkout below it, recorded in `origin`: the hook read
+        // THAT checkout's config (no project_id), so flush must too.
+        let child = root.join("child");
+        fs::create_dir_all(&child).unwrap();
+        crate::test_helpers::init_git_repo(&child);
+        fs::write(
+            session_dir.join("origin"),
+            crate::paths::worktree_toplevel(&child),
+        )
+        .unwrap();
+        assert_eq!(queue_capture_binding(&session_dir), None);
+        // ...and from a non-git sub-directory it is the umbrella's again.
+        let notes = root.join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(
+            session_dir.join("origin"),
+            crate::paths::worktree_toplevel(&notes),
+        )
+        .unwrap();
+        assert_eq!(
+            queue_capture_binding(&session_dir).map(|b| b.project_id),
+            Some(pid.to_string())
         );
     }
 

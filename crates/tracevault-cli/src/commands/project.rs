@@ -400,7 +400,8 @@ async fn switch(
 /// The project `project status` treats as effective: exactly the capture-time
 /// chain ingest uses ([`capture_project_binding`]: `--project` flag →
 /// subagent worktree override → `TRACEVAULT_PROJECT` → session
-/// `active_project` → user default).
+/// `active_project` → workspace `.tracevault/config.toml` `project_id` → user
+/// default).
 /// Pure — `status` supplies `user_default` from `user_project_default::load()`
 /// and `env_project` from `commands::stream::env_project_binding()`, the same
 /// file and the same reader `commands::stream::capture_project` uses, so the
@@ -415,6 +416,7 @@ fn status_effective(
     env_project: Option<ProjectBinding>,
     session: &SessionState,
     worktree: Option<&str>,
+    config_project: Option<ProjectBinding>,
     user_default: Option<ProjectBinding>,
 ) -> (Option<(ProjectBinding, ProjectSource)>, Option<String>) {
     match capture_project_binding(&CaptureProjectInputs {
@@ -422,6 +424,7 @@ fn status_effective(
         env_project,
         session,
         worktree_path: worktree,
+        config_project,
         user_default,
     }) {
         Some((binding, source)) if capture_project_id(&binding).is_none() => {
@@ -464,8 +467,8 @@ fn enrich_project_name(
 
 /// Warning for a `TRACEVAULT_PROJECT` that holds a NAME rather than a UUID.
 ///
-/// Same rule, and the same shape of warning, as [`config_default_warning`]:
-/// resolving a name needs a `list_projects` round trip, the per-event capture
+/// Same rule as the legacy `.tracevault/config.toml` `default_project`
+/// (`commands::migrate::legacy_default_project_notice`): resolving a name needs a `list_projects` round trip, the per-event capture
 /// path never makes one, so the variable decides nothing and attribution
 /// falls through to the next tier. `status` therefore does NOT resolve it
 /// either — reporting a name-resolved project as effective would be exactly
@@ -502,18 +505,9 @@ fn format_status(effective: Option<(&ProjectBinding, ProjectSource)>) -> String 
 /// `project_binding_check`.
 fn invalid_capture_id_warning(binding: &ProjectBinding, source: ProjectSource) -> String {
     format!(
-        "warning: project {} — {source}, but the saved project_id is not a valid id and is dropped at capture time; run `tracevault project switch <name>` to rewrite it",
-        binding_label(binding)
-    )
-}
-
-/// Warning for a `.tracevault/config.toml` `default_project`: it is a name,
-/// ingest never resolves it (that would be a per-event network call), so it
-/// never decides attribution. `status` neither resolves it nor feeds it into
-/// the chain.
-fn config_default_warning(name: &str) -> String {
-    format!(
-        "warning: .tracevault/config.toml default_project '{name}' is not used for attribution at capture time; bind explicitly with `tracevault project switch <name>`"
+        "warning: project {} — {source}, but the saved project_id is not a valid id and is dropped at capture time; run `{}` to rewrite it",
+        binding_label(binding),
+        source.rewrite_command()
     )
 }
 
@@ -622,8 +616,13 @@ async fn status_report(
         }
     };
     let worktree = crate::paths::worktree_toplevel(cwd);
-    let config_default_name =
-        crate::config::TracevaultConfig::load(project_root).and_then(|c| c.default_project);
+    // The config at the project root, read once: its `project_id` is the
+    // workspace tier — read exactly as the hook reads it, no name lookup —
+    // and its legacy `default_project` only ever produces a notice.
+    let config = crate::config::TracevaultConfig::load(project_root);
+    let config_project = config
+        .as_ref()
+        .and_then(crate::resolution::project_from_config);
     let user_default = crate::user_project_default::load();
     let git_url = git_remote_url(cwd);
 
@@ -697,13 +696,17 @@ async fn status_report(
         env_project,
         &session,
         Some(&worktree),
+        config_project.clone(),
         user_default,
     );
     report.warnings.extend(invalid_id_warning);
     let effective = enrich_project_name(effective, items.as_deref());
 
-    if let Some(name) = config_default_name.as_deref() {
-        report.warnings.push(config_default_warning(name));
+    if let Some(notice) = config
+        .as_ref()
+        .and_then(crate::commands::migrate::legacy_default_project_notice)
+    {
+        report.warnings.push(format!("warning: {notice}"));
     }
 
     report
@@ -719,7 +722,7 @@ async fn status_report(
     // (no `--project` override: the hook has none) — so a repo-less session
     // is reported as recording project-only, exactly as ingest sends it
     // (VIS-1255), and an unbound one as recording nothing.
-    let bound_repo = crate::config::TracevaultConfig::load(project_root)
+    let bound_repo = config
         .as_ref()
         .and_then(crate::resolution::binding_from_config);
     report.lines.push(crate::commands::stream::recording_line(
@@ -728,6 +731,7 @@ async fn status_report(
             &worktree,
             bound_repo,
             crate::user_default::load(),
+            config_project,
         )
         .as_ref(),
     ));
@@ -1200,7 +1204,11 @@ mod tests {
         };
         assert_eq!(
             invalid_capture_id_warning(&b, ProjectSource::UserDefault),
-            "warning: project payments — user default (project switch --user), but the saved project_id is not a valid id and is dropped at capture time; run `tracevault project switch <name>` to rewrite it"
+            "warning: project payments — user default (project switch --user), but the saved project_id is not a valid id and is dropped at capture time; run `tracevault project switch --user <name>` to rewrite it"
+        );
+        assert_eq!(
+            invalid_capture_id_warning(&b, ProjectSource::Workspace),
+            "warning: project payments — workspace .tracevault/config.toml, but the saved project_id is not a valid id and is dropped at capture time; run `tracevault init --workspace --project <name>` to rewrite it"
         );
     }
 
@@ -1217,7 +1225,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (effective, warning) = status_effective(None, None, &session, None, None);
+        let (effective, warning) = status_effective(None, None, &session, None, None, None);
         assert!(effective.is_none(), "{effective:?}");
         let warning = warning.expect("a dropped binding must be explained");
         assert!(
@@ -1237,7 +1245,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (effective, warning) = status_effective(None, None, &valid, None, None);
+        let (effective, warning) = status_effective(None, None, &valid, None, None, None);
         assert_eq!(
             effective.map(|(b, s)| (b.project_id, s)),
             Some((pid.to_string(), ProjectSource::SessionActive))
@@ -1269,6 +1277,7 @@ mod tests {
             Some(bind(u(9), "env")),
             &session,
             None,
+            None,
             Some(bind(u(3), "user")),
         );
         assert_eq!(
@@ -1281,6 +1290,7 @@ mod tests {
             Some(bind(u(1), "flag")),
             Some(bind(u(9), "env")),
             &session,
+            None,
             None,
             Some(bind(u(3), "user")),
         );
@@ -1309,14 +1319,6 @@ mod tests {
         assert!(
             warning.contains("not used") || warning.contains("ignored"),
             "{warning}"
-        );
-    }
-
-    #[test]
-    fn config_default_warning_says_it_is_not_used_at_capture_time() {
-        assert_eq!(
-            config_default_warning("web"),
-            "warning: .tracevault/config.toml default_project 'web' is not used for attribution at capture time; bind explicitly with `tracevault project switch <name>`"
         );
     }
 
@@ -1954,8 +1956,65 @@ mod tests {
                 Some(u(2)),
             ),
         ];
+        // The workspace `.tracevault/config.toml` `project_id` tier
+        // (VIS-1256): same shared chain, so it is pinned here too. Each case
+        // adds the config's `project_id` as a sixth column.
+        let session_active = || SessionState {
+            active_project: Some(bind(u(2).to_string())),
+            ..Default::default()
+        };
+        // (label, session, user default, TRACEVAULT_PROJECT, workspace
+        //  config project_id, expected id)
+        type WorkspaceCase = (
+            &'static str,
+            SessionState,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<uuid::Uuid>,
+        );
+        let workspace_cases: Vec<WorkspaceCase> = vec![
+            (
+                "(i) workspace config outranks the user default",
+                SessionState::default(),
+                Some(u(3).to_string()),
+                None,
+                Some(u(5).to_string()),
+                Some(u(5)),
+            ),
+            (
+                "(j) session active (project switch) outranks the workspace config",
+                session_active(),
+                Some(u(3).to_string()),
+                None,
+                Some(u(5).to_string()),
+                Some(u(2)),
+            ),
+            (
+                "(k) TRACEVAULT_PROJECT (UUID) outranks the workspace config",
+                SessionState::default(),
+                None,
+                Some(u(4).to_string()),
+                Some(u(5).to_string()),
+                Some(u(4)),
+            ),
+            (
+                "(l) a non-UUID workspace project_id is dropped by both, shadowing the user default",
+                SessionState::default(),
+                Some(u(3).to_string()),
+                None,
+                Some("not-a-uuid".into()),
+                None,
+            ),
+        ];
+        let cases = cases
+            .into_iter()
+            .map(|(label, session, user, env, expected)| {
+                (label, session, user, env, None, expected)
+            })
+            .chain(workspace_cases);
 
-        for (label, session, user_default, env_project, expected) in cases {
+        for (label, session, user_default, env_project, config_project, expected) in cases {
             match &user_default {
                 Some(id) => crate::user_project_default::save(&bind(id.clone())).unwrap(),
                 None => crate::user_project_default::clear().unwrap(),
@@ -1964,16 +2023,25 @@ mod tests {
                 Some(v) => _guard.set("TRACEVAULT_PROJECT", v),
                 None => _guard.remove("TRACEVAULT_PROJECT"),
             }
+            // Read the way both callers read it: through `project_from_config`.
+            let config_project = config_project.and_then(|id| {
+                crate::resolution::project_from_config(&crate::config::TracevaultConfig {
+                    project_id: Some(id),
+                    ..Default::default()
+                })
+            });
             let status_pid = status_effective(
                 None,
                 crate::commands::stream::env_project_binding(),
                 &session,
                 Some(worktree),
+                config_project.clone(),
                 crate::user_project_default::load(),
             )
             .0
             .and_then(|(b, _)| capture_project_id(&b));
-            let ingest_pid = crate::commands::stream::capture_project(&session, Some(worktree));
+            let ingest_pid =
+                crate::commands::stream::capture_project(&session, Some(worktree), config_project);
             assert_eq!(
                 status_pid, ingest_pid,
                 "{label}: status and ingest disagree"

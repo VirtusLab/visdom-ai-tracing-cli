@@ -95,7 +95,8 @@ a session is bound to a repo by:
 4. **The automatic binding** from the session's checkout, described above.
 
 A session with no repo is still recorded, repo-less, when it resolves to a project:
-`TRACEVAULT_PROJECT` set to a project UUID, a `tracevault project switch` in the session, or a
+`TRACEVAULT_PROJECT` set to a project UUID, a `tracevault project switch` in the session, a
+[workspace directory](#a-folder-of-checkouts--init---workspace) it was started under, or a
 user-level `tracevault project switch --user` default (which then catches every unbound session
 on the machine) — see [Project attribution](#project-attribution--tracevault_project-and-tracevault_project_attribution).
 A session that resolves to neither — one started outside any checkout, or in one whose remote
@@ -103,6 +104,25 @@ the server does not know — records nothing. If something else regenerates
 `~/.claude/CLAUDE.md`, the note from point 1 is lost; re-run `tracevault init --global` to
 restore it (it is idempotent). Without it, sessions are still bound automatically to the repo
 they start in, but the agent is not told to `repo switch` when it moves to another repo.
+
+### A folder of checkouts — `init --workspace`
+
+```sh
+cd ~/src/my-platform            # an umbrella directory, not itself a git repo
+tracevault init --workspace --project my-platform
+```
+
+Every session started in that directory, or in a non-git directory below it, is then recorded
+to project `my-platform` with no per-session step — without `--user`, so sessions elsewhere on
+the machine are not affected. `init --workspace` works outside git, creates `.tracevault/`
+there if needed, looks the project name up on the server **once** (an unknown or ambiguous name
+is an error and writes nothing), and writes its id to `.tracevault/config.toml` as `project_id`
+(with `project_name` for display). It binds no repo and installs no hooks: pair it with
+`init --global`. A session's own `project switch` still overrides it. A session started inside
+a git checkout below it is not covered: it follows that checkout (its own `tracevault init`, or
+the automatic binding to its repo, whose project the server deduces). Running `tracevault repo
+switch <path>` when an agent started in the workspace moves into a checkout is optional: it adds
+the repo, but the session is recorded to the workspace project either way.
 
 ### Check the result
 
@@ -193,10 +213,15 @@ export TRACEVAULT_PROJECT_ATTRIBUTION=explicit
 
 **`TRACEVAULT_PROJECT`** is one tier of the project chain the capture hook uses, which is, from
 highest precedence: a subagent's per-worktree override → `TRACEVAULT_PROJECT` → the session's
-`project switch` binding → the user-level default (`project switch --user`). When none applies,
-the hook sends no project and the server derives it from the repo. The capture hook never
-reads `default_project` from `.tracevault/config.toml` (a name would need a network lookup), so
-a config file baked into a pod image cannot outrank the launcher.
+`project switch` binding → the workspace `.tracevault/config.toml` `project_id` (written by
+[`init --workspace`](#a-folder-of-checkouts--init---workspace)) → the user-level default
+(`project switch --user`). When none applies, the hook sends no project and the server derives
+it from the repo. A config file baked into a pod image therefore cannot outrank the launcher.
+The hook reads the config's `project_id` (a UUID) and never a project name: the legacy
+`default_project` key (a name) is not used for capture. `tracevault init` and `tracevault sync`
+migrate it — they look the name up once and replace it with `project_id` + `project_name`, or
+fail naming it if it is unknown or ambiguous — and until then `status` / `project status` report
+it as unmigrated.
 
 > **Only the UUID form is honoured.** Resolving a name needs a `list_projects` round trip,
 > and the capture hook runs per event in a short-lived process, so it never makes one: a
@@ -259,10 +284,12 @@ lists them; set `repo_id` in `.tracevault/config.toml` to the right one. `tracev
 follows the same rule.
 
 Re-running `init` is safe: it keeps the existing `.tracevault/config.toml` (`repo_id`,
-`user_context`, a pinned `server_url` / `api_key` / `default_project`, and keys it does not
+`user_context`, a pinned `server_url` / `api_key` / `project_id`, and keys it does not
 know) and changes only what a flag on that run sets (`--server-url`, `--user-context`,
-`--no-user-context`). If that file cannot be parsed, `init` stops before writing anything;
-fix or remove it and run `init` again.
+`--no-user-context`). A legacy `default_project` name is migrated to `project_id` (see
+[Project attribution](#project-attribution--tracevault_project-and-tracevault_project_attribution));
+an unknown or ambiguous name stops `init` before it writes anything. If that file cannot be
+parsed, `init` stops before writing anything; fix or remove it and run `init` again.
 
 **Choosing the agent — `--agent`**
 
@@ -637,6 +664,7 @@ every session on the machine instead.
 | `--user-context <path>` | Enable the user context layer, reading this file |
 | `--no-user-context` | Disable the user context layer (conflicts with `--user-context`) |
 | `--global` | Install machine-wide instead of in this repo; does not need git. Conflicts with `--server-url`, `--claude-settings`, `--no-gitignore` |
+| `--workspace --project <name>` | Bind the current directory to a project for every session started under it (see [A folder of checkouts](#a-folder-of-checkouts--init---workspace)); does not need git, installs no hooks, writes no `repo_id`. Takes `--server-url`; conflicts with the other flags |
 | `--claude-telemetry` | Claude Code only: send Claude Code's own per-request cost to TraceVault over OpenTelemetry, configured in `~/.claude/settings.json` (see [telemetry](#tracevault-init--set-up-tracing-in-a-repo)), without asking. Neither flag: asks in a terminal (default yes), otherwise on, unless you turned it off before |
 | `--no-claude-telemetry` | Claude Code only: turn that telemetry off (removes TraceVault's entries) and remember it across upgrades. Conflicts with `--claude-telemetry` |
 
@@ -647,7 +675,9 @@ every session on the machine instead.
 
 **`tracevault sync`** — register the repo with the server, or bind to its existing record, and
 write `repo_id` into `.tracevault/config.toml` if the repo has one. Needs a login (or API key)
-and an `origin` remote. The pre-push hook runs it before every push.
+and an `origin` remote. It first migrates a legacy `default_project` name in that config to
+`project_id` — also in a directory without a remote — and exits 1 naming the value if it is
+unknown or ambiguous. The pre-push hook runs it before every push.
 
 **`tracevault status [--session-id <id>]`** — diagnose the setup: authentication, global and
 repo installation, git and agent hooks (Claude Code hooks in `.claude/settings.json`,
@@ -835,7 +865,8 @@ All user-level files live in the TraceVault config directory: `~/.config/traceva
 | `context.json` | `context … --user` | The user context layer (default location) |
 | `default_repo.toml` | `repo switch --user` | Machine-wide default repo binding |
 | `user_project.toml` | `project switch --user` | Machine-wide default project binding |
-| `<repo>/.tracevault/config.toml` | `init`, `sync`, `context source` | `repo_id`, `user_context`, the agent, and optionally `server_url` / `api_key` / `default_project` |
+| `<repo>/.tracevault/config.toml` | `init`, `sync`, `context source` | `repo_id`, `user_context`, the agent, and optionally `server_url` / `api_key` / `project_id` + `project_name` |
+| `<dir>/.tracevault/config.toml` | `init --workspace` | `project_id` + `project_name` for every session started under `<dir>` (no `repo_id`) |
 | `<repo>/.tracevault/context.json` | `context …` | The repo context layer |
 | `<repo>/.tracevault/worktrees/<key>/context.json` | `context …` in a linked worktree | The worktree context layer |
 

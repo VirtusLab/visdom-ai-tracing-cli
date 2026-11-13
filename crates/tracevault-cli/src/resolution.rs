@@ -358,7 +358,7 @@ pub struct ResolveInputs<'a> {
 }
 
 /// Inputs for the effective-project precedence chain. `project_flag` and
-/// `config_default` are resolved by the caller; `session`/`worktree_path`
+/// `config_project` are resolved by the caller; `session`/`worktree_path`
 /// come from the per-session state.
 pub struct ProjectResolveInputs<'a> {
     pub project_flag: Option<ProjectBinding>,
@@ -367,7 +367,9 @@ pub struct ProjectResolveInputs<'a> {
     pub env_project: Option<ProjectBinding>,
     pub session: &'a SessionState,
     pub worktree_path: Option<&'a str>,
-    pub config_default: Option<ProjectBinding>,
+    /// The workspace tier: `.tracevault/config.toml` `project_id`, read by
+    /// [`project_from_config`] — local, never a name lookup.
+    pub config_project: Option<ProjectBinding>,
 }
 
 /// Which precedence tier produced the [`effective_binding`] result.
@@ -413,8 +415,11 @@ pub enum ProjectSource {
     Env,
     /// The session's project-level active binding.
     SessionActive,
-    /// A pinned `.tracevault/config.toml` default_project (bound mode).
-    ConfigDefault,
+    /// The directory's `.tracevault/config.toml` `project_id` (VIS-1256):
+    /// every session started under that directory belongs to this project
+    /// unless something more specific (e.g. a `project switch`) says
+    /// otherwise.
+    Workspace,
     /// Repo deduction from the git remote, resolved server-side. Produced
     /// only by the display chain [`resolve_effective_project`], never by the
     /// capture chain [`capture_project_binding`].
@@ -425,6 +430,18 @@ pub enum ProjectSource {
     UserDefault,
 }
 
+impl ProjectSource {
+    /// The command that rewrites a binding stored by this tier, for a
+    /// warning about a stored `project_id` that is not a valid id.
+    pub fn rewrite_command(self) -> &'static str {
+        match self {
+            ProjectSource::Workspace => "tracevault init --workspace --project <name>",
+            ProjectSource::UserDefault => "tracevault project switch --user <name>",
+            _ => "tracevault project switch <name>",
+        }
+    }
+}
+
 impl std::fmt::Display for ProjectSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let label = match self {
@@ -432,7 +449,7 @@ impl std::fmt::Display for ProjectSource {
             ProjectSource::Subagent => "subagent worktree override",
             ProjectSource::Env => "TRACEVAULT_PROJECT (environment)",
             ProjectSource::SessionActive => "session (project switch)",
-            ProjectSource::ConfigDefault => "bound .tracevault/config.toml default_project",
+            ProjectSource::Workspace => "workspace .tracevault/config.toml",
             ProjectSource::Deduced => "repo deduction",
             ProjectSource::UserDefault => "user default (project switch --user)",
         };
@@ -463,9 +480,9 @@ pub fn effective_binding(inputs: ResolveInputs) -> Option<(RepoBinding, BindingS
 
 /// The project that applies, and which tier produced it: `--project` flag →
 /// subagent worktree override → `TRACEVAULT_PROJECT` → session active →
-/// config default → none.
+/// workspace config `project_id` → none.
 /// Pure; covers only the local tiers (flag → subagent → env_project →
-/// session.active_project → config_default). `env_project` is supplied BY THE
+/// session.active_project → config_project). `env_project` is supplied BY THE
 /// CALLER — this module never reads the environment — and the capture path
 /// fills it from `commands::stream::env_project_binding`, which honours the
 /// UUID form only. The user-level default (and, in the display chain only,
@@ -488,15 +505,17 @@ pub fn effective_project(inputs: &ProjectResolveInputs) -> Option<(ProjectBindin
         return Some((b.clone(), ProjectSource::SessionActive));
     }
     inputs
-        .config_default
+        .config_project
         .clone()
-        .map(|b| (b, ProjectSource::ConfigDefault))
+        .map(|b| (b, ProjectSource::Workspace))
 }
 
-/// Inputs to the capture-time project chain. Deliberately has NO
-/// `config_default` field: `.tracevault/config.toml` `default_project` is a
-/// NAME, resolving it needs a network call, and the stream hook (which fires
-/// per event) never does one — so no caller of this chain can feed it in.
+/// Inputs to the capture-time project chain. The config tier is the
+/// `.tracevault/config.toml` `project_id` (a UUID, via
+/// [`project_from_config`]); the legacy `default_project` NAME is never an
+/// input — resolving it needs a network call, and the stream hook (which
+/// fires per event) never does one. `init`/`sync` migrate it to `project_id`
+/// (`commands::migrate`).
 pub struct CaptureProjectInputs<'a> {
     /// `--project` override (only `project status` supplies it; the hook passes `None`).
     pub project_flag: Option<ProjectBinding>,
@@ -509,13 +528,17 @@ pub struct CaptureProjectInputs<'a> {
     pub env_project: Option<ProjectBinding>,
     pub session: &'a SessionState,
     pub worktree_path: Option<&'a str>,
+    /// The workspace tier: [`project_from_config`] of the
+    /// `.tracevault/config.toml` at the event's project root. Passed in so the
+    /// function stays pure.
+    pub config_project: Option<ProjectBinding>,
     /// `user_project_default::load()` — passed in so the function stays pure.
     pub user_default: Option<ProjectBinding>,
 }
 
 /// THE capture-time project chain: `--project` flag → subagent worktree
-/// override → `TRACEVAULT_PROJECT` → session `active_project` → user default
-/// → none. Pure, no network. `commands::stream::capture_project` (ingest) and
+/// override → `TRACEVAULT_PROJECT` → session `active_project` → workspace
+/// `.tracevault/config.toml` `project_id` → user default → none. Pure, no network. `commands::stream::capture_project` (ingest) and
 /// `commands::project::status` both call this, so they cannot drift.
 pub fn capture_project_binding(
     inputs: &CaptureProjectInputs<'_>,
@@ -525,7 +548,7 @@ pub fn capture_project_binding(
         env_project: inputs.env_project.clone(),
         session: inputs.session,
         worktree_path: inputs.worktree_path,
-        config_default: None,
+        config_project: inputs.config_project.clone(),
     })
     .or_else(|| {
         inputs
@@ -652,6 +675,26 @@ pub(crate) fn recorded_session_binding(
 /// network round-trip; `git_url` stays `None` here — bound mode has no live
 /// origin URL to hand back (that's the older `git_url` fallback's job, covering
 /// bindings that predate `codebase_name`).
+/// The workspace project tier of a `.tracevault/config.toml`: its
+/// `project_id`, with the recorded `project_name` for display. `None` when
+/// the config has no `project_id` — in particular for a config that still
+/// carries only the legacy `default_project` name, which is never resolved
+/// here (VIS-1256: ingest never resolves names). A `project_id` that is not a
+/// UUID is returned as is; the capture path drops it via
+/// [`capture_project_id`], and `project status` warns about it.
+pub fn project_from_config(config: &crate::config::TracevaultConfig) -> Option<ProjectBinding> {
+    let project_id = config.project_id.as_deref()?.trim();
+    if project_id.is_empty() {
+        return None;
+    }
+    Some(ProjectBinding {
+        project_id: project_id.to_string(),
+        project_name: config.project_name.clone().unwrap_or_default(),
+        updated_at: String::new(),
+        forced_until: None,
+    })
+}
+
 pub fn binding_from_config(config: &crate::config::TracevaultConfig) -> Option<RepoBinding> {
     Some(RepoBinding {
         repo_id: config.repo_id.clone()?,
@@ -764,7 +807,7 @@ mod tests {
             env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
-            config_default: None,
+            config_project: None,
         };
         let (b, src) = resolve_effective_project(&inputs, Some(ud), Some("git@x:y.git"), &client)
             .await
@@ -786,7 +829,7 @@ mod tests {
             env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
-            config_default: None,
+            config_project: None,
         };
         let (b, src) = resolve_effective_project(&inputs, None, Some("git@x:y.git"), &client)
             .await
@@ -805,7 +848,7 @@ mod tests {
             env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
-            config_default: None,
+            config_project: None,
         };
         let err = resolve_effective_project(&inputs, None, Some("git@x:y.git"), &client)
             .await
@@ -827,7 +870,7 @@ mod tests {
             env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
-            config_default: None,
+            config_project: None,
         };
         let got = resolve_effective_project(&inputs, None, Some("git@x:y.git"), &client)
             .await
@@ -848,7 +891,7 @@ mod tests {
             env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
-            config_default: None,
+            config_project: None,
         };
         let err = resolve_effective_project(&inputs, None, Some("git@x:y.git"), &client)
             .await
@@ -871,13 +914,13 @@ mod tests {
             env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
-            config_default: Some(cfg),
+            config_project: Some(cfg),
         };
         let (_b, src) = resolve_effective_project(&inputs, None, Some("git@x:y.git"), &client)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(src, ProjectSource::ConfigDefault);
+        assert_eq!(src, ProjectSource::Workspace);
     }
 
     fn binding(id: &str) -> RepoBinding {
@@ -1129,7 +1172,7 @@ mod tests {
             env_project: None,
             session: &session,
             worktree_path: Some("/wt"),
-            config_default: Some(pb("cfg")),
+            config_project: Some(pb("cfg")),
         })
         .unwrap();
         assert_eq!(got.0.project_id, "flag");
@@ -1141,7 +1184,7 @@ mod tests {
             env_project: None,
             session: &session,
             worktree_path: Some("/wt"),
-            config_default: Some(pb("cfg")),
+            config_project: Some(pb("cfg")),
         })
         .unwrap();
         assert_eq!(got.1, ProjectSource::Subagent);
@@ -1153,7 +1196,7 @@ mod tests {
             env_project: None,
             session: &session,
             worktree_path: Some("/other"),
-            config_default: Some(pb("cfg")),
+            config_project: Some(pb("cfg")),
         })
         .unwrap();
         assert_eq!(got.1, ProjectSource::SessionActive);
@@ -1164,10 +1207,10 @@ mod tests {
             env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
-            config_default: Some(pb("cfg")),
+            config_project: Some(pb("cfg")),
         })
         .unwrap();
-        assert_eq!(got.1, ProjectSource::ConfigDefault);
+        assert_eq!(got.1, ProjectSource::Workspace);
 
         // none: nothing local
         assert!(effective_project(&ProjectResolveInputs {
@@ -1175,19 +1218,18 @@ mod tests {
             env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
-            config_default: None,
+            config_project: None,
         })
         .is_none());
     }
 
-    /// Every tier of the capture chain, top to bottom, plus the empty case.
-    ///
-    /// A `.tracevault/config.toml` `default_project` cannot influence this
-    /// chain: `CaptureProjectInputs` has no `config_default` field at all, so
-    /// there is nothing a caller could pass (a negative compile test would
-    /// only restate that). The struct literals below are exhaustive — adding
-    /// such a field would break every one of them, forcing a deliberate
-    /// decision here.
+    /// Every tier of the capture chain, top to bottom, plus the empty case:
+    /// flag → subagent → env → session active → workspace config
+    /// `project_id` → user default. This pins the order `project status` and
+    /// ingest share (VIS-316, VIS-1256). The struct literals are exhaustive —
+    /// a new input breaks every one of them, forcing a deliberate decision
+    /// about its rank here. The legacy `default_project` NAME is not an input
+    /// at all (see `project_from_config_reads_project_id_never_default_project`).
     #[test]
     fn capture_project_binding_precedence() {
         let pb = |n: &str| ProjectBinding {
@@ -1210,6 +1252,7 @@ mod tests {
             env_project: Some(pb("env")),
             session: &session,
             worktree_path: Some("/wt"),
+            config_project: Some(pb("config")),
             user_default: Some(pb("user")),
         })
         .unwrap();
@@ -1224,6 +1267,7 @@ mod tests {
             env_project: Some(pb("env")),
             session: &session,
             worktree_path: Some("/wt"),
+            config_project: Some(pb("config")),
             user_default: Some(pb("user")),
         })
         .unwrap();
@@ -1238,6 +1282,7 @@ mod tests {
             env_project: Some(pb("env")),
             session: &session,
             worktree_path: Some("/other"),
+            config_project: Some(pb("config")),
             user_default: Some(pb("user")),
         })
         .unwrap();
@@ -1252,6 +1297,7 @@ mod tests {
             env_project: None,
             session: &session,
             worktree_path: Some("/other"),
+            config_project: Some(pb("config")),
             user_default: Some(pb("user")),
         })
         .unwrap();
@@ -1260,12 +1306,29 @@ mod tests {
             ("session", ProjectSource::SessionActive)
         );
 
-        // tier 5: user default when the session has nothing
+        // tier 5: the workspace config's project_id when the session has
+        // nothing — above the user default (VIS-1256)
         let got = capture_project_binding(&CaptureProjectInputs {
             project_flag: None,
             env_project: None,
             session: &SessionState::default(),
             worktree_path: Some("/wt"),
+            config_project: Some(pb("config")),
+            user_default: Some(pb("user")),
+        })
+        .unwrap();
+        assert_eq!(
+            (got.0.project_id.as_str(), got.1),
+            ("config", ProjectSource::Workspace)
+        );
+
+        // tier 6: user default when neither the session nor the config has one
+        let got = capture_project_binding(&CaptureProjectInputs {
+            project_flag: None,
+            env_project: None,
+            session: &SessionState::default(),
+            worktree_path: Some("/wt"),
+            config_project: None,
             user_default: Some(pb("user")),
         })
         .unwrap();
@@ -1280,9 +1343,36 @@ mod tests {
             env_project: None,
             session: &SessionState::default(),
             worktree_path: None,
+            config_project: None,
             user_default: None,
         })
         .is_none());
+    }
+
+    /// The workspace tier reads `project_id` (+ display `project_name`) and
+    /// nothing else: a config with only the legacy `default_project` NAME
+    /// contributes nothing, so ingest never resolves names (VIS-1256).
+    #[test]
+    fn project_from_config_reads_project_id_never_default_project() {
+        let legacy = crate::config::TracevaultConfig {
+            default_project: Some("visdom".into()),
+            ..Default::default()
+        };
+        assert_eq!(project_from_config(&legacy), None);
+        let blank = crate::config::TracevaultConfig {
+            project_id: Some("  ".into()),
+            ..Default::default()
+        };
+        assert_eq!(project_from_config(&blank), None);
+        let migrated = crate::config::TracevaultConfig {
+            project_id: Some("00000000-0000-4000-8000-0000000000aa".into()),
+            project_name: Some("visdom".into()),
+            default_project: Some("old".into()),
+            ..Default::default()
+        };
+        let got = project_from_config(&migrated).unwrap();
+        assert_eq!(got.project_id, "00000000-0000-4000-8000-0000000000aa");
+        assert_eq!(got.project_name, "visdom");
     }
 
     #[test]
@@ -1321,7 +1411,7 @@ mod tests {
             env_project: Some(pb("env")),
             session: &session,
             worktree_path: None,
-            config_default: Some(pb("config")),
+            config_project: Some(pb("config")),
         });
         assert_eq!(got.unwrap().1, ProjectSource::Env);
 
@@ -1331,7 +1421,7 @@ mod tests {
             env_project: Some(pb("env")),
             session: &session,
             worktree_path: Some("/wt"),
-            config_default: None,
+            config_project: None,
         });
         assert_eq!(got.unwrap().1, ProjectSource::Subagent);
 
@@ -1341,7 +1431,7 @@ mod tests {
             env_project: Some(pb("env")),
             session: &session,
             worktree_path: None,
-            config_default: None,
+            config_project: None,
         });
         assert_eq!(got.unwrap().1, ProjectSource::ProjectFlag);
     }

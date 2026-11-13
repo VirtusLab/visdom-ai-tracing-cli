@@ -1048,29 +1048,71 @@ fn init_rerun_flags_override_only_their_own_fields() {
     );
 }
 
+/// A one-shot local server answering `GET /api/v1/projects` with a single
+/// project named `payments`, for the `default_project` migration `init` runs
+/// (VIS-1256). Returns its base URL.
+fn spawn_projects_server() -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                break;
+            }
+        }
+        let body = r#"[{"id":"00000000-0000-4000-8000-0000000000aa","name":"payments"}]"#;
+        let mut stream = reader.into_inner();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+    });
+    base
+}
+
 /// Only what the config lacks gets a default: `user_context` is turned on.
-#[tokio::test]
-async fn init_fills_only_missing_fields_with_defaults() {
+/// A legacy `default_project` is migrated to `project_id` (VIS-1256) against
+/// a local server pinned in the config. Runs the binary with an isolated
+/// `HOME`, so a developer's own login (whose server URL would outrank the
+/// config's) cannot send the lookup to a real server.
+#[test]
+fn init_fills_only_missing_fields_with_defaults() {
     let tmp = tmp_git_repo();
+    let home = TempDir::new().unwrap();
+    let base = spawn_projects_server();
     write_repo_config(
         tmp.path(),
-        "api_key = \"tvk_test\"\ndefault_project = \"payments\"\n",
+        &format!(
+            "api_key = \"tvk_test\"\nserver_url = \"{base}\"\ndefault_project = \"payments\"\n"
+        ),
     );
 
-    tracevault_cli::commands::init::init_in_directory(
+    let output = run_init_isolated(
         tmp.path(),
-        None,
-        Some(ClaudeSettingsTarget::Shared),
-        false,
-        None,
-        Agent::ClaudeCode,
-    )
-    .await
-    .unwrap();
+        home.path(),
+        &["--claude-settings", "shared", "--no-claude-telemetry"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let cfg = tracevault_cli::config::TracevaultConfig::load(tmp.path()).unwrap();
     assert_eq!(cfg.api_key.as_deref(), Some("tvk_test"));
-    assert_eq!(cfg.default_project.as_deref(), Some("payments"));
+    assert_eq!(cfg.default_project, None);
+    assert_eq!(
+        cfg.project_id.as_deref(),
+        Some("00000000-0000-4000-8000-0000000000aa")
+    );
+    assert_eq!(cfg.project_name.as_deref(), Some("payments"));
     assert_eq!(cfg.agent, "claude-code");
     assert!(matches!(cfg.user_context, Some(UserContext::Toggle(true))));
 }
@@ -1205,4 +1247,60 @@ fn init_global_amp_defaults_to_dot_config() {
         let plugin = home.path().join(".config/amp/plugins/tracevault/index.ts");
         assert!(plugin.exists(), "{xdg:?}: {} missing", plugin.display());
     }
+}
+
+/// VIS-1256 command wiring: `init --workspace --project <name>` through the
+/// real binary binds a non-git directory (exit 0); an unknown name exits 1
+/// with nothing written; the flags require each other and conflict with
+/// `--global`.
+#[test]
+fn init_workspace_cli_binds_errors_and_requires_both_flags() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    let base = spawn_projects_server();
+    write_repo_config(
+        dir.path(),
+        &format!("api_key = \"tvk_test\"\nserver_url = \"{base}\"\n"),
+    );
+    let output = run_init_isolated(
+        dir.path(),
+        home.path(),
+        &["--workspace", "--project", "payments"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cfg = tracevault_cli::config::TracevaultConfig::load(dir.path()).unwrap();
+    assert_eq!(
+        cfg.project_id.as_deref(),
+        Some("00000000-0000-4000-8000-0000000000aa")
+    );
+    assert_eq!(cfg.repo_id, None);
+
+    let other = TempDir::new().unwrap();
+    let base = spawn_projects_server();
+    let content = format!("api_key = \"tvk_test\"\nserver_url = \"{base}\"\n");
+    write_repo_config(other.path(), &content);
+    let output = run_init_isolated(
+        other.path(),
+        home.path(),
+        &["--workspace", "--project", "nope"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("'nope' not found"), "stderr: {stderr}");
+    assert_eq!(read_repo_config(other.path()), content);
+
+    for args in [&["--workspace"][..], &["--project", "payments"][..]] {
+        let output = run_init_isolated(other.path(), home.path(), args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: clap usage error");
+    }
+    let output = run_init_isolated(
+        other.path(),
+        home.path(),
+        &["--workspace", "--project", "payments", "--global"],
+    );
+    assert_eq!(output.status.code(), Some(2), "--global conflicts");
 }

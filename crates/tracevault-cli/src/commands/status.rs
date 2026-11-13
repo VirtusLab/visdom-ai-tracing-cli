@@ -845,6 +845,7 @@ fn project_binding_check(outcome: &ProjectOutcome) -> Check {
                     | ProjectSource::Subagent
                     | ProjectSource::Env
                     | ProjectSource::SessionActive
+                    | ProjectSource::Workspace
                     | ProjectSource::UserDefault
             );
             // ...but only for the form the capture path can actually use. A
@@ -874,7 +875,8 @@ fn project_binding_check(outcome: &ProjectOutcome) -> Check {
                 Check::warn(
                     "Project",
                     format!(
-                        "{label} — {source}, but the saved project_id is not a valid id and will be dropped at capture time; run `tracevault project switch <name>` to rewrite it"
+                        "{label} — {source}, but the saved project_id is not a valid id and will be dropped at capture time; run `{}` to rewrite it",
+                        source.rewrite_command()
                     ),
                 )
             } else {
@@ -884,25 +886,17 @@ fn project_binding_check(outcome: &ProjectOutcome) -> Check {
     }
 }
 
-/// Surfaces a `.tracevault/config.toml` `default_project` NAME that failed
-/// to resolve to a real project (network failure, no matching name, or a
-/// case mismatch — names are matched case-sensitively). Without this, the
-/// tier is silently dropped and a stale/misspelled `default_project` is
-/// invisible here. (`commands::project`'s `status` never resolves the name at
-/// all; it warns that the tier is not used at capture time.)
-///
-/// Always a `Warn`, and the wording says so explicitly: even a `default_project`
-/// that DOES resolve is a `ConfigDefault` tier `capture_project` excludes (see
-/// [`project_binding_check`]), so this unresolved case must not imply fixing
-/// the name would make attribution work at capture time — it would still need
-/// `tracevault project switch <name>` or `--project`.
-fn unresolved_config_default_check(name: &str) -> Check {
-    Check::warn(
-        "Project default",
-        format!(
-            "configured default_project '{name}' could not be resolved (network error, or no matching project); even if it resolved, this tier is not used for attribution at capture time — set one with `tracevault project switch <name>` or --project instead"
-        ),
-    )
+/// Surfaces a `.tracevault/config.toml` that still carries the legacy
+/// `default_project` NAME (VIS-1256). Ingest never resolves names, so the
+/// name contributes nothing to attribution until `init`/`sync` migrate it to
+/// `project_id`; this command therefore does not resolve it either (that
+/// would report a project ingest never attributes to — VIS-316) and says so
+/// instead. `None` when there is nothing legacy in the config. Shares its
+/// wording with `commands::project`'s `status` via
+/// [`crate::commands::migrate::legacy_default_project_notice`].
+fn legacy_default_project_check(config: Option<&TracevaultConfig>) -> Option<Check> {
+    let notice = crate::commands::migrate::legacy_default_project_notice(config?)?;
+    Some(Check::warn("Project default", notice))
 }
 
 /// The one check that reflects whether anything will record this session at
@@ -1039,18 +1033,20 @@ fn recording_attribution(
         &worktree,
         bound,
         user_default_repo,
+        config.and_then(crate::resolution::project_from_config),
     );
     (attribution, worktree)
 }
 
-/// The project axis's client-backed resolution: a configured `default_project`
-/// NAME and `TRACEVAULT_PROJECT` (UUID or NAME, mirroring `commands::project`'s
-/// `status`) both get to consult `list_projects` here, then the full
-/// server-aware precedence chain (`resolve_effective_project`) runs. Pulled
-/// out analogously to [`offline_project_outcome`] so this branch is
-/// unit-testable without driving all of `run_status`. Returns the outcome
-/// plus the configured `default_project` NAME when it failed to resolve, for
-/// the caller to surface via `unresolved_config_default_check`.
+/// The project axis's client-backed resolution: `TRACEVAULT_PROJECT` (UUID
+/// or NAME, mirroring `commands::project`'s `status`) gets to consult
+/// `list_projects` here, then the full server-aware precedence chain
+/// (`resolve_effective_project`) runs. The workspace config tier is its
+/// `project_id` only (`config_project`, read locally exactly as ingest reads
+/// it); a legacy `default_project` NAME is never resolved here — the caller
+/// reports it via `legacy_default_project_check`. Pulled out analogously to
+/// [`offline_project_outcome`] so this branch is unit-testable without
+/// driving all of `run_status`.
 ///
 /// An unresolved `TRACEVAULT_PROJECT` NAME still gets no equivalent surfacing
 /// here; it is silently dropped. That is now a real (if narrow) gap rather
@@ -1062,10 +1058,8 @@ fn recording_attribution(
 /// `Check` of its own, deliberately left for a follow-up.
 /// One project NAME looked up in the server's project list, as a binding.
 ///
-/// The configured `default_project` and the NAME form of `TRACEVAULT_PROJECT`
-/// resolve identically — a client is in scope here, unlike on the capture
-/// path — so [`online_project_outcome`] runs both through this instead of
-/// writing the same `list_projects` fold twice.
+/// Used for the NAME form of `TRACEVAULT_PROJECT` — a client is in scope
+/// here, unlike on the capture path.
 async fn resolve_name_via_client(
     client: &ApiClient,
     name: &str,
@@ -1085,25 +1079,12 @@ async fn resolve_name_via_client(
 
 async fn online_project_outcome(
     client: &ApiClient,
-    config_default_name: Option<&str>,
+    config_project: Option<crate::session_state::ProjectBinding>,
     project_session: &crate::session_state::SessionState,
     worktree: &str,
     user_default_project: Option<crate::session_state::ProjectBinding>,
     project_git_url: Option<&str>,
-) -> (ProjectOutcome, Option<String>) {
-    // A configured default_project is a NAME; resolving it into a binding
-    // needs the project list, same as project.rs's status.
-    let mut config_default_unresolved = None;
-    let config_default = match config_default_name {
-        Some(name) => {
-            let resolved = resolve_name_via_client(client, name).await;
-            if resolved.is_none() {
-                config_default_unresolved = Some(name.to_string());
-            }
-            resolved
-        }
-        None => None,
-    };
+) -> ProjectOutcome {
     // `TRACEVAULT_PROJECT`: a UUID or a NAME — a client is in scope here, so
     // both forms are honoured (unlike the capture path, which is UUID-only).
     //
@@ -1126,11 +1107,9 @@ async fn online_project_outcome(
         env_project,
         session: project_session,
         worktree_path: Some(worktree),
-        config_default,
+        config_project,
     };
-    let outcome =
-        resolve_effective_project(&inputs, user_default_project, project_git_url, client).await;
-    (outcome, config_default_unresolved)
+    resolve_effective_project(&inputs, user_default_project, project_git_url, client).await
 }
 
 /// The project axis's offline/no-client display fallback: the pure local
@@ -1551,49 +1530,47 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
     // network. Whatever this resolves to (including a deduction failure) is
     // shown to the user but — unlike the verdict above — can never affect the
     // exit code beyond a Warn; see `project_binding_check`.
-    let config_default_name = config.as_ref().and_then(|c| c.default_project.clone());
+    // The workspace tier, read exactly as ingest reads it: the config's
+    // `project_id`, never the legacy `default_project` name (VIS-1256).
+    let config_project = config
+        .as_ref()
+        .and_then(crate::resolution::project_from_config);
     let user_default_project = crate::user_project_default::load();
     let project_git_url = git_remote_url(cwd);
-    // Set when a configured `default_project` NAME fails to resolve (network
-    // error, or no matching/case-matching project) — surfaced below rather
-    // than silently dropped. `None` in EITHER arm: the offline arm never
-    // attempts resolution at all (no client to call `list_projects` with),
-    // which is a different, already-visible gap (no credential -> an Error
-    // from the Authentication section).
-    let (project_outcome, config_default_unresolved): (ProjectOutcome, Option<String>) =
-        match (auth.credential.clone(), auth.server_url.as_ref()) {
-            (Some(credential), Some(server_url)) => {
-                let client = ApiClient::with_credential(server_url, Some(credential));
-                online_project_outcome(
-                    &client,
-                    config_default_name.as_deref(),
-                    &project_session,
-                    &worktree,
-                    user_default_project,
-                    project_git_url.as_deref(),
-                )
-                .await
-            }
-            _ => {
-                // Offline (no client): only the UUID form of
-                // `TRACEVAULT_PROJECT` can be honoured — a name would need
-                // `list_projects`, which needs a client this arm doesn't
-                // have. Reuses `commands::stream`'s capture-time helper
-                // rather than duplicating the same UUID-only parse a third
-                // time (the `project.rs` inline version stays separate: it
-                // must distinguish "not a UUID" from "absent" so it can fall
-                // through to name resolution, which this `Option`-returning
-                // helper can't express).
-                let inputs = ProjectResolveInputs {
-                    project_flag: None,
-                    env_project: crate::commands::stream::env_project_binding(),
-                    session: &project_session,
-                    worktree_path: Some(&worktree),
-                    config_default: None,
-                };
-                (offline_project_outcome(&inputs, user_default_project), None)
-            }
-        };
+    let project_outcome: ProjectOutcome = match (auth.credential.clone(), auth.server_url.as_ref())
+    {
+        (Some(credential), Some(server_url)) => {
+            let client = ApiClient::with_credential(server_url, Some(credential));
+            online_project_outcome(
+                &client,
+                config_project,
+                &project_session,
+                &worktree,
+                user_default_project,
+                project_git_url.as_deref(),
+            )
+            .await
+        }
+        _ => {
+            // Offline (no client): only the UUID form of
+            // `TRACEVAULT_PROJECT` can be honoured — a name would need
+            // `list_projects`, which needs a client this arm doesn't
+            // have. Reuses `commands::stream`'s capture-time helper
+            // rather than duplicating the same UUID-only parse a third
+            // time (the `project.rs` inline version stays separate: it
+            // must distinguish "not a UUID" from "absent" so it can fall
+            // through to name resolution, which this `Option`-returning
+            // helper can't express).
+            let inputs = ProjectResolveInputs {
+                project_flag: None,
+                env_project: crate::commands::stream::env_project_binding(),
+                session: &project_session,
+                worktree_path: Some(&worktree),
+                config_project,
+            };
+            offline_project_outcome(&inputs, user_default_project)
+        }
+    };
 
     let mut attribution_v = Vec::new();
     match session_id {
@@ -1607,9 +1584,7 @@ pub async fn run_status(project_root: &Path, cwd: &Path, session_id: Option<&str
     }
     attribution_v.push(binding_check);
     attribution_v.push(project_binding_check(&project_outcome));
-    if let Some(name) = config_default_unresolved {
-        attribution_v.push(unresolved_config_default_check(&name));
-    }
+    attribution_v.extend(legacy_default_project_check(config.as_ref()));
 
     // The server target is the repo the hook would attribute this worktree's
     // events to — including a subagent override — not just the session's
@@ -2869,23 +2844,34 @@ mod tests {
     }
 
     #[test]
-    fn project_binding_check_config_default_is_warn_not_ok() {
-        // `capture_project` deliberately excludes the config `default_project`
-        // tier, so displaying it as Ok would print a green Project line
-        // directly above a red Recording line for the same session.
+    fn project_binding_check_workspace_config_is_ok() {
+        // VIS-1256: the workspace config's `project_id` IS a capture tier,
+        // so a valid one reads Ok, labelled with its source.
         let outcome: ProjectOutcome = Ok(Some((
-            project_binding("pid-3", "My Project"),
-            crate::resolution::ProjectSource::ConfigDefault,
+            project_binding("00000000-0000-4000-8000-0000000000aa", "visdom"),
+            crate::resolution::ProjectSource::Workspace,
         )));
         let check = project_binding_check(&outcome);
+        assert_eq!(check.level, Level::Ok, "detail: {}", check.detail);
+        assert_eq!(check.detail, "visdom — workspace .tracevault/config.toml");
+    }
+
+    /// A legacy `default_project` is reported as unmigrated, never resolved
+    /// (status must match ingest, which ignores it).
+    #[test]
+    fn legacy_default_project_check_says_unmigrated() {
+        let cfg = TracevaultConfig {
+            default_project: Some("payments".into()),
+            ..Default::default()
+        };
+        let check = legacy_default_project_check(Some(&cfg)).unwrap();
         assert_eq!(check.level, Level::Warn);
-        assert!(
-            check
-                .detail
-                .contains("not used for attribution at capture time"),
-            "detail: {}",
-            check.detail
+        assert_eq!(
+            check.detail,
+            "default_project \"payments\" is not used for capture until migrated; run `tracevault sync`"
         );
+        assert!(legacy_default_project_check(Some(&TracevaultConfig::default())).is_none());
+        assert!(legacy_default_project_check(None).is_none());
     }
 
     #[test]
@@ -3252,7 +3238,7 @@ mod tests {
             env_project: None,
             session: &session,
             worktree_path: None,
-            config_default: None,
+            config_project: None,
         };
         // Same call `run_status`'s credential-less arm makes.
         let user_default_project = crate::user_project_default::load();
@@ -3282,9 +3268,7 @@ mod tests {
         // No `list_projects` mock: the UUID form must resolve without one.
         let client = ApiClient::new("http://127.0.0.1:0", Some("tok"));
         let session = crate::session_state::SessionState::default();
-        let (outcome, unresolved) =
-            online_project_outcome(&client, None, &session, "/wt", None, None).await;
-        assert!(unresolved.is_none());
+        let outcome = online_project_outcome(&client, None, &session, "/wt", None, None).await;
         let (b, source) = outcome
             .unwrap()
             .expect("TRACEVAULT_PROJECT must resolve to a binding");
@@ -3315,8 +3299,7 @@ mod tests {
             crate::test_helpers::spawn_seq(vec![crate::test_helpers::http_json("200 OK", &list)]);
         let client = ApiClient::new(&base, Some("tok"));
         let session = crate::session_state::SessionState::default();
-        let (outcome, _unresolved) =
-            online_project_outcome(&client, None, &session, "/wt", None, None).await;
+        let outcome = online_project_outcome(&client, None, &session, "/wt", None, None).await;
         let (b, source) = outcome
             .unwrap()
             .expect("a name should resolve via list_projects");
@@ -3473,25 +3456,6 @@ mod tests {
         assert_eq!(
             recording_check(Some("s"), attribution.as_ref()).map(|c| c.level),
             Some(Level::Error)
-        );
-    }
-
-    #[test]
-    fn unresolved_config_default_check_names_it_and_is_warn() {
-        let check = unresolved_config_default_check("payments-platform");
-        assert_eq!(check.level, Level::Warn);
-        assert!(
-            check.detail.contains("payments-platform"),
-            "detail: {}",
-            check.detail
-        );
-        assert!(
-            check
-                .detail
-                .contains("not used for attribution at capture time"),
-            "detail should not imply resolving it would make capture-time \
-             attribution work: {}",
-            check.detail
         );
     }
 }
