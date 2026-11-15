@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.4](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.29.3...v0.29.4) - 2026-11-13
+
+### Added
+
+- *(stream)* infer the repo per event in project-only sessions (VIS-1258)
+- *(project)* directory-scoped project binding via `init --workspace` (VIS-1256)
+
+### Fixed
+
+- *(stream)* read OpenCode's filePath and GSD's path for the touched checkout; test a refused inferred send (VIS-1258)
+- *(stream)* infer within the workspace project tier too; check reads the recorded inference (VIS-1258)
+- *(stream)* a failed parallel lookup never replaces an inferred repo (VIS-1258)
+- *(stream)* keep buffered events' targets, no cwd repo for files outside git, lock session-state writes (VIS-1258)
+- *(init)* honour an explicit TRACEVAULT_API_KEY with --server-url; test init --workspace through the binary (VIS-1256)
+- *(flush)* read the workspace tier from the hook's origin root, not the anchored session dir (VIS-1256)
+- *(init,migrate)* upgrade only exact earlier workspace blocks; keep the name over an invalid project_id (VIS-1256)
+- *(init)* guard --server-url against the credential's server, migrate in --global, upgrade the workspace block (VIS-1256)
+- *(session)* count anchored sessions in check's fallback and in catch-up (VIS-1257)
+- *(session)* match anchored sessions by every worktree they ran in (VIS-1257)
+- *(session)* find anchored sessions from the checkout they worked in (VIS-1257)
+- *(stream)* anchor a session's dir to where it started (VIS-1257)
+- *(stream)* adopt a project-only queue without a window that can lose it; test inline records across a repo switch (VIS-1255)
+- *(stream)* buffer refused project-only sends, adopt their queue on repo switch, report project-only recording (VIS-1255)
+
+### Other
+
+- *(stream)* reproduce session-dir split when cwd moves umbrella -> child repo (VIS-1257)
+
 ## [0.29.3](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.29.2...v0.29.3) - 2026-11-05
 
 ### Added
