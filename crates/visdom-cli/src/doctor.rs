@@ -18,7 +18,7 @@ use crate::mode::resolve_tracing_mode;
 pub fn collect(
     ctx: &CheckContext,
     adapter: &dyn AgentAdapter,
-    bazaar_url: Option<&str>,
+    bazaar_url: Result<Option<&str>, &str>,
     user_config_path: &Path,
 ) -> Vec<Finding> {
     let mut findings = tracing::check(ctx);
@@ -78,7 +78,8 @@ impl Environment {
 pub struct Session {
     pub ctx: CheckContext,
     pub adapter: Box<dyn AgentAdapter>,
-    pub bazaar_url: Option<String>,
+    /// `Err`: the server that should know it could not be asked (the reason).
+    pub bazaar_url: Result<Option<String>, String>,
     pub user_config_path: PathBuf,
     /// Problems reading visdom's own config files; the run goes on without them.
     pub warnings: Vec<String>,
@@ -162,7 +163,10 @@ impl Session {
         collect(
             &self.ctx,
             self.adapter.as_ref(),
-            self.bazaar_url.as_deref(),
+            self.bazaar_url
+                .as_ref()
+                .map(|url| url.as_deref())
+                .map_err(String::as_str),
             &self.user_config_path,
         )
     }

@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use tracevault_cli::oidc::fetch_public_config;
+use tracevault_cli::oidc::{fetch_public_config, OidcError};
 
 use crate::agents::{AgentAdapter, McpEntry, McpScope, Workdir};
 use crate::config::UserConfig;
@@ -23,20 +23,39 @@ pub const BAZAAR_CLIENT_ID: &str = "visdom-context-mcp";
 pub const BAZAAR_SERVER_NAME: &str = "bazaar";
 
 /// The bazaar MCP endpoint: `VISDOM_BAZAAR_URL`, then the user config, then
-/// what the tracing server publishes. `None` when none of them knows it (a
-/// server that cannot be reached counts as not knowing).
+/// what the tracing server publishes. `Ok(None)` when none of them knows it;
+/// `Err` with the reason when the server could not be asked.
 pub async fn resolve_bazaar_url(
     env: Option<String>,
     user: &UserConfig,
     server_url: Option<&str>,
     http: &reqwest::Client,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     let set = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
     if let Some(url) = set(env).or_else(|| set(user.bazaar_url.clone())) {
-        return Some(url);
+        return Ok(Some(url));
     }
-    let config = fetch_public_config(http, server_url?).await.ok()?;
-    config.bazaar_mcp_url
+    let Some(server_url) = server_url else {
+        return Ok(None);
+    };
+    match fetch_public_config(http, server_url).await {
+        Ok(config) => Ok(config.bazaar_mcp_url),
+        // A server without SSO answers properly; it just publishes no suite map.
+        Err(OidcError::NoKeycloak) => Ok(None),
+        Err(e) => Err(format!("{server_url} could not be asked for it: {e}")),
+    }
+}
+
+/// A name for a new registration that no configured server has: agents
+/// replace an entry registered again under its name.
+fn unused_name(entries: &[McpEntry]) -> String {
+    let taken = |name: &str| entries.iter().any(|e| e.name == name);
+    [BAZAAR_SERVER_NAME, "visdom-bazaar"]
+        .into_iter()
+        .map(String::from)
+        .chain((2..).map(|n| format!("visdom-bazaar-{n}")))
+        .find(|name| !taken(name))
+        .unwrap_or_else(|| BAZAAR_SERVER_NAME.to_string())
 }
 
 /// Whether two URLs name the same bazaar developer endpoint: same scheme, host
@@ -86,12 +105,26 @@ fn fix(action: FixAction) -> Fix {
 }
 
 pub fn check(
-    bazaar_url: Option<&str>,
+    bazaar_url: Result<Option<&str>, &str>,
     adapter: &dyn AgentAdapter,
     workdir: &Workdir,
     user_config_path: &Path,
 ) -> Vec<Finding> {
     let label = adapter.agent().label();
+    let bazaar_url = match bazaar_url {
+        Ok(url) => url,
+        Err(reason) => {
+            return vec![Finding::new(
+                COMPONENT,
+                "bazaar.url",
+                Severity::Unknown,
+                format!(
+                    "could not find out the bazaar URL, so its MCP registration was not checked \
+                     — {reason}"
+                ),
+            )]
+        }
+    };
     let Some(url) = bazaar_url else {
         return vec![Finding::new(
             COMPONENT,
@@ -146,7 +179,7 @@ pub fn check(
             ),
         )
         .with_fix(fix(adapter.register_mcp(
-            BAZAAR_SERVER_NAME,
+            &unused_name(&entries),
             url,
             BAZAAR_CLIENT_ID,
             McpScope::Local,
@@ -171,6 +204,17 @@ pub fn check(
             format!(
                 "{message} — it comes from the committed .mcp.json; set `oauth.clientId` to \
                  `{BAZAAR_CLIENT_ID}` there"
+            ),
+        )
+    } else if entry.extra_settings {
+        // Removing and re-adding it would drop its other settings.
+        Finding::new(
+            COMPONENT,
+            ID,
+            Severity::Error,
+            format!(
+                "{message} — the entry has other settings, so it is not replaced automatically; \
+                 set its OAuth client to `{BAZAAR_CLIENT_ID}` by hand"
             ),
         )
     } else {
@@ -244,11 +288,17 @@ mod tests {
             url: Some(url.to_string()),
             oauth_client_id: client.map(String::from),
             scope,
+            extra_settings: false,
         }
     }
 
     fn run(adapter: &Fake, url: Option<&str>, workdir: &Workdir) -> Finding {
-        let mut findings = check(url, adapter, workdir, Path::new("/cfg/visdom/config.toml"));
+        let mut findings = check(
+            Ok(url),
+            adapter,
+            workdir,
+            Path::new("/cfg/visdom/config.toml"),
+        );
         assert_eq!(findings.len(), 1, "{findings:?}");
         findings.remove(0)
     }
@@ -319,6 +369,52 @@ mod tests {
             fix.description,
             format!("run `agent add local bazaar {URL} {BAZAAR_CLIENT_ID}` in /work/repo")
         );
+    }
+
+    #[test]
+    fn unresolvable_url_is_unknown_with_the_reason() {
+        let findings = check(
+            Err("https://tv.example.com could not be asked for it: timeout"),
+            &fake(vec![]),
+            &repo(),
+            Path::new("/cfg"),
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, "bazaar.url");
+        assert_eq!(findings[0].severity, Severity::Unknown);
+        assert!(findings[0].message.contains("timeout"), "{findings:?}");
+        assert!(findings[0].fix.is_none());
+    }
+
+    /// Registering under a name another server has would replace that server.
+    #[test]
+    fn registration_never_takes_a_name_in_use() {
+        let name_offered = |taken: &[&str]| {
+            let entries = taken
+                .iter()
+                .map(|n| entry(n, "https://other.example.com/x", None, McpScope::User))
+                .collect();
+            match run(&fake(entries), Some(URL), &repo()).fix.unwrap().action {
+                FixAction::RunCommand { args, .. } => args[2].clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(name_offered(&[]), "bazaar");
+        assert_eq!(name_offered(&["bazaar"]), "visdom-bazaar");
+        assert_eq!(
+            name_offered(&["bazaar", "visdom-bazaar"]),
+            "visdom-bazaar-2"
+        );
+    }
+
+    #[test]
+    fn entry_with_other_settings_is_not_replaced_automatically() {
+        let mut wrong = entry("bazaar", URL, None, McpScope::User);
+        wrong.extra_settings = true;
+        let finding = run(&fake(vec![wrong]), Some(URL), &repo());
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.fix.is_none());
+        assert!(finding.message.contains("by hand"), "{finding:?}");
     }
 
     #[test]
@@ -448,6 +544,7 @@ mod tests {
                 &http
             )
             .await
+            .unwrap()
             .as_deref(),
             Some("https://env.example.com/mcp")
         );
@@ -460,6 +557,7 @@ mod tests {
                 &http
             )
             .await
+            .unwrap()
             .as_deref(),
             Some("https://user.example.com/mcp")
         );
@@ -470,6 +568,7 @@ mod tests {
         assert_eq!(
             resolve_bazaar_url(None, &none, Some(&base), &http)
                 .await
+                .unwrap()
                 .as_deref(),
             Some("https://srv.example.com/mcp/remote")
         );
@@ -479,12 +578,19 @@ mod tests {
         );
         assert_eq!(
             resolve_bazaar_url(None, &none, Some(&base), &http).await,
-            None
+            Ok(None)
         );
+        // A server that cannot be reached is an error with the reason…
+        let err = resolve_bazaar_url(None, &none, Some("http://127.0.0.1:1"), &http)
+            .await
+            .unwrap_err();
+        assert!(err.contains("http://127.0.0.1:1"), "{err}");
+        // …one without SSO simply does not know.
+        let base = serve_once(r#"{"oidc_enabled":false}"#);
         assert_eq!(
-            resolve_bazaar_url(None, &none, Some("http://127.0.0.1:1"), &http).await,
-            None
+            resolve_bazaar_url(None, &none, Some(&base), &http).await,
+            Ok(None)
         );
-        assert_eq!(resolve_bazaar_url(None, &none, None, &http).await, None);
+        assert_eq!(resolve_bazaar_url(None, &none, None, &http).await, Ok(None));
     }
 }

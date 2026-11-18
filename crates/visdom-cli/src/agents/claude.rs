@@ -59,11 +59,17 @@ fn entries(servers: Option<&serde_json::Value>, scope: McpScope, out: &mut Vec<M
     };
     for (name, server) in servers {
         let text = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()).map(String::from);
+        let only = |v: Option<&serde_json::Value>, known: &[&str]| {
+            v.and_then(|v| v.as_object())
+                .is_none_or(|o| o.keys().all(|k| known.contains(&k.as_str())))
+        };
         out.push(McpEntry {
             name: name.clone(),
             url: text(server.get("url")),
             oauth_client_id: text(server.get("oauth").and_then(|o| o.get("clientId"))),
             scope,
+            extra_settings: !only(Some(server), &["type", "url", "oauth"])
+                || !only(server.get("oauth"), &["clientId"]),
         });
     }
 }
@@ -103,7 +109,15 @@ impl AgentAdapter for Claude {
             McpScope::User,
             &mut out,
         );
-        Ok(out)
+        // One definition per name is loaded: local wins over project, project
+        // over user (the order collected above).
+        let mut loaded: Vec<McpEntry> = Vec::new();
+        for entry in out {
+            if !loaded.iter().any(|e| e.name == entry.name) {
+                loaded.push(entry);
+            }
+        }
+        Ok(loaded)
     }
 
     fn register_mcp(
@@ -211,18 +225,21 @@ mod tests {
                     url: Some("https://ctx.example.com/mcp/remote".to_string()),
                     oauth_client_id: Some("visdom-context-mcp".to_string()),
                     scope: McpScope::Local,
+                    extra_settings: false,
                 },
                 McpEntry {
                     name: "team".to_string(),
                     url: None,
                     oauth_client_id: None,
                     scope: McpScope::Project,
+                    extra_settings: true,
                 },
                 McpEntry {
                     name: "global-tool".to_string(),
                     url: Some("https://global.example.com/mcp".to_string()),
                     oauth_client_id: None,
                     scope: McpScope::User,
+                    extra_settings: false,
                 },
             ]
         );
@@ -278,6 +295,47 @@ mod tests {
         };
         assert_eq!(scopes("/work/umbrella"), [McpScope::Local, McpScope::User]);
         assert_eq!(scopes("/work/umbrella/sub"), [McpScope::User]);
+    }
+
+    /// Claude loads one definition per name; the shadowed ones must not be
+    /// reported as if they were in effect.
+    #[test]
+    fn a_local_entry_shadows_a_user_entry_of_the_same_name() {
+        let home = tempfile::tempdir().unwrap();
+        let state = serde_json::json!({
+            "mcpServers": {
+                "bazaar": { "type": "http", "url": "https://ctx/mcp", "oauth": { "clientId": "right" } }
+            },
+            "projects": { "/work/repo": { "mcpServers": {
+                "bazaar": { "type": "http", "url": "https://ctx/mcp" }
+            } } }
+        });
+        fs::write(home.path().join(".claude.json"), state.to_string()).unwrap();
+        let got = claude(home.path())
+            .mcp_entries(&Workdir::checkout("/work/repo"))
+            .unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].scope, McpScope::Local);
+        assert_eq!(got[0].oauth_client_id, None);
+    }
+
+    #[test]
+    fn settings_beyond_url_and_client_are_flagged() {
+        let home = tempfile::tempdir().unwrap();
+        let state = serde_json::json!({ "mcpServers": {
+            "plain": { "type": "http", "url": "https://a/mcp", "oauth": { "clientId": "c" } },
+            "headers": { "type": "http", "url": "https://b/mcp", "headers": { "X-Key": "k" } },
+            "port": { "type": "http", "url": "https://c/mcp", "oauth": { "clientId": "c", "callbackPort": 8080 } }
+        } });
+        fs::write(home.path().join(".claude.json"), state.to_string()).unwrap();
+        let got = claude(home.path())
+            .mcp_entries(&Workdir::plain("/tmp"))
+            .unwrap();
+        let extra: Vec<(&str, bool)> = got
+            .iter()
+            .map(|e| (e.name.as_str(), e.extra_settings))
+            .collect();
+        assert_eq!(extra, [("plain", false), ("headers", true), ("port", true)]);
     }
 
     #[test]

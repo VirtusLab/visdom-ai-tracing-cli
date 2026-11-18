@@ -42,6 +42,10 @@ impl AgentAdapter for Codex {
             return Ok(Vec::new());
         };
         let text = |v: Option<&toml::Value>| v.and_then(|v| v.as_str()).map(String::from);
+        let only = |v: Option<&toml::Value>, known: &[&str]| {
+            v.and_then(|v| v.as_table())
+                .is_none_or(|t| t.keys().all(|k| known.contains(&k.as_str())))
+        };
         Ok(servers
             .iter()
             .map(|(name, server)| McpEntry {
@@ -49,6 +53,8 @@ impl AgentAdapter for Codex {
                 url: text(server.get("url")),
                 oauth_client_id: text(server.get("oauth").and_then(|o| o.get("client_id"))),
                 scope: McpScope::User,
+                extra_settings: !only(Some(server), &["url", "oauth"])
+                    || !only(server.get("oauth"), &["client_id"]),
             })
             .collect())
     }
@@ -127,12 +133,14 @@ args = ["tool"]
                     url: Some("https://ctx.example.com/mcp/remote".to_string()),
                     oauth_client_id: Some("visdom-context-mcp".to_string()),
                     scope: McpScope::User,
+                    extra_settings: false,
                 },
                 McpEntry {
                     name: "local-tool".to_string(),
                     url: None,
                     oauth_client_id: None,
                     scope: McpScope::User,
+                    extra_settings: true,
                 },
             ]
         );
