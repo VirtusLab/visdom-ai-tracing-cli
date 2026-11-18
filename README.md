@@ -1,7 +1,7 @@
 # Visdom Trace CLI
 
 The public CLI for Visdom Trace — AI code tracing and attribution. Installs the
-`tracevault` binary and, from the release archives, `visdom`.
+`tracevault` and `visdom` binaries.
 
 ## `visdom`
 
@@ -61,7 +61,7 @@ Settings:
 
 ## Crates
 
-- **`visdom-cli`** — the `visdom` command-line tool (not on crates.io; shipped in the release archives).
+- **`visdom-cli`** — the `visdom` command-line tool.
 - **`tracevault-cli`** — the `tracevault` command-line tool (hooks, session capture, verification).
 - **`visdom-ai-tracing-protocol`** — the wire-protocol types (stream + hook events) shared between the
   CLI and the Visdom Trace server. Published so both sides depend on one source of truth.
@@ -75,8 +75,10 @@ brew install VirtusLab/visdom-ai-tracing/tracevault
 or from crates.io:
 
 ```bash
-cargo install tracevault-cli
+cargo install tracevault-cli visdom-cli
 ```
+
+Install both: `visdom-cli` provides `visdom` only, and the hooks it sets up call `tracevault`.
 
 ## Quick start
 

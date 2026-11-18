@@ -10,10 +10,10 @@ git_tag_name = "v{{ version }}"
 name = "visdom-ai-tracing-protocol"
 git_tag_name = "protocol-v{{ version }}"
 
-# `visdom` is not published to crates.io (see its Cargo.toml) and has no tag or
-# changelog of its own: it takes the workspace version and ships inside the
-# tracevault-cli release archives. Note that a change touching only
-# crates/visdom-cli therefore opens no release PR by itself.
+# `visdom` is published to crates.io with its own tag. It has no GitHub release
+# of its own: its binary ships inside the tracevault-cli release archives
+# (release-binaries.yml), next to `tracevault`.
 [[package]]
 name = "visdom-cli"
-release = false
+git_tag_name = "visdom-v{{ version }}"
+git_release_enable = false
