@@ -51,11 +51,11 @@ jobs:
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
-        run: cargo build --release --target ${{ matrix.target }} --package tracevault-cli
+        run: cargo build --release --target ${{ matrix.target }} --package tracevault-cli --package visdom-cli
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }} --package tracevault-cli
+        run: cross build --release --target ${{ matrix.target }} --package tracevault-cli --package visdom-cli
 
       - name: Package
         shell: bash
@@ -63,7 +63,10 @@ jobs:
           tag="${{ github.event.release.tag_name || inputs.tag }}"
           archive="tracevault-${tag}-${{ matrix.target }}"
           mkdir -p "$archive"
+          # Both binaries in the one archive (its name stays, so the Homebrew
+          # URLs do): `visdom`, and `tracevault`, which installed hooks call.
           cp "target/${{ matrix.target }}/release/tracevault" "$archive/"
+          cp "target/${{ matrix.target }}/release/visdom" "$archive/"
           cp LICENSE README.md "$archive/" 2>/dev/null || true
           tar czf "${archive}.tar.gz" "$archive"
           if command -v shasum &>/dev/null; then

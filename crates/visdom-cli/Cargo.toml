@@ -8,6 +8,10 @@ authors.workspace = true
 homepage.workspace = true
 description = "Visdom developer CLI: checks a project's Visdom wiring and launches the coding agent"
 readme = "README.md"
+# Not on crates.io yet: `visdom` ships in the release archives and Homebrew,
+# next to `tracevault`. Publishing reserves the crate name for good, so it is
+# a separate decision; it also needs a version on the dependency below.
+publish = false
 keywords = ["visdom", "tracing", "ai", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
@@ -20,7 +24,7 @@ name = "visdom"
 path = "src/main.rs"
 
 [dependencies]
-tracevault-cli = { path = "../tracevault-cli", version = "0.29" }
+tracevault-cli = { path = "../tracevault-cli" }
 clap = { version = "4", features = ["derive"] }
 tokio.workspace = true
 serde.workspace = true
