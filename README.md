@@ -38,6 +38,11 @@ stdin is not a terminal nothing is applied. `visdom doctor` changes nothing with
 `visdom init` is the exception by definition: asking for it is the yes, for tracing and for the
 bazaar registration alike (the command it runs is printed first).
 
+On a terminal, `visdom init` asks for what it was not given instead of failing: which agent
+(unless `--agent`, `VISDOM_AGENT` or a config names one), the tracing server URL when you are not
+logged in (then it logs you in), and the bazaar URL when nothing knows it (saved as `bazaar_url`
+in the user config). Without a terminal it asks nothing and reports what is missing.
+
 Settings:
 
 - The agent: `--agent`, then `VISDOM_AGENT`, then `agent = "…"` in the repository's

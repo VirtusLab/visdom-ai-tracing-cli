@@ -48,7 +48,7 @@ pub async fn resolve_bazaar_url(
 
 /// Whether `raw` is an absolute http(s) URL — which also means it cannot be
 /// mistaken for an option by the command it is handed to.
-fn is_http_url(raw: &str) -> bool {
+pub fn is_http_url(raw: &str) -> bool {
     url::Url::parse(raw).is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.has_host())
         && !raw.starts_with('-')
         && !raw.contains(char::is_whitespace)

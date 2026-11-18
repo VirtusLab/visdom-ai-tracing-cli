@@ -103,6 +103,21 @@ pub fn load_repo_config_in(project_root: &Path) -> Result<RepoConfig, String> {
     load(&repo_config_path_in(project_root))
 }
 
+/// The agent somebody chose outside the command line: `VISDOM_AGENT`, then
+/// the repository config, then the user config. `None` when nobody did.
+pub fn configured_agent(
+    env: Option<&str>,
+    repo: &RepoConfig,
+    user: &UserConfig,
+) -> Result<Option<Agent>, String> {
+    match env.filter(|v| !v.trim().is_empty()) {
+        Some(name) => parse_agent(name)
+            .map(Some)
+            .map_err(|e| format!("VISDOM_AGENT: {e}")),
+        None => Ok(repo.agent.or(user.agent)),
+    }
+}
+
 /// Which agent to use: `--agent`, then `VISDOM_AGENT`, then the repository
 /// config, then the user config, then Claude Code. Only Claude Code and Codex
 /// can be launched.
@@ -112,10 +127,9 @@ pub fn resolve_agent(
     repo: &RepoConfig,
     user: &UserConfig,
 ) -> Result<Agent, String> {
-    let agent = match (flag, env.filter(|v| !v.trim().is_empty())) {
-        (Some(agent), _) => agent,
-        (None, Some(name)) => parse_agent(name).map_err(|e| format!("VISDOM_AGENT: {e}"))?,
-        (None, None) => repo.agent.or(user.agent).unwrap_or(Agent::ClaudeCode),
+    let agent = match flag {
+        Some(agent) => agent,
+        None => configured_agent(env, repo, user)?.unwrap_or(Agent::ClaudeCode),
     };
     match agent {
         Agent::ClaudeCode | Agent::Codex => Ok(agent),
@@ -176,6 +190,22 @@ mod tests {
             resolve_agent(None, Some(""), &none, &user(None)),
             Ok(Agent::ClaudeCode)
         );
+    }
+
+    #[test]
+    fn configured_agent_is_none_when_nobody_chose() {
+        let none = RepoConfig::default();
+        assert_eq!(configured_agent(None, &none, &user(None)), Ok(None));
+        assert_eq!(configured_agent(Some(" "), &none, &user(None)), Ok(None));
+        assert_eq!(
+            configured_agent(None, &none, &user(Some(Agent::Codex))),
+            Ok(Some(Agent::Codex))
+        );
+        assert_eq!(
+            configured_agent(Some("codex"), &none, &user(None)),
+            Ok(Some(Agent::Codex))
+        );
+        assert!(configured_agent(Some("emacs"), &none, &user(None)).is_err());
     }
 
     #[test]
