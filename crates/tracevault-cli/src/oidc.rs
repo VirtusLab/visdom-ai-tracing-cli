@@ -57,6 +57,9 @@ pub struct PublicConfig {
     /// the CLI keeps working against a server that does not publish it; used
     /// only to sharpen the diagnosis when `/auth/me` rejects a fresh token.
     pub audience: Option<String>,
+    /// The bazaar (context) MCP endpoint of this installation, when the server
+    /// publishes it. `visdom` uses it to check an agent's MCP registration.
+    pub bazaar_mcp_url: Option<String>,
 }
 
 /// Wire shape of `GET /api/v1/auth/public-config`.
@@ -74,6 +77,8 @@ struct PublicConfigWire {
     cli_client_id: Option<String>,
     #[serde(default)]
     audience: Option<String>,
+    #[serde(default)]
+    bazaar_mcp_url: Option<String>,
 }
 
 /// The subset of the realm's OpenID discovery document the CLI uses.
@@ -378,6 +383,7 @@ pub async fn fetch_public_config(
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| missing("cli_client_id"))?,
         audience: wire.audience.filter(|s| !s.trim().is_empty()),
+        bazaar_mcp_url: wire.bazaar_mcp_url.filter(|s| !s.trim().is_empty()),
     })
 }
 
@@ -1271,6 +1277,21 @@ mod tests {
         let client = reqwest::Client::new();
         let cfg = fetch_public_config(&client, &base).await.unwrap();
         assert_eq!(cfg.audience, None);
+        assert_eq!(cfg.bazaar_mcp_url, None);
+    }
+
+    #[tokio::test]
+    async fn public_config_with_bazaar_mcp_url() {
+        let (base, _rx) = spawn_seq(vec![http_json(
+            "200 OK",
+            r#"{"oidc_enabled":true,"issuer":"https://idp.test/realms/v","cli_client_id":"tracing-cli","bazaar_mcp_url":"https://ctx.example.com/mcp/remote"}"#,
+        )]);
+        let client = reqwest::Client::new();
+        let cfg = fetch_public_config(&client, &base).await.unwrap();
+        assert_eq!(
+            cfg.bazaar_mcp_url.as_deref(),
+            Some("https://ctx.example.com/mcp/remote")
+        );
     }
 
     /// `oidc_enabled: true` with a field missing is a misconfigured server.
