@@ -21,7 +21,7 @@ visdom doctor --fix         # …and offer the fixes (--yes applies all, --json 
 | `visdom [--agent <a>] [--yes] [-- <agent args>]` | Check, offer each fix, start the agent in the current directory. Findings never stop the agent from starting. |
 | `visdom doctor [--fix] [--yes] [--json] [--agent <a>]` | The same checks without starting anything. |
 | `visdom login` / `visdom logout` | Same as `tracevault login` / `logout`. |
-| `visdom init [...]` | `tracevault init`, then the remaining checks (bazaar MCP) with their fixes. |
+| `visdom init [...]` | Sets the repository up: tracing (`tracevault init`, same flags), then registers the bazaar MCP server for the agent. |
 | `visdom trace <command>` | Every `tracevault` command: `visdom trace status`, `visdom trace verify-start`, … |
 
 What is checked:
@@ -35,6 +35,8 @@ What is checked:
 
 Nothing is changed without a yes: each fix is shown first, `--yes` applies all of them, and when
 stdin is not a terminal nothing is applied. `visdom doctor` changes nothing without `--fix`.
+`visdom init` is the exception by definition: asking for it is the yes, for tracing and for the
+bazaar registration alike (the command it runs is printed first).
 
 Settings:
 

@@ -25,14 +25,14 @@ fn main() {
         Some(VisdomCommand::Login(args)) => runtime.block_on(run(Command::Login(args))),
         Some(VisdomCommand::Logout) => runtime.block_on(run(Command::Logout)),
         Some(VisdomCommand::Trace { command }) => runtime.block_on(run(command)),
-        Some(VisdomCommand::Init { args, yes }) => {
+        Some(VisdomCommand::Init { args }) => {
             let agent = args.agent;
             // `--global` and `--workspace` set up no single repository.
             let per_repo = !args.global && !args.workspace;
             // Exits on failure.
             runtime.block_on(run(Command::Init(args)));
             if per_repo && matches!(agent, Agent::ClaudeCode | Agent::Codex) {
-                check_after_init(&runtime, agent, yes || cli.yes);
+                init_bazaar(&runtime, agent);
             }
         }
         Some(VisdomCommand::Doctor {
@@ -78,7 +78,7 @@ fn doctor(
     if policy != FixPolicy::Never && findings.iter().any(|f| f.fix.is_some()) {
         // What is wrong, before asking to change it.
         print_attention(&findings);
-        if fix(&findings, policy, &mut RealExecutor::new(json, policy)) {
+        if fix(&findings, policy, &mut RealExecutor::new(json, policy)).applied {
             session = gather(&env, agent, runtime);
             findings = session.collect();
         }
@@ -91,14 +91,34 @@ fn doctor(
     exit(exit_code(&findings))
 }
 
-fn check_after_init(runtime: &tokio::runtime::Runtime, agent: Agent, yes: bool) {
+/// The second half of `visdom init`: set up bazaar for the agent. Asking for
+/// `init` is asking for this, so the registration is shown and applied, not
+/// offered. What init cannot do (an unknown bazaar URL, an entry it will not
+/// replace) is reported; a registration that fails makes init fail.
+fn init_bazaar(runtime: &tokio::runtime::Runtime, agent: Agent) {
     let env = Environment::current();
-    let session = gather(&env, Some(agent), runtime);
-    let findings = session.collect();
+    let findings = gather(&env, Some(agent), runtime).collect();
+    let bazaar: Vec<_> = findings
+        .iter()
+        .filter(|f| f.component == "bazaar")
+        .cloned()
+        .collect();
+    let policy = FixPolicy::All;
+    let summary = fix(&bazaar, policy, &mut RealExecutor::new(false, policy));
+    let findings = if summary.applied {
+        gather(&env, Some(agent), runtime).collect()
+    } else {
+        findings
+    };
     print_attention(&findings);
-    let policy = policy_for(false, yes, false, stdin_is_tty());
-    if fix(&findings, policy, &mut RealExecutor::new(false, policy)) {
-        print_attention(&gather(&env, Some(agent), runtime).collect());
+    if summary.failed {
+        exit(1);
+    }
+    if findings
+        .iter()
+        .any(|f| f.id == "bazaar.mcp" && f.severity == visdom_cli::finding::Severity::Ok)
+    {
+        println!("Bazaar MCP registered for {}", agent.label());
     }
 }
 
@@ -115,7 +135,7 @@ fn check_and_launch(
     let findings = session.collect();
     print_attention(&findings);
     let policy = policy_for(false, yes, false, stdin_is_tty());
-    if fix(&findings, policy, &mut RealExecutor::new(false, policy)) {
+    if fix(&findings, policy, &mut RealExecutor::new(false, policy)).applied {
         session = gather(&env, agent, &runtime);
         // What is still open, once, above the agent.
         print_attention(&session.collect());

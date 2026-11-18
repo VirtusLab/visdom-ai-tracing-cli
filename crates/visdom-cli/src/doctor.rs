@@ -264,10 +264,27 @@ pub fn ask_on_terminal(fix: &Fix) -> bool {
     is_yes(read, &answer)
 }
 
+/// How a round of fixes went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixSummary {
+    /// Something was changed, so the checks are worth running again.
+    pub applied: bool,
+    /// A fix that was meant to be applied failed.
+    pub failed: bool,
+}
+
 /// Offer the fixes of `findings` under `policy`, reporting each failure on
-/// stderr. Returns whether anything was applied (so the checks are worth
-/// running again).
-pub fn fix(findings: &[Finding], policy: FixPolicy, exec: &mut dyn FixExecutor) -> bool {
+/// stderr. A fix applied without asking is still shown first.
+pub fn fix(findings: &[Finding], policy: FixPolicy, exec: &mut dyn FixExecutor) -> FixSummary {
+    if policy == FixPolicy::All {
+        let mut shown: Vec<&str> = Vec::new();
+        for fix in findings.iter().filter_map(|f| f.fix.as_ref()) {
+            if !shown.contains(&fix.description.as_str()) {
+                eprintln!("visdom: applying: {}", fix.description);
+                shown.push(&fix.description);
+            }
+        }
+    }
     let outcomes: Vec<FixOutcome> = apply_fixes(findings, policy, &mut ask_on_terminal, exec);
     let mut reported: Vec<&str> = Vec::new();
     for error in outcomes.iter().filter_map(|o| o.error.as_deref()) {
@@ -276,7 +293,10 @@ pub fn fix(findings: &[Finding], policy: FixPolicy, exec: &mut dyn FixExecutor) 
             reported.push(error);
         }
     }
-    outcomes.iter().any(|o| o.applied)
+    FixSummary {
+        applied: outcomes.iter().any(|o| o.applied),
+        failed: outcomes.iter().any(|o| o.error.is_some()),
+    }
 }
 
 /// What a developer sees before the agent starts (or after `init`): the

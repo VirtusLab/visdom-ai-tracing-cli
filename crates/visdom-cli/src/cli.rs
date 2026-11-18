@@ -51,14 +51,11 @@ pub enum VisdomCommand {
     Login(LoginArgs),
     /// Log out from Visdom
     Logout,
-    /// Set up tracing in this repository, then check the rest of the wiring
-    /// (bazaar MCP) and offer to fix it.
+    /// Set up this repository for Visdom: tracing (as `tracevault init`), and
+    /// the bazaar MCP server for the agent.
     Init {
         #[command(flatten)]
         args: InitArgs,
-        /// Apply every offered fix without asking.
-        #[arg(long)]
-        yes: bool,
     },
     /// Tracing commands (everything `tracevault` does).
     Trace {
@@ -136,12 +133,12 @@ mod tests {
     }
 
     #[test]
-    fn init_takes_tracevault_init_flags_and_yes() {
-        let cli = parse(&["visdom", "init", "--agent", "codex", "--yes"]);
+    fn init_takes_tracevault_init_flags() {
+        let cli = parse(&["visdom", "init", "--agent", "codex", "--no-gitignore"]);
         match cli.command {
-            Some(VisdomCommand::Init { args, yes }) => {
-                assert!(yes);
+            Some(VisdomCommand::Init { args }) => {
                 assert_eq!(args.agent, Agent::Codex);
+                assert!(args.no_gitignore);
             }
             _ => panic!("expected init"),
         }

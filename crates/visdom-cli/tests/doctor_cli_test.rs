@@ -199,7 +199,7 @@ fn visdom_init_in_temp_repo_installs_hooks() {
     let sb = Sandbox::new();
     let output = sb
         .visdom(sb.repo.path())
-        .args(["init", "--agent", "codex", "--yes"])
+        .args(["init", "--agent", "codex"])
         .env("VISDOM_API_KEY", "tvk_test")
         .output()
         .unwrap();
@@ -212,7 +212,7 @@ fn visdom_init_in_temp_repo_installs_hooks() {
     let hooks = std::fs::read_to_string(sb.repo.path().join(".codex/hooks.json")).unwrap();
     assert!(hooks.contains("tracevault stream"), "{hooks}");
     assert!(sb.repo.path().join(".tracevault/config.toml").exists());
-    // The rest of the wiring is checked after init: bazaar's URL is unknown here.
+    // Bazaar is part of init; here its URL is unknown, which is said, not fatal.
     assert!(
         stderr(&output).contains("bazaar URL is unknown"),
         "{}",
@@ -254,4 +254,62 @@ fn broken_credential_file_is_unknown() {
     assert_eq!(auth["id"], "tracing.auth");
     assert_eq!(auth["severity"], "unknown", "{auth}");
     assert!(auth["fix"].is_null());
+}
+
+/// `visdom init` sets up bazaar too: the registration runs through the
+/// agent's own CLI without a separate question, even with nobody to ask.
+#[test]
+fn visdom_init_registers_bazaar() {
+    let sb = Sandbox::new();
+    let (script, log) = sb.fake_agent();
+    sb.write_user_config(&format!(
+        "bazaar_url = \"{BAZAAR}\"\n[agents]\ncodex = \"{}\"\n",
+        script.display()
+    ));
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["init", "--agent", "codex"])
+        .env("VISDOM_API_KEY", "tvk_test")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(sb.repo.path().join(".codex/hooks.json").exists());
+    let log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        [format!(
+            "{}|mcp add bazaar --url {BAZAAR} --oauth-client-id visdom-context-mcp",
+            sb.repo_dir().display()
+        )]
+    );
+    // What is about to change is shown before it is done.
+    assert!(
+        stderr(&output).contains("applying: run `"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// A bazaar registration that fails makes `init` fail: half an init must not
+/// look like a whole one.
+#[test]
+fn visdom_init_fails_when_bazaar_registration_fails() {
+    let sb = Sandbox::new();
+    sb.write_user_config(&format!(
+        "bazaar_url = \"{BAZAAR}\"\n[agents]\ncodex = \"false\"\n"
+    ));
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["init", "--agent", "codex"])
+        .env("VISDOM_API_KEY", "tvk_test")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("fix failed"),
+        "{}",
+        stderr(&output)
+    );
+    // Tracing was still set up.
+    assert!(sb.repo.path().join(".codex/hooks.json").exists());
 }
