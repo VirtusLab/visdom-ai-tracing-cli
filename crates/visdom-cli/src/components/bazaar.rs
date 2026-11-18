@@ -46,6 +46,14 @@ pub async fn resolve_bazaar_url(
     }
 }
 
+/// Whether `raw` is an absolute http(s) URL — which also means it cannot be
+/// mistaken for an option by the command it is handed to.
+fn is_http_url(raw: &str) -> bool {
+    url::Url::parse(raw).is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.has_host())
+        && !raw.starts_with('-')
+        && !raw.contains(char::is_whitespace)
+}
+
 /// A name for a new registration that no configured server has: agents
 /// replace an entry registered again under its name.
 fn unused_name(entries: &[McpEntry]) -> String {
@@ -137,6 +145,16 @@ pub fn check(
             ),
         )];
     };
+    // The URL becomes an argument of the agent's CLI, and it may come from a
+    // server: only a plain http(s) URL is ever passed on.
+    if !is_http_url(url) {
+        return vec![Finding::new(
+            COMPONENT,
+            "bazaar.url",
+            Severity::Warn,
+            format!("the bazaar URL `{url}` is not an http(s) URL, so nothing was checked"),
+        )];
+    }
     const ID: &str = "bazaar.mcp";
     let entries = match adapter.mcp_entries(workdir) {
         Ok(entries) => entries,
@@ -223,7 +241,7 @@ pub fn check(
                  OAuth client to `{BAZAAR_CLIENT_ID}` there"
             ),
         )
-    } else if entry.extra_settings {
+    } else if entry.extra_settings || entry.name.starts_with('-') {
         // Removing and re-adding it would drop its other settings.
         Finding::new(
             COMPONENT,
@@ -449,6 +467,31 @@ mod tests {
             run(&fake(vec![off, on]), Some(URL), &repo()).severity,
             Severity::Ok
         );
+    }
+
+    /// Nothing that could read as an option reaches the agent's command line.
+    #[test]
+    fn only_a_plain_http_url_is_passed_to_the_agent_cli() {
+        for bad in [
+            "--header=X: y",
+            "-s",
+            "file:///etc/passwd",
+            "ctx.example.com/mcp",
+            "https://ctx.example.com/mcp --scope user",
+        ] {
+            let finding = run(&fake(vec![]), Some(bad), &repo());
+            assert_eq!(finding.id, "bazaar.url", "{bad}");
+            assert_eq!(finding.severity, Severity::Warn, "{bad}");
+            assert!(finding.fix.is_none(), "{bad}");
+        }
+        // An entry whose name would read as an option is not re-added.
+        let finding = run(
+            &fake(vec![entry("--scope", URL, None, McpScope::User)]),
+            Some(URL),
+            &repo(),
+        );
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.fix.is_none());
     }
 
     #[test]
