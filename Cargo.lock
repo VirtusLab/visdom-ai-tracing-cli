@@ -1944,6 +1944,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "visdom-cli"
+version = "0.29.4"
+dependencies = [
+ "clap",
+ "dirs",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracevault-cli",
+ "url",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
