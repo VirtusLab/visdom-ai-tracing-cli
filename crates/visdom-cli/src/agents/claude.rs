@@ -70,6 +70,7 @@ fn entries(servers: Option<&serde_json::Value>, scope: McpScope, out: &mut Vec<M
             scope,
             extra_settings: !only(Some(server), &["type", "url", "oauth"])
                 || !only(server.get("oauth"), &["clientId"]),
+            disabled: false,
         });
     }
 }
@@ -226,6 +227,7 @@ mod tests {
                     oauth_client_id: Some("visdom-context-mcp".to_string()),
                     scope: McpScope::Local,
                     extra_settings: false,
+                    disabled: false,
                 },
                 McpEntry {
                     name: "team".to_string(),
@@ -233,6 +235,7 @@ mod tests {
                     oauth_client_id: None,
                     scope: McpScope::Project,
                     extra_settings: true,
+                    disabled: false,
                 },
                 McpEntry {
                     name: "global-tool".to_string(),
@@ -240,6 +243,7 @@ mod tests {
                     oauth_client_id: None,
                     scope: McpScope::User,
                     extra_settings: false,
+                    disabled: false,
                 },
             ]
         );

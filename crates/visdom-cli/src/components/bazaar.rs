@@ -149,10 +149,27 @@ pub fn check(
             )]
         }
     };
-    let matching: Vec<&McpEntry> = entries
+    let all_matching: Vec<&McpEntry> = entries
         .iter()
         .filter(|e| e.url.as_deref().is_some_and(|u| same_bazaar(u, url)))
         .collect();
+    let matching: Vec<&McpEntry> = all_matching
+        .iter()
+        .copied()
+        .filter(|e| !e.disabled)
+        .collect();
+    if let (true, Some(off)) = (matching.is_empty(), all_matching.first()) {
+        return vec![Finding::new(
+            COMPONENT,
+            ID,
+            Severity::Error,
+            format!(
+                "bazaar MCP is registered for {label} as `{}` but switched off: the agent works \
+                 without bazaar context — enable it in the {label} MCP settings",
+                off.name
+            ),
+        )];
+    }
 
     if let Some(entry) = matching
         .iter()
@@ -202,8 +219,8 @@ pub fn check(
             ID,
             Severity::Error,
             format!(
-                "{message} — it comes from the committed .mcp.json; set `oauth.clientId` to \
-                 `{BAZAAR_CLIENT_ID}` there"
+                "{message} — it comes from a configuration file in the repository; set its \
+                 OAuth client to `{BAZAAR_CLIENT_ID}` there"
             ),
         )
     } else if entry.extra_settings {
@@ -289,6 +306,7 @@ mod tests {
             oauth_client_id: client.map(String::from),
             scope,
             extra_settings: false,
+            disabled: false,
         }
     }
 
@@ -418,6 +436,22 @@ mod tests {
     }
 
     #[test]
+    fn a_switched_off_entry_is_not_a_registration() {
+        let mut off = entry("bazaar", URL, Some(BAZAAR_CLIENT_ID), McpScope::User);
+        off.disabled = true;
+        let finding = run(&fake(vec![off.clone()]), Some(URL), &repo());
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.message.contains("switched off"), "{finding:?}");
+        assert!(finding.fix.is_none(), "re-adding would replace the entry");
+        // An enabled one beside it is what counts.
+        let on = entry("visdom", URL, Some(BAZAAR_CLIENT_ID), McpScope::User);
+        assert_eq!(
+            run(&fake(vec![off, on]), Some(URL), &repo()).severity,
+            Severity::Ok
+        );
+    }
+
+    #[test]
     fn entry_under_other_name_is_found() {
         let adapter = fake(vec![entry(
             "visdom",
@@ -478,8 +512,10 @@ mod tests {
         let finding = run(&adapter, Some(URL), &repo());
         assert_eq!(finding.severity, Severity::Error);
         assert!(finding.fix.is_none());
-        assert!(finding.message.contains(".mcp.json"), "{finding:?}");
-        assert!(finding.message.contains("oauth.clientId"), "{finding:?}");
+        assert!(
+            finding.message.contains("file in the repository"),
+            "{finding:?}"
+        );
     }
 
     #[test]

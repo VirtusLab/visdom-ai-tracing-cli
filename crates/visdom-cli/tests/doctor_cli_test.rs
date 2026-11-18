@@ -229,3 +229,29 @@ fn visdom_init_in_temp_repo_installs_hooks() {
     assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
     assert!(stdout(&output).contains("✓ Codex hooks installed"));
 }
+
+/// A credential file that is there but broken is not "not logged in": no
+/// login is offered over it.
+#[test]
+fn broken_credential_file_is_unknown() {
+    let sb = Sandbox::new();
+    let dir = sb
+        .user_config()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("tracevault");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("credentials.json"), "{ truncated").unwrap();
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let auth = &json["findings"][0];
+    assert_eq!(auth["id"], "tracing.auth");
+    assert_eq!(auth["severity"], "unknown", "{auth}");
+    assert!(auth["fix"].is_null());
+}

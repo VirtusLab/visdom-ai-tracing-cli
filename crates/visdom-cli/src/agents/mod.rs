@@ -31,6 +31,8 @@ pub struct McpEntry {
     /// The entry carries settings beyond its URL and OAuth client (headers,
     /// timeouts, …) that removing and re-adding it would lose.
     pub extra_settings: bool,
+    /// Configured but switched off: the agent does not load it.
+    pub disabled: bool,
 }
 
 /// Where the agent is about to run.
@@ -239,6 +241,7 @@ mod tests {
             oauth_client_id: None,
             scope,
             extra_settings: false,
+            disabled: false,
         };
         let claude = adapter_for(Agent::ClaudeCode, paths(tmp.path()), None).unwrap();
         let (_, args, cwd) = args_of(&claude.remove_mcp(&entry(McpScope::User), &workdir));

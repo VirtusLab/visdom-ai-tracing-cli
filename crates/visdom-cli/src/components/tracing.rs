@@ -146,6 +146,12 @@ fn auth(ctx: &CheckContext) -> Finding {
         (CredentialState::Present, None) => {
             Finding::new(COMPONENT, ID, Severity::Ok, "credential found")
         }
+        (CredentialState::Unreadable(path), _) => Finding::new(
+            COMPONENT,
+            ID,
+            Severity::Unknown,
+            format!("could not tell whether you are logged in — {path} cannot be read or parsed"),
+        ),
         (CredentialState::Unusable(reason), _) => {
             Finding::new(COMPONENT, ID, Severity::Error, reason.clone())
         }
@@ -584,6 +590,18 @@ mod tests {
         assert_eq!(auth.severity, Severity::Error);
         assert!(auth.fix.is_none());
         assert!(auth.message.contains("visdom login --server-url <url>"));
+    }
+
+    #[test]
+    fn unreadable_credential_file_is_unknown_without_login_fix() {
+        let fx = Fixture::new();
+        let mut ctx = fx.ctx(Agent::ClaudeCode);
+        ctx.credential = CredentialState::Unreadable("/cfg/tracevault/credentials.json".into());
+        let findings = check(&ctx);
+        let auth = by_id(&findings, "tracing.auth");
+        assert_eq!(auth.severity, Severity::Unknown);
+        assert!(auth.fix.is_none());
+        assert!(auth.message.contains("credentials.json"), "{auth:?}");
     }
 
     #[test]

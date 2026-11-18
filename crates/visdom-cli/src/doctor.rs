@@ -117,7 +117,7 @@ impl Session {
         let (server_url, credential) =
             match tracevault_cli::credentials::resolve_credentials_quiet(credential_root) {
                 Ok((url, Some(_))) => (url, CredentialState::Present),
-                Ok((url, None)) => (url, CredentialState::Missing),
+                Ok((url, None)) => (url, missing_or_unreadable()),
                 Err(e) => (None, CredentialState::Unusable(e.to_string())),
             };
 
@@ -169,6 +169,18 @@ impl Session {
                 .map_err(String::as_str),
             &self.user_config_path,
         )
+    }
+}
+
+/// No credential was resolved: either there is none, or the credential file
+/// is there and cannot be read or parsed (the library treats both alike).
+fn missing_or_unreadable() -> CredentialState {
+    use tracevault_cli::credentials::Credentials;
+    match Credentials::path() {
+        Ok(path) if path.exists() && Credentials::load().is_none() => {
+            CredentialState::Unreadable(path.display().to_string())
+        }
+        _ => CredentialState::Missing,
     }
 }
 

@@ -18,6 +18,8 @@ pub enum CredentialState {
     Missing,
     /// There is one, but it cannot be used as configured (the reason).
     Unusable(String),
+    /// The credential file exists but could not be read (its path).
+    Unreadable(String),
 }
 
 /// Everything the checks look at, gathered once.
