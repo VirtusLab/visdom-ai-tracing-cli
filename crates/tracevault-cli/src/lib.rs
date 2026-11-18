@@ -2,6 +2,7 @@ pub mod agent;
 pub mod api_client;
 pub(crate) mod auto_bind;
 pub mod billing;
+pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod context;
