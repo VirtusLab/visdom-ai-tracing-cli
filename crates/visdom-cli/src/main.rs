@@ -78,7 +78,7 @@ fn doctor(
     if policy != FixPolicy::Never && findings.iter().any(|f| f.fix.is_some()) {
         // What is wrong, before asking to change it.
         print_attention(&findings);
-        if fix(&findings, policy, &mut RealExecutor::new(json)) {
+        if fix(&findings, policy, &mut RealExecutor::new(json, policy)) {
             session = gather(&env, agent, runtime);
             findings = session.collect();
         }
@@ -97,7 +97,7 @@ fn check_after_init(runtime: &tokio::runtime::Runtime, agent: Agent, yes: bool) 
     let findings = session.collect();
     print_attention(&findings);
     let policy = policy_for(false, yes, false, stdin_is_tty());
-    if fix(&findings, policy, &mut RealExecutor::new(false)) {
+    if fix(&findings, policy, &mut RealExecutor::new(false, policy)) {
         print_attention(&gather(&env, Some(agent), runtime).collect());
     }
 }
@@ -115,7 +115,7 @@ fn check_and_launch(
     let findings = session.collect();
     print_attention(&findings);
     let policy = policy_for(false, yes, false, stdin_is_tty());
-    if fix(&findings, policy, &mut RealExecutor::new(false)) {
+    if fix(&findings, policy, &mut RealExecutor::new(false, policy)) {
         session = gather(&env, agent, &runtime);
         // What is still open, once, above the agent.
         print_attention(&session.collect());

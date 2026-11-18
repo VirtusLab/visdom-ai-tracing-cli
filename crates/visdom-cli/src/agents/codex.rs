@@ -58,6 +58,7 @@ impl AgentAdapter for Codex {
         name: &str,
         url: &str,
         client_id: &str,
+        _scope: McpScope,
         _workdir: &Workdir,
     ) -> FixAction {
         run_command(

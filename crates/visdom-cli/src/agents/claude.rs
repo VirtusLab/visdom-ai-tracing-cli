@@ -106,7 +106,14 @@ impl AgentAdapter for Claude {
         Ok(out)
     }
 
-    fn register_mcp(&self, name: &str, url: &str, client_id: &str, workdir: &Workdir) -> FixAction {
+    fn register_mcp(
+        &self,
+        name: &str,
+        url: &str,
+        client_id: &str,
+        scope: McpScope,
+        workdir: &Workdir,
+    ) -> FixAction {
         // Options before the positionals: `claude mcp add` treats what follows
         // the URL as arguments of a stdio server.
         run_command(
@@ -117,7 +124,7 @@ impl AgentAdapter for Claude {
                 "--transport",
                 "http",
                 "--scope",
-                "local",
+                scope_name(scope),
                 "--client-id",
                 client_id,
                 name,

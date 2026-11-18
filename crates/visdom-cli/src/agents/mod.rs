@@ -82,8 +82,16 @@ pub trait AgentAdapter {
     fn mcp_entries(&self, workdir: &Workdir) -> Result<Vec<McpEntry>, String>;
 
     /// The command that registers an HTTP MCP server with a fixed OAuth
-    /// client, for an agent started in `workdir`.
-    fn register_mcp(&self, name: &str, url: &str, client_id: &str, workdir: &Workdir) -> FixAction;
+    /// client in `scope`, for an agent started in `workdir`. An agent with a
+    /// single configuration ignores the scope.
+    fn register_mcp(
+        &self,
+        name: &str,
+        url: &str,
+        client_id: &str,
+        scope: McpScope,
+        workdir: &Workdir,
+    ) -> FixAction;
 
     /// The command that removes `entry`.
     fn remove_mcp(&self, entry: &McpEntry, workdir: &Workdir) -> FixAction;
@@ -159,8 +167,13 @@ mod tests {
         let url = "https://ctx.example.com/mcp/remote";
 
         let claude = adapter_for(Agent::ClaudeCode, paths(tmp.path()), None).unwrap();
-        let (program, args, cwd) =
-            args_of(&claude.register_mcp("bazaar", url, "visdom-context-mcp", &workdir));
+        let (program, args, cwd) = args_of(&claude.register_mcp(
+            "bazaar",
+            url,
+            "visdom-context-mcp",
+            McpScope::Local,
+            &workdir,
+        ));
         assert_eq!(program, "claude");
         assert_eq!(
             args,
@@ -184,8 +197,13 @@ mod tests {
         );
 
         let codex = adapter_for(Agent::Codex, paths(tmp.path()), None).unwrap();
-        let (program, args, cwd) =
-            args_of(&codex.register_mcp("bazaar", url, "visdom-context-mcp", &workdir));
+        let (program, args, cwd) = args_of(&codex.register_mcp(
+            "bazaar",
+            url,
+            "visdom-context-mcp",
+            McpScope::Local,
+            &workdir,
+        ));
         assert_eq!(program, "codex");
         assert_eq!(
             args,
@@ -200,6 +218,11 @@ mod tests {
             ]
         );
         assert_eq!(cwd, None, "Codex has one global configuration");
+
+        // A user-scope registration stays a user-scope one.
+        let (_, args, _) =
+            args_of(&claude.register_mcp("visdom", url, "c", McpScope::User, &workdir));
+        assert_eq!(args[4..6], ["--scope", "user"]);
     }
 
     #[test]
@@ -245,8 +268,13 @@ mod tests {
         assert_eq!(cmd.get_program(), "/opt/codex");
         assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["--model", "x"]);
         // The override also names the program of the registration command.
-        let (program, ..) =
-            args_of(&codex.register_mcp("bazaar", "https://x/mcp", "c", &Workdir::plain("/tmp")));
+        let (program, ..) = args_of(&codex.register_mcp(
+            "bazaar",
+            "https://x/mcp",
+            "c",
+            McpScope::User,
+            &Workdir::plain("/tmp"),
+        ));
         assert_eq!(program, "/opt/codex");
     }
 

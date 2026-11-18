@@ -149,6 +149,7 @@ pub fn check(
             BAZAAR_SERVER_NAME,
             url,
             BAZAAR_CLIENT_ID,
+            McpScope::Local,
             workdir,
         )))];
     };
@@ -176,7 +177,8 @@ pub fn check(
         Finding::new(COMPONENT, ID, Severity::Error, message).with_fix(fix(FixAction::Sequence {
             steps: vec![
                 adapter.remove_mcp(entry, workdir),
-                adapter.register_mcp(&entry.name, url, BAZAAR_CLIENT_ID, workdir),
+                // Back where it was: a user-scope entry serves every project.
+                adapter.register_mcp(&entry.name, url, BAZAAR_CLIENT_ID, entry.scope, workdir),
             ],
         }))
     }]
@@ -204,10 +206,20 @@ mod tests {
         fn mcp_entries(&self, _: &Workdir) -> Result<Vec<McpEntry>, String> {
             self.entries.clone()
         }
-        fn register_mcp(&self, name: &str, url: &str, client_id: &str, w: &Workdir) -> FixAction {
+        fn register_mcp(
+            &self,
+            name: &str,
+            url: &str,
+            client_id: &str,
+            scope: McpScope,
+            w: &Workdir,
+        ) -> FixAction {
+            let scope = format!("{scope:?}").to_lowercase();
             FixAction::RunCommand {
                 program: "agent".to_string(),
-                args: ["add", name, url, client_id].map(String::from).to_vec(),
+                args: ["add", &scope, name, url, client_id]
+                    .map(String::from)
+                    .to_vec(),
                 cwd: Some(w.start_dir.clone()),
             }
         }
@@ -297,7 +309,7 @@ mod tests {
             fix.action,
             FixAction::RunCommand {
                 program: "agent".to_string(),
-                args: ["add", "bazaar", URL, BAZAAR_CLIENT_ID]
+                args: ["add", "local", "bazaar", URL, BAZAAR_CLIENT_ID]
                     .map(String::from)
                     .to_vec(),
                 cwd: Some(PathBuf::from("/work/repo")),
@@ -305,7 +317,7 @@ mod tests {
         );
         assert_eq!(
             fix.description,
-            format!("run `agent add bazaar {URL} {BAZAAR_CLIENT_ID}` in /work/repo")
+            format!("run `agent add local bazaar {URL} {BAZAAR_CLIENT_ID}` in /work/repo")
         );
     }
 
@@ -325,8 +337,13 @@ mod tests {
 
     #[test]
     fn wrong_client_id_offers_remove_then_add() {
-        for client in [None, Some("something-else")] {
-            let adapter = fake(vec![entry("visdom", URL, client, McpScope::Local)]);
+        for (client, scope, scope_name) in [
+            (None, McpScope::Local, "local"),
+            // A user-scope entry serves every project: it must not come back
+            // as a registration of this project only.
+            (Some("something-else"), McpScope::User, "user"),
+        ] {
+            let adapter = fake(vec![entry("visdom", URL, client, scope)]);
             let finding = run(&adapter, Some(URL), &repo());
             assert_eq!(finding.severity, Severity::Error);
             assert!(finding.message.contains("403"), "{finding:?}");
@@ -343,7 +360,10 @@ mod tests {
                 .collect();
             // Removed, then added back under the name it had.
             assert_eq!(args[0], ["remove", "visdom"]);
-            assert_eq!(args[1], ["add", "visdom", URL, BAZAAR_CLIENT_ID]);
+            assert_eq!(
+                args[1],
+                ["add", scope_name, "visdom", URL, BAZAAR_CLIENT_ID]
+            );
         }
     }
 

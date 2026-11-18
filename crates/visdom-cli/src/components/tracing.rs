@@ -49,8 +49,21 @@ pub fn check(ctx: &CheckContext) -> Vec<Finding> {
         },
     };
 
-    let own_setup = TracevaultConfig::config_path(root).exists();
-    findings.push(if own_setup {
+    let config = TracevaultConfig::try_load(root);
+    let own_setup = !matches!(config, Ok(None));
+    findings.push(if let Err(e) = &config {
+        // It is there but the tracing library cannot use it; `init` refuses
+        // to replace it, so there is nothing to offer.
+        Finding::new(
+            COMPONENT,
+            "tracing.repo",
+            Severity::Unknown,
+            format!(
+                "cannot use {} — {e}; fix or remove it",
+                TracevaultConfig::config_path(root).display()
+            ),
+        )
+    } else if own_setup {
         Finding::new(
             COMPONENT,
             "tracing.repo",
@@ -82,7 +95,15 @@ pub fn check(ctx: &CheckContext) -> Vec<Finding> {
         hooks
     });
 
-    if let Some(missing) = missing_git_hooks(root) {
+    let git_hooks = missing_git_hooks(root);
+    if let Err(unreadable) = &git_hooks {
+        findings.push(Finding::new(
+            COMPONENT,
+            "tracing.git_hooks",
+            Severity::Unknown,
+            format!("could not tell whether the git hooks are installed — {unreadable}"),
+        ));
+    } else if let Ok(Some(missing)) = &git_hooks {
         let message = format!(
             "git {missing} hook{} not installed in {}: commits are not linked to sessions and \
              policies are not checked before a push",
@@ -219,21 +240,24 @@ fn agent_hooks(ctx: &CheckContext, project_dir: &Path, root: &Path, global: &Pat
 }
 
 /// `"pre-push"`, `"post-commit"` or `"pre-push and post-commit"` — whichever
-/// lacks the tracing block — or `None` when both have it.
-fn missing_git_hooks(root: &Path) -> Option<String> {
+/// lacks the tracing block — or `None` when both have it. A hook file that
+/// exists but cannot be read is an error naming it: it may well have the block.
+fn missing_git_hooks(root: &Path) -> Result<Option<String>, String> {
     let hooks = root.join(".git").join("hooks");
-    let has = |name: &str, marker: &str| {
-        std::fs::read_to_string(hooks.join(name)).is_ok_and(|text| text.contains(marker))
-    };
-    let missing: Vec<&str> = [
+    let mut missing: Vec<&str> = Vec::new();
+    for (name, marker) in [
         ("pre-push", PRE_PUSH_MARKER),
         ("post-commit", POST_COMMIT_MARKER),
-    ]
-    .into_iter()
-    .filter(|(name, marker)| !has(name, marker))
-    .map(|(name, _)| name)
-    .collect();
-    (!missing.is_empty()).then(|| missing.join(" and "))
+    ] {
+        let path = hooks.join(name);
+        match std::fs::read(&path) {
+            Ok(bytes) if String::from_utf8_lossy(&bytes).contains(marker) => {}
+            Ok(_) => missing.push(name),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push(name),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    Ok((!missing.is_empty()).then(|| missing.join(" and ")))
 }
 
 #[cfg(test)]
@@ -468,6 +492,44 @@ mod tests {
         let findings = check(&fx.ctx(Agent::ClaudeCode));
         let git = by_id(&findings, "tracing.git_hooks");
         assert!(git.message.contains("git pre-push hook not"), "{git:?}");
+    }
+
+    #[test]
+    fn malformed_tracing_config_is_unknown_without_fix() {
+        let fx = Fixture::new();
+        fx.wire_git_hooks();
+        fx.write(".claude/settings.json", CLAUDE_HOOKS);
+        fx.write(".tracevault/config.toml", "server_url = [truncated");
+        let findings = check(&fx.ctx(Agent::ClaudeCode));
+        let repo = by_id(&findings, "tracing.repo");
+        assert_eq!(repo.severity, Severity::Unknown, "{repo:?}");
+        assert!(repo.fix.is_none());
+        assert!(repo.message.contains("config.toml"), "{repo:?}");
+    }
+
+    #[test]
+    fn unreadable_git_hook_is_unknown_without_fix() {
+        let fx = Fixture::new();
+        fx.wire_config();
+        fx.wire_git_hooks();
+        fx.write(".claude/settings.json", CLAUDE_HOOKS);
+        // A directory where the hook file should be: it exists, and reading
+        // it fails (for every user, root included).
+        fs::remove_file(fx.repo.path().join(".git/hooks/pre-push")).unwrap();
+        fs::create_dir(fx.repo.path().join(".git/hooks/pre-push")).unwrap();
+        let findings = check(&fx.ctx(Agent::ClaudeCode));
+        let git = by_id(&findings, "tracing.git_hooks");
+        assert_eq!(git.severity, Severity::Unknown, "{git:?}");
+        assert!(git.fix.is_none());
+        assert!(git.message.contains("pre-push"), "{git:?}");
+
+        // Not UTF-8 is still readable: the marker is found in it.
+        fs::remove_dir(fx.repo.path().join(".git/hooks/pre-push")).unwrap();
+        let mut bytes = vec![0xff, 0xfe, b'\n'];
+        bytes.extend_from_slice(PRE_PUSH_MARKER.as_bytes());
+        fs::write(fx.repo.path().join(".git/hooks/pre-push"), bytes).unwrap();
+        let findings = check(&fx.ctx(Agent::ClaudeCode));
+        assert_eq!(by_id(&findings, "tracing.git_hooks").severity, Severity::Ok);
     }
 
     /// In a linked worktree the tracing state belongs to the primary checkout:

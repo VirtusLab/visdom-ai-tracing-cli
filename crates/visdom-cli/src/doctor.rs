@@ -175,13 +175,17 @@ pub struct RealExecutor {
     pub visdom: PathBuf,
     /// Send the commands' stdout to stderr (when stdout carries JSON).
     pub stdout_to_stderr: bool,
+    /// Give the commands no stdin, so none of them can stop to ask anything:
+    /// with `--yes` the fix shown is applied with its defaults.
+    pub no_questions: bool,
 }
 
 impl RealExecutor {
-    pub fn new(stdout_to_stderr: bool) -> Self {
+    pub fn new(stdout_to_stderr: bool, policy: FixPolicy) -> Self {
         RealExecutor {
             visdom: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("visdom")),
             stdout_to_stderr,
+            no_questions: policy == FixPolicy::All,
         }
     }
 
@@ -194,6 +198,9 @@ impl RealExecutor {
         }
         if self.stdout_to_stderr {
             cmd.stdout(Stdio::from(std::io::stderr()));
+        }
+        if self.no_questions {
+            cmd.stdin(Stdio::null());
         }
         match cmd.status() {
             Ok(status) if status.success() => Ok(()),
@@ -223,15 +230,22 @@ impl FixExecutor for RealExecutor {
     }
 }
 
-/// Show one fix on the terminal and read the answer; Enter means yes.
+/// Whether a line read at the prompt is a yes. Enter alone is; end of input
+/// (nothing read, not even a newline) and a read error are not.
+pub fn is_yes(read: std::io::Result<usize>, line: &str) -> bool {
+    match read {
+        Ok(0) | Err(_) => false,
+        Ok(_) => matches!(line.trim(), "" | "y" | "Y" | "yes"),
+    }
+}
+
+/// Show one fix on the terminal and read the answer.
 pub fn ask_on_terminal(fix: &Fix) -> bool {
     eprint!("Apply: {}? [Y/n] ", fix.description);
     let _ = std::io::stderr().flush();
     let mut answer = String::new();
-    if std::io::stdin().lock().read_line(&mut answer).is_err() {
-        return false;
-    }
-    matches!(answer.trim(), "" | "y" | "Y" | "yes")
+    let read = std::io::stdin().lock().read_line(&mut answer);
+    is_yes(read, &answer)
 }
 
 /// Offer the fixes of `findings` under `policy`, reporting each failure on
@@ -263,6 +277,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn end_of_input_at_the_prompt_is_a_no() {
+        assert!(is_yes(Ok(1), "\n"));
+        assert!(is_yes(Ok(2), "y\n"));
+        assert!(is_yes(Ok(4), "yes\n"));
+        assert!(!is_yes(Ok(2), "n\n"));
+        assert!(!is_yes(Ok(6), "maybe\n"));
+        // Ctrl-D: nothing was read.
+        assert!(!is_yes(Ok(0), ""));
+        assert!(!is_yes(Err(std::io::Error::other("closed")), ""));
+    }
+
+    /// With `--yes` a fix must not stop to ask: its command gets no stdin.
+    #[test]
+    fn no_questions_gives_commands_an_empty_stdin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("read");
+        let mut exec = RealExecutor {
+            visdom: PathBuf::from("visdom"),
+            stdout_to_stderr: true,
+            no_questions: true,
+        };
+        let script = format!("cat > '{}'", out.display());
+        let result = exec.execute(&FixAction::RunCommand {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), script],
+            cwd: None,
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(std::fs::read(&out).unwrap(), b"");
+        assert!(RealExecutor::new(false, FixPolicy::All).no_questions);
+        assert!(!RealExecutor::new(false, FixPolicy::Ask).no_questions);
+    }
+
+    #[test]
     fn git_toplevel_is_none_outside_a_repository() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(git_toplevel(tmp.path()), None);
@@ -287,6 +335,7 @@ mod tests {
         let mut exec = RealExecutor {
             visdom: PathBuf::from("visdom"),
             stdout_to_stderr: true,
+            no_questions: false,
         };
         let run = |program: &str, args: &[&str]| FixAction::RunCommand {
             program: program.to_string(),
@@ -309,6 +358,7 @@ mod tests {
         let mut exec = RealExecutor {
             visdom: PathBuf::from("visdom"),
             stdout_to_stderr: true,
+            no_questions: false,
         };
         let step = |program: &str, args: Vec<String>| FixAction::RunCommand {
             program: program.to_string(),
@@ -331,6 +381,7 @@ mod tests {
         let mut exec = RealExecutor {
             visdom: PathBuf::from("visdom"),
             stdout_to_stderr: true,
+            no_questions: false,
         };
         let result = exec.execute(&FixAction::RunCommand {
             program: "touch".to_string(),
