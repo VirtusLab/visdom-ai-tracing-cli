@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.5](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.29.4...v0.29.5) - 2026-11-19
+
+### Added
+
+- *(cli)* expose hook detection and optional bazaar URL for visdom (VIS-1297)
+
+### Fixed
+
+- *(visdom)* keep an MCP entry's scope on repair; never apply on EOF; no prompts under --yes (VIS-1297)
+
+### Other
+
+- *(cli)* move tracevault command surface into the library (VIS-1297)
+
 ## [0.29.4](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.29.3...v0.29.4) - 2026-11-13
 
 ### Added
