@@ -9,3 +9,11 @@ git_tag_name = "v{{ version }}"
 [[package]]
 name = "visdom-ai-tracing-protocol"
 git_tag_name = "protocol-v{{ version }}"
+
+# `visdom` is published to crates.io with its own tag. It has no GitHub release
+# of its own: its binary ships inside the tracevault-cli release archives
+# (release-binaries.yml), next to `tracevault`.
+[[package]]
+name = "visdom-cli"
+git_tag_name = "visdom-v{{ version }}"
+git_release_enable = false

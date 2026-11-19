@@ -1,10 +1,74 @@
 # Visdom Trace CLI
 
 The public CLI for Visdom Trace — AI code tracing and attribution. Installs the
-`tracevault` binary.
+`tracevault` and `visdom` binaries.
+
+## `visdom`
+
+`visdom` is the developer CLI for the whole Visdom suite and is replacing `tracevault`. Run it
+instead of your coding agent: it checks that the project is wired up, offers to fix what is not,
+and starts the agent.
+
+```sh
+visdom                      # check → offer fixes → start the agent (Claude Code by default)
+visdom --agent codex -- --model gpt-x     # arguments after `--` go to the agent
+visdom doctor               # the checks only; exit code 1 when one fails
+visdom doctor --fix         # …and offer the fixes (--yes applies all, --json for scripts)
+```
+
+| Command | What it does |
+|---|---|
+| `visdom [--agent <a>] [--yes] [-- <agent args>]` | Check, offer each fix, start the agent in the current directory. Findings never stop the agent from starting. |
+| `visdom doctor [--fix] [--yes] [--json] [--agent <a>]` | The same checks without starting anything. |
+| `visdom login` / `visdom logout` | Same as `tracevault login` / `logout`. |
+| `visdom init [...]` | Sets the repository up: tracing (`tracevault init`, same flags), then registers the bazaar MCP server for the agent. |
+| `visdom trace <command>` | Every `tracevault` command: `visdom trace status`, `visdom trace verify-start`, … |
+
+What is checked:
+
+- **Tracing** — logged in; the repository is set up (or covered by a `--global` install); the
+  agent's hooks are installed; the git hooks are installed.
+- **Bazaar** — the bazaar MCP server is registered for the agent with the OAuth client
+  `visdom-context-mcp` (without it sign-in fails with a 403). The entry is recognised by its URL,
+  whatever it is named. Registration goes through the agent's own CLI (`claude mcp add …`,
+  `codex mcp add …`); `visdom` never edits the agent's files.
+
+Nothing is changed without a yes: each fix is shown first, `--yes` applies all of them, and when
+stdin is not a terminal nothing is applied. `visdom doctor` changes nothing without `--fix`.
+`visdom init` is the exception by definition: asking for it is the yes, for tracing and for the
+bazaar registration alike (the command it runs is printed first).
+
+On a terminal, `visdom init` asks for what it was not given instead of failing: which agent
+(unless `--agent`, `VISDOM_AGENT` or a config names one), the tracing server URL when you are not
+logged in (then it logs you in), and the bazaar URL when nothing knows it (saved as `bazaar_url`
+in the user config). Without a terminal it asks nothing and reports what is missing.
+
+Settings:
+
+- The agent: `--agent`, then `VISDOM_AGENT`, then `agent = "…"` in the repository's
+  `.visdom/config.toml`, then in the user config, then `claude-code`. Supported: `claude-code`,
+  `codex`.
+- User config, `visdom/config.toml` in the user config directory (`~/.config` on Linux):
+
+  ```toml
+  agent = "codex"
+  bazaar_url = "https://context.example.com/mcp/remote"   # until the server publishes it
+
+  [agents]                 # run another executable for an agent
+  claude_code = "/opt/claude/bin/claude"
+  ```
+- The bazaar URL: `VISDOM_BAZAAR_URL`, then `bazaar_url` above, then the tracing server's
+  `public-config` (`bazaar_mcp_url`, when it publishes one).
+- `VISDOM_SERVER_URL`, `VISDOM_API_KEY`, `VISDOM_SESSION_ID` and `VISDOM_NO_BROWSER` are accepted
+  for the `TRACEVAULT_*` variables of the same name and win over them.
+
+`tracevault` keeps working during the transition and both binaries share one login
+(`tracevault/credentials.json`). Installed hooks keep calling `tracevault …`, so it must stay on
+`PATH`; run interactively it prints a one-line deprecation note on stderr.
 
 ## Crates
 
+- **`visdom-cli`** — the `visdom` command-line tool.
 - **`tracevault-cli`** — the `tracevault` command-line tool (hooks, session capture, verification).
 - **`visdom-ai-tracing-protocol`** — the wire-protocol types (stream + hook events) shared between the
   CLI and the Visdom Trace server. Published so both sides depend on one source of truth.
@@ -18,8 +82,10 @@ brew install VirtusLab/visdom-ai-tracing/tracevault
 or from crates.io:
 
 ```bash
-cargo install tracevault-cli
+cargo install tracevault-cli visdom-cli
 ```
+
+Install both: `visdom-cli` provides `visdom` only, and the hooks it sets up call `tracevault`.
 
 ## Quick start
 

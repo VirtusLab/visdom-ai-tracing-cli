@@ -1,0 +1,34 @@
+[package]
+name = "visdom-cli"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+description = "Visdom developer CLI: checks a project's Visdom wiring and launches the coding agent"
+readme = "README.md"
+keywords = ["visdom", "tracing", "ai", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "visdom_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "visdom"
+path = "src/main.rs"
+
+[dependencies]
+tracevault-cli = { path = "../tracevault-cli", version = "0.29" }
+clap = { version = "4", features = ["derive"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+url = "2"
+dirs = "6"
+toml = { version = "0.8", features = ["preserve_order"] }
+
+[dev-dependencies]
+tempfile = "3"

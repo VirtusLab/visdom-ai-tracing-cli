@@ -718,7 +718,8 @@ fn update_root_gitignore(project_root: &Path, settings_entry: &str) -> Result<()
     fs::write(path, content)
 }
 
-const HOOK_MARKER: &str = "# tracevault:enforce";
+/// Marks the block `init` writes into `.git/hooks/pre-push`.
+pub const PRE_PUSH_MARKER: &str = "# tracevault:enforce";
 const OLD_HOOK_MARKER: &str = "# tracevault:auto-push";
 
 fn install_git_hook(project_root: &Path) -> Result<(), io::Error> {
@@ -733,7 +734,7 @@ fn install_git_hook(project_root: &Path) -> Result<(), io::Error> {
     // already-installed hooks keep working without re-running `tracevault
     // init`.
     let tracevault_block = format!(
-        "{HOOK_MARKER}\n\
+        "{PRE_PUSH_MARKER}\n\
          # Capture git's pre-push ref list once; `check` uses it to determine\n\
          # which files are being pushed.\n\
          tracevault_prepush_stdin=$(cat)\n\
@@ -745,7 +746,7 @@ fn install_git_hook(project_root: &Path) -> Result<(), io::Error> {
         let existing = fs::read_to_string(&hook_path)?;
 
         // Already has new-style hook
-        if existing.contains(HOOK_MARKER) {
+        if existing.contains(PRE_PUSH_MARKER) {
             return Ok(());
         }
 
@@ -799,7 +800,8 @@ fn install_git_hook(project_root: &Path) -> Result<(), io::Error> {
     Ok(())
 }
 
-const POST_COMMIT_MARKER: &str = "# tracevault:post-commit";
+/// Marks the block `init` writes into `.git/hooks/post-commit`.
+pub const POST_COMMIT_MARKER: &str = "# tracevault:post-commit";
 
 fn install_post_commit_hook(project_root: &Path) -> Result<(), io::Error> {
     let hooks_dir = project_root.join(".git/hooks");
@@ -1646,10 +1648,11 @@ fn merge_hooks(
     Ok(())
 }
 
-/// Whether the Claude Code settings file at `path` holds any TraceVault hook.
+/// Whether the hook file at `path` (Claude Code settings or Codex `hooks.json`)
+/// holds any TraceVault hook.
 /// A missing file holds none; one that cannot be read or parsed is an error
 /// (it may hold some).
-pub(crate) fn has_tracevault_hooks(path: &Path) -> io::Result<bool> {
+pub fn has_tracevault_hooks(path: &Path) -> io::Result<bool> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -2368,6 +2371,24 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
         assert!(!leftover);
+    }
+
+    /// The detector written for Claude settings reads Codex's hooks.json too
+    /// (same `hooks.<event>[].hooks[].command` shape), which `visdom` relies on.
+    #[test]
+    fn has_tracevault_hooks_reads_codex_hooks_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_dir = tmp.path().join(".codex");
+        install_global_codex_hooks(&codex_dir).unwrap();
+        assert!(has_tracevault_hooks(&codex_dir.join("hooks.json")).unwrap());
+
+        let foreign = tmp.path().join("foreign.json");
+        fs::write(
+            &foreign,
+            r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"other-tool stop"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(!has_tracevault_hooks(&foreign).unwrap());
     }
 
     #[test]
