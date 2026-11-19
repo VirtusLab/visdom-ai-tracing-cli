@@ -13,8 +13,11 @@ use visdom_cli::finding::FixAction;
 use visdom_cli::finding::{exit_code, render_json, render_text};
 use visdom_cli::fixes::FixExecutor;
 use visdom_cli::fixes::{policy_for, FixPolicy};
+use visdom_cli::gateway::{ensure_key, key_store_path_in, KeyStore};
+use visdom_cli::mode::{configured_mode, ModeReason, TracingMode, TrafficPolicy, MODE_ENV};
+use visdom_cli::suite::PolicyState;
 use visdom_cli::{config, interactive};
-use visdom_cli::{env_alias, launch};
+use visdom_cli::{doctor as checks, env_alias, launch};
 
 fn main() {
     // Before the runtime starts its threads: this changes the environment.
@@ -52,6 +55,7 @@ fn main() {
             runtime.block_on(run(Command::Init(args)));
             if per_repo && matches!(agent, Agent::ClaudeCode | Agent::Codex) {
                 init_bazaar(&runtime, agent);
+                init_mode(&runtime, agent, cli.mode);
             }
         }
         Some(VisdomCommand::Doctor {
@@ -59,13 +63,71 @@ fn main() {
             json,
             yes,
             agent,
-        }) => doctor(&runtime, agent.or(cli.agent), fix, yes || cli.yes, json),
-        None => check_and_launch(runtime, cli.agent, cli.yes, &cli.agent_args),
+            mode,
+        }) => doctor(
+            &runtime,
+            agent.or(cli.agent),
+            mode.or(cli.mode),
+            fix,
+            yes || cli.yes,
+            json,
+        ),
+        Some(VisdomCommand::GatewayKey { console, project }) => {
+            gateway_key(&runtime, &console, &project)
+        }
+        None => check_and_launch(runtime, cli.agent, cli.mode, cli.yes, &cli.agent_args),
     }
 }
 
-fn gather(env: &Environment, agent: Option<Agent>, runtime: &tokio::runtime::Runtime) -> Session {
-    match Session::gather(env, agent, runtime) {
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `visdom gateway-key`: the key a launched agent asks for. The kept key is
+/// printed without asking anybody; only a missing or expiring one costs a
+/// request. Nothing but the key goes to stdout.
+fn gateway_key(runtime: &tokio::runtime::Runtime, console: &str, project: &str) -> ! {
+    let env = Environment::current();
+    let store = KeyStore::at(key_store_path_in(&env.config_root));
+    if let Some(key) = store.usable(console, project, now()) {
+        println!("{}", key.secret);
+        exit(0);
+    }
+    let issued = checks::person_token(&env.cwd, runtime).and_then(|token| {
+        runtime.block_on(ensure_key(
+            &launch::key_http_client(),
+            console,
+            &token,
+            project,
+            &store,
+            now(),
+        ))
+    });
+    match issued {
+        Ok((key, warning)) => {
+            if let Some(warning) = warning {
+                eprintln!("visdom: warning: {warning}");
+            }
+            println!("{}", key.secret);
+            exit(0)
+        }
+        Err(e) => {
+            eprintln!("visdom: {e}");
+            exit(1)
+        }
+    }
+}
+
+fn gather(
+    env: &Environment,
+    agent: Option<Agent>,
+    mode: Option<TracingMode>,
+    runtime: &tokio::runtime::Runtime,
+) -> Session {
+    match Session::gather(env, agent, mode, runtime) {
         Ok(session) => {
             for warning in &session.warnings {
                 eprintln!("visdom: warning: {warning}");
@@ -86,19 +148,20 @@ fn stdin_is_tty() -> bool {
 fn doctor(
     runtime: &tokio::runtime::Runtime,
     agent: Option<Agent>,
+    mode: Option<TracingMode>,
     fix_flag: bool,
     yes: bool,
     json: bool,
 ) -> ! {
     let env = Environment::current();
-    let mut session = gather(&env, agent, runtime);
+    let mut session = gather(&env, agent, mode, runtime);
     let mut findings = session.collect();
     let policy = policy_for(fix_flag, yes, true, stdin_is_tty());
     if policy != FixPolicy::Never && findings.iter().any(|f| f.fix.is_some()) {
         // What is wrong, before asking to change it.
         print_attention(&findings);
         if fix(&findings, policy, &mut RealExecutor::new(json, policy)).applied {
-            session = gather(&env, agent, runtime);
+            session = gather(&env, agent, mode, runtime);
             findings = session.collect();
         }
     }
@@ -142,7 +205,7 @@ fn init_login(runtime: &tokio::runtime::Runtime, args: &InitArgs) {
         return;
     }
     let env = Environment::current();
-    let session = gather(&env, Some(args.agent), runtime);
+    let session = gather(&env, Some(args.agent), None, runtime);
     if session.ctx.credential != CredentialState::Missing {
         return;
     }
@@ -167,7 +230,7 @@ fn init_login(runtime: &tokio::runtime::Runtime, args: &InitArgs) {
 /// replace) is reported; a registration that fails makes init fail.
 fn init_bazaar(runtime: &tokio::runtime::Runtime, agent: Agent) {
     let env = Environment::current();
-    let mut session = gather(&env, Some(agent), runtime);
+    let mut session = gather(&env, Some(agent), None, runtime);
     // Nobody knows the bazaar URL: ask, and remember the answer for next time.
     if matches!(session.bazaar_url, Ok(None)) && interactive::is_interactive() {
         if let Some(url) = interactive::ask_url("Bazaar MCP URL (Enter to skip):") {
@@ -187,7 +250,7 @@ fn init_bazaar(runtime: &tokio::runtime::Runtime, agent: Agent) {
     let policy = FixPolicy::All;
     let summary = fix(&bazaar, policy, &mut RealExecutor::new(false, policy));
     let findings = if summary.applied {
-        let mut after = gather(&env, Some(agent), runtime);
+        let mut after = gather(&env, Some(agent), None, runtime);
         // The URL just typed counts even if it could not be saved.
         if matches!(after.bazaar_url, Ok(None)) {
             after.bazaar_url = session.bazaar_url.clone();
@@ -208,29 +271,134 @@ fn init_bazaar(runtime: &tokio::runtime::Runtime, agent: Agent) {
     }
 }
 
+/// The last part of `visdom init`: how the developer's sessions are traced.
+/// Asked only when it is theirs to choose — nothing chosen yet, a gateway to
+/// choose, and no workspace policy deciding it — and remembered in their
+/// config. A policy that decides is said instead.
+fn init_mode(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<TracingMode>) {
+    let env = Environment::current();
+    let session = gather(&env, Some(agent), flag, runtime);
+    match session.mode.reason {
+        ModeReason::Policy(TrafficPolicy::Enforced) => {
+            println!(
+                "This workspace requires the AI Gateway: `visdom` starts the agent through it."
+            );
+            return;
+        }
+        ModeReason::Policy(_) | ModeReason::Chosen => return,
+        ModeReason::Default => {}
+    }
+    let user = config::load_user_config_in(&env.config_root).unwrap_or_default();
+    let gateway_known = env.gateway_url.is_some()
+        || user.gateway.url.is_some()
+        || session.suite.ai_gateway_url.is_some();
+    let free_choice = matches!(
+        session.policy,
+        PolicyState::Fresh(TrafficPolicy::PerAgent)
+            | PolicyState::Remembered(TrafficPolicy::PerAgent, _)
+    );
+    if !gateway_known || !free_choice || !interactive::is_interactive() {
+        return;
+    }
+    // Asked again here only to rule out a choice made outside the user config.
+    let repo = git_toplevel(&env.cwd)
+        .and_then(|dir| config::load_repo_config_in(&dir).ok())
+        .unwrap_or_default();
+    if !matches!(
+        configured_mode(
+            flag,
+            env.mode.as_deref(),
+            repo.tracing_mode,
+            user.tracing_mode
+        ),
+        Ok(None)
+    ) {
+        return;
+    }
+    let Some(mode) = interactive::ask_mode() else {
+        return;
+    };
+    match interactive::save_tracing_mode(&session.user_config_path, mode) {
+        Ok(()) => eprintln!("Saved to {}", session.user_config_path.display()),
+        Err(e) => eprintln!("visdom: warning: tracing mode not saved: {e}"),
+    }
+}
+
+/// The agent's command for this session: through the AI Gateway when that is
+/// the mode and the gateway is ready. A gateway that is not ready stops the
+/// launch only when the workspace requires it; a developer who merely chose
+/// it gets their agent, traced by hooks.
+fn agent_command(
+    session: &Session,
+    runtime: &tokio::runtime::Runtime,
+    agent_args: &[String],
+) -> std::process::Command {
+    let hooks = |session: &Session| {
+        let mut cmd = session.adapter.launch(agent_args);
+        // Said outright, so a `gateway` left in the environment cannot switch
+        // the hooks' capture off for a session that does not use the gateway.
+        cmd.env(MODE_ENV, TracingMode::Hooks.name());
+        cmd
+    };
+    if session.mode.mode != TracingMode::Gateway {
+        return hooks(session);
+    }
+    let visdom = std::env::current_exe().unwrap_or_else(|_| "visdom".into());
+    match launch::prepare_gateway(session, runtime, &visdom, now()) {
+        Ok((gateway, notes)) => {
+            for note in notes {
+                eprintln!("visdom: warning: {note}");
+            }
+            session
+                .adapter
+                .launch_via_gateway(agent_args, &gateway, &|name| std::env::var(name).ok())
+        }
+        Err(why) => {
+            // A gateway that could not be planned was already reported with
+            // the findings; say here only what was not.
+            if matches!(session.gateway, Some(Ok(_))) {
+                eprintln!("visdom: {why}");
+            }
+            if matches!(
+                session.mode.reason,
+                ModeReason::Policy(TrafficPolicy::Enforced)
+            ) {
+                eprintln!(
+                    "visdom: the workspace requires the AI Gateway, so the agent is not started"
+                );
+                exit(1);
+            }
+            eprintln!("visdom: starting the agent with hooks tracing instead");
+            hooks(session)
+        }
+    }
+}
+
 /// Plain `visdom`: check, offer the fixes, start the agent. Findings never
-/// stop the agent from starting.
+/// stop the agent from starting; only a gateway the workspace requires and
+/// that cannot be used does.
 fn check_and_launch(
     runtime: tokio::runtime::Runtime,
     agent: Option<Agent>,
+    mode: Option<TracingMode>,
     yes: bool,
     agent_args: &[String],
 ) -> ! {
     let env = Environment::current();
-    let mut session = gather(&env, agent, &runtime);
+    let mut session = gather(&env, agent, mode, &runtime);
     let findings = session.collect();
     print_attention(&findings);
     let policy = policy_for(false, yes, false, stdin_is_tty());
     if fix(&findings, policy, &mut RealExecutor::new(false, policy)).applied {
-        session = gather(&env, agent, &runtime);
+        session = gather(&env, agent, mode, &runtime);
         // What is still open, once, above the agent.
         print_attention(&session.collect());
     } else if policy == FixPolicy::Never && findings.iter().any(|f| f.fix.is_some()) {
         eprintln!("visdom: run `visdom doctor --fix` (or `visdom --yes`) to apply the fixes");
     }
+    // In the directory visdom was run in, like starting the agent by hand.
+    let cmd = agent_command(&session, &runtime, agent_args);
     // The agent takes over this process: no runtime threads may outlive it.
     drop(runtime);
-    // In the directory visdom was run in, like starting the agent by hand.
-    let cmd = session.adapter.launch(agent_args);
     launch::exec_agent(cmd, session.ctx.agent, &session.user_config_path)
 }

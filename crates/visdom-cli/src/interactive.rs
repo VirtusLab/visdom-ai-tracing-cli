@@ -7,6 +7,8 @@ use std::path::Path;
 
 use tracevault_cli::agent::Agent;
 
+use crate::mode::TracingMode;
+
 /// Whether there is somebody to ask.
 pub fn is_interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
@@ -41,6 +43,29 @@ pub fn ask_agent() -> Agent {
         };
         match parse_agent_choice(&answer) {
             Some(agent) => return agent,
+            None => eprintln!("Answer 1 or 2."),
+        }
+    }
+}
+
+/// The mode an answer names: its number in the list, or its name. An empty
+/// answer takes the default, hooks. `None` when it names neither.
+pub fn parse_mode_choice(answer: &str) -> Option<TracingMode> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "hooks" => Some(TracingMode::Hooks),
+        "2" | "gateway" => Some(TracingMode::Gateway),
+        _ => None,
+    }
+}
+
+/// Ask how sessions should be traced. `None` at end of input: nothing chosen.
+pub fn ask_mode() -> Option<TracingMode> {
+    loop {
+        let answer = ask_line(
+            "How should your sessions be traced? [1] hooks  [2] through the AI Gateway  (default 1):",
+        )?;
+        match parse_mode_choice(&answer) {
+            Some(mode) => return Some(mode),
             None => eprintln!("Answer 1 or 2."),
         }
     }
@@ -92,6 +117,17 @@ pub fn ask_url(question: &str) -> Option<String> {
 /// Record `bazaar_url` in the user config at `path`, creating the file if
 /// needed and leaving everything else in it as it is.
 pub fn save_bazaar_url(path: &Path, url: &str) -> Result<(), String> {
+    save_user_setting(path, "bazaar_url", url)
+}
+
+/// Record `tracing_mode` in the user config at `path`, the same way.
+pub fn save_tracing_mode(path: &Path, mode: TracingMode) -> Result<(), String> {
+    save_user_setting(path, "tracing_mode", mode.name())
+}
+
+/// Set the top-level string `key` in the user config at `path`, creating the
+/// file if needed and leaving everything else in it as it is.
+fn save_user_setting(path: &Path, key: &str, value: &str) -> Result<(), String> {
     let existing = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -99,14 +135,11 @@ pub fn save_bazaar_url(path: &Path, url: &str) -> Result<(), String> {
     };
     let mut table: toml::Table =
         toml::from_str(&existing).map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
-    let line = format!("bazaar_url = {}\n", toml::Value::String(url.to_string()));
-    let updated = if table.contains_key("bazaar_url") {
+    let line = format!("{key} = {}\n", toml::Value::String(value.to_string()));
+    let updated = if table.contains_key(key) {
         // Already there (empty, or it would not have been asked for): the
         // file is rewritten from its parsed form.
-        table.insert(
-            "bazaar_url".to_string(),
-            toml::Value::String(url.to_string()),
-        );
+        table.insert(key.to_string(), toml::Value::String(value.to_string()));
         toml::to_string(&table).map_err(|e| e.to_string())?
     } else {
         // A top-level key must come before the first table: put it first, and
@@ -134,6 +167,39 @@ mod tests {
         assert_eq!(parse_agent_choice("codex"), Some(Agent::Codex));
         assert_eq!(parse_agent_choice("3"), None);
         assert_eq!(parse_agent_choice("amp"), None);
+    }
+
+    #[test]
+    fn mode_choice_by_number_name_or_default() {
+        assert_eq!(parse_mode_choice(""), Some(TracingMode::Hooks));
+        assert_eq!(parse_mode_choice("1"), Some(TracingMode::Hooks));
+        assert_eq!(parse_mode_choice(" Gateway "), Some(TracingMode::Gateway));
+        assert_eq!(parse_mode_choice("2"), Some(TracingMode::Gateway));
+        assert_eq!(parse_mode_choice("3"), None);
+        assert_eq!(parse_mode_choice("proxy"), None);
+    }
+
+    #[test]
+    fn the_mode_is_saved_next_to_the_other_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = crate::config::user_config_path_in(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let before = "agent = \"codex\"\n\n[gateway]\nproject = \"alpha\"\n";
+        std::fs::write(&path, before).unwrap();
+        save_tracing_mode(&path, TracingMode::Gateway).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("tracing_mode = \"gateway\"\n{before}")
+        );
+        let user = load_user_config_in(tmp.path()).unwrap();
+        assert_eq!(user.tracing_mode, Some(TracingMode::Gateway));
+        assert_eq!(user.agent, Some(Agent::Codex));
+        assert_eq!(user.gateway.project.as_deref(), Some("alpha"));
+        // Choosing again replaces it.
+        save_tracing_mode(&path, TracingMode::Hooks).unwrap();
+        let user = load_user_config_in(tmp.path()).unwrap();
+        assert_eq!(user.tracing_mode, Some(TracingMode::Hooks));
+        assert_eq!(user.gateway.project.as_deref(), Some("alpha"));
     }
 
     #[test]

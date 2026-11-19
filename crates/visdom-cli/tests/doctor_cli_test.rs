@@ -101,7 +101,16 @@ fn doctor_outside_a_repository_reports_and_exits() {
     // Logged in (API key), no repository, bazaar URL unknown: nothing is an error.
     assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
     let json: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
-    assert_eq!(ids(&json), ["tracing.auth", "tracing.repo", "bazaar.url"]);
+    assert_eq!(
+        ids(&json),
+        [
+            "tracing.auth",
+            "tracing.repo",
+            "gateway.mode",
+            "gateway.policy",
+            "bazaar.url"
+        ]
+    );
 }
 
 #[test]

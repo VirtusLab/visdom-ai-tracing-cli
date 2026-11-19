@@ -12,22 +12,25 @@ and starts the agent.
 ```sh
 visdom                      # check → offer fixes → start the agent (Claude Code by default)
 visdom --agent codex -- --model gpt-x     # arguments after `--` go to the agent
+visdom --mode gateway       # …with the agent's LLM traffic going through the AI Gateway
 visdom doctor               # the checks only; exit code 1 when one fails
 visdom doctor --fix         # …and offer the fixes (--yes applies all, --json for scripts)
 ```
 
 | Command | What it does |
 |---|---|
-| `visdom [--agent <a>] [--yes] [-- <agent args>]` | Check, offer each fix, start the agent in the current directory. Findings never stop the agent from starting. |
-| `visdom doctor [--fix] [--yes] [--json] [--agent <a>]` | The same checks without starting anything. |
+| `visdom [--agent <a>] [--mode <m>] [--yes] [-- <agent args>]` | Check, offer each fix, start the agent in the current directory. Findings never stop the agent from starting (one exception: a gateway the workspace requires and that cannot be used, see below). |
+| `visdom doctor [--fix] [--yes] [--json] [--agent <a>] [--mode <m>]` | The same checks without starting anything. |
 | `visdom login` / `visdom logout` | Same as `tracevault login` / `logout`. |
-| `visdom init [...]` | Sets the repository up: tracing (`tracevault init`, same flags), then registers the bazaar MCP server for the agent. |
+| `visdom init [...]` | Sets the repository up: tracing (`tracevault init`, same flags), then registers the bazaar MCP server for the agent, then asks how your sessions are traced when that is yours to choose. |
 | `visdom trace <command>` | Every `tracevault` command: `visdom trace status`, `visdom trace verify-start`, … |
 
 What is checked:
 
 - **Tracing** — logged in; the repository is set up (or covered by a `--global` install); the
   agent's hooks are installed; the git hooks are installed.
+- **Gateway** — which way sessions are traced and who decided it; through the AI Gateway, that
+  the gateway is known, your login works there and a project lets you have a personal key.
 - **Bazaar** — the bazaar MCP server is registered for the agent with the OAuth client
   `visdom-context-mcp` (without it sign-in fails with a 403). The entry is recognised by its URL,
   whatever it is named. Registration goes through the agent's own CLI (`claude mcp add …`,
@@ -40,8 +43,58 @@ bazaar registration alike (the command it runs is printed first).
 
 On a terminal, `visdom init` asks for what it was not given instead of failing: which agent
 (unless `--agent`, `VISDOM_AGENT` or a config names one), the tracing server URL when you are not
-logged in (then it logs you in), and the bazaar URL when nothing knows it (saved as `bazaar_url`
-in the user config). Without a terminal it asks nothing and reports what is missing.
+logged in (then it logs you in), the bazaar URL when nothing knows it (saved as `bazaar_url`
+in the user config), and how your sessions are traced when the installation has an AI Gateway and
+the choice is yours (saved as `tracing_mode`). Without a terminal it asks nothing and reports what
+is missing.
+
+### Hooks or the AI Gateway
+
+A session reaches AI Tracing one of two ways, and **you choose**:
+
+- `hooks` (the default) — the agent's hooks capture the session, as with `tracevault`.
+- `gateway` — `visdom` starts the agent with its LLM traffic going through the Visdom AI Gateway,
+  which records the calls. The hooks stay installed (they still bring the repository's policies
+  into the session, link commits and check policies before a push) but their capture is off for
+  that agent, so nothing is recorded twice.
+
+Your choice is `--mode`, then `VISDOM_TRACING_MODE`, then `tracing_mode` in the repository's
+`.visdom/config.toml`, then in the user config.
+
+**A workspace admin may decide instead**, with the AI traffic policy in Control Plane:
+`enforced` puts every session through the gateway, `direct` keeps every session on hooks, and
+`per_agent` (the default) leaves it to you. `visdom` reads the policy with your login on every
+start and remembers the last answer for when Control Plane cannot be reached. When no policy can
+be read at all, your choice applies.
+
+In gateway mode `visdom`:
+
+- finds Control Plane and the gateway from the tracing server you are logged in to (its
+  `public-config`), so there is nothing to configure in a normal installation;
+- asks the gateway console for your **personal key** for the project (`[gateway] project` when
+  several are open to you), keeps it in `visdom/gateway-keys.json` readable by you only, and
+  reuses it until shortly before it expires — a new key revokes the previous one, and sessions
+  started side by side must not cut each other off;
+- gives everything to the launched agent only (environment and launch options); your agent's own
+  configuration files are not touched, and the agent started without `visdom` is as it was.
+
+| | Claude Code | Codex |
+|---|---|---|
+| Key | from `visdom gateway-key` (`apiKeyHelper`), renewed during the session | fixed at start (`VISDOM_GATEWAY_API_KEY`); a session running when the key expires (24 hours at most) has to be restarted |
+| Model | `ANTHROPIC_MODEL` and the small model, set to a gateway alias | `--model <alias>` |
+| Session id | chosen by `visdom` and sent with every call | Codex's own (`thread-id`) |
+
+The model alias is the one under `[gateway]` in your config, else the first alias the key may
+call that is named for the agent (`claude…`, `gpt…`); with neither the agent asks for its own
+default, which the project may refuse — `visdom` says so.
+
+If gateway mode cannot be set up (no gateway, an API-key login, no project open to you):
+
+- you chose it: the agent is started with hooks tracing and `visdom` says why;
+- the workspace requires it: the agent is **not** started, since it would bypass the policy.
+
+An API key (`VISDOM_API_KEY`) is only ever sent to the tracing server; the gateway and Control
+Plane need a Visdom account login (`visdom login`).
 
 Settings:
 
@@ -54,11 +107,24 @@ Settings:
   agent = "codex"
   bazaar_url = "https://context.example.com/mcp/remote"   # until the server publishes it
 
+  tracing_mode = "gateway"                                # or "hooks" (the default)
+
   [agents]                 # run another executable for an agent
   claude_code = "/opt/claude/bin/claude"
+
+  [gateway]                # only for tracing_mode = "gateway"; all optional
+  project = "payments"                 # the gateway project, when several are open to you
+  claude_code_model = "claude-sonnet"  # model aliases to ask the gateway for
+  codex_model = "gpt-general"
+  url = "https://ai-gateway.example.com"   # the console, until the server publishes it
   ```
+- A repository may name its own in `.visdom/config.toml`: `agent`, `tracing_mode`, and
+  `[gateway] project`.
 - The bazaar URL: `VISDOM_BAZAAR_URL`, then `bazaar_url` above, then the tracing server's
   `public-config` (`bazaar_mcp_url`, when it publishes one).
+- Control Plane and the gateway console: `VISDOM_CONTROL_PLANE_URL` / `VISDOM_GATEWAY_URL`, then
+  `control_plane_url` / `[gateway] url` in the user config, then the tracing server's
+  `public-config` (`control_plane_url`, `ai_gateway_url`).
 - `VISDOM_SERVER_URL`, `VISDOM_API_KEY`, `VISDOM_SESSION_ID` and `VISDOM_NO_BROWSER` are accepted
   for the `TRACEVAULT_*` variables of the same name and win over them.
 

@@ -4,6 +4,8 @@ use clap::{Parser, Subcommand};
 use tracevault_cli::agent::Agent;
 use tracevault_cli::cli::{Command, InitArgs, LoginArgs};
 
+use crate::mode::TracingMode;
+
 #[derive(Parser)]
 #[command(
     name = "visdom",
@@ -11,7 +13,8 @@ use tracevault_cli::cli::{Command, InitArgs, LoginArgs};
     about = "Visdom developer CLI",
     long_about = "Visdom developer CLI.\n\nWithout a subcommand: checks that this project is wired \
                   for the coding agent (tracing, bazaar MCP), offers to fix what is not, and \
-                  launches the agent. Arguments after `--` go to the agent."
+                  launches the agent — with hooks tracing, or through the AI Gateway (--mode). \
+                  Arguments after `--` go to the agent."
 )]
 pub struct VisdomCli {
     /// The agent to check and launch: claude-code or codex. Default: the
@@ -19,6 +22,12 @@ pub struct VisdomCli {
     /// then the user config, then claude-code.
     #[arg(long, value_enum)]
     pub agent: Option<Agent>,
+    /// How the session is traced: by hooks, or through the AI Gateway.
+    /// Default: the VISDOM_TRACING_MODE variable, then `.visdom/config.toml`
+    /// in the repository, then the user config (`tracing_mode`), then hooks.
+    /// The workspace's AI traffic policy may require one of them.
+    #[arg(long, value_enum)]
+    pub mode: Option<TracingMode>,
     /// Apply every offered fix without asking.
     #[arg(long)]
     pub yes: bool,
@@ -46,6 +55,20 @@ pub enum VisdomCommand {
         /// The agent to check (see `visdom --help`).
         #[arg(long, value_enum)]
         agent: Option<Agent>,
+        /// The tracing mode to check (see `visdom --help`).
+        #[arg(long, value_enum)]
+        mode: Option<TracingMode>,
+    },
+    /// Print the developer's AI Gateway key for a project: what a launched
+    /// agent runs to get, and renew, its key.
+    #[command(hide = true)]
+    GatewayKey {
+        /// The gateway console's address.
+        #[arg(long)]
+        console: String,
+        /// The gateway project's id.
+        #[arg(long)]
+        project: String,
     },
     /// Log in to Visdom
     Login(LoginArgs),
@@ -72,6 +95,43 @@ mod tests {
         match VisdomCli::try_parse_from(args) {
             Ok(cli) => cli,
             Err(e) => panic!("{args:?} must parse: {e}"),
+        }
+    }
+
+    #[test]
+    fn the_mode_is_an_option_of_the_launch_and_of_doctor() {
+        let cli = parse(&["visdom", "--mode", "gateway", "--", "--verbose"]);
+        assert_eq!(cli.mode, Some(TracingMode::Gateway));
+        assert_eq!(cli.agent_args, ["--verbose"]);
+        let cli = parse(&["visdom", "doctor", "--mode", "hooks"]);
+        assert!(matches!(
+            cli.command,
+            Some(VisdomCommand::Doctor {
+                mode: Some(TracingMode::Hooks),
+                ..
+            })
+        ));
+        assert!(VisdomCli::try_parse_from(["visdom", "--mode", "proxy"]).is_err());
+    }
+
+    #[test]
+    fn the_key_helper_takes_a_console_and_a_project() {
+        let cli = parse(&[
+            "visdom",
+            "gateway-key",
+            "--console",
+            "https://gw.example.com",
+            "--project",
+            "p-1",
+        ]);
+        match cli.command {
+            Some(VisdomCommand::GatewayKey { console, project }) => {
+                assert_eq!(
+                    (console.as_str(), project.as_str()),
+                    ("https://gw.example.com", "p-1")
+                );
+            }
+            _ => panic!("expected gateway-key"),
         }
     }
 
@@ -127,7 +187,8 @@ mod tests {
                 json: true,
                 fix: false,
                 yes: false,
-                agent: None
+                agent: None,
+                mode: None
             })
         ));
     }

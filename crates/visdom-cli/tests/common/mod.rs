@@ -9,6 +9,10 @@ use std::process::{Command, Output, Stdio};
 
 use tempfile::TempDir;
 
+/// The library's own test server, shared with these tests.
+#[path = "../../src/test_http.rs"]
+pub mod http;
+
 pub struct Sandbox {
     pub home: TempDir,
     pub repo: TempDir,
@@ -63,9 +67,70 @@ impl Sandbox {
             cmd.env_remove(format!("TRACEVAULT_{name}"));
             cmd.env_remove(format!("VISDOM_{name}"));
         }
-        cmd.env_remove("VISDOM_AGENT")
-            .env_remove("VISDOM_BAZAAR_URL");
+        for name in [
+            "VISDOM_AGENT",
+            "VISDOM_BAZAAR_URL",
+            "VISDOM_TRACING_MODE",
+            "VISDOM_GATEWAY_URL",
+            "VISDOM_CONTROL_PLANE_URL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_CUSTOM_HEADERS",
+        ] {
+            cmd.env_remove(name);
+        }
         cmd
+    }
+
+    /// Log this sandbox in to the tracing server at `server_url` with a
+    /// Visdom account whose access token is `token` (valid for an hour).
+    pub fn log_in(&self, server_url: &str, token: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let credentials = serde_json::json!({
+            "server_url": server_url,
+            "email": "dev@example.com",
+            "auth": {
+                "issuer": "https://idp.invalid/realms/visdom",
+                "client_id": "visdom-cli",
+                "refresh_token": "refresh",
+                "access_token": token,
+                "access_expires_at": now + 3600,
+            },
+        });
+        let path = self.home.path().join(".config/tracevault/credentials.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, credentials.to_string()).unwrap();
+    }
+
+    /// An executable standing in for an agent that also records the
+    /// environment it was given: every invocation appends its arguments (one
+    /// `arg:` line each) and the named variables (`NAME=value`, or
+    /// `NAME unset`) to the returned log file.
+    pub fn recording_agent(&self, variables: &[&str]) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.home.path().join("bin");
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("recording-agent");
+        let log = dir.join("recording-agent.log");
+        let mut text = format!(
+            "#!/bin/sh\nexec >> '{}'\nfor a in \"$@\"; do printf 'arg:%s\\n' \"$a\"; done\n",
+            log.display()
+        );
+        for name in variables {
+            text.push_str(&format!(
+                "if [ \"${{{name}+set}}\" = set ]; then printf '%s=%s\\n' {name} \"${name}\"; \
+                 else printf '%s unset\\n' {name}; fi\n"
+            ));
+        }
+        fs::write(&script, text).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        (script, log)
     }
 
     /// An executable standing in for an agent: every invocation appends

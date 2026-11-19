@@ -9,6 +9,7 @@ use crate::agents::Workdir;
 use crate::mode::TracingMode;
 
 pub mod bazaar;
+pub mod gateway;
 pub mod tracing;
 
 /// Whether the tracing library found a credential for this project.

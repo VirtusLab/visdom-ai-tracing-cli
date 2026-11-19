@@ -8,6 +8,8 @@ use clap::ValueEnum;
 use serde::{Deserialize, Deserializer};
 use tracevault_cli::agent::Agent;
 
+use crate::mode::{parse_mode, TracingMode};
+
 /// `<config dir>/visdom/config.toml`.
 #[derive(Debug, Default, Deserialize)]
 pub struct UserConfig {
@@ -17,9 +19,46 @@ pub struct UserConfig {
     /// The bazaar MCP endpoint, when the server does not publish it.
     #[serde(default)]
     pub bazaar_url: Option<String>,
+    /// How this developer's sessions are traced: `hooks` or `gateway`.
+    #[serde(default, deserialize_with = "de_mode")]
+    pub tracing_mode: Option<TracingMode>,
+    /// Control Plane's address, when the server does not publish it.
+    #[serde(default)]
+    pub control_plane_url: Option<String>,
     /// Per-agent executable overrides.
     #[serde(default)]
     pub agents: AgentCommands,
+    /// The AI Gateway, for `tracing_mode = "gateway"`.
+    #[serde(default)]
+    pub gateway: GatewayConfig,
+}
+
+/// `[gateway]`: how to reach and use the AI Gateway.
+#[derive(Debug, Default, Deserialize)]
+pub struct GatewayConfig {
+    /// The gateway console's address, when the server does not publish it.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// The gateway project (its slug) whose personal key the agent uses.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// The model alias Claude Code asks the gateway for.
+    #[serde(default, alias = "claude-code-model")]
+    pub claude_code_model: Option<String>,
+    /// The model alias Codex asks the gateway for.
+    #[serde(default, alias = "codex-model")]
+    pub codex_model: Option<String>,
+}
+
+impl GatewayConfig {
+    /// The configured model alias for `agent`, if any.
+    pub fn model_for(&self, agent: Agent) -> Option<String> {
+        match agent {
+            Agent::ClaudeCode => self.claude_code_model.clone(),
+            Agent::Codex => self.codex_model.clone(),
+            _ => None,
+        }
+    }
 }
 
 /// `[agents]`: the executable to run for an agent instead of the default.
@@ -42,11 +81,24 @@ impl AgentCommands {
     }
 }
 
-/// `.visdom/config.toml` in a repository: a team-preferred agent.
+/// `.visdom/config.toml` in a repository: what the team prefers for it.
 #[derive(Debug, Default, Deserialize)]
 pub struct RepoConfig {
     #[serde(default, deserialize_with = "de_agent")]
     pub agent: Option<Agent>,
+    /// The tracing mode the team prefers here; a developer's own choice on
+    /// the command line or in the environment still wins.
+    #[serde(default, deserialize_with = "de_mode")]
+    pub tracing_mode: Option<TracingMode>,
+    #[serde(default)]
+    pub gateway: RepoGatewayConfig,
+}
+
+/// `[gateway]` in a repository: the gateway project this repository belongs to.
+#[derive(Debug, Default, Deserialize)]
+pub struct RepoGatewayConfig {
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// The `[agents]` key that overrides `agent`'s executable.
@@ -70,6 +122,15 @@ fn de_agent<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Agent>, D::Error> 
     match Option::<String>::deserialize(d)? {
         None => Ok(None),
         Some(name) => parse_agent(&name)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+fn de_mode<'de, D: Deserializer<'de>>(d: D) -> Result<Option<TracingMode>, D::Error> {
+    match Option::<String>::deserialize(d)? {
+        None => Ok(None),
+        Some(name) => parse_mode(&name)
             .map(Some)
             .map_err(serde::de::Error::custom),
     }
@@ -155,6 +216,7 @@ mod tests {
     fn agent_precedence_flag_env_repo_user_default() {
         let repo = RepoConfig {
             agent: Some(Agent::Codex),
+            ..Default::default()
         };
         let none = RepoConfig::default();
         let cases = [
@@ -278,5 +340,62 @@ mod tests {
         std::fs::write(&path, "agent = \"emacs\"\n").unwrap();
         let err = load_user_config_in(tmp.path()).unwrap_err();
         assert!(err.contains("emacs"), "{err}");
+    }
+
+    #[test]
+    fn the_tracing_mode_and_gateway_settings_are_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = user_config_path_in(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "tracing_mode = \"gateway\"\ncontrol_plane_url = \"https://cp.example.com\"\n\n\
+             [gateway]\nurl = \"https://gw.example.com\"\nproject = \"alpha\"\n\
+             claude_code_model = \"claude-sonnet\"\ncodex-model = \"gpt-general\"\n",
+        )
+        .unwrap();
+        let user = load_user_config_in(tmp.path()).unwrap();
+        assert_eq!(user.tracing_mode, Some(TracingMode::Gateway));
+        assert_eq!(
+            user.control_plane_url.as_deref(),
+            Some("https://cp.example.com")
+        );
+        assert_eq!(user.gateway.url.as_deref(), Some("https://gw.example.com"));
+        assert_eq!(user.gateway.project.as_deref(), Some("alpha"));
+        assert_eq!(
+            user.gateway.model_for(Agent::ClaudeCode).as_deref(),
+            Some("claude-sonnet")
+        );
+        assert_eq!(
+            user.gateway.model_for(Agent::Codex).as_deref(),
+            Some("gpt-general")
+        );
+        assert_eq!(user.gateway.model_for(Agent::Amp), None);
+    }
+
+    #[test]
+    fn a_repository_names_its_mode_and_gateway_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = repo_config_path_in(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "tracing_mode = \"hooks\"\n\n[gateway]\nproject = \"beta\"\n",
+        )
+        .unwrap();
+        let repo = load_repo_config_in(tmp.path()).unwrap();
+        assert_eq!(repo.tracing_mode, Some(TracingMode::Hooks));
+        assert_eq!(repo.gateway.project.as_deref(), Some("beta"));
+        assert_eq!(repo.agent, None);
+    }
+
+    #[test]
+    fn an_unknown_tracing_mode_is_a_config_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = user_config_path_in(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "tracing_mode = \"proxy\"\n").unwrap();
+        let err = load_user_config_in(tmp.path()).unwrap_err();
+        assert!(err.contains("hooks or gateway"), "{err}");
     }
 }
