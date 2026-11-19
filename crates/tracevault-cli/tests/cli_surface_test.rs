@@ -107,3 +107,66 @@ fn no_deprecation_notice_when_stderr_is_not_a_terminal() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("deprecated"), "{stderr}");
 }
+
+/// Run the capture hook for one event in `dir`, with its own home and state
+/// directories, and return its stdout.
+fn stream_event(dir: &std::path::Path, home: &std::path::Path, mode: Option<&str>) -> String {
+    use std::io::Write;
+    let event = serde_json::json!({
+        "session_id": "11111111-2222-3333-4444-555555555555",
+        "cwd": dir,
+        "hook_event_name": "Stop",
+    });
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tracevault"));
+    cmd.args(["stream", "--event", "stop"])
+        .current_dir(dir)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env_remove("TRACEVAULT_API_KEY")
+        .env_remove("TRACEVAULT_SERVER_URL")
+        .env_remove("VISDOM_TRACING_MODE")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(mode) = mode {
+        cmd.env("VISDOM_TRACING_MODE", mode);
+    }
+    let mut child = cmd.spawn().expect("failed to run tracevault");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(event.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "a hook never fails");
+    stdout(&output)
+}
+
+/// An agent `visdom` started through the AI Gateway carries
+/// `VISDOM_TRACING_MODE=gateway`; its capture hook then answers and records
+/// nothing — not even the session's local state.
+#[test]
+fn the_capture_hook_records_nothing_for_a_gateway_session() {
+    let home = tempfile::tempdir().unwrap();
+
+    let gateway = tempfile::tempdir().unwrap();
+    let out = stream_event(gateway.path(), home.path(), Some("gateway"));
+    let answer: serde_json::Value = serde_json::from_str(out.trim()).expect("a hook response");
+    assert!(answer.is_object(), "{out}");
+    assert!(
+        !gateway.path().join(".tracevault").exists(),
+        "nothing may be written for a gateway session"
+    );
+
+    // The same event in a hooks session leaves the session's local state.
+    for mode in [None, Some("hooks")] {
+        let hooks = tempfile::tempdir().unwrap();
+        stream_event(hooks.path(), home.path(), mode);
+        assert!(
+            hooks.path().join(".tracevault").exists(),
+            "{mode:?}: a hooks session is recorded locally"
+        );
+    }
+}
