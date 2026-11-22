@@ -216,6 +216,9 @@ pub fn claude_command(
     // What decides where the session goes: in the environment and, over
     // whatever a settings file says, in the settings.
     let mut routing: Vec<(&str, String)> = vec![
+        // The hooks read this to record nothing: a settings file must not
+        // switch them back on beside the gateway.
+        (MODE_ENV, TracingMode::Gateway.name().to_string()),
         ("ANTHROPIC_BASE_URL", gateway.llm_url.clone()),
         ("ANTHROPIC_CUSTOM_HEADERS", headers),
         (
@@ -227,7 +230,6 @@ pub fn claude_command(
     routing.extend(CLAUDE_OTHER_PROVIDERS.map(|switch| (switch, "0".to_string())));
 
     let mut cmd = Command::new(program);
-    cmd.env(MODE_ENV, TracingMode::Gateway.name());
     for (name, value) in &routing {
         cmd.env(name, value);
         settings_env.insert(name.to_string(), value.clone().into());
@@ -235,10 +237,13 @@ pub fn claude_command(
     for switch in CLAUDE_OTHER_PROVIDERS {
         cmd.env_remove(switch);
     }
-    // A key of the developer's own would be sent in place of the gateway's.
+    // A key of the developer's own would be sent in place of the gateway's
+    // (and to the gateway). Removed from the environment, and set to nothing
+    // in the settings, which is how one in a settings file is cleared: Claude
+    // Code then asks the key helper.
     for key in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] {
         cmd.env_remove(key);
-        settings_env.remove(key);
+        settings_env.insert(key.to_string(), "".into());
     }
     if let Some(model) = &gateway.model {
         // The project's allow-list has aliases, not Claude Code's defaults:
@@ -467,6 +472,9 @@ mod tests {
         assert_eq!(
             settings["env"],
             serde_json::json!({
+                "VISDOM_TRACING_MODE": "gateway",
+                "ANTHROPIC_API_KEY": "",
+                "ANTHROPIC_AUTH_TOKEN": "",
                 "ANTHROPIC_BASE_URL": "https://llm.example.com",
                 "ANTHROPIC_CUSTOM_HEADERS": env["ANTHROPIC_CUSTOM_HEADERS"],
                 "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "300000",
@@ -552,6 +560,7 @@ mod tests {
             r#"{"permissions":{"allow":["Bash(ls)"]},"apiKeyHelper":"echo mine",
                 "env":{"ANTHROPIC_BASE_URL":"https://elsewhere.example.com",
                        "CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_API_KEY":"sk-mine",
+                       "ANTHROPIC_AUTH_TOKEN":"tok-mine","VISDOM_TRACING_MODE":"hooks",
                        "ANTHROPIC_CUSTOM_HEADERS":"x-team: blue","MY_VAR":"kept"}}"#,
         )
         .unwrap();
@@ -568,7 +577,9 @@ mod tests {
             assert_eq!(env["MY_VAR"], "kept");
             assert_eq!(env["ANTHROPIC_BASE_URL"], "https://llm.example.com");
             assert_eq!(env["CLAUDE_CODE_USE_BEDROCK"], "0");
-            assert_eq!(env.get("ANTHROPIC_API_KEY"), None);
+            assert_eq!(env["ANTHROPIC_API_KEY"], "");
+            assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "");
+            assert_eq!(env["VISDOM_TRACING_MODE"], "gateway");
             let headers = env["ANTHROPIC_CUSTOM_HEADERS"].as_str().unwrap();
             assert!(
                 headers.starts_with("x-team: blue\nx-tracevault-agent"),

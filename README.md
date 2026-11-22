@@ -98,7 +98,9 @@ Your own agent configuration cannot take a gateway session elsewhere:
   `visdom` gives the gateway's address, the attribution headers and the key helper as settings on
   the command line (`--settings`), which come after your `settings.json` and the project's; there
   it also switches off `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` and
-  `CLAUDE_CODE_USE_FOUNDRY`, each of which would send the session to that provider. Settings you
+  `CLAUDE_CODE_USE_FOUNDRY`, each of which would send the session to that provider, and clears
+  an `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` of yours, which would be sent in place of the
+  gateway key. Settings you
   pass with `--settings` yourself are kept, merged under these; a `--settings` value that cannot be
   read stops the gateway launch. (Settings your organisation manages come after everything and are
   not `visdom`'s to overrule.)
