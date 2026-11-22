@@ -65,7 +65,7 @@ Your choice is `--mode`, then `VISDOM_TRACING_MODE`, then `tracing_mode` in the 
 `enforced` puts every session through the gateway, `direct` keeps every session on hooks, and
 `per_agent` (the default) leaves it to you. `visdom` reads the policy with your login on every
 start and remembers the last answer for when Control Plane cannot be reached; where Control Plane
-is, it remembers too, for when the tracing server cannot be asked. When no policy can be read at
+is, it remembers too, for when the tracing server cannot be asked (both per installation). When no policy can be read at
 all, your choice applies.
 
 In gateway mode `visdom`:
@@ -92,12 +92,23 @@ The model alias is the one under `[gateway]` in your config, else the first alia
 call that is named for the agent (`claude…`, `gpt…`); with neither the agent asks for its own
 default, which the project may refuse — `visdom` says so.
 
-For Claude Code `visdom` also clears `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` and
-`CLAUDE_CODE_USE_FOUNDRY` for the launched process: each would send the session to that provider,
-past the gateway.
+Your own agent configuration cannot take a gateway session elsewhere:
+
+- **Claude Code** applies the `env` of its settings files over the environment it is started in, so
+  `visdom` gives the gateway's address, the attribution headers and the key helper as settings on
+  the command line (`--settings`), which come after your `settings.json` and the project's; there
+  it also switches off `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` and
+  `CLAUDE_CODE_USE_FOUNDRY`, each of which would send the session to that provider. Settings you
+  pass with `--settings` yourself are kept, merged under these; a `--settings` value that cannot be
+  read stops the gateway launch. (Settings your organisation manages come after everything and are
+  not `visdom`'s to overrule.)
+- **Codex** takes your `-c` overrides after `visdom`'s, so one that chooses the model provider
+  (`-c model_provider=…`, `-c model_providers.visdom-gateway.…`, `--oss`, `--local-provider`) stops
+  the gateway launch: leave it out, or use `--mode hooks`.
 
 If gateway mode cannot be set up (no gateway, an API-key login, no project open to you, an LLM
-gateway that does not answer or refuses the key):
+gateway that does not answer or refuses the key, a key that cannot be kept, options of yours that
+choose another provider):
 
 - you chose it: the agent is started with hooks tracing and `visdom` says why;
 - the workspace requires it: the agent is **not** started, since it would bypass the policy.

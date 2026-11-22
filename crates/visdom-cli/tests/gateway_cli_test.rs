@@ -636,3 +636,43 @@ fn logging_out_forgets_the_kept_keys() {
     let _ = sb.visdom(sb.repo.path()).arg("logout").output().unwrap();
     assert!(!store.exists(), "the keys go with the login");
 }
+
+/// Codex takes the caller's `-c` overrides after visdom's: one that names
+/// another provider would take the session past a gateway the workspace
+/// requires, so nothing is started.
+#[test]
+fn an_enforcing_workspace_does_not_start_codex_told_to_use_another_provider() {
+    let settings = policy("enforced");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let (agent, log) = sb.recording_agent(&VARIABLES);
+    sb.write_user_config(&format!("[agents]\ncodex = \"{}\"\n", agent.display()));
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--agent", "codex", "--", "-c", "model_provider=openai"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let said = stderr(&output);
+    assert!(said.contains("`-c model_provider=openai`"), "{said}");
+    assert!(said.contains("the agent is not started"), "{said}");
+    assert!(lines(&log).is_empty(), "the agent must not have run");
+
+    // Without it, Codex starts on the gateway's provider.
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--agent", "codex"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(modes(&log), ["VISDOM_TRACING_MODE=gateway"]);
+    assert!(args(&log).contains(&r#"model_provider="visdom-gateway""#.to_string()));
+}

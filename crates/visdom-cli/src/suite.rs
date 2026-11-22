@@ -67,36 +67,47 @@ pub async fn fetch_suite_map(http: &reqwest::Client, server_url: &str) -> Result
     Ok(map.only_urls())
 }
 
-/// The suite map last read from a tracing server, kept so that the rest of
-/// the suite — and with it a workspace policy that requires the gateway — is
-/// still found while that server cannot be asked.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct CachedSuite {
-    server_url: String,
-    map: SuiteMap,
+/// A small JSON file of answers remembered per address, so that using a
+/// second installation does not forget the first one's.
+fn load_remembered<T: for<'de> Deserialize<'de>>(path: &Path, address: &str) -> Option<T> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut all: std::collections::BTreeMap<String, T> = serde_json::from_str(&text).ok()?;
+    all.remove(&trim_slash(address.to_string()))
 }
 
+/// Best effort: an answer that cannot be written only means no fallback
+/// later. Entries that no longer read (another version's) are dropped.
+fn save_remembered<T: Serialize + for<'de> Deserialize<'de>>(path: &Path, address: &str, value: T) {
+    let mut all: std::collections::BTreeMap<String, serde_json::Value> =
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+    all.retain(|_, entry| serde_json::from_value::<T>(entry.clone()).is_ok());
+    let Ok(value) = serde_json::to_value(value) else {
+        return;
+    };
+    all.insert(trim_slash(address.to_string()), value);
+    if let (Some(dir), Ok(text)) = (path.parent(), serde_json::to_string(&all)) {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// Where the suite maps last read from tracing servers are kept, so that the
+/// rest of the suite — and with it a workspace policy that requires the
+/// gateway — is still found while a server cannot be asked.
 pub fn suite_cache_path_in(config_root: &Path) -> PathBuf {
     config_root.join("visdom").join("suite.json")
 }
 
-/// The remembered suite map of `server_url`, if that is the server remembered.
+/// The remembered suite map of `server_url`.
 pub fn load_cached_suite(path: &Path, server_url: &str) -> Option<SuiteMap> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let cached: CachedSuite = serde_json::from_str(&text).ok()?;
-    (cached.server_url == trim_slash(server_url.to_string())).then(|| cached.map.only_urls())
+    load_remembered::<SuiteMap>(path, server_url).map(SuiteMap::only_urls)
 }
 
-/// Best effort: a map that cannot be written only means no fallback later.
 pub fn save_cached_suite(path: &Path, server_url: &str, map: &SuiteMap) {
-    let cached = CachedSuite {
-        server_url: trim_slash(server_url.to_string()),
-        map: map.clone(),
-    };
-    if let (Some(dir), Ok(text)) = (path.parent(), serde_json::to_string(&cached)) {
-        let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::write(path, text);
-    }
+    save_remembered(path, server_url, map.clone());
 }
 
 /// The suite map to work with, given what the tracing server at `server_url`
@@ -154,35 +165,19 @@ pub async fn fetch_policy(
         .map_err(|e| format!("Control Plane's settings could not be read ({e})"))
 }
 
-/// The policy last read from a Control Plane, kept so that an enforced policy
-/// still holds while Control Plane cannot be reached.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CachedPolicy {
-    pub control_plane_url: String,
-    pub policy: TrafficPolicy,
-}
-
+/// Where the policies last read from Control Planes are kept, so that an
+/// enforced policy still holds while Control Plane cannot be reached.
 pub fn policy_cache_path_in(config_root: &Path) -> PathBuf {
     config_root.join("visdom").join("policy.json")
 }
 
-/// The cached policy of `control_plane_url`, if that is the one cached.
+/// The remembered policy of `control_plane_url`.
 pub fn load_cached_policy(path: &Path, control_plane_url: &str) -> Option<TrafficPolicy> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let cached: CachedPolicy = serde_json::from_str(&text).ok()?;
-    (cached.control_plane_url == control_plane_url).then_some(cached.policy)
+    load_remembered(path, control_plane_url)
 }
 
-/// Best effort: a cache that cannot be written only means asking again.
 pub fn save_cached_policy(path: &Path, control_plane_url: &str, policy: TrafficPolicy) {
-    let cached = CachedPolicy {
-        control_plane_url: control_plane_url.to_string(),
-        policy,
-    };
-    if let (Some(dir), Ok(text)) = (path.parent(), serde_json::to_string(&cached)) {
-        let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::write(path, text);
-    }
+    save_remembered(path, control_plane_url, policy);
 }
 
 /// What is known about the workspace policy for one run.
@@ -402,6 +397,15 @@ mod tests {
             suite_map_or_remembered(&down, "https://other.example.com", &cache),
             SuiteMap::default()
         );
+        // Another installation's answer is kept beside it, not in its place.
+        let other = SuiteMap {
+            control_plane_url: Some("https://cp.other.example.com".to_string()),
+            ..SuiteMap::default()
+        };
+        let elsewhere = "https://tracing.other.example.com";
+        suite_map_or_remembered(&Ok(other.clone()), elsewhere, &cache);
+        assert_eq!(suite_map_or_remembered(&down, server, &cache), map);
+        assert_eq!(suite_map_or_remembered(&down, elsewhere, &cache), other);
         // A later answer replaces it, an empty one included.
         suite_map_or_remembered(&Ok(SuiteMap::default()), server, &cache);
         assert_eq!(

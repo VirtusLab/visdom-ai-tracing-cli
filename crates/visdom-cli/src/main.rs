@@ -115,9 +115,6 @@ fn gateway_key(runtime: &tokio::runtime::Runtime, console: &str, project: &str) 
     });
     match issued {
         Ok(ensured) => {
-            if let Some(warning) = ensured.warning {
-                eprintln!("visdom: warning: {warning}");
-            }
             println!("{}", ensured.key.secret);
             exit(0)
         }
@@ -359,14 +356,19 @@ fn agent_command(
         return hooks(session);
     }
     let visdom = std::env::current_exe().unwrap_or_else(|_| "visdom".into());
-    match launch::prepare_gateway(session, runtime, &visdom, now()) {
-        Ok((gateway, notes)) => {
-            for note in notes {
-                eprintln!("visdom: warning: {note}");
-            }
+    let prepared =
+        launch::prepare_gateway(session, runtime, &visdom, now()).and_then(|(gateway, notes)| {
             session
                 .adapter
                 .launch_via_gateway(agent_args, &gateway, &|name| std::env::var(name).ok())
+                .map(|cmd| (cmd, notes))
+        });
+    match prepared {
+        Ok((cmd, notes)) => {
+            for note in notes {
+                eprintln!("visdom: warning: {note}");
+            }
+            cmd
         }
         Err(why) => {
             // A gateway that could not be planned was already reported with

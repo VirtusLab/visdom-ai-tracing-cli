@@ -38,8 +38,8 @@ pub fn key_http_client() -> reqwest::Client {
 
 /// Everything the agent needs to run through the gateway: the developer's
 /// key (the kept one, or a new one), a model alias and the ids that attribute
-/// the session. The second value holds what the developer should know (a key
-/// that could not be kept).
+/// the session. The second value holds what the developer should know (no
+/// model alias to ask for).
 ///
 /// The LLM gateway is asked for its models with the key before anything is
 /// started: an agent pointed at a gateway that does not answer, or does not
@@ -85,7 +85,7 @@ pub fn prepare_gateway(
         Err(e) => return Err(e.why),
     };
     let key = ensured.key;
-    let mut notes: Vec<String> = ensured.warning.into_iter().collect();
+    let mut notes: Vec<String> = Vec::new();
     let model = gateway::pick_model(
         session.ctx.agent,
         session.gateway_model.as_deref(),

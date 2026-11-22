@@ -111,12 +111,13 @@ pub trait AgentAdapter {
 
     /// The command that starts the agent with `args` and its LLM traffic
     /// going through the AI Gateway. `env` reads the current environment.
+    /// `Err` when the caller's own `args` would take the session elsewhere.
     fn launch_via_gateway(
         &self,
         args: &[String],
         gateway: &via_gateway::GatewayLaunch,
         env: &dyn Fn(&str) -> Option<String>,
-    ) -> std::process::Command {
+    ) -> Result<std::process::Command, String> {
         match self.agent() {
             Agent::Codex => via_gateway::codex_command(self.program(), args, gateway),
             _ => via_gateway::claude_command(self.program(), args, gateway, env),

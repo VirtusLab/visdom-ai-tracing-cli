@@ -456,15 +456,12 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 /// A key from [`ensure_key`].
 pub struct EnsuredKey {
     pub key: IssuedKey,
-    /// Why the key could not be stored, when it could not: it still works
-    /// for this session.
-    pub warning: Option<String>,
     /// Issued just now, rather than found in the store.
     pub issued: bool,
 }
 
 /// The developer's key for `project_id`: the stored one while it lasts, else a
-/// new one, which is then stored. `rejected` is a key the gateway no longer
+/// new one, which is then stored (a key that cannot be stored is an error). `rejected` is a key the gateway no longer
 /// takes (revoked by a newer one issued elsewhere): the stored key is used
 /// only if it is another one.
 ///
@@ -483,7 +480,7 @@ pub async fn ensure_key(
     let account = account_of(token);
     // Waiting for another process must not hold up this runtime's thread. A
     // store that cannot be locked (a read-only config directory) is used
-    // without: the key then cannot be stored either.
+    // without: a new key then cannot be stored either, which is an error.
     let locking = store.clone();
     let _lock = tokio::task::spawn_blocking(move || locking.lock().ok())
         .await
@@ -493,21 +490,16 @@ pub async fn ensure_key(
         .usable(console_url, project_id, &account, now)
         .filter(|key| Some(key.secret.as_str()) != rejected);
     if let Some(key) = stored {
-        return Ok(EnsuredKey {
-            key,
-            warning: None,
-            issued: false,
-        });
+        return Ok(EnsuredKey { key, issued: false });
     }
     let key = issue_key(http, console_url, token, project_id, now).await?;
-    let warning = store
+    // A key that is not kept is issued again by the next session, and by the
+    // agent's own key helper, each time revoking the one in use: that is no
+    // working gateway session.
+    store
         .keep(console_url, project_id, &account, &key, now)
-        .err();
-    Ok(EnsuredKey {
-        key,
-        warning,
-        issued: true,
-    })
+        .map_err(|why| format!("the personal AI Gateway key could not be kept: {why}"))?;
+    Ok(EnsuredKey { key, issued: true })
 }
 
 #[cfg(test)]
@@ -785,10 +777,7 @@ mod tests {
         let first = ensure_key(&http, &server.url, "tok", "p-1", &store, now, None)
             .await
             .unwrap();
-        assert_eq!(
-            (first.key.secret.as_str(), first.warning, first.issued),
-            ("sk-abc", None, true)
-        );
+        assert_eq!((first.key.secret.as_str(), first.issued), ("sk-abc", true));
         let second = ensure_key(&http, &server.url, "tok", "p-1", &store, now + 3600, None)
             .await
             .unwrap();
@@ -968,6 +957,27 @@ mod tests {
             "{}",
             err.why
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_key_that_cannot_be_kept_is_an_error() {
+        let http = reqwest::Client::new();
+        let tmp = tempfile::tempdir().unwrap();
+        // The store's directory cannot be made: a file is in its place.
+        std::fs::write(tmp.path().join("visdom"), "").unwrap();
+        let store = KeyStore::at(key_store_path_in(tmp.path()));
+        let server = MockServer::start(&[(
+            "POST /api/me/keys",
+            201,
+            r#"{"secret":"sk-abc","id":"h","name":"n","expiresAt":"2099-01-01T00:00:00Z"}"#,
+        )]);
+        let err = ensure_key(&http, &server.url, "tok", "p-1", &store, 0, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.contains("could not be kept"), "{err}");
+        assert!(!err.contains("sk-abc"), "{err}");
     }
 
     #[test]
