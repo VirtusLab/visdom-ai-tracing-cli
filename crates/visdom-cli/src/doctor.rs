@@ -163,7 +163,16 @@ impl Session {
             None => Ok(SuiteMap::default()),
         };
         let bazaar_url = bazaar::resolve_bazaar_url(env.bazaar_url.clone(), &user, &published);
-        let suite_map = published.unwrap_or_default();
+        // While that server is away, the rest of the suite is where it last
+        // said: a policy that requires the gateway must not lapse with it.
+        let suite_map = match &server_url {
+            Some(url) => suite::suite_map_or_remembered(
+                &published,
+                url,
+                &suite::suite_cache_path_in(&env.config_root),
+            ),
+            None => SuiteMap::default(),
+        };
 
         // The developer's own token opens the suite's other products. Only a
         // Keycloak login has one; an API key is never sent anywhere else.
@@ -281,6 +290,21 @@ pub fn person_token(start: &Path, runtime: &tokio::runtime::Runtime) -> Result<S
             .ok_or_else(|| login.to_string()),
         Ok(_) => Err(login.to_string()),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The account of the login stored for the project containing `start`, read
+/// from the token as it is on disk: nobody is asked. `None` without a Visdom
+/// account login.
+pub fn stored_account(start: &Path) -> Option<String> {
+    let root = git_toplevel(start)
+        .map(|dir| tracevault_cli::paths::resolve_project_root(&dir).root)
+        .unwrap_or_else(|| start.to_path_buf());
+    match tracevault_cli::credentials::resolve_credentials_quiet(&root) {
+        Ok((_, Some(Credential::Keycloak(session)))) => {
+            Some(gateway::account_of(&session.access_token))
+        }
+        _ => None,
     }
 }
 

@@ -12,7 +12,8 @@ use common::http::MockServer;
 use common::{stderr, stdout, Sandbox};
 
 const PERSON_TOKEN: &str = "person-access-token";
-const VARIABLES: [&str; 6] = [
+const VARIABLES: [&str; 7] = [
+    "CLAUDE_CODE_USE_BEDROCK",
     "VISDOM_TRACING_MODE",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_API_KEY",
@@ -98,6 +99,8 @@ fn a_chosen_gateway_session_gets_a_key_a_model_and_its_ids() {
     let output = sb
         .visdom(sb.repo.path())
         .args(["--mode", "gateway", "--", "--verbose"])
+        // Left over from working with another provider.
+        .env("CLAUDE_CODE_USE_BEDROCK", "1")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
@@ -105,6 +108,7 @@ fn a_chosen_gateway_session_gets_a_key_a_model_and_its_ids() {
     let recorded = lines(&log);
     let has = |line: &str| recorded.iter().any(|l| l == line);
     assert!(has("VISDOM_TRACING_MODE=gateway"), "{recorded:?}");
+    assert!(has("CLAUDE_CODE_USE_BEDROCK unset"), "{recorded:?}");
     assert!(
         has(&format!("ANTHROPIC_BASE_URL={}", server.url)),
         "{recorded:?}"
@@ -395,4 +399,240 @@ fn doctor_reports_the_mode_without_issuing_a_key() {
         !server.routes().iter().any(|r| r == "POST /api/me/keys"),
         "a check issues nothing: a new key would revoke the one in use"
     );
+}
+
+fn count(server: &MockServer, route: &str) -> usize {
+    server.routes().iter().filter(|r| *r == route).count()
+}
+
+fn modes(log: &Path) -> Vec<String> {
+    lines(log)
+        .into_iter()
+        .filter(|l| l.starts_with("VISDOM_TRACING_MODE"))
+        .collect()
+}
+
+/// The tracing server names Control Plane. While it is away, a workspace
+/// that requires the gateway still does: what the server said last holds.
+#[test]
+fn an_enforcing_workspace_still_enforces_while_the_tracing_server_is_away() {
+    let settings = policy("enforced");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/auth/public-config", 503, "{}"),
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let (sb, log) = sandbox(&server);
+    for _ in 0..2 {
+        let output = sb.visdom(sb.repo.path()).output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    }
+    assert_eq!(count(&server, "GET /api/v1/auth/public-config"), 2);
+    assert_eq!(
+        modes(&log),
+        ["VISDOM_TRACING_MODE=gateway", "VISDOM_TRACING_MODE=gateway"],
+        "the second session must not fall to hooks"
+    );
+}
+
+#[test]
+fn a_chosen_gateway_whose_llm_endpoint_fails_falls_back_to_hooks() {
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        ("GET /v1/models", 502, "{}"),
+    ]);
+    let (sb, log) = sandbox(&server);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let said = stderr(&output);
+    assert!(
+        said.contains("cannot list the AI Gateway's models"),
+        "{said}"
+    );
+    assert!(said.contains("with hooks tracing instead"), "{said}");
+    assert_eq!(modes(&log), ["VISDOM_TRACING_MODE=hooks"]);
+    assert!(lines(&log).contains(&"ANTHROPIC_BASE_URL unset".to_string()));
+}
+
+#[test]
+fn an_enforcing_workspace_does_not_start_an_agent_whose_llm_endpoint_fails() {
+    let settings = policy("enforced");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        ("GET /v1/models", 502, "{}"),
+    ]);
+    let (sb, log) = sandbox(&server);
+    let output = sb.visdom(sb.repo.path()).output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let said = stderr(&output);
+    assert!(
+        said.contains("cannot list the AI Gateway's models"),
+        "{said}"
+    );
+    assert!(said.contains("the agent is not started"), "{said}");
+    assert!(lines(&log).is_empty(), "the agent must not have run");
+}
+
+/// A key issued elsewhere (the console) revokes the kept one: the gateway
+/// refuses it, and the session gets a new key instead of a dead one.
+#[test]
+fn a_kept_key_the_gateway_refuses_is_replaced() {
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        (
+            "POST /api/me/keys",
+            201,
+            r#"{"secret":"sk-second","id":"h2","name":"personal-dev-2","expiresAt":"2099-01-01T00:00:00Z"}"#,
+        ),
+        MODELS,
+        ("GET /v1/models", 401, r#"{"error":"revoked"}"#),
+        MODELS,
+    ]);
+    let (sb, log) = sandbox(&server);
+    for _ in 0..2 {
+        let output = sb
+            .visdom(sb.repo.path())
+            .args(["--mode", "gateway"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    }
+    assert_eq!(count(&server, "POST /api/me/keys"), 2);
+    assert_eq!(count(&server, "GET /v1/models"), 3);
+    let asked: Vec<Option<String>> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.route == "GET /v1/models")
+        .map(|r| r.authorization)
+        .collect();
+    assert_eq!(
+        asked,
+        ["sk-personal", "sk-personal", "sk-second"].map(|k| Some(format!("Bearer {k}")))
+    );
+    assert_eq!(modes(&log), ["VISDOM_TRACING_MODE=gateway"; 2]);
+    let kept =
+        std::fs::read_to_string(sb.home.path().join(".config/visdom/gateway-keys.json")).unwrap();
+    assert!(
+        kept.contains("sk-second") && !kept.contains("sk-personal"),
+        "{kept}"
+    );
+}
+
+fn key_helper(sb: &Sandbox, server: &MockServer) -> std::process::Output {
+    sb.visdom(sb.repo.path())
+        .args(["gateway-key", "--console", &server.url, "--project", "p-1"])
+        .output()
+        .unwrap()
+}
+
+/// What Claude Code runs during a long session: a key about to expire is
+/// renewed with the stored login, kept, and nothing but the key is printed.
+#[test]
+fn the_key_helper_renews_an_expiring_key() {
+    let server = MockServer::start(&[ISSUE]);
+    let (sb, _log) = sandbox(&server);
+    let store = sb.home.path().join(".config/visdom/gateway-keys.json");
+    let soon = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 60;
+    std::fs::write(
+        &store,
+        serde_json::json!([{
+            "console_url": server.url, "project_id": "p-1", "account": "",
+            "secret": "sk-expiring", "expires_at": soon,
+        }])
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = key_helper(&sb, &server);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "sk-personal\n");
+    let asked = server.requests();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].route, "POST /api/me/keys");
+    assert_eq!(
+        asked[0].authorization.as_deref(),
+        Some("Bearer person-access-token")
+    );
+    let kept = std::fs::read_to_string(&store).unwrap();
+    assert!(
+        kept.contains("sk-personal") && !kept.contains("sk-expiring"),
+        "{kept}"
+    );
+    assert_eq!(
+        std::fs::metadata(&store).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // And from then on it is answered from the store.
+    assert_eq!(stdout(&key_helper(&sb, &server)), "sk-personal\n");
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn a_key_helper_that_cannot_renew_fails_without_printing_anything() {
+    let server = MockServer::start(&[(
+        "POST /api/me/keys",
+        403,
+        r#"{"error":"Alpha does not allow personal keys"}"#,
+    )]);
+    let (sb, _log) = sandbox(&server);
+    let output = key_helper(&sb, &server);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "", "stdout is the key, or nothing");
+    let said = stderr(&output);
+    assert!(said.contains("does not allow personal keys"), "{said}");
+    assert!(!said.contains(PERSON_TOKEN), "{said}");
+
+    // Without a login there is nobody to renew it for.
+    let anonymous = Sandbox::new();
+    let output = key_helper(&anonymous, &server);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert!(
+        stderr(&output).contains("visdom login"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "nothing was asked without a login"
+    );
+}
+
+#[test]
+fn logging_out_forgets_the_kept_keys() {
+    let server = MockServer::start(&[ISSUE]);
+    let (sb, _log) = sandbox(&server);
+    assert_eq!(stdout(&key_helper(&sb, &server)), "sk-personal\n");
+    let store = sb.home.path().join(".config/visdom/gateway-keys.json");
+    assert!(store.exists());
+    // Whether or not the identity provider can be told.
+    let _ = sb.visdom(sb.repo.path()).arg("logout").output().unwrap();
+    assert!(!store.exists(), "the keys go with the login");
 }

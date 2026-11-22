@@ -37,7 +37,11 @@ fn main() {
     };
     match cli.command {
         Some(VisdomCommand::Login(args)) => runtime.block_on(run(Command::Login(args))),
-        Some(VisdomCommand::Logout) => runtime.block_on(run(Command::Logout)),
+        Some(VisdomCommand::Logout) => {
+            // First: a failed logout exits.
+            forget_gateway_keys();
+            runtime.block_on(run(Command::Logout))
+        }
         Some(VisdomCommand::Trace { command }) => runtime.block_on(run(command)),
         Some(VisdomCommand::Init { mut args }) => {
             // `--global` and `--workspace` set up no single repository: they
@@ -92,7 +96,9 @@ fn now() -> i64 {
 fn gateway_key(runtime: &tokio::runtime::Runtime, console: &str, project: &str) -> ! {
     let env = Environment::current();
     let store = KeyStore::at(key_store_path_in(&env.config_root));
-    if let Some(key) = store.usable(console, project, now()) {
+    let kept = checks::stored_account(&env.cwd)
+        .and_then(|account| store.usable(console, project, &account, now()));
+    if let Some(key) = kept {
         println!("{}", key.secret);
         exit(0);
     }
@@ -104,20 +110,29 @@ fn gateway_key(runtime: &tokio::runtime::Runtime, console: &str, project: &str) 
             project,
             &store,
             now(),
+            None,
         ))
     });
     match issued {
-        Ok((key, warning)) => {
-            if let Some(warning) = warning {
+        Ok(ensured) => {
+            if let Some(warning) = ensured.warning {
                 eprintln!("visdom: warning: {warning}");
             }
-            println!("{}", key.secret);
+            println!("{}", ensured.key.secret);
             exit(0)
         }
         Err(e) => {
             eprintln!("visdom: {e}");
             exit(1)
         }
+    }
+}
+
+/// `visdom logout`: the gateway keys kept for this login go with it.
+fn forget_gateway_keys() {
+    let env = Environment::current();
+    if let Err(e) = KeyStore::at(key_store_path_in(&env.config_root)).clear() {
+        eprintln!("visdom: warning: the kept AI Gateway keys could not be removed: {e}");
     }
 }
 

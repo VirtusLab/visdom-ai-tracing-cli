@@ -51,10 +51,47 @@ fn has_option(args: &[String], options: &[&str]) -> bool {
     })
 }
 
+/// The value `args` give one of `options` (`--name value` or `--name=value`).
+fn option_value<'a>(args: &'a [String], options: &[&str]) -> Option<&'a str> {
+    args.iter().enumerate().find_map(|(i, arg)| {
+        options.iter().find_map(|o| {
+            if arg == o {
+                args.get(i + 1).map(String::as_str)
+            } else {
+                arg.strip_prefix(o).and_then(|rest| rest.strip_prefix('='))
+            }
+        })
+    })
+}
+
 /// `value` as one header value: no line breaks, which would start another
 /// header.
 fn header_value(value: &str) -> String {
     value.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Claude Code's switches to another provider's API. Each takes precedence
+/// over `ANTHROPIC_BASE_URL`, so one left set would send the session past the
+/// gateway while the hooks record nothing.
+const CLAUDE_OTHER_PROVIDERS: [&str; 3] = [
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+];
+
+/// The session id the caller's own options give Claude Code, when they name
+/// one: `--session-id`, or `--resume <id>`, which carries on under the same
+/// id unless `--fork-session` asks for a new one. `None` when Claude Code
+/// decides (a picker, `--continue`, a fork).
+fn callers_session(args: &[String]) -> Option<&str> {
+    let is_id = |value: &&str| uuid::Uuid::parse_str(value).is_ok();
+    option_value(args, &["--session-id"])
+        .filter(is_id)
+        .or_else(|| {
+            option_value(args, &["--resume", "-r"])
+                .filter(is_id)
+                .filter(|_| !has_option(args, &["--fork-session"]))
+        })
 }
 
 /// Claude Code through the gateway. `env` reads the current environment.
@@ -62,8 +99,10 @@ fn header_value(value: &str) -> String {
 /// - The key comes from `apiKeyHelper` (given with `--settings`), so a key
 ///   renewed during a long session is picked up; when the caller passes their
 ///   own `--settings`, the key is given once, as `ANTHROPIC_AUTH_TOKEN`.
-/// - The session id is fixed up front and sent with every request, unless the
-///   caller resumes or names a session themselves.
+/// - The session id is fixed up front and sent with every request. A caller
+///   who names the session themselves gets theirs sent; one who leaves it to
+///   Claude Code (`--continue`, a picker) gets none, and the gateway's
+///   records of that session carry no session id.
 pub fn claude_command(
     program: &str,
     args: &[String],
@@ -73,6 +112,9 @@ pub fn claude_command(
     let mut cmd = Command::new(program);
     cmd.env(MODE_ENV, TracingMode::Gateway.name());
     cmd.env("ANTHROPIC_BASE_URL", &gateway.llm_url);
+    for switch in CLAUDE_OTHER_PROVIDERS {
+        cmd.env_remove(switch);
+    }
     // A key of the developer's own would bypass the gateway's.
     cmd.env_remove("ANTHROPIC_API_KEY");
     if has_option(args, &["--settings"]) {
@@ -106,6 +148,10 @@ pub fn claude_command(
             "--teleport",
         ],
     );
+    let session = match own_session {
+        true => callers_session(args),
+        false => Some(gateway.session_id.as_str()),
+    };
     let mut headers: Vec<String> = env("ANTHROPIC_CUSTOM_HEADERS")
         .filter(|h| !h.trim().is_empty())
         .into_iter()
@@ -117,11 +163,10 @@ pub fn claude_command(
     if let Some(repo) = &gateway.repo_id {
         headers.push(format!("x-tracevault-repo: {}", header_value(repo)));
     }
+    if let Some(session) = session {
+        headers.push(format!("x-tracevault-session: {}", header_value(session)));
+    }
     if !own_session {
-        headers.push(format!(
-            "x-tracevault-session: {}",
-            header_value(&gateway.session_id)
-        ));
         cmd.arg("--session-id").arg(&gateway.session_id);
     }
     cmd.env("ANTHROPIC_CUSTOM_HEADERS", headers.join("\n"));
@@ -264,11 +309,14 @@ mod tests {
     }
 
     #[test]
-    fn a_resumed_claude_session_keeps_its_own_id() {
+    fn a_session_claude_code_picks_itself_gets_no_session_id() {
         for resume in [
-            strings(&["--resume", "abc"]),
+            strings(&["--resume"]),
+            strings(&["--resume", "a title, not an id"]),
             strings(&["-c"]),
             strings(&["--session-id=xyz"]),
+            // A fork gets a new id, which only Claude Code knows.
+            strings(&["--resume", OTHER_SESSION, "--fork-session"]),
         ] {
             let cmd = claude_command("claude", &resume, &gateway(), &no_env);
             let args = args_of(&cmd);
@@ -276,6 +324,41 @@ mod tests {
             let headers = envs_of(&cmd)["ANTHROPIC_CUSTOM_HEADERS"].clone().unwrap();
             assert!(!headers.contains("x-tracevault-session"), "{headers}");
             assert!(headers.contains("x-tracevault-repo"), "{headers}");
+        }
+    }
+
+    const OTHER_SESSION: &str = "99999999-8888-7777-6666-555555555555";
+
+    #[test]
+    fn a_session_the_caller_names_is_the_one_sent() {
+        for named in [
+            strings(&["--session-id", OTHER_SESSION]),
+            strings(&[&format!("--session-id={OTHER_SESSION}")]),
+            strings(&["--resume", OTHER_SESSION]),
+            strings(&["-r", OTHER_SESSION, "--verbose"]),
+        ] {
+            let cmd = claude_command("claude", &named, &gateway(), &no_env);
+            // Nothing of visdom's own is added to what the caller asked for.
+            assert_eq!(args_of(&cmd)[2..], named[..]);
+            let headers = envs_of(&cmd)["ANTHROPIC_CUSTOM_HEADERS"].clone().unwrap();
+            assert!(
+                headers.ends_with(&format!("x-tracevault-session: {OTHER_SESSION}")),
+                "{headers}"
+            );
+            assert!(!headers.contains(&gateway().session_id), "{headers}");
+        }
+    }
+
+    #[test]
+    fn claude_is_not_left_pointed_at_another_provider() {
+        let cmd = claude_command("claude", &[], &gateway(), &no_env);
+        let env = envs_of(&cmd);
+        for switch in [
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        ] {
+            assert_eq!(env[switch], None, "{switch} must be removed");
         }
     }
 

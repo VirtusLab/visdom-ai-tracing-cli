@@ -5,7 +5,8 @@
 //! A new personal key revokes the developer's previous one for that project,
 //! so a key is kept (in visdom's own config directory, readable by the user
 //! only) and reused until shortly before it expires: sessions started side by
-//! side share it instead of cutting each other off.
+//! side share it instead of cutting each other off. A kept key belongs to the
+//! account it was issued for and is not handed to another.
 
 use std::path::{Path, PathBuf};
 
@@ -166,12 +167,22 @@ pub async fn issue_key(
     })
 }
 
-/// The model aliases `key` may call.
+/// Why the LLM gateway's models could not be listed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelsError {
+    pub why: String,
+    /// The gateway answered that it does not take this key (HTTP 401 or 403):
+    /// another key may work where this one does not.
+    pub rejected: bool,
+}
+
+/// The model aliases `key` may call. This is also the proof that the LLM
+/// gateway answers and takes the key, before an agent is pointed at it.
 pub async fn models(
     http: &reqwest::Client,
     llm_url: &str,
     key: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ModelsError> {
     #[derive(Deserialize)]
     struct Model {
         id: String,
@@ -181,10 +192,33 @@ pub async fn models(
         data: Vec<Model>,
     }
     let what = "cannot list the AI Gateway's models";
-    let request = http
+    let failed = |why: String, rejected: bool| ModelsError { why, rejected };
+    let response = http
         .get(format!("{}/v1/models", base(llm_url)))
-        .bearer_auth(key);
-    let list: List = parse(what, &read(what, llm_url, request).await?)?;
+        .bearer_auth(key)
+        .send()
+        .await
+        .map_err(|e| {
+            failed(
+                format!("{what}: the AI Gateway ({llm_url}) did not answer: {e}"),
+                false,
+            )
+        })?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let rejected = matches!(status.as_u16(), 401 | 403);
+        let why = if rejected {
+            format!(
+                "{what}: the AI Gateway did not accept the personal key (HTTP {})",
+                status.as_u16()
+            )
+        } else {
+            format!("{what}: HTTP {}", status.as_u16())
+        };
+        return Err(failed(why, rejected));
+    }
+    let list: List = parse(what, &body).map_err(|why| failed(why, false))?;
     Ok(list.data.into_iter().map(|m| m.id).collect())
 }
 
@@ -246,16 +280,55 @@ pub fn pick_model(agent: Agent, configured: Option<&str>, available: &[String]) 
     })
 }
 
+/// Whose key it is: the issuer and subject of the developer's access token.
+/// A key is the person's, so one kept for somebody else who logged in on this
+/// machine before must not be handed out. Empty for a token that is not a
+/// readable JWT, which then cannot be told apart from another such token.
+pub fn account_of(token: &str) -> String {
+    use base64::Engine;
+    #[derive(Deserialize)]
+    struct Claims {
+        #[serde(default)]
+        iss: String,
+        sub: String,
+    }
+    let mut parts = token.split('.');
+    let (Some(_), Some(payload), Some(_), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return String::new();
+    };
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Claims>(&bytes).ok())
+        .filter(|claims| !claims.sub.is_empty())
+        .map(|claims| format!("{}|{}", claims.iss, claims.sub))
+        .unwrap_or_default()
+}
+
 /// One stored personal key.
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredKey {
     console_url: String,
     project_id: String,
+    /// [`account_of`] the token it was issued for.
+    #[serde(default)]
+    account: String,
     secret: String,
     expires_at: i64,
 }
 
-/// The personal keys `visdom` holds, one per console and project.
+impl StoredKey {
+    fn is_for(&self, console_url: &str, project_id: &str, account: &str) -> bool {
+        self.console_url == base(console_url)
+            && self.project_id == project_id
+            && self.account == account
+    }
+}
+
+/// The personal keys `visdom` holds, one per console, project and account.
+#[derive(Clone)]
 pub struct KeyStore {
     path: PathBuf,
 }
@@ -263,6 +336,9 @@ pub struct KeyStore {
 pub fn key_store_path_in(config_root: &Path) -> PathBuf {
     config_root.join("visdom").join("gateway-keys.json")
 }
+
+/// Held while a key is looked up, issued and stored; released when dropped.
+pub struct KeyStoreLock(#[allow(dead_code)] std::fs::File);
 
 impl KeyStore {
     pub fn at(path: PathBuf) -> KeyStore {
@@ -276,12 +352,34 @@ impl KeyStore {
             .unwrap_or_default()
     }
 
-    /// The stored key for this console and project, when it has at least
-    /// [`MIN_KEY_SECONDS_LEFT`] left.
-    pub fn usable(&self, console_url: &str, project_id: &str, now: i64) -> Option<IssuedKey> {
+    /// Wait for this store to be free of every other `visdom` process, and
+    /// take it. Issuing a key revokes the previous one, so two sessions
+    /// starting together must not both issue: the second waits here and then
+    /// finds the first one's key.
+    pub fn lock(&self) -> std::io::Result<KeyStoreLock> {
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.path.with_extension("lock"))?;
+        file.lock()?;
+        Ok(KeyStoreLock(file))
+    }
+
+    /// The stored key of `account` for this console and project, when it has
+    /// at least [`MIN_KEY_SECONDS_LEFT`] left.
+    pub fn usable(
+        &self,
+        console_url: &str,
+        project_id: &str,
+        account: &str,
+        now: i64,
+    ) -> Option<IssuedKey> {
         self.load()
             .into_iter()
-            .find(|k| k.console_url == base(console_url) && k.project_id == project_id)
+            .find(|k| k.is_for(console_url, project_id, account))
             .filter(|k| k.expires_at - now >= MIN_KEY_SECONDS_LEFT)
             .map(|k| IssuedKey {
                 secret: k.secret,
@@ -289,12 +387,14 @@ impl KeyStore {
             })
     }
 
-    /// Keep `key`, replacing the one for the same console and project and
-    /// dropping keys that have expired. The file is the user's alone.
+    /// Keep `key`, replacing the one for the same console and project
+    /// (whoever's it was: this machine's user is now `account`) and dropping
+    /// keys that have expired. The file is the user's alone.
     pub fn keep(
         &self,
         console_url: &str,
         project_id: &str,
+        account: &str,
         key: &IssuedKey,
         now: i64,
     ) -> Result<(), String> {
@@ -307,12 +407,22 @@ impl KeyStore {
         keys.push(StoredKey {
             console_url: base(console_url).to_string(),
             project_id: project_id.to_string(),
+            account: account.to_string(),
             secret: key.secret.clone(),
             expires_at: key.expires_at,
         });
         let text = serde_json::to_string(&keys).map_err(|e| e.to_string())?;
         write_private(&self.path, &text)
             .map_err(|e| format!("cannot write {}: {e}", self.path.display()))
+    }
+
+    /// Forget every kept key (on logout). The keys stay valid at the gateway
+    /// until they expire; they are only no longer on this machine.
+    pub fn clear(&self) -> std::io::Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -343,9 +453,24 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     }
 }
 
+/// A key from [`ensure_key`].
+pub struct EnsuredKey {
+    pub key: IssuedKey,
+    /// Why the key could not be stored, when it could not: it still works
+    /// for this session.
+    pub warning: Option<String>,
+    /// Issued just now, rather than found in the store.
+    pub issued: bool,
+}
+
 /// The developer's key for `project_id`: the stored one while it lasts, else a
-/// new one, which is then stored. A key that cannot be stored is still
-/// returned (with the reason), as it works for this session.
+/// new one, which is then stored. `rejected` is a key the gateway no longer
+/// takes (revoked by a newer one issued elsewhere): the stored key is used
+/// only if it is another one.
+///
+/// Looking, issuing and storing happen under the store's lock, so sessions
+/// starting side by side end up sharing one key instead of revoking each
+/// other's.
 pub async fn ensure_key(
     http: &reqwest::Client,
     console_url: &str,
@@ -353,13 +478,36 @@ pub async fn ensure_key(
     project_id: &str,
     store: &KeyStore,
     now: i64,
-) -> Result<(IssuedKey, Option<String>), String> {
-    if let Some(key) = store.usable(console_url, project_id, now) {
-        return Ok((key, None));
+    rejected: Option<&str>,
+) -> Result<EnsuredKey, String> {
+    let account = account_of(token);
+    // Waiting for another process must not hold up this runtime's thread. A
+    // store that cannot be locked (a read-only config directory) is used
+    // without: the key then cannot be stored either.
+    let locking = store.clone();
+    let _lock = tokio::task::spawn_blocking(move || locking.lock().ok())
+        .await
+        .ok()
+        .flatten();
+    let stored = store
+        .usable(console_url, project_id, &account, now)
+        .filter(|key| Some(key.secret.as_str()) != rejected);
+    if let Some(key) = stored {
+        return Ok(EnsuredKey {
+            key,
+            warning: None,
+            issued: false,
+        });
     }
     let key = issue_key(http, console_url, token, project_id, now).await?;
-    let warning = store.keep(console_url, project_id, &key, now).err();
-    Ok((key, warning))
+    let warning = store
+        .keep(console_url, project_id, &account, &key, now)
+        .err();
+    Ok(EnsuredKey {
+        key,
+        warning,
+        issued: true,
+    })
 }
 
 #[cfg(test)]
@@ -546,24 +694,30 @@ mod tests {
             secret: "sk-abc".to_string(),
             expires_at: 10_000,
         };
-        assert!(store.usable("https://gw.example.com", "p-1", 0).is_none());
+        assert!(store
+            .usable("https://gw.example.com", "p-1", "", 0)
+            .is_none());
         store
-            .keep("https://gw.example.com/", "p-1", &key, 0)
+            .keep("https://gw.example.com/", "p-1", "", &key, 0)
             .unwrap();
-        let again = store.usable("https://gw.example.com", "p-1", 0).unwrap();
+        let again = store
+            .usable("https://gw.example.com", "p-1", "", 0)
+            .unwrap();
         assert_eq!(again.secret, "sk-abc");
         // Another project or console has its own key.
-        assert!(store.usable("https://gw.example.com", "p-2", 0).is_none());
         assert!(store
-            .usable("https://other.example.com", "p-1", 0)
+            .usable("https://gw.example.com", "p-2", "", 0)
+            .is_none());
+        assert!(store
+            .usable("https://other.example.com", "p-1", "", 0)
             .is_none());
         // Close to expiry it is no longer handed out.
         let late = 10_000 - MIN_KEY_SECONDS_LEFT + 1;
         assert!(store
-            .usable("https://gw.example.com", "p-1", late)
+            .usable("https://gw.example.com", "p-1", "", late)
             .is_none());
         assert!(store
-            .usable("https://gw.example.com", "p-1", late - 1)
+            .usable("https://gw.example.com", "p-1", "", late - 1)
             .is_some());
     }
 
@@ -576,24 +730,24 @@ mod tests {
             expires_at,
         };
         store
-            .keep("https://gw", "p-1", &key("old", 5_000), 0)
+            .keep("https://gw", "p-1", "", &key("old", 5_000), 0)
             .unwrap();
         store
-            .keep("https://gw", "p-2", &key("other", 9_000), 0)
+            .keep("https://gw", "p-2", "", &key("other", 9_000), 0)
             .unwrap();
         store
-            .keep("https://gw", "p-1", &key("new", 90_000), 6_000)
+            .keep("https://gw", "p-1", "", &key("new", 90_000), 6_000)
             .unwrap();
         assert_eq!(
-            store.usable("https://gw", "p-1", 6_000).unwrap().secret,
+            store.usable("https://gw", "p-1", "", 6_000).unwrap().secret,
             "new"
         );
         assert_eq!(
-            store.usable("https://gw", "p-2", 6_000).unwrap().secret,
+            store.usable("https://gw", "p-2", "", 6_000).unwrap().secret,
             "other"
         );
         store
-            .keep("https://gw", "p-3", &key("third", 99_000), 9_500)
+            .keep("https://gw", "p-3", "", &key("third", 99_000), 9_500)
             .unwrap();
         assert_eq!(store.load().len(), 2, "the expired p-2 key is gone");
     }
@@ -609,8 +763,8 @@ mod tests {
             secret: "sk-abc".to_string(),
             expires_at: 10_000,
         };
-        store.keep("https://gw", "p-1", &key, 0).unwrap();
-        store.keep("https://gw", "p-2", &key, 0).unwrap();
+        store.keep("https://gw", "p-1", "", &key, 0).unwrap();
+        store.keep("https://gw", "p-2", "", &key, 0).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
@@ -628,19 +782,205 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-11-19T10:00:00Z")
             .unwrap()
             .timestamp();
-        let (first, warning) = ensure_key(&http, &server.url, "tok", "p-1", &store, now)
+        let first = ensure_key(&http, &server.url, "tok", "p-1", &store, now, None)
             .await
             .unwrap();
-        assert_eq!((first.secret.as_str(), warning), ("sk-abc", None));
-        let (second, _) = ensure_key(&http, &server.url, "tok", "p-1", &store, now + 3600)
+        assert_eq!(
+            (first.key.secret.as_str(), first.warning, first.issued),
+            ("sk-abc", None, true)
+        );
+        let second = ensure_key(&http, &server.url, "tok", "p-1", &store, now + 3600, None)
             .await
             .unwrap();
-        assert_eq!(second.secret, "sk-abc");
+        assert_eq!(
+            (second.key.secret.as_str(), second.issued),
+            ("sk-abc", false)
+        );
         assert_eq!(server.routes(), ["POST /api/me/keys"], "issued once");
         // A day later it has expired: a new one is issued.
-        ensure_key(&http, &server.url, "tok", "p-1", &store, now + 86_400)
+        ensure_key(&http, &server.url, "tok", "p-1", &store, now + 86_400, None)
             .await
             .unwrap();
         assert_eq!(server.routes().len(), 2);
+    }
+
+    /// A JWT as Keycloak issues one, unsigned: only its claims are read here.
+    fn token_of(iss: &str, sub: &str) -> String {
+        use base64::Engine;
+        let part = |json: String| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        format!(
+            "{}.{}.signature",
+            part(r#"{"alg":"RS256"}"#.to_string()),
+            part(format!(r#"{{"iss":"{iss}","sub":"{sub}","exp":1}}"#))
+        )
+    }
+
+    #[test]
+    fn the_account_is_the_tokens_issuer_and_subject() {
+        let alice = token_of("https://idp/realms/visdom", "alice-id");
+        assert_eq!(account_of(&alice), "https://idp/realms/visdom|alice-id");
+        assert_ne!(
+            account_of(&alice),
+            account_of(&token_of("https://idp/realms/visdom", "bob-id"))
+        );
+        assert_ne!(
+            account_of(&alice),
+            account_of(&token_of("https://idp/realms/other", "alice-id"))
+        );
+        // Not a JWT, or one without a subject: no account.
+        for opaque in ["person-access-token", "a.b.c", "a.b", "", "a.b.c.d"] {
+            assert_eq!(account_of(opaque), "", "{opaque}");
+        }
+        assert_eq!(account_of(&token_of("https://idp", "")), "");
+    }
+
+    #[tokio::test]
+    async fn a_kept_key_is_not_handed_to_another_account() {
+        let http = reqwest::Client::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KeyStore::at(key_store_path_in(tmp.path()));
+        let server = MockServer::start(&[
+            (
+                "POST /api/me/keys",
+                201,
+                r#"{"secret":"sk-alice","id":"h","name":"n","expiresAt":"2099-01-01T00:00:00Z"}"#,
+            ),
+            (
+                "POST /api/me/keys",
+                201,
+                r#"{"secret":"sk-bob","id":"h","name":"n","expiresAt":"2099-01-01T00:00:00Z"}"#,
+            ),
+        ]);
+        let alice = token_of("https://idp", "alice-id");
+        let bob = token_of("https://idp", "bob-id");
+        let first = ensure_key(&http, &server.url, &alice, "p-1", &store, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(first.key.secret, "sk-alice");
+        // Bob logs in on the same machine: Alice's key is not his.
+        let second = ensure_key(&http, &server.url, &bob, "p-1", &store, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (second.key.secret.as_str(), second.issued),
+            ("sk-bob", true)
+        );
+        let asked = server.requests();
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[1].authorization, Some(format!("Bearer {bob}")));
+        // And Alice's is gone from the file, not kept beside his.
+        assert!(store
+            .usable(&server.url, "p-1", &account_of(&alice), 0)
+            .is_none());
+        assert_eq!(store.load().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_key_is_replaced_unless_somebody_already_did() {
+        let http = reqwest::Client::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KeyStore::at(key_store_path_in(tmp.path()));
+        let server = MockServer::start(&[(
+            "POST /api/me/keys",
+            201,
+            r#"{"secret":"sk-new","id":"h","name":"n","expiresAt":"2099-01-01T00:00:00Z"}"#,
+        )]);
+        let old = IssuedKey {
+            secret: "sk-old".to_string(),
+            expires_at: 4_000_000_000,
+        };
+        store.keep(&server.url, "p-1", "", &old, 0).unwrap();
+        // The gateway refused sk-old: the stored copy is not offered again.
+        let renewed = ensure_key(&http, &server.url, "tok", "p-1", &store, 0, Some("sk-old"))
+            .await
+            .unwrap();
+        assert_eq!(
+            (renewed.key.secret.as_str(), renewed.issued),
+            ("sk-new", true)
+        );
+        // Another session that also saw sk-old refused finds the new one.
+        let other = ensure_key(&http, &server.url, "tok", "p-1", &store, 0, Some("sk-old"))
+            .await
+            .unwrap();
+        assert_eq!((other.key.secret.as_str(), other.issued), ("sk-new", false));
+        assert_eq!(server.routes().len(), 1);
+    }
+
+    /// Issuing revokes the previous key, so sessions starting together must
+    /// end up with one key: the later ones wait and find the first one's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sessions_starting_together_issue_one_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KeyStore::at(key_store_path_in(tmp.path()));
+        let server = MockServer::start(&[
+            (
+                "POST /api/me/keys",
+                201,
+                r#"{"secret":"sk-first","id":"h","name":"n","expiresAt":"2099-01-01T00:00:00Z"}"#,
+            ),
+            (
+                "POST /api/me/keys",
+                201,
+                r#"{"secret":"sk-second","id":"h","name":"n","expiresAt":"2099-01-01T00:00:00Z"}"#,
+            ),
+        ]);
+        let starts = (0..6).map(|_| {
+            let (store, url) = (store.clone(), server.url.clone());
+            tokio::spawn(async move {
+                let http = reqwest::Client::new();
+                ensure_key(&http, &url, "tok", "p-1", &store, 0, None)
+                    .await
+                    .unwrap()
+                    .key
+                    .secret
+            })
+        });
+        let mut secrets = Vec::new();
+        for start in starts.collect::<Vec<_>>() {
+            secrets.push(start.await.unwrap());
+        }
+        assert_eq!(secrets, ["sk-first"; 6]);
+        assert_eq!(server.routes(), ["POST /api/me/keys"]);
+    }
+
+    #[tokio::test]
+    async fn a_gateway_that_refuses_the_key_is_told_from_one_that_is_away() {
+        let http = reqwest::Client::new();
+        let server = MockServer::start(&[
+            ("GET /v1/models", 401, r#"{"error":"bad key"}"#),
+            ("GET /v1/models", 403, ""),
+            ("GET /v1/models", 500, ""),
+            ("GET /v1/models", 200, "not json"),
+        ]);
+        for (rejected, said) in [
+            (true, "did not accept the personal key (HTTP 401)"),
+            (true, "HTTP 403"),
+            (false, "HTTP 500"),
+            (false, "unreadable answer"),
+        ] {
+            let err = models(&http, &server.url, "sk").await.unwrap_err();
+            assert_eq!(err.rejected, rejected, "{}", err.why);
+            assert!(err.why.contains(said), "{}", err.why);
+        }
+        let err = models(&http, "http://127.0.0.1:1", "sk").await.unwrap_err();
+        assert!(
+            !err.rejected && err.why.contains("did not answer"),
+            "{}",
+            err.why
+        );
+    }
+
+    #[test]
+    fn clearing_the_store_forgets_every_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KeyStore::at(key_store_path_in(tmp.path()));
+        assert!(store.clear().is_ok(), "nothing to forget is fine");
+        let key = IssuedKey {
+            secret: "sk-abc".to_string(),
+            expires_at: 10_000,
+        };
+        store.keep("https://gw", "p-1", "", &key, 0).unwrap();
+        store.clear().unwrap();
+        assert!(store.usable("https://gw", "p-1", "", 0).is_none());
     }
 }

@@ -39,7 +39,13 @@ pub fn key_http_client() -> reqwest::Client {
 /// Everything the agent needs to run through the gateway: the developer's
 /// key (the kept one, or a new one), a model alias and the ids that attribute
 /// the session. The second value holds what the developer should know (a key
-/// that could not be kept, models that could not be listed).
+/// that could not be kept).
+///
+/// The LLM gateway is asked for its models with the key before anything is
+/// started: an agent pointed at a gateway that does not answer, or does not
+/// take the key, would run with nothing recording it. A kept key the gateway
+/// refuses (a newer one was issued elsewhere, which revoked it) is replaced
+/// once.
 pub fn prepare_gateway(
     session: &Session,
     runtime: &tokio::runtime::Runtime,
@@ -57,25 +63,29 @@ pub fn prepare_gateway(
         .ok_or("the AI Gateway needs a Visdom account login: run `visdom login`")?;
     let http = key_http_client();
     let store = KeyStore::at(gateway::key_store_path_in(&session.config_root));
-    let (key, kept) = runtime.block_on(gateway::ensure_key(
-        &http,
-        &plan.console_url,
-        token,
-        &plan.project.id,
-        &store,
-        now,
-    ))?;
-    let mut notes: Vec<String> = kept.into_iter().collect();
-    // The aliases only matter when no model is configured.
-    let available = match &session.gateway_model {
-        Some(_) => Vec::new(),
-        None => runtime
-            .block_on(gateway::models(&http, &plan.llm_url, &key.secret))
-            .unwrap_or_else(|why| {
-                notes.push(why);
-                Vec::new()
-            }),
+    let key_unless = |rejected: Option<&str>| {
+        runtime.block_on(gateway::ensure_key(
+            &http,
+            &plan.console_url,
+            token,
+            &plan.project.id,
+            &store,
+            now,
+            rejected,
+        ))
     };
+    let models = |key: &str| runtime.block_on(gateway::models(&http, &plan.llm_url, key));
+    let mut ensured = key_unless(None)?;
+    let available = match models(&ensured.key.secret) {
+        Ok(available) => available,
+        Err(refusal) if refusal.rejected && !ensured.issued => {
+            ensured = key_unless(Some(&ensured.key.secret))?;
+            models(&ensured.key.secret).map_err(|e| e.why)?
+        }
+        Err(e) => return Err(e.why),
+    };
+    let key = ensured.key;
+    let mut notes: Vec<String> = ensured.warning.into_iter().collect();
     let model = gateway::pick_model(
         session.ctx.agent,
         session.gateway_model.as_deref(),

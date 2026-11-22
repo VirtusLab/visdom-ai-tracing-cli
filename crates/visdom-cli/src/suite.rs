@@ -13,7 +13,7 @@ use crate::mode::TrafficPolicy;
 
 /// The suite's other products, as the tracing server publishes them. A
 /// product that is not there (or not published) is `None`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuiteMap {
     /// Control Plane's public URL.
     #[serde(default)]
@@ -65,6 +65,55 @@ pub async fn fetch_suite_map(http: &reqwest::Client, server_url: &str) -> Result
         .await
         .map_err(|e| failed(format!("unreadable answer ({e})")))?;
     Ok(map.only_urls())
+}
+
+/// The suite map last read from a tracing server, kept so that the rest of
+/// the suite — and with it a workspace policy that requires the gateway — is
+/// still found while that server cannot be asked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CachedSuite {
+    server_url: String,
+    map: SuiteMap,
+}
+
+pub fn suite_cache_path_in(config_root: &Path) -> PathBuf {
+    config_root.join("visdom").join("suite.json")
+}
+
+/// The remembered suite map of `server_url`, if that is the server remembered.
+pub fn load_cached_suite(path: &Path, server_url: &str) -> Option<SuiteMap> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let cached: CachedSuite = serde_json::from_str(&text).ok()?;
+    (cached.server_url == trim_slash(server_url.to_string())).then(|| cached.map.only_urls())
+}
+
+/// Best effort: a map that cannot be written only means no fallback later.
+pub fn save_cached_suite(path: &Path, server_url: &str, map: &SuiteMap) {
+    let cached = CachedSuite {
+        server_url: trim_slash(server_url.to_string()),
+        map: map.clone(),
+    };
+    if let (Some(dir), Ok(text)) = (path.parent(), serde_json::to_string(&cached)) {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// The suite map to work with, given what the tracing server at `server_url`
+/// just said: its answer (which is then remembered), or, when it could not be
+/// asked, the one it gave last time.
+pub fn suite_map_or_remembered(
+    published: &Result<SuiteMap, String>,
+    server_url: &str,
+    cache: &Path,
+) -> SuiteMap {
+    match published {
+        Ok(map) => {
+            save_cached_suite(cache, server_url, map);
+            map.clone()
+        }
+        Err(_) => load_cached_suite(cache, server_url).unwrap_or_default(),
+    }
 }
 
 /// The workspace's AI traffic policy, from Control Plane at `control_plane_url`
@@ -321,6 +370,44 @@ mod tests {
             PolicyState::Unknown(_) => {}
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_server_that_cannot_be_asked_leaves_its_last_suite_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = suite_cache_path_in(tmp.path());
+        let server = "https://tracing.example.com";
+        let down = Err("no answer".to_string());
+        // Never asked successfully: nothing to fall back to.
+        assert_eq!(
+            suite_map_or_remembered(&down, server, &cache),
+            SuiteMap::default()
+        );
+        let map = SuiteMap {
+            control_plane_url: Some("https://cp.example.com".to_string()),
+            ai_gateway_url: Some("https://gw.example.com".to_string()),
+            bazaar_mcp_url: None,
+        };
+        assert_eq!(
+            suite_map_or_remembered(&Ok(map.clone()), server, &cache),
+            map
+        );
+        // Now it is away: what it said last holds, for that server only.
+        assert_eq!(suite_map_or_remembered(&down, server, &cache), map);
+        assert_eq!(
+            suite_map_or_remembered(&down, &format!("{server}/"), &cache),
+            map
+        );
+        assert_eq!(
+            suite_map_or_remembered(&down, "https://other.example.com", &cache),
+            SuiteMap::default()
+        );
+        // A later answer replaces it, an empty one included.
+        suite_map_or_remembered(&Ok(SuiteMap::default()), server, &cache);
+        assert_eq!(
+            suite_map_or_remembered(&down, server, &cache),
+            SuiteMap::default()
+        );
     }
 
     #[tokio::test]

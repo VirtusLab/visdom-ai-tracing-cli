@@ -64,8 +64,9 @@ Your choice is `--mode`, then `VISDOM_TRACING_MODE`, then `tracing_mode` in the 
 **A workspace admin may decide instead**, with the AI traffic policy in Control Plane:
 `enforced` puts every session through the gateway, `direct` keeps every session on hooks, and
 `per_agent` (the default) leaves it to you. `visdom` reads the policy with your login on every
-start and remembers the last answer for when Control Plane cannot be reached. When no policy can
-be read at all, your choice applies.
+start and remembers the last answer for when Control Plane cannot be reached; where Control Plane
+is, it remembers too, for when the tracing server cannot be asked. When no policy can be read at
+all, your choice applies.
 
 In gateway mode `visdom`:
 
@@ -73,8 +74,11 @@ In gateway mode `visdom`:
   `public-config`), so there is nothing to configure in a normal installation;
 - asks the gateway console for your **personal key** for the project (`[gateway] project` when
   several are open to you), keeps it in `visdom/gateway-keys.json` readable by you only, and
-  reuses it until shortly before it expires — a new key revokes the previous one, and sessions
-  started side by side must not cut each other off;
+  reuses it until shortly before it expires — a new key revokes the previous one, so sessions
+  started side by side share one (the later ones wait for the first). A kept key is the account's
+  it was issued for, and `visdom logout` removes them all;
+- asks the LLM gateway for its models with that key before starting anything: a kept key the
+  gateway no longer takes (you issued a newer one in the console) is replaced once;
 - gives everything to the launched agent only (environment and launch options); your agent's own
   configuration files are not touched, and the agent started without `visdom` is as it was.
 
@@ -82,13 +86,18 @@ In gateway mode `visdom`:
 |---|---|---|
 | Key | from `visdom gateway-key` (`apiKeyHelper`), renewed during the session | fixed at start (`VISDOM_GATEWAY_API_KEY`); a session running when the key expires (24 hours at most) has to be restarted |
 | Model | `ANTHROPIC_MODEL` and the small model, set to a gateway alias | `--model <alias>` |
-| Session id | chosen by `visdom` and sent with every call | Codex's own (`thread-id`) |
+| Session id | chosen by `visdom` and sent with every call; yours when you pass `--session-id` or `--resume <id>`; none when Claude Code picks it (`--continue`, a picker, `--fork-session`) | Codex's own (`thread-id`) |
 
 The model alias is the one under `[gateway]` in your config, else the first alias the key may
 call that is named for the agent (`claude…`, `gpt…`); with neither the agent asks for its own
 default, which the project may refuse — `visdom` says so.
 
-If gateway mode cannot be set up (no gateway, an API-key login, no project open to you):
+For Claude Code `visdom` also clears `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` and
+`CLAUDE_CODE_USE_FOUNDRY` for the launched process: each would send the session to that provider,
+past the gateway.
+
+If gateway mode cannot be set up (no gateway, an API-key login, no project open to you, an LLM
+gateway that does not answer or refuses the key):
 
 - you chose it: the agent is started with hooks tracing and `visdom` says why;
 - the workspace requires it: the agent is **not** started, since it would bypass the policy.

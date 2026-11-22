@@ -27,6 +27,7 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 url = "2"
+base64 = "0.22"
 chrono.workspace = true
 uuid.workspace = true
 dirs = "6"
