@@ -1061,6 +1061,11 @@ Releases are automated with [release-plz](https://release-plz.dev) by
    `tracevault-cli` was released, starts `release-binaries.yml` for the binaries and the
    Homebrew formula.
 
+`tracevault-cli` and `visdom-ai-tracing-protocol` share the workspace version. `visdom-cli` has
+its own (1.0 and on), set in `crates/visdom-cli/Cargo.toml`; its binary still ships in the
+`tracevault-cli` release archives, so the archive and the Homebrew formula carry `tracevault`'s
+version while `visdom --version` prints its own.
+
 GitHub sometimes does not fire the `push` event after a squash merge. If a merge to `main`
 produced no "Release-plz" run (check `gh run list --workflow release-plz.yml`), start one by
 hand:

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/visdom-v0.29.5...visdom-v1.0.0) - 2026-11-23
+
+The first stable release of `visdom`. From here it has its own version, apart from
+`tracevault`'s, which it is still shipped with.
+
+### Added
+
+- *(visdom)* start the agent through the AI Gateway (VIS-1297)
+
+### Fixed
+
+- *(visdom)* every Claude Code provider switch is off in a gateway session (VIS-1297)
+- *(visdom)* the gateway key is written as the key helper's output (VIS-1297)
+- *(visdom)* only an agent visdom routed through the gateway goes uncaptured (VIS-1297)
+- *(visdom)* a key in Claude's settings is not sent in place of the gateway's (VIS-1297)
+- *(visdom)* the agent's own configuration cannot take a gateway session elsewhere (VIS-1297)
+- *(visdom)* a gateway session cannot slip past the gateway (VIS-1297)
+
 ## [0.29.5](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/visdom-v0.29.4...visdom-v0.29.5) - 2026-11-19
 
 ### Added
