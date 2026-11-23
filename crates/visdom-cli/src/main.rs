@@ -92,6 +92,19 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Give the key to the agent that asked for it, which reads this command's
+/// output: the key is that output, written as such and to nowhere else. A
+/// reader that has gone away is a failure, not a panic.
+fn hand_over(secret: &str) -> ! {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let written = out
+        .write_all(secret.as_bytes())
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush());
+    exit(if written.is_ok() { 0 } else { 1 })
+}
+
 /// `visdom gateway-key`: the key a launched agent asks for. The kept key is
 /// printed without asking anybody; only a missing or expiring one costs a
 /// request. Nothing but the key goes to stdout.
@@ -101,8 +114,7 @@ fn gateway_key(runtime: &tokio::runtime::Runtime, console: &str, project: &str) 
     let kept = checks::stored_account(&env.cwd)
         .and_then(|account| store.usable(console, project, &account, now()));
     if let Some(key) = kept {
-        println!("{}", key.secret);
-        exit(0);
+        hand_over(&key.secret);
     }
     let issued = checks::person_token(&env.cwd, runtime).and_then(|token| {
         runtime.block_on(ensure_key(
@@ -116,10 +128,7 @@ fn gateway_key(runtime: &tokio::runtime::Runtime, console: &str, project: &str) 
         ))
     });
     match issued {
-        Ok(ensured) => {
-            println!("{}", ensured.key.secret);
-            exit(0)
-        }
+        Ok(ensured) => hand_over(&ensured.key.secret),
         Err(e) => {
             eprintln!("visdom: {e}");
             exit(1)
