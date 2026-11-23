@@ -910,7 +910,7 @@ fn init_leaves_the_gateway_ready_and_says_where_its_settings_are() {
     assert!(said.contains("AI Gateway ready for Claude Code"), "{said}");
     for line in [
         "published by the tracing server",
-        "the only project open to you",
+        "project under [gateway]",
         "claude_code_model under [gateway]",
         "VISDOM_GATEWAY_PROJECT",
         "source <(visdom env)",
@@ -921,8 +921,10 @@ fn init_leaves_the_gateway_ready_and_says_where_its_settings_are() {
     // What was settled is in the config: the next `visdom` needs no option.
     let config = std::fs::read_to_string(sb.user_config()).unwrap();
     assert!(config.contains("tracing_mode = \"gateway\""), "{config}");
+    // The only project open today too: one more opened later changes nothing.
+    assert!(config.contains("project = \"alpha\""), "{config}");
     assert!(
-        config.contains("[gateway]\nclaude_code_model = \"claude-sonnet\""),
+        config.contains("claude_code_model = \"claude-sonnet\""),
         "{config}"
     );
     assert_eq!(count(&server, "POST /api/me/keys"), 1);
@@ -992,4 +994,103 @@ fn init_fails_when_the_gateway_cannot_be_made_ready() {
         "{said}"
     );
     assert!(said.contains("required by the workspace"), "{said}");
+}
+
+const CUSTOM_MODELS: (&str, u16, &str) = (
+    "GET /v1/models",
+    200,
+    r#"{"object":"list","data":[{"id":"team-assistant"},{"id":"team-fast"}]}"#,
+);
+
+/// A gateway whose aliases say nothing about the agent, and nobody to ask
+/// which to use: the agent would ask for its own default, which the project
+/// does not have. That is not a gateway left ready, nor one to hand out
+/// variables for.
+#[test]
+fn init_and_env_fail_without_a_model_alias_to_ask_for() {
+    let settings = policy("per_agent");
+    let routes = [
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, settings.as_str()),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        CUSTOM_MODELS,
+    ];
+    let server = MockServer::start(&routes);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway", "init"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    let said = stderr(&output);
+    assert!(said.contains("the AI Gateway is not ready"), "{said}");
+    assert!(said.contains("team-assistant, team-fast"), "{said}");
+    assert!(said.contains("claude_code_model"), "{said}");
+    assert!(said.contains("VISDOM_GATEWAY_MODEL"), "{said}");
+    assert!(!stdout(&output).contains("AI Gateway ready"));
+
+    let output = sb.visdom(sb.repo.path()).arg("env").output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert!(
+        stderr(&output).contains("team-assistant"),
+        "{}",
+        stderr(&output)
+    );
+
+    // Named, it is ready.
+    let output = sb
+        .visdom(sb.repo.path())
+        .arg("init")
+        .env("VISDOM_GATEWAY_MODEL", "team-assistant")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("VISDOM_GATEWAY_MODEL in the environment"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+/// What init settles has to be found by the next `visdom`: a config that
+/// cannot be written is a failed init, not a summary of a setup that is gone
+/// when the command ends.
+#[cfg(unix)]
+#[test]
+fn init_fails_when_what_it_settled_cannot_be_saved() {
+    use std::os::unix::fs::PermissionsExt;
+    let settings = policy("enforced");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    sb.write_user_config("agent = \"claude-code\"\n");
+    let config = sb.user_config();
+    let read_only = std::fs::Permissions::from_mode(0o444);
+    std::fs::set_permissions(&config, read_only).unwrap();
+    let output = sb.visdom(sb.repo.path()).arg("init").output().unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+    if std::fs::read_to_string(&config)
+        .unwrap()
+        .contains("[gateway]")
+    {
+        // Running as root: nothing is read-only.
+        return;
+    }
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    let said = stderr(&output);
+    assert!(said.contains("could not be saved"), "{said}");
+    assert!(said.contains("VISDOM_GATEWAY_PROJECT"), "{said}");
+    assert!(!stdout(&output).contains("AI Gateway ready"));
 }

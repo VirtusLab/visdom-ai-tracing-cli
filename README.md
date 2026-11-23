@@ -54,7 +54,8 @@ When your sessions go through the AI Gateway — you chose it just now or earlie
 ends by making the gateway ready, so that the first `visdom` does not fail on something init
 could have settled:
 
-- with several gateway projects open to you it asks which one, and saves it (`[gateway] project`);
+- it writes down the gateway project (`[gateway] project`): the only one open to you, or, with
+  several, the one you pick — so that a project opened to you later does not unsettle it;
 - it issues your personal key and tries it on the LLM gateway;
 - it writes down the model alias the agent will ask for (`[gateway] claude_code_model` /
   `codex_model`): the one picked for the agent, or, when none of the aliases is named for it, the
@@ -72,7 +73,8 @@ could have settled:
   ```
 
 A gateway that cannot be made ready (nobody to ask which project, no login it accepts, an LLM
-gateway that refuses the key) makes `visdom init` fail, with what to set and where.
+gateway that refuses the key, no model alias to ask for, a config that cannot be written) makes
+`visdom init` fail, with what to set and where.
 
 Every one of these settings can be kept in the config file; **what is left out there is taken
 from the environment** (`VISDOM_TRACING_MODE`, `VISDOM_GATEWAY_URL`, `VISDOM_GATEWAY_PROJECT`,
@@ -178,7 +180,8 @@ claude                               # now goes through the gateway
   repository (an `.envrc` does that).
 - It is weaker than `visdom`: `env` in the agent's own settings files still wins over the
   environment, and nothing checks the gateway again before each start. Where the workspace keeps
-  sessions off the gateway (`direct`) it prints nothing and fails.
+  sessions off the gateway (`direct`), or the gateway is not ready (no model alias to ask for
+  included), it prints nothing and fails.
 
 Settings:
 

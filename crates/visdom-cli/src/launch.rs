@@ -134,6 +134,37 @@ pub fn prepare_gateway(
     })
 }
 
+/// The environment variable that gives the gateway setting `key` of the user
+/// config, for when the file cannot be written.
+pub fn gateway_setting_env(key: &str) -> Option<&'static str> {
+    match key {
+        "project" => Some("export VISDOM_GATEWAY_PROJECT=<project>"),
+        "url" => Some("export VISDOM_GATEWAY_URL=<console address>"),
+        key if key.ends_with("_model") => Some("export VISDOM_GATEWAY_MODEL=<model alias>"),
+        _ => None,
+    }
+}
+
+/// Why there is no model alias for `agent` to ask the gateway for, and what
+/// to set: without one the agent asks for its own default, which a project's
+/// allow-list of aliases does not have.
+pub fn no_model(agent: Agent, project: &str, available: &[String]) -> String {
+    let key = format!("{}_model", agent_config_key(agent));
+    let choice = match available.is_empty() {
+        true => format!("the project `{project}` lets your key call no model alias at all"),
+        false => format!(
+            "none of the model aliases your key may call in the project `{project}` is named \
+             for {} ({})",
+            agent.label(),
+            available.join(", ")
+        ),
+    };
+    format!(
+        "{choice}: set {key} under [gateway] in your visdom config, or VISDOM_GATEWAY_MODEL, to \
+         the alias to use"
+    )
+}
+
 /// Where the gateway's settings are made, for somebody whose gateway is not
 /// ready or who wants another one.
 pub fn gateway_settings_hint(user_config: &Path) -> String {

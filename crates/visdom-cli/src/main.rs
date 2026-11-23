@@ -365,18 +365,22 @@ fn save_mode(session: &Session, mode: TracingMode) {
     }
 }
 
-fn save_gateway(session: &Session, key: &str, value: &str) -> bool {
+/// Write a gateway setting init has settled to the user config. One that
+/// cannot be written ends init: the next `visdom` would not find it, and the
+/// setup would only look done.
+fn save_gateway(session: &Session, key: &str, value: &str) {
     match interactive::save_gateway_setting(&session.user_config_path, key, value) {
-        Ok(()) => {
-            eprintln!(
-                "Saved {key} = \"{value}\" under [gateway] to {}",
-                session.user_config_path.display()
-            );
-            true
-        }
+        Ok(()) => eprintln!(
+            "Saved {key} = \"{value}\" under [gateway] to {}",
+            session.user_config_path.display()
+        ),
         Err(e) => {
-            eprintln!("visdom: warning: {key} not saved: {e}");
-            false
+            eprintln!("visdom: the AI Gateway is not set up: {key} could not be saved: {e}");
+            eprintln!(
+                "  Set it yourself: {}",
+                launch::gateway_setting_env(key).unwrap_or(key)
+            );
+            exit(1);
         }
     }
 }
@@ -415,9 +419,8 @@ fn init_gateway(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<Tr
             if let Some(i) =
                 interactive::ask_choice("Which AI Gateway project is this for?", &names)
             {
-                if save_gateway(&session, "project", &open[i].slug) {
-                    session = gather(&env, Some(agent), flag, runtime);
-                }
+                save_gateway(&session, "project", &open[i].slug);
+                session = gather(&env, Some(agent), flag, runtime);
             }
         }
     }
@@ -433,7 +436,22 @@ fn init_gateway(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<Tr
             exit(1);
         }
     };
+    let Some(Ok(plan)) = &session.gateway else {
+        return;
+    };
     let mut sources = session.gateway_sources.clone();
+    let in_user_config = |key: &str| {
+        Some(format!(
+            "{key} under [gateway] in {}",
+            session.user_config_path.display()
+        ))
+    };
+    if sources.project.is_none() {
+        // The only project open today: written down, so that being given
+        // access to another one later does not leave the choice open.
+        save_gateway(&session, "project", &plan.project.slug);
+        sources.project = in_user_config("project");
+    }
     let model_key = format!("{}_model", config::agent_config_key(agent));
     if sources.model.is_none() {
         // Nobody named a model: the one picked for the agent, else theirs to
@@ -453,18 +471,18 @@ fn init_gateway(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<Tr
                 .map(|i| prepared.available[i].clone())
         });
         if let Some(model) = picked {
-            if save_gateway(&session, &model_key, &model) {
-                sources.model = Some(format!(
-                    "{model_key} under [gateway] in {}",
-                    session.user_config_path.display()
-                ));
-            }
+            save_gateway(&session, &model_key, &model);
+            sources.model = in_user_config(&model_key);
             prepared.launch.model = Some(model);
         }
     }
-    let Some(Ok(plan)) = &session.gateway else {
-        return;
-    };
+    if prepared.launch.model.is_none() {
+        eprintln!(
+            "visdom: the AI Gateway is not ready: {}",
+            launch::no_model(agent, &plan.project.slug, &prepared.available)
+        );
+        exit(1);
+    }
     print!(
         "{}",
         launch::gateway_summary(
@@ -493,13 +511,20 @@ fn env_script(runtime: &tokio::runtime::Runtime, agent: Option<Agent>) -> ! {
     }
     let visdom = std::env::current_exe().unwrap_or_else(|_| "visdom".into());
     let script = launch::prepare_gateway(&session, runtime, &visdom, now()).and_then(|prepared| {
-        for note in &prepared.notes {
-            eprintln!("visdom: warning: {note}");
-        }
         let project = match &session.gateway {
             Some(Ok(plan)) => plan.project.slug.clone(),
             _ => String::new(),
         };
+        // Nothing checks the gateway again before an agent started by hand:
+        // a setup that would ask for a model the project refuses is not one
+        // to hand out.
+        if prepared.launch.model.is_none() {
+            return Err(launch::no_model(
+                session.ctx.agent,
+                &project,
+                &prepared.available,
+            ));
+        }
         session.adapter.env_script(&prepared.launch, &project)
     });
     match script {
