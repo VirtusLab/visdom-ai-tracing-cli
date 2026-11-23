@@ -5,6 +5,7 @@ use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches};
 use tracevault_cli::agent::Agent;
 use tracevault_cli::cli::{run, Command, InitArgs};
+use visdom_cli::agents::McpScope;
 use visdom_cli::cli::{VisdomCli, VisdomCommand};
 use visdom_cli::components::CredentialState;
 use visdom_cli::doctor::git_toplevel;
@@ -14,6 +15,7 @@ use visdom_cli::finding::{exit_code, render_json, render_text};
 use visdom_cli::fixes::FixExecutor;
 use visdom_cli::fixes::{policy_for, FixPolicy};
 use visdom_cli::gateway::{ensure_key, key_store_path_in, KeyStore};
+use visdom_cli::interactive::InitScope;
 use visdom_cli::mode::{
     configured_mode, ModeReason, TracingMode, TrafficPolicy, GATEWAY_SESSION_ENV, MODE_ENV,
 };
@@ -46,23 +48,35 @@ fn main() {
         }
         Some(VisdomCommand::Trace { command }) => runtime.block_on(run(command)),
         Some(VisdomCommand::Init { mut args }) => {
-            // `--global` and `--workspace` set up no single repository: they
-            // are `tracevault init` as it is.
-            let per_repo = !args.global && !args.workspace;
-            if per_repo {
-                let typed = init_agent_typed.then_some(args.agent).or(cli.agent);
-                args.agent = init_agent(typed);
-                if matches!(args.agent, Agent::ClaudeCode | Agent::Codex) {
-                    init_login(&runtime, &args);
-                }
-            }
+            // A repository, the whole machine or a folder of checkouts: said
+            // with a flag, else asked. Whichever it is, the rest of the setup
+            // (login, bazaar, the tracing mode, the gateway) is the same.
+            let scope = init_scope(&args);
+            let typed = init_agent_typed.then_some(args.agent).or(cli.agent);
+            args.agent = init_agent(typed);
             let agent = args.agent;
+            let launched = matches!(agent, Agent::ClaudeCode | Agent::Codex);
+            if launched {
+                init_login(&runtime, &args);
+            }
+            // A workspace has no hooks of its own: chosen from the question,
+            // the machine-wide ones are installed with it.
+            let also_machine =
+                (scope.scope == InitScope::Workspace && scope.asked).then(|| machine_wide(&args));
+            match scope.scope {
+                InitScope::Repo => {}
+                InitScope::Machine => args.global = true,
+                InitScope::Workspace => init_workspace_args(&mut args),
+            }
             // Exits on failure.
             runtime.block_on(run(Command::Init(args)));
-            if per_repo && matches!(agent, Agent::ClaudeCode | Agent::Codex) {
-                init_bazaar(&runtime, agent);
+            if let Some(machine) = also_machine {
+                runtime.block_on(run(Command::Init(machine)));
+            }
+            if launched {
+                init_bazaar(&runtime, agent, scope.scope);
                 init_mode(&runtime, agent, cli.mode);
-                init_gateway(&runtime, agent, cli.mode);
+                init_gateway(&runtime, agent, cli.mode, scope.scope);
             }
         }
         Some(VisdomCommand::Doctor {
@@ -207,7 +221,7 @@ fn init_agent(typed: Option<Agent>) -> Agent {
     }
     let env = Environment::current();
     let user = config::load_user_config_in(&env.config_root).unwrap_or_default();
-    let repo = git_toplevel(&env.cwd)
+    let repo = checks::settings_dir(&env.cwd)
         .and_then(|dir| config::load_repo_config_in(&dir).ok())
         .unwrap_or_default();
     match config::configured_agent(env.agent.as_deref(), &repo, &user) {
@@ -219,6 +233,78 @@ fn init_agent(typed: Option<Agent>) -> Agent {
             exit(2);
         }
     }
+}
+
+/// What `init` is to set up, and whether somebody was asked.
+struct ScopeChoice {
+    scope: InitScope,
+    asked: bool,
+}
+
+/// The scope of this `init`: `--global` or `--workspace` when given, the
+/// repository when an option only a repository has is given or there is
+/// nobody to ask, else the answer to the question — whose default is the
+/// repository inside a checkout and the machine outside one.
+fn init_scope(args: &InitArgs) -> ScopeChoice {
+    let said = |scope| ScopeChoice {
+        scope,
+        asked: false,
+    };
+    if args.global {
+        return said(InitScope::Machine);
+    }
+    if args.workspace {
+        return said(InitScope::Workspace);
+    }
+    let repo_only = args.claude_settings.is_some() || args.no_gitignore;
+    if repo_only || !interactive::is_interactive() {
+        return said(InitScope::Repo);
+    }
+    let default = match git_toplevel(&Environment::current().cwd) {
+        Some(_) => InitScope::Repo,
+        None => InitScope::Machine,
+    };
+    match interactive::ask_scope(default) {
+        Some(scope) => ScopeChoice { scope, asked: true },
+        None => exit(1),
+    }
+}
+
+/// `args` as a `--workspace` init: the project it records to is asked for
+/// when not given. Options a workspace does not take stop here, said as they
+/// would be on the command line.
+fn init_workspace_args(args: &mut InitArgs) {
+    let refused = [
+        ("--claude-settings", args.claude_settings.is_some()),
+        ("--no-gitignore", args.no_gitignore),
+        ("--no-user-context", args.no_user_context),
+        ("--user-context", args.user_context.is_some()),
+        ("--claude-telemetry", args.claude_telemetry),
+        ("--no-claude-telemetry", args.no_claude_telemetry),
+    ];
+    if let Some((option, _)) = refused.iter().find(|(_, given)| *given) {
+        eprintln!("visdom: {option} cannot be used for a workspace");
+        exit(2);
+    }
+    if args.project.is_none() {
+        args.project = interactive::ask_text("Project the workspace's sessions are recorded to:");
+    }
+    if args.project.is_none() {
+        eprintln!("visdom: a workspace needs a project: pass --workspace --project <name>");
+        exit(2);
+    }
+    args.workspace = true;
+}
+
+/// `args` as the `--global` init that goes with a workspace.
+fn machine_wide(args: &InitArgs) -> InitArgs {
+    let mut machine = args.clone();
+    machine.global = true;
+    machine.workspace = false;
+    machine.project = None;
+    // Of a repository only.
+    machine.server_url = None;
+    machine
 }
 
 /// Before `init`, with somebody to ask: when not logged in, ask for the
@@ -253,9 +339,16 @@ fn init_login(runtime: &tokio::runtime::Runtime, args: &InitArgs) {
 /// `init` is asking for this, so the registration is shown and applied, not
 /// offered. What init cannot do (an unknown bazaar URL, an entry it will not
 /// replace) is reported; a registration that fails makes init fail.
-fn init_bazaar(runtime: &tokio::runtime::Runtime, agent: Agent) {
+fn init_bazaar(runtime: &tokio::runtime::Runtime, agent: Agent, scope: InitScope) {
     let env = Environment::current();
+    // For a repository the registration is that project directory's; a
+    // machine or a folder of checkouts has sessions in many directories.
+    let mcp_scope = match scope {
+        InitScope::Repo => McpScope::Local,
+        InitScope::Machine | InitScope::Workspace => McpScope::User,
+    };
     let mut session = gather(&env, Some(agent), None, runtime);
+    session.mcp_scope = mcp_scope;
     // Nobody knows the bazaar URL: ask, and remember the answer for next time.
     if matches!(session.bazaar_url, Ok(None)) && interactive::is_interactive() {
         if let Some(url) = interactive::ask_url("Bazaar MCP URL (Enter to skip):") {
@@ -276,6 +369,7 @@ fn init_bazaar(runtime: &tokio::runtime::Runtime, agent: Agent) {
     let summary = fix(&bazaar, policy, &mut RealExecutor::new(false, policy));
     let findings = if summary.applied {
         let mut after = gather(&env, Some(agent), None, runtime);
+        after.mcp_scope = mcp_scope;
         // The URL just typed counts even if it could not be saved.
         if matches!(after.bazaar_url, Ok(None)) {
             after.bazaar_url = session.bazaar_url.clone();
@@ -362,7 +456,7 @@ fn init_mode(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<Traci
         return;
     }
     // Asked again here only to rule out a choice made outside the user config.
-    let repo = git_toplevel(&env.cwd)
+    let repo = checks::settings_dir(&env.cwd)
         .and_then(|dir| config::load_repo_config_in(&dir).ok())
         .unwrap_or_default();
     if !matches!(
@@ -384,7 +478,7 @@ fn init_mode(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<Traci
 
 /// The repository's own visdom config for the directory `visdom` runs in.
 fn checks_repo_config(env: &Environment) -> config::RepoConfig {
-    git_toplevel(&env.cwd)
+    checks::settings_dir(&env.cwd)
         .and_then(|dir| config::load_repo_config_in(&dir).ok())
         .unwrap_or_default()
 }
@@ -405,14 +499,14 @@ fn save_mode(session: &Session, mode: TracingMode) {
     }
 }
 
-/// Write a gateway setting init has settled to the user config. One that
-/// cannot be written ends init: the next `visdom` would not find it, and the
-/// setup would only look done.
-fn save_gateway(session: &Session, key: &str, value: &str) {
-    match interactive::save_gateway_setting(&session.user_config_path, key, value) {
+/// Write a gateway setting init has settled to the config at `path`. One
+/// that cannot be written ends init: the next `visdom` would not find it,
+/// and the setup would only look done.
+fn save_gateway(path: &std::path::Path, key: &str, value: &str) {
+    match interactive::save_gateway_setting(path, key, value) {
         Ok(()) => eprintln!(
             "Saved {key} = \"{value}\" under [gateway] to {}",
-            session.user_config_path.display()
+            path.display()
         ),
         Err(e) => {
             eprintln!("visdom: the AI Gateway is not set up: {key} could not be saved: {e}");
@@ -432,8 +526,19 @@ fn save_gateway(session: &Session, key: &str, value: &str) {
 /// key is issued and tried on the LLM gateway, and what was set up is shown
 /// with where each setting comes from. A gateway that cannot be made ready
 /// makes init fail, with what to set.
-fn init_gateway(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<TracingMode>) {
+fn init_gateway(
+    runtime: &tokio::runtime::Runtime,
+    agent: Agent,
+    flag: Option<TracingMode>,
+    scope: InitScope,
+) {
     let env = Environment::current();
+    // The gateway project of a folder of checkouts is that folder's, kept in
+    // its own `.visdom/config.toml`; otherwise it is the developer's.
+    let workspace_file = (scope == InitScope::Workspace && git_toplevel(&env.cwd).is_none())
+        .then(|| config::repo_config_path_in(&env.cwd));
+    let project_file =
+        &workspace_file.unwrap_or_else(|| config::user_config_path_in(&env.config_root));
     let mut session = gather(&env, Some(agent), flag, runtime);
     if session.mode.mode != TracingMode::Gateway {
         return;
@@ -459,7 +564,7 @@ fn init_gateway(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<Tr
             if let Some(i) =
                 interactive::ask_choice("Which AI Gateway project is this for?", &names)
             {
-                save_gateway(&session, "project", &open[i].slug);
+                save_gateway(project_file, "project", &open[i].slug);
                 session = gather(&env, Some(agent), flag, runtime);
             }
         }
@@ -489,8 +594,11 @@ fn init_gateway(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<Tr
     if sources.project.is_none() {
         // The only project open today: written down, so that being given
         // access to another one later does not leave the choice open.
-        save_gateway(&session, "project", &plan.project.slug);
-        sources.project = in_user_config("project");
+        save_gateway(project_file, "project", &plan.project.slug);
+        sources.project = Some(format!(
+            "project under [gateway] in {}",
+            project_file.display()
+        ));
     }
     let model_key = format!("{}_model", config::agent_config_key(agent));
     if sources.model.is_none() {
@@ -511,7 +619,7 @@ fn init_gateway(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<Tr
                 .map(|i| prepared.available[i].clone())
         });
         if let Some(model) = picked {
-            save_gateway(&session, &model_key, &model);
+            save_gateway(&session.user_config_path, &model_key, &model);
             sources.model = in_user_config(&model_key);
             prepared.launch.model = Some(model);
         }

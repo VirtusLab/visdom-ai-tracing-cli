@@ -110,6 +110,7 @@ pub fn check(
     adapter: &dyn AgentAdapter,
     workdir: &Workdir,
     user_config_path: &Path,
+    register_scope: McpScope,
 ) -> Vec<Finding> {
     let label = adapter.agent().label();
     let bazaar_url = match bazaar_url {
@@ -210,7 +211,7 @@ pub fn check(
             &unused_name(&entries),
             url,
             BAZAAR_CLIENT_ID,
-            McpScope::Local,
+            register_scope,
             workdir,
         )))];
     };
@@ -327,6 +328,7 @@ mod tests {
             adapter,
             workdir,
             Path::new("/cfg/visdom/config.toml"),
+            McpScope::Local,
         );
         assert_eq!(findings.len(), 1, "{findings:?}");
         findings.remove(0)
@@ -407,6 +409,7 @@ mod tests {
             &fake(vec![]),
             &repo(),
             Path::new("/cfg"),
+            McpScope::Local,
         );
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].id, "bazaar.url");

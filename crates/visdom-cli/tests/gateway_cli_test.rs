@@ -1254,3 +1254,81 @@ fn init_fails_when_the_mode_it_saves_would_be_overruled() {
     assert!(said.contains("hooks"), "{said}");
     assert!(!stdout(&output).contains("AI Gateway ready"));
 }
+
+/// `visdom init --global` is the whole setup too, for the machine: bazaar is
+/// registered for all of the user's projects, and the gateway is left ready.
+#[test]
+fn a_machine_wide_init_sets_up_bazaar_and_the_gateway_too() {
+    let settings = policy("enforced");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let (agent, log) = sb.recording_agent(&[]);
+    sb.write_user_config(&format!(
+        "bazaar_url = \"https://context.example.com/mcp/remote\"\n\n[agents]\nclaude_code = \"{}\"\n",
+        agent.display()
+    ));
+    // Not in a repository: a machine-wide setup needs none.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let output = sb
+        .visdom(elsewhere.path())
+        .args(["init", "--global"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let said = stdout(&output);
+    assert!(said.contains("AI Gateway ready for Claude Code"), "{said}");
+    let args = args(&log);
+    let scope = args.iter().position(|a| a == "--scope").expect("mcp add");
+    assert_eq!(args[scope + 1], "user", "{args:?}");
+}
+
+/// A folder of checkouts set up as a workspace keeps its gateway project in
+/// its own `.visdom/config.toml`, which applies in it and below it although
+/// it is no git checkout.
+#[test]
+fn a_workspace_folder_names_its_own_gateway_project() {
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        TWO_PROJECTS,
+        ISSUE,
+        MODELS,
+    ]);
+    let (sb, log) = sandbox(&server);
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(workspace.path().join(".visdom")).unwrap();
+    std::fs::write(
+        workspace.path().join(".visdom/config.toml"),
+        "tracing_mode = \"gateway\"\n\n[gateway]\nproject = \"beta\"\n",
+    )
+    .unwrap();
+    let below = workspace.path().join("notes");
+    std::fs::create_dir_all(&below).unwrap();
+    let output = sb.visdom(&below).output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let recorded = lines(&log);
+    assert!(
+        recorded.contains(&"VISDOM_GATEWAY_SESSION=claude-code".to_string()),
+        "{recorded:?} {}",
+        stderr(&output)
+    );
+    // The key is the workspace's project's.
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|r| r.route == "POST /api/me/keys" && r.body.contains("p-2")),
+        "{:?}",
+        server.routes()
+    );
+}

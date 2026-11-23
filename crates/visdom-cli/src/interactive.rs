@@ -48,6 +48,55 @@ pub fn ask_agent() -> Agent {
     }
 }
 
+/// What `visdom init` sets up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitScope {
+    /// The repository `visdom init` is run in.
+    Repo,
+    /// Every session of the agent on this machine (`--global`).
+    Machine,
+    /// The directory `visdom init` is run in, as a folder of checkouts
+    /// recorded to one project (`--workspace`).
+    Workspace,
+}
+
+/// The scope an answer names: its number in the list, or its name. An empty
+/// answer takes `default`. `None` when it names none.
+pub fn parse_scope_choice(answer: &str, default: InitScope) -> Option<InitScope> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "" => Some(default),
+        "1" | "repo" | "repository" => Some(InitScope::Repo),
+        "2" | "machine" | "global" => Some(InitScope::Machine),
+        "3" | "workspace" | "folder" => Some(InitScope::Workspace),
+        _ => None,
+    }
+}
+
+/// Ask what to set up. `None` at end of input: nothing chosen.
+pub fn ask_scope(default: InitScope) -> Option<InitScope> {
+    let number = match default {
+        InitScope::Repo => 1,
+        InitScope::Machine => 2,
+        InitScope::Workspace => 3,
+    };
+    eprintln!("What should visdom set up?");
+    eprintln!("  [1] this repository");
+    eprintln!("  [2] every session on this machine");
+    eprintln!("  [3] this folder of checkouts, recorded to one project (a workspace)");
+    loop {
+        let answer = ask_line(&format!("Number (default {number}):"))?;
+        match parse_scope_choice(&answer, default) {
+            Some(scope) => return Some(scope),
+            None => eprintln!("Answer 1, 2 or 3."),
+        }
+    }
+}
+
+/// Ask for a line of text; `None` when nothing was typed.
+pub fn ask_text(question: &str) -> Option<String> {
+    ask_line(question).filter(|answer| !answer.is_empty())
+}
+
 /// The mode an answer names: its number in the list, or its name. An empty
 /// answer takes the default, hooks. `None` when it names neither.
 pub fn parse_mode_choice(answer: &str) -> Option<TracingMode> {
@@ -263,6 +312,20 @@ mod tests {
         let user = load_user_config_in(tmp.path()).unwrap();
         assert_eq!(user.tracing_mode, Some(TracingMode::Hooks));
         assert_eq!(user.gateway.project.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn scope_choice_by_number_name_or_default() {
+        use InitScope::*;
+        assert_eq!(parse_scope_choice("", Machine), Some(Machine));
+        assert_eq!(parse_scope_choice("\n", Repo), Some(Repo));
+        assert_eq!(parse_scope_choice("1", Machine), Some(Repo));
+        assert_eq!(parse_scope_choice(" 2 ", Repo), Some(Machine));
+        assert_eq!(parse_scope_choice("global", Repo), Some(Machine));
+        assert_eq!(parse_scope_choice("3", Repo), Some(Workspace));
+        assert_eq!(parse_scope_choice("Workspace", Repo), Some(Workspace));
+        assert_eq!(parse_scope_choice("4", Repo), None);
+        assert_eq!(parse_scope_choice("everything", Repo), None);
     }
 
     #[test]
