@@ -87,14 +87,17 @@ fn save_remembered<T: Serialize + for<'de> Deserialize<'de>>(path: &Path, addres
         return;
     };
     let _ = std::fs::create_dir_all(dir);
-    // Without the lock (a directory that cannot be written) there is nothing
-    // to write either.
-    let _lock = std::fs::OpenOptions::new()
+    // Nothing is written without the lock: it would be over what another
+    // session is writing.
+    let Ok(_lock) = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(path.with_extension("lock"))
-        .and_then(|file| file.lock().map(|()| file));
+        .and_then(|file| file.lock().map(|()| file))
+    else {
+        return;
+    };
     let mut all: std::collections::BTreeMap<String, serde_json::Value> =
         std::fs::read_to_string(path)
             .ok()
@@ -390,6 +393,25 @@ mod tests {
             .filter(|name| name.contains("tmp"))
             .collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn nothing_is_remembered_while_the_cache_cannot_be_locked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = policy_cache_path_in(tmp.path());
+        save_cached_policy(&cache, "https://cp.example.com", TrafficPolicy::Enforced);
+        // The lock file cannot be opened: a directory is in its place.
+        std::fs::remove_file(cache.with_extension("lock")).unwrap();
+        std::fs::create_dir(cache.with_extension("lock")).unwrap();
+        save_cached_policy(&cache, "https://other.example.com", TrafficPolicy::Direct);
+        assert_eq!(
+            load_cached_policy(&cache, "https://cp.example.com"),
+            Some(TrafficPolicy::Enforced)
+        );
+        assert_eq!(
+            load_cached_policy(&cache, "https://other.example.com"),
+            None
+        );
     }
 
     #[tokio::test]

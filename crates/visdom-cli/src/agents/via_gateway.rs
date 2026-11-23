@@ -72,11 +72,17 @@ fn header_value(value: &str) -> String {
 
 /// Claude Code's switches to another provider's API. Each takes precedence
 /// over `ANTHROPIC_BASE_URL`, so one left set would send the session past the
-/// gateway while the hooks record nothing.
-const CLAUDE_OTHER_PROVIDERS: [&str; 3] = [
+/// gateway while the hooks record nothing. (`CLAUDE_CODE_USE_GATEWAY` is
+/// Claude Code's own gateway sign-in, which is not this key helper's.) The
+/// list is Claude Code's: a switch it gains has to be added here.
+const CLAUDE_OTHER_PROVIDERS: [&str; 7] = [
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_GATEWAY",
 ];
 
 /// The session id the caller's own options give Claude Code, when they name
@@ -485,6 +491,10 @@ mod tests {
                 "CLAUDE_CODE_USE_BEDROCK": "0",
                 "CLAUDE_CODE_USE_VERTEX": "0",
                 "CLAUDE_CODE_USE_FOUNDRY": "0",
+                "CLAUDE_CODE_USE_MANTLE": "0",
+                "CLAUDE_CODE_USE_ANTHROPIC_AWS": "0",
+                "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD": "0",
+                "CLAUDE_CODE_USE_GATEWAY": "0",
             })
         );
         assert_eq!(
@@ -549,6 +559,10 @@ mod tests {
             "CLAUDE_CODE_USE_BEDROCK",
             "CLAUDE_CODE_USE_VERTEX",
             "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_MANTLE",
+            "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+            "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+            "CLAUDE_CODE_USE_GATEWAY",
         ] {
             assert_eq!(env[switch], None, "{switch} must be removed");
             assert_eq!(settings["env"][switch], "0", "{switch} must be off");

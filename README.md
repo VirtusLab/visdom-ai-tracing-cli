@@ -102,8 +102,9 @@ Your own agent configuration cannot take a gateway session elsewhere:
 - **Claude Code** applies the `env` of its settings files over the environment it is started in, so
   `visdom` gives the gateway's address, the attribution headers and the key helper as settings on
   the command line (`--settings`), which come after your `settings.json` and the project's; there
-  it also switches off `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` and
-  `CLAUDE_CODE_USE_FOUNDRY`, each of which would send the session to that provider, and clears
+  it also switches off Claude Code's switches to another provider (`CLAUDE_CODE_USE_BEDROCK`,
+  `…_VERTEX`, `…_FOUNDRY`, `…_MANTLE`, `…_ANTHROPIC_AWS`, `…_ANTHROPIC_GOOGLE_CLOUD`,
+  `…_GATEWAY`), each of which would send the session there instead, and clears
   an `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` of yours, which would be sent in place of the
   gateway key. Settings you
   pass with `--settings` yourself are kept, merged under these; a `--settings` value that cannot be
