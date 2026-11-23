@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.6](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.29.5...v0.29.6) - 2026-11-23
+
+### Added
+
+- *(stream)* the capture hook records nothing for a gateway session (VIS-1297)
+
+### Fixed
+
+- *(visdom)* only an agent visdom routed through the gateway goes uncaptured (VIS-1297)
+
 ## [0.29.5](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.29.4...v0.29.5) - 2026-11-19
 
 ### Added
