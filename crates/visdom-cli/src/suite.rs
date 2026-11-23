@@ -77,7 +77,24 @@ fn load_remembered<T: for<'de> Deserialize<'de>>(path: &Path, address: &str) -> 
 
 /// Best effort: an answer that cannot be written only means no fallback
 /// later. Entries that no longer read (another version's) are dropped.
+///
+/// Sessions starting side by side each remember their own installation's
+/// answer: reading, changing and writing happen under a lock, and the file is
+/// replaced in one move, so neither loses the other's entry nor reads half a
+/// file. An answer already remembered is not written again.
 fn save_remembered<T: Serialize + for<'de> Deserialize<'de>>(path: &Path, address: &str, value: T) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dir);
+    // Without the lock (a directory that cannot be written) there is nothing
+    // to write either.
+    let _lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("lock"))
+        .and_then(|file| file.lock().map(|()| file));
     let mut all: std::collections::BTreeMap<String, serde_json::Value> =
         std::fs::read_to_string(path)
             .ok()
@@ -87,10 +104,19 @@ fn save_remembered<T: Serialize + for<'de> Deserialize<'de>>(path: &Path, addres
     let Ok(value) = serde_json::to_value(value) else {
         return;
     };
-    all.insert(trim_slash(address.to_string()), value);
-    if let (Some(dir), Ok(text)) = (path.parent(), serde_json::to_string(&all)) {
-        let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::write(path, text);
+    let address = trim_slash(address.to_string());
+    if all.get(&address) == Some(&value) {
+        return;
+    }
+    all.insert(address, value);
+    if let Ok(text) = serde_json::to_string(&all) {
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        if std::fs::write(&tmp, text)
+            .and_then(|()| std::fs::rename(&tmp, path))
+            .is_err()
+        {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 
@@ -332,6 +358,38 @@ mod tests {
         assert!(err.contains("could not be read"), "{err}");
         let server = MockServer::start(&[(SETTINGS, 200, r#"{"ai_traffic_policy":"new"}"#)]);
         assert!(fetch_policy(&http, &server.url, "tok").await.is_err());
+    }
+
+    /// Sessions starting side by side, each with its own installation: every
+    /// answer is kept, and the file never reads as anything but whole.
+    #[test]
+    fn answers_remembered_at_the_same_time_are_all_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = policy_cache_path_in(tmp.path());
+        let address = |i: usize| format!("https://cp-{i}.example.com");
+        std::thread::scope(|scope| {
+            for i in 0..16 {
+                let cache = &cache;
+                scope.spawn(move || {
+                    save_cached_policy(cache, &address(i), TrafficPolicy::Enforced);
+                    let text = std::fs::read_to_string(cache).unwrap();
+                    serde_json::from_str::<serde_json::Value>(&text).expect("a whole file");
+                });
+            }
+        });
+        for i in 0..16 {
+            assert_eq!(
+                load_cached_policy(&cache, &address(i)),
+                Some(TrafficPolicy::Enforced),
+                "{i}"
+            );
+        }
+        let left: Vec<_> = std::fs::read_dir(cache.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.contains("tmp"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[tokio::test]

@@ -55,11 +55,16 @@ A session reaches AI Tracing one of two ways, and **you choose**:
 - `hooks` (the default) — the agent's hooks capture the session, as with `tracevault`.
 - `gateway` — `visdom` starts the agent with its LLM traffic going through the Visdom AI Gateway,
   which records the calls. The hooks stay installed (they still bring the repository's policies
-  into the session, link commits and check policies before a push) but their capture is off for
-  that agent, so nothing is recorded twice.
+  into the session and link commits) but their capture is off for that agent, so nothing is
+  recorded twice. **Known limit:** the check before a push evaluates the sessions the hooks
+  captured on this machine; a gateway session is not among them, so it is not part of that
+  check.
 
 Your choice is `--mode`, then `VISDOM_TRACING_MODE`, then `tracing_mode` in the repository's
-`.visdom/config.toml`, then in the user config.
+`.visdom/config.toml`, then in the user config. That variable is only your preference for
+`visdom`: an agent you start without `visdom` is captured by its hooks whatever it says (what
+switches the capture off is `VISDOM_GATEWAY_SESSION=1`, which `visdom` sets on the agent it has
+routed through the gateway, and nobody else should).
 
 **A workspace admin may decide instead**, with the AI traffic policy in Control Plane:
 `enforced` puts every session through the gateway, `direct` keeps every session on hooks, and
@@ -109,8 +114,8 @@ Your own agent configuration cannot take a gateway session elsewhere:
   the gateway launch: leave it out, or use `--mode hooks`.
 
 If gateway mode cannot be set up (no gateway, an API-key login, no project open to you, an LLM
-gateway that does not answer or refuses the key, a key that cannot be kept, options of yours that
-choose another provider):
+gateway that does not answer or refuses the key, a key store that cannot be locked or written,
+options of yours that choose another provider):
 
 - you chose it: the agent is started with hooks tracing and `visdom` says why;
 - the workspace requires it: the agent is **not** started, since it would bypass the policy.

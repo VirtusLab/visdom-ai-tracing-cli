@@ -12,7 +12,8 @@ use common::http::MockServer;
 use common::{stderr, stdout, Sandbox};
 
 const PERSON_TOKEN: &str = "person-access-token";
-const VARIABLES: [&str; 7] = [
+const VARIABLES: [&str; 8] = [
+    "VISDOM_GATEWAY_SESSION",
     "CLAUDE_CODE_USE_BEDROCK",
     "VISDOM_TRACING_MODE",
     "ANTHROPIC_BASE_URL",
@@ -108,6 +109,7 @@ fn a_chosen_gateway_session_gets_a_key_a_model_and_its_ids() {
     let recorded = lines(&log);
     let has = |line: &str| recorded.iter().any(|l| l == line);
     assert!(has("VISDOM_TRACING_MODE=gateway"), "{recorded:?}");
+    assert!(has("VISDOM_GATEWAY_SESSION=1"), "{recorded:?}");
     assert!(has("CLAUDE_CODE_USE_BEDROCK unset"), "{recorded:?}");
     assert!(
         has(&format!("ANTHROPIC_BASE_URL={}", server.url)),
@@ -312,8 +314,10 @@ fn a_direct_workspace_keeps_sessions_on_hooks() {
     let output = sb
         .visdom(sb.repo.path())
         .args(["--mode", "gateway"])
-        // A stale variable must not switch the hooks' capture off either.
+        // What is left in the environment (of a gateway session's shell,
+        // say) must not switch the hooks' capture off either.
         .env("VISDOM_TRACING_MODE", "gateway")
+        .env("VISDOM_GATEWAY_SESSION", "1")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
@@ -321,6 +325,10 @@ fn a_direct_workspace_keeps_sessions_on_hooks() {
     let recorded = lines(&log);
     assert!(
         recorded.contains(&"VISDOM_TRACING_MODE=hooks".to_string()),
+        "{recorded:?}"
+    );
+    assert!(
+        recorded.contains(&"VISDOM_GATEWAY_SESSION unset".to_string()),
         "{recorded:?}"
     );
     assert!(

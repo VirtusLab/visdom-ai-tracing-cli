@@ -8,7 +8,7 @@ use std::process::Command;
 
 use tracevault_cli::agent::Agent;
 
-use crate::mode::{TracingMode, MODE_ENV};
+use crate::mode::{TracingMode, GATEWAY_SESSION_ENV, MODE_ENV};
 
 /// The environment variable Codex reads the gateway key from.
 pub const CODEX_KEY_ENV: &str = "VISDOM_GATEWAY_API_KEY";
@@ -218,6 +218,7 @@ pub fn claude_command(
     let mut routing: Vec<(&str, String)> = vec![
         // The hooks read this to record nothing: a settings file must not
         // switch them back on beside the gateway.
+        (GATEWAY_SESSION_ENV, "1".to_string()),
         (MODE_ENV, TracingMode::Gateway.name().to_string()),
         ("ANTHROPIC_BASE_URL", gateway.llm_url.clone()),
         ("ANTHROPIC_CUSTOM_HEADERS", headers),
@@ -337,6 +338,7 @@ pub fn codex_command(
         ));
     }
     let mut cmd = Command::new(program);
+    cmd.env(GATEWAY_SESSION_ENV, "1");
     cmd.env(MODE_ENV, TracingMode::Gateway.name());
     cmd.env(CODEX_KEY_ENV, &gateway.key);
     let provider = format!("model_providers.{CODEX_PROVIDER}");
@@ -441,6 +443,7 @@ mod tests {
     fn claude_gets_the_gateway_the_key_helper_and_a_session() {
         let cmd = claude(&strings(&["--verbose"]), &gateway(), &no_env);
         let env = envs_of(&cmd);
+        assert_eq!(env["VISDOM_GATEWAY_SESSION"].as_deref(), Some("1"));
         assert_eq!(env["VISDOM_TRACING_MODE"].as_deref(), Some("gateway"));
         assert_eq!(
             env["ANTHROPIC_BASE_URL"].as_deref(),
@@ -472,6 +475,7 @@ mod tests {
         assert_eq!(
             settings["env"],
             serde_json::json!({
+                "VISDOM_GATEWAY_SESSION": "1",
                 "VISDOM_TRACING_MODE": "gateway",
                 "ANTHROPIC_API_KEY": "",
                 "ANTHROPIC_AUTH_TOKEN": "",
@@ -670,6 +674,7 @@ mod tests {
         launch.model = Some("gpt-general".to_string());
         let cmd = codex(&strings(&["exec", "hi"]), &launch);
         let env = envs_of(&cmd);
+        assert_eq!(env["VISDOM_GATEWAY_SESSION"].as_deref(), Some("1"));
         assert_eq!(env["VISDOM_TRACING_MODE"].as_deref(), Some("gateway"));
         assert_eq!(env["VISDOM_GATEWAY_API_KEY"].as_deref(), Some("sk-abc"));
         let args = args_of(&cmd);

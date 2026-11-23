@@ -71,6 +71,7 @@ impl Sandbox {
             "VISDOM_AGENT",
             "VISDOM_BAZAAR_URL",
             "VISDOM_TRACING_MODE",
+            "VISDOM_GATEWAY_SESSION",
             "VISDOM_GATEWAY_URL",
             "VISDOM_CONTROL_PLANE_URL",
             "ANTHROPIC_API_KEY",

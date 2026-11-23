@@ -253,8 +253,8 @@ pub fn pick_project(configured: Option<&str>, open: &[OpenProject]) -> Result<Op
             }),
         None if open.len() == 1 => Ok(open[0].clone()),
         None => Err(format!(
-            "several AI Gateway projects are open to you ({}): set gateway_project in \
-             .visdom/config.toml or in your visdom config",
+            "several AI Gateway projects are open to you ({}): set `project` under \
+             `[gateway]` in .visdom/config.toml or in your visdom config",
             names()
         )),
     }
@@ -478,20 +478,27 @@ pub async fn ensure_key(
     rejected: Option<&str>,
 ) -> Result<EnsuredKey, String> {
     let account = account_of(token);
-    // Waiting for another process must not hold up this runtime's thread. A
-    // store that cannot be locked (a read-only config directory) is used
-    // without: a new key then cannot be stored either, which is an error.
+    // Waiting for another process must not hold up this runtime's thread.
     let locking = store.clone();
-    let _lock = tokio::task::spawn_blocking(move || locking.lock().ok())
+    let lock = tokio::task::spawn_blocking(move || locking.lock())
         .await
-        .ok()
-        .flatten();
+        .map_err(|e| e.to_string())
+        .and_then(|locked| locked.map_err(|e| e.to_string()));
     let stored = store
         .usable(console_url, project_id, &account, now)
         .filter(|key| Some(key.secret.as_str()) != rejected);
     if let Some(key) = stored {
         return Ok(EnsuredKey { key, issued: false });
     }
+    // A kept key is read without the lock just as well. A new one is not
+    // issued without it: issuing revokes the key another session, issuing at
+    // the same moment, is about to use.
+    let _lock = lock.map_err(|why| {
+        format!(
+            "the personal AI Gateway key store {} could not be locked: {why}",
+            store.path.display()
+        )
+    })?;
     let key = issue_key(http, console_url, token, project_id, now).await?;
     // A key that is not kept is issued again by the next session, and by the
     // agent's own key helper, each time revoking the one in use: that is no
@@ -643,7 +650,7 @@ mod tests {
         assert_eq!(pick_project(Some("BETA"), &two).unwrap().id, "p-2");
         let err = pick_project(None, &two).unwrap_err();
         assert!(
-            err.contains("alpha, beta") && err.contains("gateway_project"),
+            err.contains("alpha, beta") && err.contains("`project` under `[gateway]`"),
             "{err}"
         );
         let err = pick_project(Some("gamma"), &two).unwrap_err();
@@ -964,9 +971,9 @@ mod tests {
     async fn a_key_that_cannot_be_kept_is_an_error() {
         let http = reqwest::Client::new();
         let tmp = tempfile::tempdir().unwrap();
-        // The store's directory cannot be made: a file is in its place.
-        std::fs::write(tmp.path().join("visdom"), "").unwrap();
+        // The store's file cannot be replaced: a directory is in its place.
         let store = KeyStore::at(key_store_path_in(tmp.path()));
+        std::fs::create_dir_all(&store.path).unwrap();
         let server = MockServer::start(&[(
             "POST /api/me/keys",
             201,
@@ -978,6 +985,41 @@ mod tests {
             .unwrap();
         assert!(err.contains("could not be kept"), "{err}");
         assert!(!err.contains("sk-abc"), "{err}");
+    }
+
+    /// Issuing revokes the key in use, so it is not done without the lock
+    /// that keeps two sessions from doing it at once; a kept key needs none.
+    #[tokio::test]
+    async fn no_key_is_issued_while_the_store_cannot_be_locked() {
+        let http = reqwest::Client::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KeyStore::at(key_store_path_in(tmp.path()));
+        // The lock file cannot be opened: a directory is in its place.
+        std::fs::create_dir_all(store.path.with_extension("lock")).unwrap();
+        let server = MockServer::start(&[(
+            "POST /api/me/keys",
+            201,
+            r#"{"secret":"sk-abc","id":"h","name":"n","expiresAt":"2099-01-01T00:00:00Z"}"#,
+        )]);
+        let err = ensure_key(&http, &server.url, "tok", "p-1", &store, 0, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.contains("could not be locked"), "{err}");
+        assert!(server.routes().is_empty(), "{:?}", server.routes());
+
+        let kept = IssuedKey {
+            secret: "sk-kept".to_string(),
+            expires_at: 1_000_000,
+        };
+        let account = account_of("tok");
+        store.keep(&server.url, "p-1", &account, &kept, 0).unwrap();
+        let ensured = ensure_key(&http, &server.url, "tok", "p-1", &store, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(ensured.key.secret, "sk-kept");
+        assert!(!ensured.issued);
+        assert!(server.routes().is_empty(), "{:?}", server.routes());
     }
 
     #[test]

@@ -14,7 +14,9 @@ use visdom_cli::finding::{exit_code, render_json, render_text};
 use visdom_cli::fixes::FixExecutor;
 use visdom_cli::fixes::{policy_for, FixPolicy};
 use visdom_cli::gateway::{ensure_key, key_store_path_in, KeyStore};
-use visdom_cli::mode::{configured_mode, ModeReason, TracingMode, TrafficPolicy, MODE_ENV};
+use visdom_cli::mode::{
+    configured_mode, ModeReason, TracingMode, TrafficPolicy, GATEWAY_SESSION_ENV, MODE_ENV,
+};
 use visdom_cli::suite::PolicyState;
 use visdom_cli::{config, interactive};
 use visdom_cli::{doctor as checks, env_alias, launch};
@@ -347,9 +349,11 @@ fn agent_command(
 ) -> std::process::Command {
     let hooks = |session: &Session| {
         let mut cmd = session.adapter.launch(agent_args);
-        // Said outright, so a `gateway` left in the environment cannot switch
-        // the hooks' capture off for a session that does not use the gateway.
+        // Said outright, so nothing left in the environment (this may be an
+        // agent's own shell, inside a gateway session) can switch the hooks'
+        // capture off for a session that does not use the gateway.
         cmd.env(MODE_ENV, TracingMode::Hooks.name());
+        cmd.env_remove(GATEWAY_SESSION_ENV);
         cmd
     };
     if session.mode.mode != TracingMode::Gateway {

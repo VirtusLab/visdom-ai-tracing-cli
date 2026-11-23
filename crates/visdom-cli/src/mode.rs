@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 /// choice and sets it on the agent it launches, where the capture hooks read
 /// it: under `gateway` they record nothing, the gateway does.
 pub const MODE_ENV: &str = tracevault_cli::commands::stream::TRACING_MODE_ENV;
+/// Set to `1` on an agent started through the AI Gateway, and on nothing
+/// else: what tells the capture hooks to record nothing.
+pub const GATEWAY_SESSION_ENV: &str = tracevault_cli::commands::stream::GATEWAY_SESSION_ENV;
 
 /// The capture path of a session. Exactly one is meant to be active.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]

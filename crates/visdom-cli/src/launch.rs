@@ -100,6 +100,9 @@ pub fn prepare_gateway(
             agent_config_key(session.ctx.agent)
         ));
     }
+    // The repository a new session's events go under, as far as it is known
+    // before the session exists: the checkout's own, else the user's default
+    // (`tracevault repo switch --user`), as the capture hook has it.
     let repo_id = session
         .ctx
         .workdir
@@ -107,6 +110,8 @@ pub fn prepare_gateway(
         .as_deref()
         .and_then(|root| TracevaultConfig::try_load(root).ok().flatten())
         .and_then(|config| config.repo_id)
+        .filter(|id| !id.trim().is_empty())
+        .or_else(|| tracevault_cli::user_default::load().map(|binding| binding.repo_id))
         .filter(|id| !id.trim().is_empty());
     Ok((
         GatewayLaunch {
