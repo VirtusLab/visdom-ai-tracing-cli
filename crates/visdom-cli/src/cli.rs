@@ -70,6 +70,14 @@ pub enum VisdomCommand {
         #[arg(long)]
         project: String,
     },
+    /// Print shell commands that send an agent started without `visdom`
+    /// through the AI Gateway: `source <(visdom env)`. The key is not in the
+    /// output, only the command that gets it.
+    Env {
+        /// The agent the commands are for (see `visdom --help`).
+        #[arg(long, value_enum)]
+        agent: Option<Agent>,
+    },
     /// Log in to Visdom
     Login(LoginArgs),
     /// Log out from Visdom

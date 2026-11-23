@@ -11,10 +11,7 @@ use crate::config::agent_config_key;
 use crate::doctor::Session;
 use crate::gateway::{self, KeyStore};
 
-/// `text` as one word of a POSIX shell command.
-pub fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
-}
+pub use crate::agents::via_gateway::shell_quote;
 
 /// The command a launched agent runs to get its gateway key: this `visdom`,
 /// asked for the key of one console and project.
@@ -36,6 +33,15 @@ pub fn key_http_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+/// A gateway session ready to start.
+pub struct Prepared {
+    pub launch: GatewayLaunch,
+    /// What the developer should know (no model alias to ask for).
+    pub notes: Vec<String>,
+    /// The model aliases the key may call.
+    pub available: Vec<String>,
+}
+
 /// Everything the agent needs to run through the gateway: the developer's
 /// key (the kept one, or a new one), a model alias and the ids that attribute
 /// the session. The second value holds what the developer should know (no
@@ -51,7 +57,7 @@ pub fn prepare_gateway(
     runtime: &tokio::runtime::Runtime,
     visdom: &Path,
     now: i64,
-) -> Result<(GatewayLaunch, Vec<String>), String> {
+) -> Result<Prepared, String> {
     let plan = match &session.gateway {
         Some(Ok(plan)) => plan,
         Some(Err(why)) => return Err(why.clone()),
@@ -94,7 +100,8 @@ pub fn prepare_gateway(
     if model.is_none() {
         notes.push(format!(
             "no AI Gateway model alias was chosen for {}: it asks for its own default, which \
-             the project `{}` may not allow (set {}_model under [gateway] in your visdom config)",
+             the project `{}` may not allow (set {}_model under [gateway] in your visdom config, \
+             or VISDOM_GATEWAY_MODEL)",
             session.ctx.agent.label(),
             plan.project.slug,
             agent_config_key(session.ctx.agent)
@@ -113,8 +120,8 @@ pub fn prepare_gateway(
         .filter(|id| !id.trim().is_empty())
         .or_else(|| tracevault_cli::user_default::load().map(|binding| binding.repo_id))
         .filter(|id| !id.trim().is_empty());
-    Ok((
-        GatewayLaunch {
+    Ok(Prepared {
+        launch: GatewayLaunch {
             llm_url: plan.llm_url.clone(),
             key: key.secret,
             key_helper: key_helper_command(visdom, &plan.console_url, &plan.project.id),
@@ -123,7 +130,96 @@ pub fn prepare_gateway(
             session_id: uuid::Uuid::new_v4().to_string(),
         },
         notes,
-    ))
+        available,
+    })
+}
+
+/// Where the gateway's settings are made, for somebody whose gateway is not
+/// ready or who wants another one.
+pub fn gateway_settings_hint(user_config: &Path) -> String {
+    format!(
+        "  Settings: `url`, `project`, `claude_code_model`, `codex_model` under [gateway] and \
+         `tracing_mode` in {}.\n  \
+         Left out there, they are taken from the environment — VISDOM_GATEWAY_URL, \
+         VISDOM_GATEWAY_PROJECT, VISDOM_GATEWAY_MODEL, VISDOM_TRACING_MODE (which win over the \
+         file when set) — and the gateway's address from the tracing server.",
+        user_config.display()
+    )
+}
+
+/// What `visdom init` set up for the gateway, and where each setting comes
+/// from.
+pub fn gateway_summary(
+    agent: Agent,
+    mode: &crate::mode::ResolvedMode,
+    plan: &crate::components::gateway::GatewayPlan,
+    sources: &crate::doctor::GatewaySources,
+    model: Option<&str>,
+    user_config: &Path,
+) -> String {
+    use crate::mode::ModeReason;
+    let mode_source = match mode.reason {
+        ModeReason::Policy(policy) => format!(
+            "required by the workspace's AI traffic policy, `{}`",
+            policy.name()
+        ),
+        _ => "your choice".to_string(),
+    };
+    let or = |source: &Option<String>, otherwise: &str| {
+        source.clone().unwrap_or_else(|| otherwise.to_string())
+    };
+    let rows = [
+        ("mode", "gateway".to_string(), mode_source),
+        (
+            "console",
+            plan.console_url.clone(),
+            or(&sources.console_url, "not set"),
+        ),
+        (
+            "LLM gateway",
+            plan.llm_url.clone(),
+            "named by the console".to_string(),
+        ),
+        (
+            "project",
+            plan.project.slug.clone(),
+            or(&sources.project, "the only project open to you"),
+        ),
+        (
+            "model",
+            model.unwrap_or("the agent's own default").to_string(),
+            match model {
+                Some(_) => or(
+                    &sources.model,
+                    "the first alias the key may call that is named for the agent",
+                ),
+                None => "no alias is set, and the project may refuse the default".to_string(),
+            },
+        ),
+        (
+            "personal key",
+            "issued, and accepted by the LLM gateway".to_string(),
+            "kept for you only, renewed by `visdom`".to_string(),
+        ),
+    ];
+    let width = rows
+        .iter()
+        .map(|(_, value, _)| value.len())
+        .max()
+        .unwrap_or(0);
+    let mut out = format!(
+        "AI Gateway ready for {}: `visdom` starts it through the gateway.\n",
+        agent.label()
+    );
+    for (name, value, source) in rows {
+        out.push_str(&format!("  {name:<13}{value:<width$}  ({source})\n"));
+    }
+    out.push_str(&gateway_settings_hint(user_config));
+    out.push_str(
+        "\n  To send an agent you start without `visdom` through the gateway as well:  \
+         source <(visdom env)\n",
+    );
+    out
 }
 
 /// What to tell the user when the agent's executable cannot be started.

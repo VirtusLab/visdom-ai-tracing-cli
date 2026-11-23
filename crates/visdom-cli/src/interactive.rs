@@ -71,6 +71,31 @@ pub fn ask_mode() -> Option<TracingMode> {
     }
 }
 
+/// The entry of a list of `count` an answer names by its number, from 1.
+pub fn parse_choice(answer: &str, count: usize) -> Option<usize> {
+    let n: usize = answer.trim().parse().ok()?;
+    (1..=count).contains(&n).then(|| n - 1)
+}
+
+/// Ask for one of `options`. `None` at end of input, or with nothing to
+/// choose from.
+pub fn ask_choice(question: &str, options: &[String]) -> Option<usize> {
+    if options.is_empty() {
+        return None;
+    }
+    eprintln!("{question}");
+    for (i, option) in options.iter().enumerate() {
+        eprintln!("  [{}] {option}", i + 1);
+    }
+    loop {
+        let answer = ask_line("Number:")?;
+        match parse_choice(&answer, options.len()) {
+            Some(index) => return Some(index),
+            None => eprintln!("Answer a number from 1 to {}.", options.len()),
+        }
+    }
+}
+
 /// What a typed URL answer means.
 #[derive(Debug, PartialEq, Eq)]
 pub enum UrlAnswer {
@@ -123,6 +148,41 @@ pub fn save_bazaar_url(path: &Path, url: &str) -> Result<(), String> {
 /// Record `tracing_mode` in the user config at `path`, the same way.
 pub fn save_tracing_mode(path: &Path, mode: TracingMode) -> Result<(), String> {
     save_user_setting(path, "tracing_mode", mode.name())
+}
+
+/// Record `key` under `[gateway]` in the user config at `path`, creating the
+/// file if needed. A file with no `[gateway]` table gets one at its end and
+/// is otherwise kept byte for byte; one that has it is rewritten from its
+/// parsed form.
+pub fn save_gateway_setting(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let mut table: toml::Table =
+        toml::from_str(&existing).map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+    let value = toml::Value::String(value.to_string());
+    let updated = match table.get_mut("gateway") {
+        Some(toml::Value::Table(gateway)) => {
+            gateway.insert(key.to_string(), value);
+            toml::to_string(&table).map_err(|e| e.to_string())?
+        }
+        Some(_) => return Err(format!("`gateway` in {} is not a table", path.display())),
+        None => {
+            let gap = match existing.is_empty() || existing.ends_with("\n\n") {
+                true => "",
+                false if existing.ends_with('\n') => "\n",
+                false => "\n\n",
+            };
+            format!("{existing}{gap}[gateway]\n{key} = {value}\n")
+        }
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    std::fs::write(path, updated).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
 /// Set the top-level string `key` in the user config at `path`, creating the
@@ -200,6 +260,55 @@ mod tests {
         let user = load_user_config_in(tmp.path()).unwrap();
         assert_eq!(user.tracing_mode, Some(TracingMode::Hooks));
         assert_eq!(user.gateway.project.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn a_choice_is_a_number_of_the_list() {
+        assert_eq!(parse_choice("1", 3), Some(0));
+        assert_eq!(parse_choice(" 3\n", 3), Some(2));
+        for answer in ["0", "4", "", "alpha", "-1"] {
+            assert_eq!(parse_choice(answer, 3), None, "{answer}");
+        }
+    }
+
+    #[test]
+    fn a_gateway_setting_is_saved_without_touching_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("visdom").join("config.toml");
+        // A new file.
+        save_gateway_setting(&path, "project", "alpha").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[gateway]\nproject = \"alpha\"\n"
+        );
+        // A second setting, and the first one replaced.
+        save_gateway_setting(&path, "claude_code_model", "claude-sonnet").unwrap();
+        save_gateway_setting(&path, "project", "beta").unwrap();
+        let user = load_user_config_in(tmp.path()).unwrap();
+        assert_eq!(user.gateway.project.as_deref(), Some("beta"));
+        assert_eq!(
+            user.gateway.claude_code_model.as_deref(),
+            Some("claude-sonnet")
+        );
+
+        // A file with no [gateway] keeps every byte, comments included.
+        let before =
+            "# mine\ntracing_mode = \"gateway\"\n\n[agents]\ncodex = \"cdx\" # local build";
+        std::fs::write(&path, before).unwrap();
+        save_gateway_setting(&path, "codex_model", "gpt-general").unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after,
+            format!("{before}\n\n[gateway]\ncodex_model = \"gpt-general\"\n")
+        );
+        let user = load_user_config_in(tmp.path()).unwrap();
+        assert_eq!(user.gateway.codex_model.as_deref(), Some("gpt-general"));
+        assert_eq!(user.agents.codex.as_deref(), Some("cdx"));
+
+        // One that cannot be parsed is left alone.
+        std::fs::write(&path, "[gateway\n").unwrap();
+        assert!(save_gateway_setting(&path, "project", "alpha").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[gateway\n");
     }
 
     #[test]

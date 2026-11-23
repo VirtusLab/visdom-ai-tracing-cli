@@ -381,6 +381,87 @@ pub fn codex_command(
     Ok(cmd)
 }
 
+/// `text` as one word of a POSIX shell command.
+pub fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The lines every such script starts and ends with: the key is not in the
+/// script, which only says how to get it, so the script can be kept (a shell
+/// profile, an `.envrc`) and shown around.
+fn script(agent: Agent, project: &str, lines: Vec<String>) -> String {
+    let mut out = vec![
+        format!(
+            "# {} through the Visdom AI Gateway (project `{project}`), started without `visdom`.",
+            agent.label()
+        ),
+        "# Use:  source <(visdom env)    — again when the key expires (24 hours at most).".into(),
+        "# Settings your agent's own configuration files make still win over these;".into(),
+        "# `visdom` itself is the way that cannot be overruled.".into(),
+    ];
+    out.extend(lines);
+    // The hooks record nothing for an agent started from this shell: the
+    // gateway records it.
+    out.push(format!("export {GATEWAY_SESSION_ENV}=1"));
+    out.join("\n") + "\n"
+}
+
+/// Shell commands that send a Claude Code started from that shell, without
+/// `visdom`, through the gateway.
+pub fn claude_env_script(gateway: &GatewayLaunch, project: &str) -> String {
+    let mut headers = vec![format!(
+        "x-tracevault-agent: {}",
+        Agent::ClaudeCode.tool_name()
+    )];
+    if let Some(repo) = &gateway.repo_id {
+        headers.push(format!("x-tracevault-repo: {}", header_value(repo)));
+    }
+    let mut lines = vec![
+        format!(
+            "export ANTHROPIC_BASE_URL={}",
+            shell_quote(&gateway.llm_url)
+        ),
+        format!("export ANTHROPIC_AUTH_TOKEN=\"$({})\"", gateway.key_helper),
+        format!(
+            "export ANTHROPIC_CUSTOM_HEADERS={}",
+            shell_quote(&headers.join("\n"))
+        ),
+    ];
+    if let Some(model) = &gateway.model {
+        for name in ["ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"] {
+            lines.push(format!("export {name}={}", shell_quote(model)));
+        }
+    }
+    lines.push(format!(
+        "unset ANTHROPIC_API_KEY {}",
+        CLAUDE_OTHER_PROVIDERS.join(" ")
+    ));
+    script(Agent::ClaudeCode, project, lines)
+}
+
+/// The same for Codex, whose provider is given as options, not variables:
+/// the script defines a `codex` function that adds them.
+pub fn codex_env_script(
+    program: &str,
+    gateway: &GatewayLaunch,
+    project: &str,
+) -> Result<String, String> {
+    let cmd = codex_command(program, &[], gateway)?;
+    let options: Vec<String> = cmd
+        .get_args()
+        .map(|arg| shell_quote(&arg.to_string_lossy()))
+        .collect();
+    let lines = vec![
+        format!("export {CODEX_KEY_ENV}=\"$({})\"", gateway.key_helper),
+        format!(
+            "codex() {{ command {} {} \"$@\"; }}",
+            shell_quote(program),
+            options.join(" ")
+        ),
+    ];
+    Ok(script(Agent::Codex, project, lines))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -42,6 +42,34 @@ pub fn git_toplevel(from: &Path) -> Option<PathBuf> {
     Some(path.canonicalize().unwrap_or(path))
 }
 
+pub const GATEWAY_URL_ENV: &str = "VISDOM_GATEWAY_URL";
+pub const GATEWAY_PROJECT_ENV: &str = "VISDOM_GATEWAY_PROJECT";
+pub const GATEWAY_MODEL_ENV: &str = "VISDOM_GATEWAY_MODEL";
+
+/// Where the gateway settings of a session come from, each said as a person
+/// would read it (`VISDOM_GATEWAY_URL in the environment`, a config file's
+/// key, `published by the tracing server`). `None`: nobody set it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GatewaySources {
+    pub console_url: Option<String>,
+    pub project: Option<String>,
+    pub model: Option<String>,
+}
+
+/// The first value that is set, and where it was found.
+fn first_from<const N: usize>(
+    candidates: [(Option<String>, String); N],
+) -> (Option<String>, Option<String>) {
+    candidates
+        .into_iter()
+        .find_map(|(value, source)| {
+            value
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| (Some(v), Some(source)))
+        })
+        .unwrap_or((None, None))
+}
+
 /// The process environment a [`Session`] is gathered from.
 pub struct Environment {
     pub cwd: PathBuf,
@@ -59,6 +87,10 @@ pub struct Environment {
     pub gateway_url: Option<String>,
     /// `VISDOM_CONTROL_PLANE_URL`.
     pub control_plane_url: Option<String>,
+    /// `VISDOM_GATEWAY_PROJECT`: the gateway project (slug, id or name).
+    pub gateway_project: Option<String>,
+    /// `VISDOM_GATEWAY_MODEL`: the model alias the agent asks the gateway for.
+    pub gateway_model: Option<String>,
 }
 
 impl Environment {
@@ -76,6 +108,8 @@ impl Environment {
             mode: set(MODE_ENV),
             gateway_url: set("VISDOM_GATEWAY_URL"),
             control_plane_url: set("VISDOM_CONTROL_PLANE_URL"),
+            gateway_project: set(GATEWAY_PROJECT_ENV),
+            gateway_model: set(GATEWAY_MODEL_ENV),
             home,
         }
     }
@@ -102,6 +136,10 @@ pub struct Session {
     pub token: Option<String>,
     /// The model alias configured for this agent through the gateway.
     pub gateway_model: Option<String>,
+    /// The gateway console's address, as far as anybody names one.
+    pub console_url: Option<String>,
+    /// Who set the gateway's address, project and model.
+    pub gateway_sources: GatewaySources,
     /// Where visdom keeps its own state (`<config dir>`).
     pub config_root: PathBuf,
 }
@@ -198,20 +236,44 @@ impl Session {
             &suite::policy_cache_path_in(&env.config_root),
         ));
         let mode = effective_mode(chosen, policy.policy());
-        let gateway = (mode.mode == TracingMode::Gateway).then(|| {
-            let console_url = first_set([
-                env.gateway_url.clone(),
-                user.gateway.url.clone(),
+        // The environment first, then the files, then what the server says:
+        // a setting left out of the config is taken from the environment.
+        let user_file = config::user_config_path_in(&env.config_root);
+        let in_env = |name: &str| format!("{name} in the environment");
+        let in_user = |key: &str| format!("{key} in {}", user_file.display());
+        let (console_url, console_source) = first_from([
+            (env.gateway_url.clone(), in_env(GATEWAY_URL_ENV)),
+            (user.gateway.url.clone(), in_user("url under [gateway]")),
+            (
                 suite_map.ai_gateway_url.clone(),
-            ]);
-            let project = repo
-                .gateway
-                .project
-                .clone()
-                .or_else(|| user.gateway.project.clone());
+                "published by the tracing server".to_string(),
+            ),
+        ]);
+        let (project, project_source) = first_from([
+            (env.gateway_project.clone(), in_env(GATEWAY_PROJECT_ENV)),
+            (
+                repo.gateway.project.clone(),
+                "project under [gateway] in .visdom/config.toml".to_string(),
+            ),
+            (
+                user.gateway.project.clone(),
+                in_user("project under [gateway]"),
+            ),
+        ]);
+        let (gateway_model, model_source) = first_from([
+            (env.gateway_model.clone(), in_env(GATEWAY_MODEL_ENV)),
+            (
+                user.gateway.model_for(agent),
+                in_user(&format!(
+                    "{}_model under [gateway]",
+                    config::agent_config_key(agent)
+                )),
+            ),
+        ]);
+        let gateway = (mode.mode == TracingMode::Gateway).then(|| {
             runtime.block_on(plan_gateway(
                 &http,
-                console_url,
+                console_url.clone(),
                 token.as_deref(),
                 project.as_deref(),
             ))
@@ -246,7 +308,13 @@ impl Session {
             gateway,
             suite: suite_map,
             token,
-            gateway_model: user.gateway.model_for(agent),
+            gateway_model,
+            console_url,
+            gateway_sources: GatewaySources {
+                console_url: console_source,
+                project: project_source,
+                model: model_source,
+            },
             config_root: env.config_root.clone(),
         })
     }
@@ -330,8 +398,8 @@ pub async fn plan_gateway(
     project: Option<&str>,
 ) -> Result<GatewayPlan, String> {
     let console_url = console_url.ok_or(
-        "this installation names no AI Gateway: set VISDOM_GATEWAY_URL, or url under [gateway] \
-         in your visdom config, to the gateway console's address",
+        "this installation names no AI Gateway: set url under [gateway] in your visdom config, \
+         or VISDOM_GATEWAY_URL, to the gateway console's address",
     )?;
     if !bazaar::is_http_url(&console_url) {
         return Err(format!(
