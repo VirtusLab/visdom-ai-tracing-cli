@@ -1332,3 +1332,44 @@ fn a_workspace_folder_names_its_own_gateway_project() {
         server.routes()
     );
 }
+
+/// `visdom init --workspace` binds the folder to its project and then goes
+/// on with the rest of the setup, like any other init.
+#[test]
+fn a_workspace_init_binds_the_folder_and_sets_up_the_gateway() {
+    let settings = policy("enforced");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        (
+            "GET /api/v1/projects",
+            200,
+            r#"[{"id":"11111111-2222-3333-4444-555555555555","name":"my-platform"}]"#,
+        ),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let folder = tempfile::tempdir().unwrap();
+    let output = sb
+        .visdom(folder.path())
+        .args(["init", "--workspace", "--project", "my-platform"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let bound = std::fs::read_to_string(folder.path().join(".tracevault/config.toml")).unwrap();
+    assert!(
+        bound.contains("11111111-2222-3333-4444-555555555555"),
+        "{bound}"
+    );
+    let said = stdout(&output);
+    assert!(said.contains("AI Gateway ready for Claude Code"), "{said}");
+    // Said with the flag, it is `tracevault init --workspace` as it is: the
+    // machine-wide hooks are not installed behind the developer's back.
+    let hooks =
+        std::fs::read_to_string(sb.home.path().join(".claude/settings.json")).unwrap_or_default();
+    assert!(!hooks.contains("tracevault stream"), "{hooks}");
+}
