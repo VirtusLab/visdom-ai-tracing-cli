@@ -7,11 +7,10 @@
 
 use std::path::Path;
 
-use tracevault_cli::oidc::{fetch_public_config, OidcError};
-
 use crate::agents::{AgentAdapter, McpEntry, McpScope, Workdir};
 use crate::config::UserConfig;
 use crate::finding::{command_line, Finding, Fix, FixAction, Severity};
+use crate::suite::SuiteMap;
 
 const COMPONENT: &str = "bazaar";
 
@@ -23,27 +22,21 @@ pub const BAZAAR_CLIENT_ID: &str = "visdom-context-mcp";
 pub const BAZAAR_SERVER_NAME: &str = "bazaar";
 
 /// The bazaar MCP endpoint: `VISDOM_BAZAAR_URL`, then the user config, then
-/// what the tracing server publishes. `Ok(None)` when none of them knows it;
-/// `Err` with the reason when the server could not be asked.
-pub async fn resolve_bazaar_url(
+/// what the tracing server publishes (`suite`). `Ok(None)` when none of them
+/// knows it; `Err` with the reason when the server could not be asked.
+pub fn resolve_bazaar_url(
     env: Option<String>,
     user: &UserConfig,
-    server_url: Option<&str>,
-    http: &reqwest::Client,
+    suite: &Result<SuiteMap, String>,
 ) -> Result<Option<String>, String> {
     let set = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
     if let Some(url) = set(env).or_else(|| set(user.bazaar_url.clone())) {
         return Ok(Some(url));
     }
-    let Some(server_url) = server_url else {
-        return Ok(None);
-    };
-    match fetch_public_config(http, server_url).await {
-        Ok(config) => Ok(config.bazaar_mcp_url),
-        // A server without SSO answers properly; it just publishes no suite map.
-        Err(OidcError::NoKeycloak) => Ok(None),
-        Err(e) => Err(format!("{server_url} could not be asked for it: {e}")),
-    }
+    suite
+        .as_ref()
+        .map(|map| map.bazaar_mcp_url.clone())
+        .map_err(Clone::clone)
 }
 
 /// Whether `raw` is an absolute http(s) URL — which also means it cannot be
@@ -586,90 +579,52 @@ mod tests {
         }
     }
 
-    /// One HTTP response on a local port; returns the base URL.
-    fn serve_once(body: &'static str) -> String {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
-                     connection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            }
-        });
-        base
-    }
-
-    #[tokio::test]
-    async fn url_precedence_env_user_server() {
-        let http = reqwest::Client::new();
+    #[test]
+    fn url_precedence_env_user_server() {
         let user = UserConfig {
             bazaar_url: Some("https://user.example.com/mcp".to_string()),
             ..Default::default()
         };
         let none = UserConfig::default();
-        // The environment wins; no server is contacted (the URL is unusable).
+        let published: Result<SuiteMap, String> = Ok(SuiteMap {
+            bazaar_mcp_url: Some("https://srv.example.com/mcp/remote".to_string()),
+            ..SuiteMap::default()
+        });
+        let unreachable: Result<SuiteMap, String> = Err("tv.example.com: refused".to_string());
+        // The environment wins, whatever the server says or fails to say.
         assert_eq!(
             resolve_bazaar_url(
                 Some("https://env.example.com/mcp".to_string()),
                 &user,
-                Some("http://127.0.0.1:1"),
-                &http
+                &unreachable
             )
-            .await
             .unwrap()
             .as_deref(),
             Some("https://env.example.com/mcp")
         );
         // An empty variable is unset; the user config is next.
         assert_eq!(
-            resolve_bazaar_url(
-                Some(" ".to_string()),
-                &user,
-                Some("http://127.0.0.1:1"),
-                &http
-            )
-            .await
-            .unwrap()
-            .as_deref(),
+            resolve_bazaar_url(Some(" ".to_string()), &user, &unreachable)
+                .unwrap()
+                .as_deref(),
             Some("https://user.example.com/mcp")
         );
         // Last, what the tracing server publishes.
-        let base = serve_once(
-            r#"{"oidc_enabled":true,"issuer":"https://idp.test/realms/v","cli_client_id":"c","bazaar_mcp_url":"https://srv.example.com/mcp/remote"}"#,
-        );
         assert_eq!(
-            resolve_bazaar_url(None, &none, Some(&base), &http)
-                .await
+            resolve_bazaar_url(None, &none, &published)
                 .unwrap()
                 .as_deref(),
             Some("https://srv.example.com/mcp/remote")
         );
-        // A server that does not publish it, an unreachable one, or none at all.
-        let base = serve_once(
-            r#"{"oidc_enabled":true,"issuer":"https://idp.test/realms/v","cli_client_id":"c"}"#,
-        );
+        // A server that does not publish it does not know…
         assert_eq!(
-            resolve_bazaar_url(None, &none, Some(&base), &http).await,
+            resolve_bazaar_url(None, &none, &Ok(SuiteMap::default())),
             Ok(None)
         );
-        // A server that cannot be reached is an error with the reason…
-        let err = resolve_bazaar_url(None, &none, Some("http://127.0.0.1:1"), &http)
-            .await
-            .unwrap_err();
-        assert!(err.contains("http://127.0.0.1:1"), "{err}");
-        // …one without SSO simply does not know.
-        let base = serve_once(r#"{"oidc_enabled":false}"#);
+        // …one that could not be asked is an error with the reason.
         assert_eq!(
-            resolve_bazaar_url(None, &none, Some(&base), &http).await,
-            Ok(None)
+            resolve_bazaar_url(None, &none, &unreachable),
+            Err("tv.example.com: refused".to_string())
         );
-        assert_eq!(resolve_bazaar_url(None, &none, None, &http).await, Ok(None));
     }
 }

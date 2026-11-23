@@ -6,29 +6,27 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use tracevault_cli::agent::Agent;
+use tracevault_cli::credentials::Credential;
 
 use crate::agents::{adapter_for, AgentAdapter, AgentPaths, Workdir};
-use crate::components::{bazaar, tracing, CheckContext, CredentialState};
-use crate::config::{self, UserConfig};
+use crate::components::gateway::GatewayPlan;
+use crate::components::{
+    bazaar, gateway as gateway_checks, tracing, CheckContext, CredentialState,
+};
+use crate::config::{self, RepoConfig, UserConfig};
 use crate::finding::{command_line, needs_attention, render_text, Finding, Fix, FixAction};
 use crate::fixes::{apply_fixes, FixExecutor, FixOutcome, FixPolicy};
-use crate::mode::resolve_tracing_mode;
+use crate::gateway;
+use crate::mode::{configured_mode, effective_mode, ResolvedMode, TracingMode, MODE_ENV};
+use crate::suite::{self, PolicyState, SuiteMap};
 
-/// Tracing first, then bazaar.
-pub fn collect(
-    ctx: &CheckContext,
-    adapter: &dyn AgentAdapter,
-    bazaar_url: Result<Option<&str>, &str>,
-    user_config_path: &Path,
-) -> Vec<Finding> {
-    let mut findings = tracing::check(ctx);
-    findings.extend(bazaar::check(
-        bazaar_url,
-        adapter,
-        &ctx.workdir,
-        user_config_path,
-    ));
-    findings
+/// The first of `candidates` that is set to something.
+fn first_set(candidates: [Option<String>; 3]) -> Option<String> {
+    candidates
+        .into_iter()
+        .flatten()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .find(|v| !v.is_empty())
 }
 
 /// The canonical top level of the git checkout containing `from`.
@@ -55,6 +53,12 @@ pub struct Environment {
     pub agent: Option<String>,
     /// `VISDOM_BAZAAR_URL`.
     pub bazaar_url: Option<String>,
+    /// `VISDOM_TRACING_MODE`.
+    pub mode: Option<String>,
+    /// `VISDOM_GATEWAY_URL`: the AI Gateway console.
+    pub gateway_url: Option<String>,
+    /// `VISDOM_CONTROL_PLANE_URL`.
+    pub control_plane_url: Option<String>,
 }
 
 impl Environment {
@@ -69,6 +73,9 @@ impl Environment {
                 .unwrap_or_else(|| home.join(".codex")),
             agent: set("VISDOM_AGENT"),
             bazaar_url: set("VISDOM_BAZAAR_URL"),
+            mode: set(MODE_ENV),
+            gateway_url: set("VISDOM_GATEWAY_URL"),
+            control_plane_url: set("VISDOM_CONTROL_PLANE_URL"),
             home,
         }
     }
@@ -83,6 +90,20 @@ pub struct Session {
     pub user_config_path: PathBuf,
     /// Problems reading visdom's own config files; the run goes on without them.
     pub warnings: Vec<String>,
+    /// How this session is traced, and who decided.
+    pub mode: ResolvedMode,
+    pub policy: PolicyState,
+    /// In gateway mode: what the session will use, or why it cannot.
+    pub gateway: Option<Result<GatewayPlan, String>>,
+    /// The suite's other products, as far as the tracing server says.
+    pub suite: SuiteMap,
+    /// The developer's Keycloak access token, for the suite's other products.
+    /// Never an API key: that is the tracing server's alone.
+    pub token: Option<String>,
+    /// The model alias configured for this agent through the gateway.
+    pub gateway_model: Option<String>,
+    /// Where visdom keeps its own state (`<config dir>`).
+    pub config_root: PathBuf,
 }
 
 impl Session {
@@ -91,6 +112,7 @@ impl Session {
     pub fn gather(
         env: &Environment,
         agent_flag: Option<Agent>,
+        mode_flag: Option<TracingMode>,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Session, String> {
         let mut warnings = Vec::new();
@@ -108,29 +130,92 @@ impl Session {
                 None
             })
             .unwrap_or_default();
+        let repo: RepoConfig = repo;
         let agent = config::resolve_agent(agent_flag, env.agent.as_deref(), &repo, &user)?;
+        let chosen = configured_mode(
+            mode_flag,
+            env.mode.as_deref(),
+            repo.tracing_mode,
+            user.tracing_mode,
+        )?;
 
         let tracing_root = project_dir
             .as_deref()
             .map(|dir| tracevault_cli::paths::resolve_project_root(dir).root);
         let credential_root = tracing_root.as_deref().unwrap_or(&env.cwd);
-        let (server_url, credential) =
+        let (server_url, credential, session) =
             match tracevault_cli::credentials::resolve_credentials_quiet(credential_root) {
-                Ok((url, Some(_))) => (url, CredentialState::Present),
-                Ok((url, None)) => (url, missing_or_unreadable()),
-                Err(e) => (None, CredentialState::Unusable(e.to_string())),
+                Ok((url, Some(credential))) => {
+                    let session = match credential {
+                        Credential::Keycloak(_) => Some(credential),
+                        Credential::ApiKey(_) => None,
+                    };
+                    (url, CredentialState::Present, session)
+                }
+                Ok((url, None)) => (url, missing_or_unreadable(), None),
+                Err(e) => (None, CredentialState::Unusable(e.to_string()), None),
             };
 
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .build()
-            .unwrap_or_default();
-        let bazaar_url = runtime.block_on(bazaar::resolve_bazaar_url(
-            env.bazaar_url.clone(),
-            &user,
-            server_url.as_deref(),
+        let http = http_client();
+        // One question to the tracing server tells where everything else is.
+        let published = match &server_url {
+            Some(url) => runtime.block_on(suite::fetch_suite_map(&http, url)),
+            None => Ok(SuiteMap::default()),
+        };
+        let bazaar_url = bazaar::resolve_bazaar_url(env.bazaar_url.clone(), &user, &published);
+        // While that server is away, the rest of the suite is where it last
+        // said: a policy that requires the gateway must not lapse with it.
+        let suite_map = match &server_url {
+            Some(url) => suite::suite_map_or_remembered(
+                &published,
+                url,
+                &suite::suite_cache_path_in(&env.config_root),
+            ),
+            None => SuiteMap::default(),
+        };
+
+        // The developer's own token opens the suite's other products. Only a
+        // Keycloak login has one; an API key is never sent anywhere else.
+        let token = match (&server_url, session) {
+            (Some(url), Some(session)) => runtime
+                .block_on(
+                    tracevault_cli::api_client::ApiClient::with_credential(url, Some(session))
+                        .bearer_valid_for(MIN_TOKEN_SECONDS),
+                )
+                .ok()
+                .flatten(),
+            _ => None,
+        };
+        let control_plane_url = first_set([
+            env.control_plane_url.clone(),
+            user.control_plane_url.clone(),
+            suite_map.control_plane_url.clone(),
+        ]);
+        let policy = runtime.block_on(suite::resolve_policy(
             &http,
+            control_plane_url.as_deref(),
+            token.as_deref(),
+            &suite::policy_cache_path_in(&env.config_root),
         ));
+        let mode = effective_mode(chosen, policy.policy());
+        let gateway = (mode.mode == TracingMode::Gateway).then(|| {
+            let console_url = first_set([
+                env.gateway_url.clone(),
+                user.gateway.url.clone(),
+                suite_map.ai_gateway_url.clone(),
+            ]);
+            let project = repo
+                .gateway
+                .project
+                .clone()
+                .or_else(|| user.gateway.project.clone());
+            runtime.block_on(plan_gateway(
+                &http,
+                console_url,
+                token.as_deref(),
+                project.as_deref(),
+            ))
+        });
 
         let paths = AgentPaths {
             home: env.home.clone(),
@@ -140,7 +225,7 @@ impl Session {
             .ok_or_else(|| format!("visdom cannot launch {}", agent.tool_name()))?;
         Ok(Session {
             ctx: CheckContext {
-                mode: resolve_tracing_mode(project_dir.as_deref()),
+                mode: mode.mode,
                 workdir: Workdir {
                     start_dir: env.cwd.clone(),
                     checkout: project_dir,
@@ -156,20 +241,115 @@ impl Session {
             bazaar_url,
             user_config_path: config::user_config_path_in(&env.config_root),
             warnings,
+            mode,
+            policy,
+            gateway,
+            suite: suite_map,
+            token,
+            gateway_model: user.gateway.model_for(agent),
+            config_root: env.config_root.clone(),
         })
     }
 
+    /// Tracing, then the mode and the gateway, then bazaar.
     pub fn collect(&self) -> Vec<Finding> {
-        collect(
-            &self.ctx,
-            self.adapter.as_ref(),
+        let mut findings = tracing::check(&self.ctx);
+        findings.extend(gateway_checks::check(
+            &self.mode,
+            &self.policy,
+            self.gateway.as_ref(),
+            self.ctx.agent,
+        ));
+        findings.extend(bazaar::check(
             self.bazaar_url
                 .as_ref()
                 .map(|url| url.as_deref())
                 .map_err(String::as_str),
+            self.adapter.as_ref(),
+            &self.ctx.workdir,
             &self.user_config_path,
-        )
+        ));
+        findings
     }
+}
+
+/// The developer's Keycloak access token for the project containing
+/// `start`, refreshed if needed. An error says why there is none.
+pub fn person_token(start: &Path, runtime: &tokio::runtime::Runtime) -> Result<String, String> {
+    let root = git_toplevel(start)
+        .map(|dir| tracevault_cli::paths::resolve_project_root(&dir).root)
+        .unwrap_or_else(|| start.to_path_buf());
+    let login = "the AI Gateway needs a Visdom account login: run `visdom login`";
+    match tracevault_cli::credentials::resolve_credentials_quiet(&root) {
+        Ok((Some(url), Some(session @ Credential::Keycloak(_)))) => runtime
+            .block_on(
+                tracevault_cli::api_client::ApiClient::with_credential(&url, Some(session))
+                    .bearer_valid_for(MIN_TOKEN_SECONDS),
+            )
+            .map_err(|e| format!("your Visdom login could not be used ({e}): run `visdom login`"))?
+            .ok_or_else(|| login.to_string()),
+        Ok(_) => Err(login.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The account of the login stored for the project containing `start`, read
+/// from the token as it is on disk: nobody is asked. `None` without a Visdom
+/// account login.
+pub fn stored_account(start: &Path) -> Option<String> {
+    let root = git_toplevel(start)
+        .map(|dir| tracevault_cli::paths::resolve_project_root(&dir).root)
+        .unwrap_or_else(|| start.to_path_buf());
+    match tracevault_cli::credentials::resolve_credentials_quiet(&root) {
+        Ok((_, Some(Credential::Keycloak(session)))) => {
+            Some(gateway::account_of(&session.access_token))
+        }
+        _ => None,
+    }
+}
+
+/// How long the token handed to the suite's other products must still be
+/// valid: enough for the few calls of one run.
+const MIN_TOKEN_SECONDS: i64 = 60;
+
+/// The HTTP client for the questions asked before an agent starts: nothing
+/// here may hold the developer up for long.
+pub fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap_or_default()
+}
+
+/// What a session through the gateway will use: the console, the LLM gateway
+/// behind it and the project whose key the agent gets. Nothing is issued.
+pub async fn plan_gateway(
+    http: &reqwest::Client,
+    console_url: Option<String>,
+    token: Option<&str>,
+    project: Option<&str>,
+) -> Result<GatewayPlan, String> {
+    let console_url = console_url.ok_or(
+        "this installation names no AI Gateway: set VISDOM_GATEWAY_URL, or url under [gateway] \
+         in your visdom config, to the gateway console's address",
+    )?;
+    if !bazaar::is_http_url(&console_url) {
+        return Err(format!(
+            "the AI Gateway address `{console_url}` is not an http(s) URL"
+        ));
+    }
+    let token = token.ok_or(
+        "the AI Gateway needs a Visdom account login (an API key does not work there): run \
+         `visdom login`",
+    )?;
+    let llm_url = gateway::llm_gateway_url(http, &console_url, token).await?;
+    let open = gateway::open_projects(http, &console_url, token).await?;
+    let project = gateway::pick_project(project, &open)?;
+    Ok(GatewayPlan {
+        console_url,
+        llm_url,
+        project,
+    })
 }
 
 /// No credential was resolved: either there is none, or the credential file

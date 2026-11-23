@@ -1417,6 +1417,25 @@ async fn deliver_parts(
     Ok(all_accepted)
 }
 
+/// The developer's choice of tracing mode for `visdom` (`hooks` or
+/// `gateway`). A preference, not a fact about a running agent: an agent
+/// started without `visdom` may well carry `gateway` here and still talk to
+/// its provider directly.
+pub const TRACING_MODE_ENV: &str = "VISDOM_TRACING_MODE";
+
+/// The variable `visdom` sets, to `1`, on an agent it has routed through the
+/// AI Gateway, which then records the session itself. Nobody else sets it.
+pub const GATEWAY_SESSION_ENV: &str = "VISDOM_GATEWAY_SESSION";
+
+/// Whether the session this hook runs in is recorded by the AI Gateway, given
+/// the value of [`GATEWAY_SESSION_ENV`]. Hooks inherit the agent's
+/// environment, so this is true exactly for the events of an agent `visdom`
+/// started through the gateway. The capture hook then records nothing: the
+/// same session captured twice would be a second, conflicting source.
+pub fn captured_by_gateway(marker: Option<&str>) -> bool {
+    marker.is_some_and(|m| m.trim() == "1")
+}
+
 pub async fn run_stream(
     event_type: &str,
     agent: crate::agent::Agent,
@@ -1425,6 +1444,11 @@ pub async fn run_stream(
     let deadline = std::time::Instant::now() + DELIVERY_BUDGET;
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
+    // The event is read (the agent is writing it) and then left alone.
+    if captured_by_gateway(std::env::var(GATEWAY_SESSION_ENV).ok().as_deref()) {
+        println!("{}", serde_json::to_string(&HookResponse::allow())?);
+        return Ok(());
+    }
     let hook_event = parse_hook_event(&input)?;
 
     // Resolve project_root and session_dir via the shared git-aware resolver.

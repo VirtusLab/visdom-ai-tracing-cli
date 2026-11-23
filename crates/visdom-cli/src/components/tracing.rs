@@ -8,20 +8,14 @@ use tracevault_cli::config::TracevaultConfig;
 
 use super::{CheckContext, CredentialState};
 use crate::finding::{Finding, Fix, FixAction, Severity};
-use crate::mode::TracingMode;
 
 const COMPONENT: &str = "tracing";
 
+/// The same in both tracing modes. Through the AI Gateway the hooks still
+/// matter: they bring the repository's policies into the session, link
+/// commits to it and check policies before a push; only their capture is
+/// switched off, for the launched agent, by `visdom` itself.
 pub fn check(ctx: &CheckContext) -> Vec<Finding> {
-    if ctx.mode == TracingMode::Gateway {
-        return vec![Finding::new(
-            COMPONENT,
-            "tracing.mode",
-            Severity::Warn,
-            "this project traces through the AI Gateway, which this visdom version does not \
-             support yet — upgrade visdom",
-        )];
-    }
     let mut findings = vec![auth(ctx)];
     let (Some(project_dir), Some(root)) = (&ctx.workdir.checkout, &ctx.workdir.primary) else {
         findings.push(Finding::new(
@@ -299,7 +293,7 @@ mod tests {
                 home: self.home.path().to_path_buf(),
                 codex_home: self.home.path().join(".codex"),
                 agent,
-                mode: TracingMode::Hooks,
+                mode: crate::mode::TracingMode::Hooks,
                 server_url: Some("https://tv.example.com".to_string()),
                 credential: CredentialState::Present,
             }
@@ -631,14 +625,16 @@ mod tests {
     }
 
     #[test]
-    fn gateway_mode_is_reported_unsupported() {
+    fn the_setup_is_checked_the_same_in_gateway_mode() {
         let fx = Fixture::new();
+        let hooks = check(&fx.ctx(Agent::ClaudeCode));
         let mut ctx = fx.ctx(Agent::ClaudeCode);
-        ctx.mode = TracingMode::Gateway;
-        let findings = check(&ctx);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].id, "tracing.mode");
-        assert_eq!(findings[0].severity, Severity::Warn);
-        assert!(findings[0].fix.is_none());
+        ctx.mode = crate::mode::TracingMode::Gateway;
+        let gateway = check(&ctx);
+        let ids = |findings: &[Finding]| -> Vec<(&'static str, Severity)> {
+            findings.iter().map(|f| (f.id, f.severity)).collect()
+        };
+        assert_eq!(ids(&gateway), ids(&hooks));
+        assert!(!gateway.is_empty());
     }
 }

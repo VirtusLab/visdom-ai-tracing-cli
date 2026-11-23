@@ -11,6 +11,10 @@ pub mod doctor;
 pub mod env_alias;
 pub mod finding;
 pub mod fixes;
+pub mod gateway;
 pub mod interactive;
 pub mod launch;
 pub mod mode;
+pub mod suite;
+#[cfg(test)]
+mod test_http;
