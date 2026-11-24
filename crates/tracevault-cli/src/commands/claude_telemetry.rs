@@ -1,4 +1,4 @@
-//! Claude Code OpenTelemetry export to TraceVault (VIS-1081): `init
+//! Claude Code OpenTelemetry export to Visdom (VIS-1081): `init
 //! --claude-telemetry` and `tracevault otel-headers`. On by default since
 //! VIS-1109; `--no-claude-telemetry` removes our settings again ([`uninstall`]).
 //!
@@ -11,11 +11,12 @@
 //!
 //! Claude Code applies the helper's headers to every OTLP exporter it runs, so
 //! an existing exporter setup (the user's own collector, metrics, a static
-//! header) is never merged with ours: it would receive TraceVault's token.
+//! header) is never merged with ours: it would receive Visdom's token.
 //! Such a setup is left untouched and the collector route is printed instead.
 
 use crate::api_client::ApiClient;
 use crate::credentials::{same_server, Credential};
+use crate::program::{ENV, TOP};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -72,10 +73,10 @@ fn helper_command_for(server_url: &str, visdom: bool) -> String {
 /// the helper's command line, which Claude Code runs through a shell.
 fn validate_server_url(server_url: &str) -> Result<(), String> {
     let parsed = url::Url::parse(server_url)
-        .map_err(|e| format!("invalid TraceVault server URL `{server_url}`: {e}"))?;
+        .map_err(|e| format!("invalid Visdom server URL `{server_url}`: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(format!(
-            "TraceVault server URL `{server_url}` must be http:// or https://"
+            "Visdom server URL `{server_url}` must be http:// or https://"
         ));
     }
     let shell_safe = server_url
@@ -83,7 +84,7 @@ fn validate_server_url(server_url: &str) -> Result<(), String> {
         .all(|c| c.is_ascii_alphanumeric() || ":/._~%-".contains(c));
     if !shell_safe {
         return Err(format!(
-            "TraceVault server URL `{server_url}` contains characters that cannot go into \
+            "Visdom server URL `{server_url}` contains characters that cannot go into \
              Claude Code's otelHeadersHelper command"
         ));
     }
@@ -168,7 +169,7 @@ impl Environment {
     }
 }
 
-/// Exporter settings that are not TraceVault's, each described for the user
+/// Exporter settings that are not Visdom's, each described for the user
 /// (header values are never printed). `settings` is the parsed
 /// `~/.claude/settings.json`, `env` what else decides (see [`Environment`]).
 /// An endpoint counts as ours when it is `expected`, or — only in the user
@@ -451,7 +452,7 @@ pub fn interval_added_by_install(claude_dir: &Path) -> Option<bool> {
 
 /// Claude Code variables that add content (prompt text, tool input and
 /// output, responses, raw API bodies) to the telemetry it exports. All are off
-/// by default, and TraceVault never sets them.
+/// by default, and Visdom never sets them.
 const CONTENT_LOGGING: [&str; 5] = [
     "OTEL_LOG_USER_PROMPTS",
     "OTEL_LOG_TOOL_DETAILS",
@@ -501,15 +502,15 @@ pub fn content_logging_in(claude_dir: &Path, env: &Environment) -> Vec<String> {
 /// Telemetry as `status` reports it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TelemetryState {
-    /// No TraceVault telemetry settings.
+    /// No Visdom telemetry settings.
     Off,
-    /// TraceVault's settings, with whatever is missing or wrong in them.
+    /// Visdom's settings, with whatever is missing or wrong in them.
     Ours {
         endpoint: Option<String>,
         missing: Vec<&'static str>,
     },
     /// Another exporter setup; `ours_too` when our helper is also installed,
-    /// i.e. TraceVault's token goes to those exporters as well.
+    /// i.e. Visdom's token goes to those exporters as well.
     Foreign {
         reasons: Vec<String>,
         ours_too: bool,
@@ -555,38 +556,38 @@ pub fn inspect(
 }
 
 /// What to do instead when Claude Code telemetry already goes elsewhere: send
-/// a copy of the `api_request` events to TraceVault from the user's own
+/// a copy of the `api_request` events to Visdom from the user's own
 /// OpenTelemetry Collector.
 pub fn collector_instructions(server_url: &str, reasons: &[String]) -> String {
     let server = server_url.trim_end_matches('/');
     let mut out = String::from(
-        "Claude Code telemetry is already exported elsewhere, so TraceVault left \
+        "Claude Code telemetry is already exported elsewhere, so Visdom left \
          ~/.claude/settings.json unchanged:\n",
     );
     for r in reasons {
         out.push_str(&format!("  - {r}\n"));
     }
     out.push_str(&format!(
-        "To also send Claude Code's cost to TraceVault, forward its `api_request` events from \
-         your OpenTelemetry Collector (authenticate with a TraceVault API key):\n\
+        "To also send Claude Code's cost to Visdom, forward its `api_request` events from \
+         your OpenTelemetry Collector (authenticate with a Visdom API key):\n\
          \n\
          processors:\n\
-         \x20 filter/tracevault:\n\
+         \x20 filter/visdom:\n\
          \x20   error_mode: ignore\n\
          \x20   logs:\n\
          \x20     log_record:\n\
          \x20       - 'attributes[\"event.name\"] != \"api_request\"'\n\
          exporters:\n\
-         \x20 otlphttp/tracevault:\n\
+         \x20 otlphttp/visdom:\n\
          \x20   endpoint: {server}/otlp\n\
          \x20   headers:\n\
-         \x20     Authorization: \"Bearer ${{env:TRACEVAULT_API_KEY}}\"\n\
+         \x20     Authorization: \"Bearer ${{env:{ENV}_API_KEY}}\"\n\
          service:\n\
          \x20 pipelines:\n\
-         \x20   logs/tracevault:\n\
+         \x20   logs/visdom:\n\
          \x20     receivers: [otlp]\n\
-         \x20     processors: [filter/tracevault]\n\
-         \x20     exporters: [otlphttp/tracevault]\n"
+         \x20     processors: [filter/visdom]\n\
+         \x20     exporters: [otlphttp/visdom]\n"
     ));
     out
 }
@@ -604,21 +605,21 @@ pub fn telemetry_server_url(project_root: &Path, flag: Option<&str>) -> Result<S
         (Some(flag), Some(resolved)) if !same_server(flag, resolved) => Err(format!(
             "you are logged in to {resolved}, not {flag}: Claude Code telemetry can only be \
              authenticated with the credential of the server it is sent to. Run \
-             `tracevault login --server-url {flag}` first."
+             `{TOP} login --server-url {flag}` first."
         )),
         (Some(url), _) | (None, Some(url)) => Ok(url.trim_end_matches('/').to_string()),
-        (None, None) => Err(
-            "no TraceVault server URL configured: run `tracevault login --server-url <URL>` \
-             or set TRACEVAULT_SERVER_URL"
-                .to_string(),
-        ),
+        (None, None) => Err(crate::program::say(
+            "no Visdom server URL configured: run `tracevault login --server-url <URL>` \
+             or set TRACEVAULT_SERVER_URL",
+        )
+        .to_string()),
     }
 }
 
 fn not_logged_in(url: Option<&str>) -> String {
     format!(
-        "Not logged in to TraceVault, so Claude Code telemetry cannot be authenticated. Run \
-         `tracevault login --server-url {}` (or set TRACEVAULT_API_KEY).",
+        "Not logged in to Visdom, so Claude Code telemetry cannot be authenticated. Run \
+         `{TOP} login --server-url {}` (or set {ENV}_API_KEY).",
         url.unwrap_or("<URL>")
     )
 }
@@ -637,7 +638,7 @@ pub fn prompt() -> io::Result<bool> {
 fn ask(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<bool> {
     write!(
         output,
-        "Also send Claude Code's per-request cost to TraceVault over OpenTelemetry \
+        "Also send Claude Code's per-request cost to Visdom over OpenTelemetry \
          (writes ~/.claude/settings.json)? [Y/n]: "
     )?;
     output.flush()?;
@@ -646,7 +647,7 @@ fn ask(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<bool> {
     Ok(!matches!(line.trim().to_lowercase().as_str(), "n" | "no"))
 }
 
-/// Whether `<claude_dir>/settings.json` has no TraceVault or other telemetry
+/// Whether `<claude_dir>/settings.json` has no Visdom or other telemetry
 /// configured yet, i.e. whether the interactive prompt has anything to offer.
 pub fn is_off(claude_dir: &Path) -> bool {
     let settings = fs::read_to_string(claude_dir.join("settings.json"))
@@ -671,9 +672,9 @@ pub async fn otel_headers(cwd: &Path, server_url: Option<&str>) -> Result<String
     if let (Some(wanted), Some(resolved)) = (server_url, resolved.as_deref()) {
         if !same_server(wanted, resolved) {
             return Err(format!(
-                "the TraceVault credential is for {resolved}, but Claude Code telemetry is \
-                 configured for {wanted}. Run `tracevault login --server-url {wanted}`, or \
-                 `tracevault init --claude-telemetry` to export to {resolved} instead."
+                "the Visdom credential is for {resolved}, but Claude Code telemetry is \
+                 configured for {wanted}. Run `{TOP} login --server-url {wanted}`, or \
+                 `{TOP} init --claude-telemetry` to export to {resolved} instead."
             ));
         }
     }
@@ -1061,7 +1062,7 @@ pub(crate) mod tests {
             managed: vec![("managed".to_string(), json!({ HEADERS_HELPER: helper }))],
             ..Default::default()
         };
-        // Pinned to another TraceVault server: it overrides ours and would
+        // Pinned to another Visdom server: it overrides ours and would
         // refuse the new login's credential.
         assert_left_alone(
             json!({}),

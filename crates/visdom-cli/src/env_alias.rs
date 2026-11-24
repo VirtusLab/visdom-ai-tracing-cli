@@ -2,7 +2,14 @@
 //! as `TRACEVAULT_*`.
 
 /// The variables that have a `VISDOM_` spelling.
-pub const ALIASED: [&str; 4] = ["SERVER_URL", "API_KEY", "SESSION_ID", "NO_BROWSER"];
+pub const ALIASED: [&str; 6] = [
+    "SERVER_URL",
+    "API_KEY",
+    "SESSION_ID",
+    "NO_BROWSER",
+    "PROJECT",
+    "PROJECT_ATTRIBUTION",
+];
 
 /// `("TRACEVAULT_X", value)` for every `VISDOM_X` that `get` returns.
 pub fn alias_pairs(get: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {

@@ -1,7 +1,7 @@
 //! `tracevault login` — interactive human sign-in via Keycloak's RFC 8628
 //! device authorization grant.
 //!
-//! The TraceVault server is not part of the token exchange: it only tells the
+//! The Visdom server is not part of the token exchange: it only tells the
 //! CLI which realm and client id to use (`/api/v1/auth/public-config`). The
 //! CLI then talks to Keycloak directly, and the refresh token it gets back
 //! (via `offline_access`) is what lets unattended git hooks keep working
@@ -13,6 +13,7 @@
 use crate::api_client::{ApiClient, GetMeError};
 use crate::credentials::{Credential, Credentials, KeycloakSession};
 use crate::oidc::{self, OidcError};
+use crate::program::{ENV, TOP};
 
 /// Decide whether we're probably in a headless environment where opening a
 /// browser will fail. Errs on the side of *not* opening when we're unsure,
@@ -115,7 +116,7 @@ where
     F: std::future::Future<Output = ()>,
 {
     // A dedicated client for the IdP conversation: these requests carry no
-    // TraceVault credential, and there isn't one yet anyway.
+    // Visdom credential, and there isn't one yet anyway.
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
@@ -127,13 +128,13 @@ where
             // Permanent: no amount of retrying helps, so point at the only
             // credential that works on such an instance.
             eprintln!(
-                "This TraceVault server has no Keycloak/SSO configured, so `tracevault login` \
+                "This Visdom server has no Keycloak/SSO configured, so `{TOP} login` \
                  cannot run the browser sign-in flow."
             );
             eprintln!();
             eprintln!("Use an API key instead:");
-            eprintln!("  export TRACEVAULT_SERVER_URL=\"{server_url}\"");
-            eprintln!("  export TRACEVAULT_API_KEY=\"tvk_...\"");
+            eprintln!("  export {ENV}_SERVER_URL=\"{server_url}\"");
+            eprintln!("  export {ENV}_API_KEY=\"tvk_...\"");
             // Deliberately no credentials written on this path.
             return Err("server has no Keycloak configured".into());
         }
@@ -216,7 +217,7 @@ where
     let mut creds = Credentials::keycloak(server_url, String::new(), session.clone());
     creds.save()?;
 
-    // 6. Confirm with TraceVault who this token resolves to. This is also
+    // 6. Confirm with Visdom who this token resolves to. This is also
     // where a missing `tracevault` grant surfaces.
     let client = ApiClient::with_credential(server_url, Some(Credential::Keycloak(session)));
     match client.get_me().await {

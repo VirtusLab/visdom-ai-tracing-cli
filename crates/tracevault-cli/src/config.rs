@@ -1,3 +1,4 @@
+use crate::program::TOP;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -156,7 +157,7 @@ pub fn load_user_config_in(config_root: &Path) -> TracevaultConfig {
         Ok(Some(cfg)) => cfg,
         Ok(None) => TracevaultConfig::default(),
         Err(e) => {
-            eprintln!("tracevault: warning: malformed user tracing config: {e}");
+            eprintln!("{TOP}: warning: malformed user tracing config: {e}");
             TracevaultConfig::default()
         }
     }
@@ -377,7 +378,7 @@ impl TracevaultConfig {
         match Self::try_load(project_root) {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("tracevault: warning: malformed tracing config: {e}");
+                eprintln!("{TOP}: warning: malformed tracing config: {e}");
                 None
             }
         }

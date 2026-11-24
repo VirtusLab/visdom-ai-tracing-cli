@@ -29,16 +29,16 @@ fn top_level_help_is_unchanged() {
 Usage: tracevault <COMMAND>
 
 Commands:
-  init            Initialize TraceVault in current repository
+  init            Initialize Visdom in current repository
   telemetry       Claude Code telemetry (cost over OpenTelemetry, on by default): `on`, `off` (remembered across upgrades) or `status`
   status          Show current session status
   check           Check session policies before pushing
-  sync            Sync repo remote URL with the TraceVault server
+  sync            Sync repo remote URL with the Visdom server
   stats           Show local session statistics
-  login           Log in to a TraceVault server
-  logout          Log out from the TraceVault server
+  login           Log in to a Visdom server
+  logout          Log out from the Visdom server
   flush           Force-sync all pending events to server
-  verify          Verify commits are registered and sealed on the TraceVault server
+  verify          Verify commits are registered and sealed on the Visdom server
   verify-start    Open (or re-open) a verification phase for the current session
   agent-policies  Print agent-readable instructions derived from active policies
   proxy           LLM proxy commands

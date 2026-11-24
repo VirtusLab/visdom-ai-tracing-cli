@@ -1,6 +1,7 @@
 //! The `tracevault` command surface and its dispatch, shared by the
 //! `tracevault` binary and by `visdom` (which mounts it under `visdom trace`).
 
+use crate::program::{CLI, TOP};
 use std::env;
 
 use crate::commands::project::ProjectCmd;
@@ -9,7 +10,7 @@ use crate::{commands, config, install_state};
 
 #[derive(clap::Subcommand)]
 pub enum Command {
-    /// Initialize TraceVault in current repository
+    /// Initialize Visdom in current repository
     Init(InitArgs),
     /// Claude Code telemetry (cost over OpenTelemetry, on by default): `on`,
     /// `off` (remembered across upgrades) or `status`.
@@ -18,8 +19,8 @@ pub enum Command {
         action: TelemetryAction,
     },
     /// Print the Authorization header for Claude Code's OpenTelemetry export,
-    /// as JSON, from the TraceVault credential store. Installed as
-    /// `otelHeadersHelper` by `tracevault init --claude-telemetry` — not
+    /// as JSON, from the Visdom credential store. Installed as
+    /// `otelHeadersHelper` by `init --claude-telemetry` — not
     /// intended to be run manually.
     #[command(name = "otel-headers", hide = true)]
     OtelHeaders {
@@ -30,13 +31,13 @@ pub enum Command {
     /// Show current session status
     Status {
         /// Session to inspect for the workspace binding; defaults to
-        /// $TRACEVAULT_SESSION_ID (in Amp: $AMP_CURRENT_THREAD_ID), else the
+        /// the session id the session-start hook exported (in Amp: $AMP_CURRENT_THREAD_ID), else the
         /// most recent session that has a workspace binding.
         #[arg(long)]
         session_id: Option<String>,
     },
     /// Stream hook events to server in real-time.
-    /// Installed into .claude/settings.json by `tracevault init` and invoked
+    /// Installed into .claude/settings.json by `init` and invoked
     /// by Claude Code on every tool event — not intended to be run manually.
     #[command(hide = true)]
     Stream {
@@ -49,36 +50,36 @@ pub enum Command {
     },
     /// SessionStart hook: exports the session id, binds an unbound session to
     /// the repo of its checkout's origin remote, and injects the bound repo's
-    /// policies as additionalContext. Installed by `tracevault init` (per-repo
+    /// policies as additionalContext. Installed by `init` (per-repo
     /// or --global) into the Claude Code settings or the Codex hooks.json —
     /// not intended to be run manually.
     #[command(name = "session-start", hide = true)]
     SessionStart,
     /// UserPromptSubmit hook: reinforces the bound repo's policies as
     /// additionalContext when the effective repo has changed since the last
-    /// injection. Installed by `tracevault init` (per-repo or --global) into
+    /// injection. Installed by `init` (per-repo or --global) into
     /// the Claude Code settings or the Codex hooks.json — not intended to be
     /// run manually.
     #[command(name = "user-prompt", hide = true)]
     UserPrompt,
     /// Check session policies before pushing
     Check,
-    /// Sync repo remote URL with the TraceVault server
+    /// Sync repo remote URL with the Visdom server
     Sync,
     /// Show local session statistics
     Stats,
-    /// Log in to a TraceVault server
+    /// Log in to a Visdom server
     Login(LoginArgs),
-    /// Log out from the TraceVault server
+    /// Log out from the Visdom server
     Logout,
     /// Push commit metadata to the server.
-    /// Installed into .git/hooks/post-commit by `tracevault init` and
+    /// Installed into .git/hooks/post-commit by `init` and
     /// invoked by git after every commit — not intended to be run manually.
     #[command(hide = true)]
     CommitPush,
     /// Force-sync all pending events to server
     Flush,
-    /// Verify commits are registered and sealed on the TraceVault server
+    /// Verify commits are registered and sealed on the Visdom server
     Verify {
         /// Comma-separated list of commit SHAs
         #[arg(long)]
@@ -99,7 +100,7 @@ pub enum Command {
     #[command(name = "verify-start")]
     VerifyStart {
         /// Explicit session ID to open the window for. When omitted, the
-        /// invoking session ($TRACEVAULT_SESSION_ID; in Amp: $AMP_CURRENT_THREAD_ID)
+        /// invoking session (the session id the session-start hook exported; in Amp: $AMP_CURRENT_THREAD_ID)
         /// is used if it has events in this worktree, else the session is
         /// detected by worktree.
         #[arg(long)]
@@ -110,7 +111,7 @@ pub enum Command {
     /// Fetches the rendered instructions from the server for the current repo
     /// and prints them to stdout. Designed to be invoked from CLAUDE.md (or
     /// equivalent) at session start so the agent's behaviour matches the
-    /// policies configured on the TraceVault server.
+    /// policies configured on the Visdom server.
     #[command(name = "agent-policies")]
     AgentPolicies,
     /// LLM proxy commands.
@@ -138,7 +139,7 @@ pub enum Command {
 /// Arguments of `init`.
 #[derive(clap::Args, Clone)]
 pub struct InitArgs {
-    /// TraceVault server URL for repo registration
+    /// Visdom server URL for repo registration
     #[arg(long)]
     pub server_url: Option<String>,
     /// Where to install Claude Code hooks: `shared` (.claude/settings.json,
@@ -161,7 +162,7 @@ pub struct InitArgs {
     /// where it sets the path the user-level context is read from.
     #[arg(long, conflicts_with = "no_user_context")]
     pub user_context: Option<String>,
-    /// Install TraceVault once for ALL sessions of the chosen --agent on
+    /// Install Visdom once for ALL sessions of the chosen --agent on
     /// this machine, instead of initializing the current repo: Claude Code
     /// hooks into ~/.claude/ (settings.json + CLAUDE.md), Codex hooks into
     /// ~/.codex/ (hooks.json + AGENTS.md), the GSD extension via
@@ -181,14 +182,14 @@ pub struct InitArgs {
     /// hooks (.claude/settings.json or settings.local.json); `codex` writes
     /// .codex/hooks.json; `gsd` (alias `gsd2`) registers the GSD extension
     /// with `gsd install -l`; `opencode` writes
-    /// .opencode/plugins/tracevault.ts; `amp` writes
-    /// .amp/plugins/tracevault/index.ts. With --global, the user-level
+    /// a plugin under .opencode/plugins/; `amp` writes
+    /// a plugin under .amp/plugins/. With --global, the user-level
     /// equivalents instead.
     #[arg(long, value_enum, default_value = "claude-code")]
     pub agent: crate::agent::Agent,
-    /// Export Claude Code's own per-request cost to TraceVault over
+    /// Export Claude Code's own per-request cost to Visdom over
     /// OpenTelemetry (the default): writes the OTel log exporter settings
-    /// and an `otelHeadersHelper` (`tracevault otel-headers`) into the
+    /// and an `otelHeadersHelper` (the `otel-headers` command) into the
     /// USER-level ~/.claude/settings.json, per-repo or with --global. An
     /// existing exporter setup is left untouched (collector instructions
     /// are printed instead). Without either flag, an interactive init asks
@@ -196,7 +197,7 @@ pub struct InitArgs {
     /// opted out before.
     #[arg(long, conflicts_with = "no_claude_telemetry")]
     pub claude_telemetry: bool,
-    /// Opt out of Claude Code telemetry: removes TraceVault's entries from
+    /// Opt out of Claude Code telemetry: removes Visdom's entries from
     /// ~/.claude/settings.json and records the choice, so neither a later
     /// `init` nor a CLI upgrade turns it back on.
     #[arg(long)]
@@ -228,7 +229,7 @@ pub struct InitArgs {
 /// Arguments of `login`.
 #[derive(clap::Args)]
 pub struct LoginArgs {
-    /// TraceVault server URL
+    /// Visdom server URL
     #[arg(long)]
     pub server_url: String,
     /// Do not try to open a browser; just print the URL.
@@ -237,7 +238,7 @@ pub struct LoginArgs {
     pub no_browser: bool,
 }
 
-/// Sub-actions for `tracevault context`.
+/// Sub-actions for `context`.
 #[derive(clap::Subcommand)]
 pub enum ContextAction {
     /// Set the context, replacing any previously saved context entirely.
@@ -364,8 +365,8 @@ fn finish_global_user_context(no_user_context: bool, user_context: Option<String
                 None => println!("User-level context is disabled (`--no-user-context`)."),
             }
             println!(
-                "Edit it with `tracevault context set --user …`; disable with \
-                 `tracevault init --global --no-user-context`."
+                "Edit it with `{CLI} context set --user …`; disable with \
+                 `{TOP} init --global --no-user-context`."
             );
         }
         Err(e) => eprintln!("Warning: could not write user-level context config: {e}"),
@@ -474,7 +475,7 @@ fn finish_claude_telemetry(
         Ok(removed) => {
             if removed {
                 println!(
-                    "Claude Code telemetry is off (removed TraceVault's settings from {})",
+                    "Claude Code telemetry is off (removed Visdom's settings from {})",
                     claude_dir.join("settings.json").display()
                 );
             } else {
@@ -492,7 +493,7 @@ fn finish_claude_telemetry(
         TelemetryChoice::Default if state.claude_telemetry_opt_out => {
             println!(
                 "Claude Code telemetry stays off, as you chose earlier \
-                 (`tracevault telemetry on` to enable it)"
+                 (`{CLI} telemetry on` to enable it)"
             );
             return;
         }
@@ -500,7 +501,7 @@ fn finish_claude_telemetry(
             // Not recorded: nothing was decided.
             eprintln!(
                 "Warning: Claude Code telemetry not turned on: Claude Code is set to export \
-                 content ({}); run `tracevault telemetry on` to send it to TraceVault anyway",
+                 content ({}); run `{CLI} telemetry on` to send it to Visdom anyway",
                 content().join("; ")
             );
             return;
@@ -518,7 +519,7 @@ fn finish_claude_telemetry(
         Ok((url, commands::claude_telemetry::InstallOutcome::Configured)) => {
             println!(
                 "Claude Code telemetry exports to {} (configured in {}; restart Claude Code to \
-                 apply; `tracevault telemetry off` to disable)",
+                 apply; `{CLI} telemetry off` to disable)",
                 commands::claude_telemetry::logs_endpoint(&url),
                 claude_dir.join("settings.json").display()
             );
@@ -610,12 +611,12 @@ pub async fn run(cmd: Command) {
                         println!("Wrote {}", bound.config_path.display());
                         println!(
                             "Every session started under this directory is recorded to that \
-                             project unless it runs `tracevault project switch` or binds a repo \
+                             project unless it runs `{CLI} project switch` or binds a repo \
                              with its own configuration."
                         );
                         println!(
                             "No hooks were installed: if this machine has no global install yet, \
-                             run `tracevault init --global`."
+                             run `{TOP} init --global`."
                         );
                     }
                     Err(e) => {
@@ -629,7 +630,7 @@ pub async fn run(cmd: Command) {
             {
                 eprintln!(
                     "Error: --claude-telemetry and --no-claude-telemetry only apply to \
-                     --agent claude-code (use `tracevault telemetry off` instead)"
+                     --agent claude-code (use `{CLI} telemetry off` instead)"
                 );
                 std::process::exit(1);
             }
@@ -665,7 +666,7 @@ pub async fn run(cmd: Command) {
                         match commands::init::install_global_codex_hooks(&codex_dir) {
                             Ok(()) => {
                                 println!(
-                                    "Installed TraceVault Codex hooks in {}",
+                                    "Installed Visdom Codex hooks in {}",
                                     codex_dir.join("hooks.json").display()
                                 );
                                 println!(
@@ -718,7 +719,7 @@ pub async fn run(cmd: Command) {
                         match commands::init::install_global_hooks(&claude_dir) {
                             Ok(()) => {
                                 println!(
-                                    "Installed TraceVault hooks in {}",
+                                    "Installed Visdom hooks in {}",
                                     claude_dir.join("settings.json").display()
                                 );
                                 println!("Updated {}", claude_dir.join("CLAUDE.md").display());
@@ -760,10 +761,7 @@ pub async fn run(cmd: Command) {
                         // there directly.
                         match commands::init::install_amp_plugin(None) {
                             Ok(path) => {
-                                println!(
-                                    "Installed the TraceVault Amp plugin in {}",
-                                    path.display()
-                                );
+                                println!("Installed the Visdom Amp plugin in {}", path.display());
                                 println!(
                                     "This applies to ALL Amp sessions on this machine, not just this repo."
                                 );
@@ -803,15 +801,12 @@ pub async fn run(cmd: Command) {
             .await
             {
                 Ok(entry) => {
-                    println!("TraceVault initialized in {}", cwd.display());
+                    println!("Visdom initialized in {}", cwd.display());
                     if entry.is_empty() {
                         // GSD (pi): the extension lives in the user-global
                         // ~/.gsd/extensions/tracevault/, not in the repo — there's
                         // no per-repo hook file to report or gitignore.
-                        println!(
-                            "{} extension installed (~/.gsd/extensions/tracevault/)",
-                            agent.label()
-                        );
+                        println!("{} extension installed", agent.label());
                         println!("Git hooks installed (pre-push, post-commit)");
                         println!(
                             "Tracing state is kept in .visdom/ (ignored by its own .gitignore)"
@@ -824,11 +819,9 @@ pub async fn run(cmd: Command) {
                             "Tracing state is kept in .visdom/ (ignored by its own .gitignore)"
                         );
                     }
+                    println!("Nothing needs to be committed — all Visdom files are local only.");
                     println!(
-                        "Nothing needs to be committed — all TraceVault files are local only."
-                    );
-                    println!(
-                        "Other contributors run `tracevault init` to set up their own local hooks."
+                        "Other contributors run `{TOP} init` to set up their own local hooks."
                     );
                     if agent == crate::agent::Agent::ClaudeCode {
                         finish_claude_telemetry(telemetry, &cwd, server_url.as_deref());
@@ -858,7 +851,7 @@ pub async fn run(cmd: Command) {
             match commands::claude_telemetry::otel_headers(&cwd, server_url.as_deref()).await {
                 Ok(headers) => println!("{headers}"),
                 Err(e) => {
-                    eprintln!("tracevault otel-headers: {e}");
+                    eprintln!("{CLI} otel-headers: {e}");
                     std::process::exit(1);
                 }
             }
@@ -1193,10 +1186,10 @@ mod tests {
         for needle in [
             ".codex/hooks.json",
             "gsd install -l",
-            ".opencode/plugins/tracevault.ts",
+            ".opencode/plugins/",
             "~/.codex/",
             "OpenCode plugin",
-            ".amp/plugins/tracevault/index.ts",
+            ".amp/plugins/",
             "$XDG_CONFIG_HOME/amp/plugins/",
             "~/.config/amp/plugins/",
             "--server-url, --claude-settings and --no-gitignore",

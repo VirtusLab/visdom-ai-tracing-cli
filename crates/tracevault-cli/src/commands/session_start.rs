@@ -21,6 +21,7 @@
 //! handled internally, and the function always prints a valid `HookOutput`
 //! JSON payload before returning `Ok(())`.
 
+use crate::program::TOP;
 use std::path::Path;
 
 use crate::commands::session_hooks::{read_hook_event_or_allow, resolve_and_inject};
@@ -48,19 +49,30 @@ pub fn write_session_env(env_file: &Path, session_id: &str) -> std::io::Result<(
     if !crate::session_state::is_safe_session_id(session_id) {
         return Ok(());
     }
-    let line = format!("export TRACEVAULT_SESSION_ID='{session_id}'");
-
-    if let Ok(existing) = std::fs::read_to_string(env_file) {
-        if existing.lines().any(|l| l == line) {
-            return Ok(());
-        }
+    // `TRACEVAULT_SESSION_ID` is what every command reads. Run as `visdom`,
+    // the variable is exported under that name as well: it is the one the
+    // messages name, and `visdom` takes it for the other.
+    let mut names = vec!["TRACEVAULT_SESSION_ID"];
+    if crate::program::is_visdom() {
+        names.push("VISDOM_SESSION_ID");
     }
-
+    let existing = std::fs::read_to_string(env_file).unwrap_or_default();
+    let missing: Vec<String> = names
+        .iter()
+        .map(|name| format!("export {name}='{session_id}'"))
+        .filter(|line| !existing.lines().any(|l| l == line))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(env_file)?;
-    writeln!(file, "{line}")
+    for line in missing {
+        writeln!(file, "{line}")?;
+    }
+    Ok(())
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -127,7 +139,7 @@ async fn run_catch_up(cwd: &Path, session_id: &str, started: std::time::Instant)
     let worktree = crate::paths::worktree_toplevel(cwd);
     let sweep = catch_up::sweep(project_root, worktree, session_id.to_string(), deadline);
     if tokio::spawn(sweep).await.is_err() {
-        eprintln!("tracevault: the catch-up sweep failed unexpectedly");
+        eprintln!("{TOP}: the catch-up sweep failed unexpectedly");
     }
 }
 
@@ -147,7 +159,7 @@ fn run_upgrade_step(cwd: &Path) -> Option<String> {
         })
     })
     .unwrap_or_else(|_| {
-        eprintln!("tracevault: the upgrade step failed unexpectedly");
+        eprintln!("{TOP}: the upgrade step failed unexpectedly");
         None
     })
 }

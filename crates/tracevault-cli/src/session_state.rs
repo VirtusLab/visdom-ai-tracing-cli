@@ -298,7 +298,7 @@ pub fn sessions_dir() -> Option<PathBuf> {
 ///
 /// Amp's plugin cannot export a variable into Amp's shell (it runs in a
 /// separate process), but that shell has the current thread id, and the Amp
-/// plugin uses the thread id as the TraceVault session id (VIS-1199). Empty
+/// plugin uses the thread id as the Visdom session id (VIS-1199). Empty
 /// values count as unset.
 pub fn env_session_id() -> Option<String> {
     session_id_from_env(

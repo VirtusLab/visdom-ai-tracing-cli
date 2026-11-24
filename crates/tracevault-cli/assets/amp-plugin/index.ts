@@ -1,5 +1,5 @@
 /**
- * TraceVault Amp plugin, installed by `tracevault init --agent amp`.
+ * Visdom Amp plugin, installed by `tracevault init --agent amp`.
  *
  * Amp has no shell hooks, only in-process plugins, so this plugin listens to
  * Amp's plugin events and shells out to `tracevault stream --agent amp` with
@@ -62,28 +62,29 @@ import { fileURLToPath } from 'node:url'
  */
 const CLI = ['tracevault']
 
-export const description = 'TraceVault: sends this Amp session to TraceVault (tracevault stream --agent amp)'
+export const description = 'Visdom: sends this Amp session to Visdom (tracevault stream --agent amp)'
 
 /**
  * A `tracevault` run that takes longer than this is killed: it must never hold
  * up Amp. The CLI gives up delivering after about 7 s and queues the rest.
  */
-const SPAWN_TIMEOUT_MS = envMs('TRACEVAULT_AMP_SPAWN_TIMEOUT_MS', 30_000)
+const SPAWN_TIMEOUT_MS = envMs('AMP_SPAWN_TIMEOUT_MS', 30_000)
 /** How long `onDispose` waits for sends still in flight. */
-const DISPOSE_WAIT_MS = envMs('TRACEVAULT_AMP_DISPOSE_WAIT_MS', 10_000)
+const DISPOSE_WAIT_MS = envMs('AMP_DISPOSE_WAIT_MS', 10_000)
 /**
  * How long `agent.start` waits for the policies before the turn goes on
  * without them. The CLI keeps its own network work under 8 s.
  */
-const INJECT_TIMEOUT_MS = envMs('TRACEVAULT_AMP_INJECT_TIMEOUT_MS', 10_000)
+const INJECT_TIMEOUT_MS = envMs('AMP_INJECT_TIMEOUT_MS', 10_000)
 /** How much of a failing run's stderr goes to the plugin log. */
 const STDERR_LIMIT = 2_000
 /** How much of a policy run's stdout is read; the CLI caps the context at 10k characters. */
 const STDOUT_LIMIT = 1_000_000
 
 /** A positive number of milliseconds from the environment (for tests), else `fallback`. */
+/** `VISDOM_<name>`, else `TRACEVAULT_<name>` (the earlier spelling), in ms. */
 function envMs(name: string, fallback: number): number {
-	const value = Number(process.env[name])
+	const value = Number(process.env[`VISDOM_${name}`] ?? process.env[`TRACEVAULT_${name}`])
 	return Number.isFinite(value) && value > 0 ? value : fallback
 }
 
@@ -186,12 +187,12 @@ export default function tracevault(amp: PluginAPI) {
 				const context = hookContext(text, command, log)
 				if (!timedOut) resolve(context)
 				else if (context) {
-					log(`tracevault ${command}: answered late, policies go into the next turn`)
+					log(`${CLI.join(' ')} ${command}: answered late, policies go into the next turn`)
 					latePolicies.set(threadId, context)
 				}
 			}
 			const timer = setTimeout(() => {
-				log(`tracevault ${command}: no answer after ${INJECT_TIMEOUT_MS} ms, turn goes on without policies`)
+				log(`${CLI.join(' ')} ${command}: no answer after ${INJECT_TIMEOUT_MS} ms, turn goes on without policies`)
 				timedOut = true
 				resolve(undefined)
 			}, INJECT_TIMEOUT_MS)
@@ -417,12 +418,12 @@ function hookContext(text: string | undefined, command: string, log: (msg: strin
 	try {
 		const answer = JSON.parse(text)
 		if (typeof answer?.systemMessage === 'string' && answer.systemMessage) {
-			log(`tracevault ${command}: ${answer.systemMessage}`)
+			log(`${CLI.join(' ')} ${command}: ${answer.systemMessage}`)
 		}
 		const context = answer?.hookSpecificOutput?.additionalContext
 		return typeof context === 'string' && context.trim() ? context : undefined
 	} catch {
-		log(`tracevault ${command}: unreadable answer: ${text.slice(0, 200)}`)
+		log(`${CLI.join(' ')} ${command}: unreadable answer: ${text.slice(0, 200)}`)
 		return undefined
 	}
 }

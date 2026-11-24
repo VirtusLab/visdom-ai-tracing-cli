@@ -82,13 +82,13 @@ pub enum VisdomCommand {
     Login(LoginArgs),
     /// Log out from Visdom
     Logout,
-    /// Set up this repository for Visdom: tracing (as `tracevault init`), and
+    /// Set up this repository for Visdom: tracing, and
     /// the bazaar MCP server for the agent.
     Init {
         #[command(flatten)]
         args: InitArgs,
     },
-    /// Tracing commands (everything `tracevault` does).
+    /// Tracing commands: status, check, repo, project, context and the rest.
     Trace {
         #[command(subcommand)]
         command: Command,

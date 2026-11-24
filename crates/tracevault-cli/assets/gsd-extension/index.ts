@@ -1,7 +1,7 @@
 /**
- * TraceVault pi/GSD extension.
+ * Visdom pi/GSD extension.
  *
- * Streams pi session events to TraceVault by shelling out to the `tracevault`
+ * Streams pi session events to Visdom by shelling out to the `tracevault`
  * CLI (which owns credentials, repo binding, retry, and pre-push `check`). This
  * extension carries NO credentials or config of its own.
  *
@@ -153,5 +153,5 @@ export default function tracevault(pi: ExtensionAPI): void {
     chains.delete(sessionId);
   });
 
-  console.error("[tracevault] pi/GSD extension loaded (streaming via tracevault CLI)");
+  console.error("[tracevault] pi/GSD extension loaded (streaming via the CLI)");
 }

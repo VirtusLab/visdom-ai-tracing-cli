@@ -3,6 +3,7 @@ use crate::commands::init::persist_repo_binding;
 use crate::commands::migrate::{migrate_default_project, migration_report, ResolveNameError};
 use crate::config::TracevaultConfig;
 use crate::credentials::resolve_credentials;
+use crate::program::{CLI, TOP};
 use crate::resolution::{git_remote_url, git_repo_name, plan_registration, RegistrationPlan};
 use std::path::Path;
 
@@ -18,7 +19,7 @@ pub async fn sync_repo(project_root: &Path) -> Result<(), Box<dyn std::error::Er
     };
 
     if credential.is_none() {
-        eprintln!("Not logged in. Run 'tracevault login' to sync.");
+        eprintln!("Not logged in. Run '{TOP} login' to sync.");
         return Ok(());
     }
 
@@ -51,9 +52,11 @@ pub async fn sync_repo(project_root: &Path) -> Result<(), Box<dyn std::error::Er
                 "Repo already registered (id: {repo_id}, codebase: {}); {}",
                 codebase.display_name(),
                 if bound {
-                    "bound .visdom/tracing.toml to it"
+                    "bound .visdom/tracing.toml to it".to_string()
                 } else {
-                    "no .visdom/tracing.toml here to bind (run `tracevault init` to create one)"
+                    crate::program::say(
+                        "no .visdom/tracing.toml here to bind (run `tracevault init` to create one)"
+                    )
                 }
             );
             return Ok(());
@@ -123,7 +126,7 @@ async fn migrate_config_default_project(
         Err(ResolveNameError::Unreachable(e)) => {
             eprintln!(
                 "Warning: could not migrate default_project (could not list projects: {e}); \
-                 it stays unused for capture until `tracevault sync` succeeds."
+                 it stays unused for capture until `{CLI} sync` succeeds."
             );
             Ok(())
         }

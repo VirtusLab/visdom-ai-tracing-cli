@@ -26,7 +26,7 @@ const ACCEPT_DEADLINE: Duration = Duration::from_secs(5);
 /// A staged "response" that never answers.
 const STALL: &str = "stall";
 
-/// What Claude Code allows a TraceVault hook before killing it.
+/// What Claude Code allows a Visdom hook before killing it.
 const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn accept_with_deadline(listener: &TcpListener) -> Option<std::net::TcpStream> {

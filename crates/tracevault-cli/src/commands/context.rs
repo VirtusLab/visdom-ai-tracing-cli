@@ -1,5 +1,6 @@
 use crate::config::{TracevaultConfig, UserContext};
 use crate::context::{resolve_context_paths, Context, WorktreeScope};
+use crate::program::TOP;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +18,7 @@ pub fn find_project_root(start: &Path) -> Result<PathBuf, Box<dyn std::error::Er
     }
     Err(format!(
         "No .visdom/ directory found in '{}' or any parent directory. \
-         Run `tracevault init` first.",
+         Run `{TOP} init` first.",
         start.display()
     )
     .into())
@@ -135,7 +136,7 @@ pub fn run_set(
 
     // Require an initialised .visdom/ before mutating.
     if !paths.is_set_up() {
-        return Err("no .visdom/ found — run 'tracevault init' first".into());
+        return Err(crate::program::say("no .visdom/ found — run 'tracevault init' first").into());
     }
 
     if global || matches!(paths.scope, WorktreeScope::Primary) {
@@ -189,7 +190,7 @@ pub fn run_update(
 
     // Require an initialised .visdom/ before mutating.
     if !paths.is_set_up() {
-        return Err("no .visdom/ found — run 'tracevault init' first".into());
+        return Err(crate::program::say("no .visdom/ found — run 'tracevault init' first").into());
     }
 
     let use_global = global || matches!(paths.scope, WorktreeScope::Primary);
@@ -302,7 +303,7 @@ pub fn run_show_in(cwd: &Path, config_root: &Path) -> Result<(), Box<dyn std::er
     // find_project_root gives the classic walk-up path; if it also fails, the
     // user has not run `tracevault init` yet.
     if !paths.is_set_up() && find_project_root(cwd).is_err() {
-        eprintln!("hint: No .visdom/ directory found. Run `tracevault init` first.");
+        eprintln!("hint: No .visdom/ directory found. Run `{TOP} init` first.");
     }
 
     let is_linked = matches!(paths.scope, WorktreeScope::Linked { .. });
@@ -532,7 +533,7 @@ pub fn run_clear(cwd: &Path, global: bool, user: bool) -> Result<(), Box<dyn std
 
     // Require an initialised .visdom/ before mutating.
     if !paths.is_set_up() {
-        return Err("no .visdom/ found — run 'tracevault init' first".into());
+        return Err(crate::program::say("no .visdom/ found — run 'tracevault init' first").into());
     }
 
     let use_global = global || matches!(paths.scope, WorktreeScope::Primary);
@@ -585,7 +586,10 @@ pub fn run_source(
     let mut config = match TracevaultConfig::try_load(&root) {
         Ok(Some(cfg)) => cfg,
         Ok(None) => {
-            return Err("no .visdom/tracing.toml found — run 'tracevault init' first".into())
+            return Err(crate::program::say(
+                "no .visdom/tracing.toml found — run 'tracevault init' first",
+            )
+            .into())
         }
         Err(e) => return Err(format!("malformed .visdom/tracing.toml: {e}").into()),
     };

@@ -1,3 +1,4 @@
+use crate::program::{CLI, TOP};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
@@ -748,7 +749,7 @@ pub(crate) fn recording_line(attribution: Option<&Attribution>) -> String {
         }) => format!("recording: repo {repo_id} in project {pid}"),
         Some(Attribution::ProjectOnly { project_id }) => format!(
             "recording: project {project_id} only — no repo is bound, so events are sent \
-             without one (`tracevault repo switch <path>` adds the repo)"
+             without one (`{CLI} repo switch <path>` adds the repo)"
         ),
         None => "recording: nothing — neither a repo nor a project is bound, so this \
                  session's events are not sent"
@@ -775,21 +776,21 @@ pub(crate) fn refused_project_only_error(
 ) -> String {
     let base = match kind {
         ClientErrorKind::Forbidden => format!(
-            "tracevault: error: the server refused this repo-less session's event for project \
+            "{TOP}: error: the server refused this repo-less session's event for project \
              {pid} (403). Either this account has no access to that project (no `Operator` \
-             role on it) — run `tracevault project switch <name>` (add `--user` if the binding \
+             role on it) — run `{CLI} project switch <name>` (add `--user` if the binding \
              is the machine-wide default in `user_project.toml`) — or it has no `tracevault` \
              grant in Control Plane at all, which an administrator must grant. The session has \
              no repo binding, so the event was not sent anywhere else; it has been queued and \
              will be retried with the next event."
         ),
         ClientErrorKind::Scoping => format!(
-            "tracevault: error: project {pid} does not resolve on the server (400/404/409: it \
+            "{TOP}: error: project {pid} does not resolve on the server (400/404/409: it \
              does not exist, or this account cannot see it). The session has no repo binding, \
              so the event was not sent anywhere else; it has been queued and will be retried \
-             with the next event. Run `tracevault project switch <name>` (add `--user` if the \
+             with the next event. Run `{CLI} project switch <name>` (add `--user` if the \
              binding is the machine-wide default in `user_project.toml`) to bind a project that \
-             exists, or `tracevault repo switch <path>` to record this session to a repo."
+             exists, or `{CLI} repo switch <path>` to record this session to a repo."
         ),
     };
     with_force_clause(base, kind, force)
@@ -865,19 +866,19 @@ pub(crate) fn refused_error(
         // on the code path users hit most. The server's 403 envelope is not
         // distinguishable from here (see `ClientErrorKind`), so name both.
         ClientErrorKind::Forbidden => format!(
-            "tracevault: error: the server refused to attribute this event to active project \
+            "{TOP}: error: the server refused to attribute this event to active project \
              {pid} (403). Either that project does not apply to this repo (not a member, or \
-             no `Operator` role on it) — run `tracevault project switch <name>` (add `--user` if the \
+             no `Operator` role on it) — run `{CLI} project switch <name>` (add `--user` if the \
              binding is the machine-wide default in `user_project.toml`) — or this account has \
              no `tracevault` grant in Control Plane at all, which an administrator must grant. \
              The event was NOT re-attributed elsewhere; it has been queued and will be retried \
              once the binding or the grant is fixed."
         ),
         ClientErrorKind::Scoping => format!(
-            "tracevault: error: active project {pid} does not apply to this repo (not a member, \
+            "{TOP}: error: active project {pid} does not apply to this repo (not a member, \
              missing permission, or the project no longer exists). The event was NOT \
              re-attributed elsewhere; it has been queued and will be retried once the binding is \
-             fixed. Run `tracevault project switch <name>` (add `--user` if the binding is the \
+             fixed. Run `{CLI} project switch <name>` (add `--user` if the binding is the \
              machine-wide default in `user_project.toml`) to update it."
         ),
     };
@@ -919,11 +920,15 @@ fn with_force_clause(base: String, kind: &ClientErrorKind, force: AttributionFor
 /// leaves the other still forcing, which would look exactly like the fix not
 /// working.
 fn force_remediation(force: AttributionForce) -> String {
-    let env_fix = "unset `TRACEVAULT_PROJECT_ATTRIBUTION` in this environment (it is \
-                   process-wide and never expires, so no switch clears it)";
-    let binding_fix = "run `tracevault project switch <name>` WITHOUT \
+    let env_fix = crate::program::say(
+        "unset `TRACEVAULT_PROJECT_ATTRIBUTION` in this environment (it is \
+                   process-wide and never expires, so no switch clears it)",
+    );
+    let binding_fix = crate::program::say(
+        "run `tracevault project switch <name>` WITHOUT \
                        `--project-attribution explicit` (add `--user` if the forced binding \
-                       is the machine-wide default in `user_project.toml`)";
+                       is the machine-wide default in `user_project.toml`)",
+    );
     match (force.env, force.binding) {
         (true, false) => format!("{env_fix}."),
         (false, true) => format!("{binding_fix}."),
@@ -1246,7 +1251,7 @@ async fn deliver_subagent_transcripts(
             Ok(None) => {
                 if wait_for_lock.is_some() {
                     eprintln!(
-                        "tracevault: warning: skipping subagent transcript {}: \
+                        "{TOP}: warning: skipping subagent transcript {}: \
                          another hook is still sending it",
                         file.display()
                     );
@@ -1255,7 +1260,7 @@ async fn deliver_subagent_transcripts(
             }
             Err(e) => {
                 eprintln!(
-                    "tracevault: warning: skipping subagent transcript {}: cannot lock: {e}",
+                    "{TOP}: warning: skipping subagent transcript {}: cannot lock: {e}",
                     file.display()
                 );
                 continue;
@@ -1265,7 +1270,7 @@ async fn deliver_subagent_transcripts(
             Ok(read) => read,
             Err(e) => {
                 eprintln!(
-                    "tracevault: warning: skipping subagent transcript {}: {e}",
+                    "{TOP}: warning: skipping subagent transcript {}: {e}",
                     file.display()
                 );
                 continue;
@@ -1494,7 +1499,7 @@ pub async fn run_stream(
         // directory — which is how stray per-subdirectory `.visdom/` dirs
         // appear. Surface it (best-effort; stderr never blocks the hook).
         eprintln!(
-            "tracevault: warning: could not resolve a git project root from {}; \
+            "{TOP}: warning: could not resolve a git project root from {}; \
              creating .visdom/ there. Ensure `git` is on PATH for the hook and \
              that it runs inside the repository to keep sessions under the repo root.",
             hook_cwd.display()

@@ -31,7 +31,7 @@ than a single pinned repo), use workspace mode to bind a session to different re
 multi-repo workspaces, or a user-level (global) installation — versus the normal `tracevault init`
 single-repo flow.
 
-**Global installation** — `tracevault init --global` installs TraceVault hooks once into
+**Global installation** — `tracevault init --global` installs Visdom hooks once into
 `~/.claude/settings.json` (deep-merged; appends to existing hooks and does not clobber) for use
 across ALL Claude Code sessions without per-repo setup. Does not create `.visdom/tracing.toml`.
 Adds two session-level hooks: `SessionStart` exports the session ID and injects the bound repo's
@@ -53,7 +53,7 @@ persist the opt-out explicitly.
 **Commands**
 
 - `tracevault repo switch <path>` — bind the current session's tracing to the repo at `<path>`
-  (must be pre-registered with TraceVault) and print its policies. When the checkout's codebase
+  (must be pre-registered with Visdom) and print its policies. When the checkout's codebase
   has several repo records, switch keeps the one already in use (the session's current binding,
   else a checkout's `.visdom/tracing.toml`) and errors if none of them is; pick one
   explicitly with `--repo-id <id>`.
@@ -80,7 +80,7 @@ information — it may belong to another repo; pass `--session-id` to target one
 **Precedence** (high → low): `--path` override → subagent worktree override → session binding
 (`repo switch`) → bound `.visdom/tracing.toml`.
 
-**Note:** Repos must be pre-registered with TraceVault. Workspace mode resolves a repo by its
+**Note:** Repos must be pre-registered with Visdom. Workspace mode resolves a repo by its
 git remote URL; it does not create new registrations.
 
 ## License

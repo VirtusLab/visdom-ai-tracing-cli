@@ -7,6 +7,7 @@
 use crate::api_client::{ApiClient, GetMeError};
 use crate::config::TracevaultConfig;
 use crate::credentials::{Credential, Credentials};
+use crate::program::{CLI, ENV, TOP};
 use crate::resolution::{
     effective_project, git_remote_url, resolve_effective_project, ProjectResolveInputs,
     ProjectSource,
@@ -134,7 +135,11 @@ fn resolve_auth(config_server_url: Option<&str>, config_api_key: Option<&str>) -
             // in the config is a working setup, not "no server URL".
             server_url: env_url.or_else(|| config_server_url.map(str::to_string)),
             credential: Some(Credential::ApiKey(token)),
-            source: "env (TRACEVAULT_API_KEY)",
+            source: if crate::program::is_visdom() {
+                "env (VISDOM_API_KEY)"
+            } else {
+                "env (TRACEVAULT_API_KEY)"
+            },
             email_from_creds: None,
             // An explicitly supplied API key may target any URL by design.
             url_override_mismatch: None,
@@ -188,7 +193,9 @@ async fn auth_checks(auth: &AuthContext, config_server_url: Option<&str>) -> Vec
         (None, _) => {
             out.push(Check::err(
                 "Logged in",
-                "no credentials found. Run `tracevault login --server-url <URL>`.",
+                crate::program::say(
+                    "no credentials found. Run `tracevault login --server-url <URL>`.",
+                ),
             ));
             out.push(Check::skip("Token valid", "no token to check"));
             return out;
@@ -196,7 +203,7 @@ async fn auth_checks(auth: &AuthContext, config_server_url: Option<&str>) -> Vec
         (Some(_), None) => {
             out.push(Check::err(
                 "Logged in",
-                "token found but no server URL (set TRACEVAULT_SERVER_URL)",
+                crate::program::say("token found but no server URL (set TRACEVAULT_SERVER_URL)"),
             ));
             out.push(Check::skip("Token valid", "no server URL to call"));
             return out;
@@ -213,9 +220,9 @@ async fn auth_checks(auth: &AuthContext, config_server_url: Option<&str>) -> Vec
         out.push(Check::err(
             "Server URL",
             format!(
-                "TRACEVAULT_SERVER_URL is '{env_url}' but the saved login is for '{file_url}'. \
+                "{ENV}_SERVER_URL is '{env_url}' but the saved login is for '{file_url}'. \
                  Commands will refuse to run rather than send that session's token to another \
-                 instance. Unset TRACEVAULT_SERVER_URL, or run `tracevault login --server-url \
+                 instance. Unset {ENV}_SERVER_URL, or run `{TOP} login --server-url \
                  {env_url}`."
             ),
         ));
@@ -238,7 +245,7 @@ async fn auth_checks(auth: &AuthContext, config_server_url: Option<&str>) -> Vec
             format!(
                 ".visdom/tracing.toml pins '{config_url}' but the saved login is for \
                  '{file_url}'. The config URL is ignored — commands use '{file_url}'. Run \
-                 `tracevault login --server-url {config_url}` to use the repo's instance, or \
+                 `{TOP} login --server-url {config_url}` to use the repo's instance, or \
                  remove `server_url` from .visdom/tracing.toml."
             ),
         ));
@@ -270,7 +277,9 @@ async fn auth_checks(auth: &AuthContext, config_server_url: Option<&str>) -> Vec
         Err(GetMeError::Unauthorized) => {
             out.push(Check::err(
                 "Token valid",
-                "rejected by server (expired or revoked). Run `tracevault login` again.",
+                crate::program::say(
+                    "rejected by server (expired or revoked). Run `tracevault login` again.",
+                ),
             ));
         }
         // A valid token whose account isn't authorized. Re-running login
@@ -342,7 +351,7 @@ fn project_checks(
             if tv_present {
                 out.push(Check::warn(
                     "Project config",
-                    "No .visdom/tracing.toml — run `tracevault init`, or use workspace mode (`tracevault repo status`).",
+                    crate::program::say("No .visdom/tracing.toml — run `tracevault init`, or use workspace mode (`tracevault repo status`)."),
                 ));
             }
             None
@@ -376,7 +385,7 @@ fn project_checks(
     } else {
         out.push(Check::skip(
             "Git hooks",
-            "not installed (no .visdom/ — run `tracevault init`)",
+            crate::program::say("not installed (no .visdom/ — run `tracevault init`)"),
         ));
     }
 
@@ -394,14 +403,14 @@ fn git_hook_check(project_root: &Path, name: &str, marker: &str) -> Check {
     if !path.exists() {
         return Check::warn(
             label,
-            format!(".git/hooks/{name} missing — rerun `tracevault init`"),
+            format!(".git/hooks/{name} missing — rerun `{TOP} init`"),
         );
     }
     match fs::read_to_string(&path) {
-        Ok(s) if s.contains(marker) => Check::ok(label, "installed"),
+        Ok(s) if crate::commands::init::has_marker(&s, marker) => Check::ok(label, "installed"),
         Ok(_) => Check::warn(
             label,
-            format!("{name} exists but no tracevault block — rerun `tracevault init`"),
+            format!("{name} exists but has no Visdom block — rerun `{TOP} init`"),
         ),
         Err(e) => Check::warn(label, format!("cannot read hook: {e}")),
     }
@@ -448,7 +457,7 @@ fn global_hook_check_in(settings_path: &Path) -> Check {
         ),
         SettingsHooks::NoHooks => Check::skip(
             "Global install",
-            "~/.claude/settings.json has no tracevault hooks",
+            crate::program::say("~/.claude/settings.json has no tracevault hooks"),
         ),
         SettingsHooks::Missing => Check::skip("Global install", "no ~/.claude/settings.json"),
         SettingsHooks::Unreadable(e) => Check::warn(
@@ -458,7 +467,7 @@ fn global_hook_check_in(settings_path: &Path) -> Check {
     }
 }
 
-/// Whether Claude Code's cost reaches TraceVault over OpenTelemetry
+/// Whether Claude Code's cost reaches Visdom over OpenTelemetry
 /// (`init --claude-telemetry`), read from `~/.claude/settings.json` and this
 /// process's `OTEL_*` environment. Off or exported elsewhere → Skip (both are
 /// legitimate); an incomplete install, one for another server than the login,
@@ -482,15 +491,18 @@ fn claude_telemetry_check_in(
     };
     let expected = server_url.map(logs_endpoint);
     match inspect(&settings, env, expected.as_deref()) {
-        TelemetryState::Off => Check::skip(LABEL, "off (enable with `tracevault telemetry on`)"),
+        TelemetryState::Off => Check::skip(
+            LABEL,
+            crate::program::say("off (enable with `tracevault telemetry on`)"),
+        ),
         TelemetryState::Foreign { reasons, ours_too } => {
             let detail = format!("exported elsewhere: {}", reasons.join("; "));
             if ours_too {
                 Check::warn(
                     LABEL,
                     format!(
-                        "{detail} — these exporters also receive TraceVault's otel-headers \
-                         token; remove them or TraceVault's otelHeadersHelper"
+                        "{detail} — these exporters also receive Visdom's otel-headers \
+                         token; remove them or Visdom's otelHeadersHelper"
                     ),
                 )
             } else {
@@ -500,7 +512,7 @@ fn claude_telemetry_check_in(
         TelemetryState::Ours { missing, .. } if !missing.is_empty() => Check::warn(
             LABEL,
             format!(
-                "incomplete ({} missing or changed): re-run `tracevault init --claude-telemetry`",
+                "incomplete ({} missing or changed): re-run `{TOP} init --claude-telemetry`",
                 missing.join(", ")
             ),
         ),
@@ -511,7 +523,7 @@ fn claude_telemetry_check_in(
                     LABEL,
                     format!(
                         "exports to {endpoint}, but you are logged in to {}: re-run \
-                         `tracevault init --claude-telemetry`",
+                         `{TOP} init --claude-telemetry`",
                         server_url.unwrap_or_default()
                     ),
                 ),
@@ -527,15 +539,16 @@ fn claude_telemetry_check_in(
 fn with_telemetry_choice(mut check: Check, state: &crate::install_state::InstallState) -> Check {
     match check.level {
         Level::Skip if state.claude_telemetry_opt_out && check.detail.starts_with("off") => {
-            check.detail =
-                "off — you opted out, upgrades keep it off (`tracevault telemetry on` to enable)"
-                    .to_string();
+            check.detail = crate::program::say(
+                "off — you opted out, upgrades keep it off (`tracevault telemetry on` to enable)",
+            )
+            .to_string();
         }
         Level::Ok => {
             if let Some(version) = &state.telemetry_auto_enabled {
                 check.detail.push_str(&format!(
                     " — turned on automatically by the upgrade to {version} \
-                     (`tracevault telemetry off` to disable)"
+                     (`{CLI} telemetry off` to disable)"
                 ));
             }
         }
@@ -607,22 +620,24 @@ fn claude_hook_check_in(repo_claude_dir: &Path, global_settings: Option<&Path>) 
     )
 }
 
-/// Severity of the "TraceVault initialized" check. A per-repo `.visdom/`
+/// Severity of the "Visdom initialized" check. A per-repo `.visdom/`
 /// present is always Ok. Absent is EXPECTED (Skip) when the user has a global
 /// install or an active workspace binding; only a truly-unconfigured setup
 /// (none of the three) is an Error.
 fn tracevault_init_check(tv_dir_present: bool, has_global: bool, has_binding: bool) -> Check {
     if tv_dir_present {
-        Check::ok("TraceVault initialized", ".visdom/ present")
+        Check::ok("Visdom initialized", ".visdom/ present")
     } else if has_global || has_binding {
         Check::skip(
-            "TraceVault initialized",
+            "Visdom initialized",
             "no per-repo .visdom/ — global/workspace mode",
         )
     } else {
         Check::err(
-            "TraceVault initialized",
-            "not set up: run `tracevault init` (per-repo) or `tracevault init --global`",
+            "Visdom initialized",
+            crate::program::say(
+                "not set up: run `tracevault init` (per-repo) or `tracevault init --global`",
+            ),
         )
     }
 }
@@ -680,7 +695,7 @@ fn workspace_repo_binding_check(
         Check::warn(
             "Workspace repo",
             format!(
-                "{base} — this repo_id is not a valid id and will be dropped at capture time; run `tracevault repo switch <path>` to rewrite it"
+                "{base} — this repo_id is not a valid id and will be dropped at capture time; run `{CLI} repo switch <path>` to rewrite it"
             ),
         )
     }
@@ -833,7 +848,7 @@ fn project_binding_check(outcome: &ProjectOutcome) -> Check {
         Err(e) => Check::warn("Project", e.to_string()),
         Ok(None) => Check::skip(
             "Project",
-            "not bound — run `tracevault project switch --user \"<name>\"`, or `tracevault repo switch <path>` inside a checkout",
+            crate::program::say("not bound — run `tracevault project switch --user \"<name>\"`, or `tracevault repo switch <path>` inside a checkout"),
         ),
         Ok(Some((binding, source))) => {
             // `Env` (`TRACEVAULT_PROJECT`) joined this list once
@@ -864,7 +879,7 @@ fn project_binding_check(outcome: &ProjectOutcome) -> Check {
                 Check::warn(
                     "Project",
                     format!(
-                        "{label} — {source}, resolved for display only: the capture path honours only the UUID form of TRACEVAULT_PROJECT, so a NAME is ignored there and attribution falls through to the next tier — export TRACEVAULT_PROJECT={} instead, or bind it with `tracevault project switch <name>`",
+                        "{label} — {source}, resolved for display only: the capture path honours only the UUID form of {ENV}_PROJECT, so a NAME is ignored there and attribution falls through to the next tier — export {ENV}_PROJECT={} instead, or bind it with `{CLI} project switch <name>`",
                         binding.project_id
                     ),
                 )
@@ -872,7 +887,7 @@ fn project_binding_check(outcome: &ProjectOutcome) -> Check {
                 Check::warn(
                     "Project",
                     format!(
-                        "{label} — {source}, not used for attribution at capture time; set one explicitly with `tracevault project switch <name>` or --project"
+                        "{label} — {source}, not used for attribution at capture time; set one explicitly with `{CLI} project switch <name>` or --project"
                     ),
                 )
             } else if binding.project_id.parse::<uuid::Uuid>().is_err() {
@@ -934,8 +949,8 @@ fn recording_check(
         "Recording",
         format!(
             "nothing will be recorded — session {id} is bound on neither the repo nor the \
-             project axis; run `tracevault project switch --user \"<name>\"` on a repo-less \
-             machine, or `tracevault repo switch <path>` inside a checkout"
+             project axis; run `{CLI} project switch --user \"<name>\"` on a repo-less \
+             machine, or `{CLI} repo switch <path>` inside a checkout"
         ),
     ))
 }
@@ -980,7 +995,7 @@ fn checkout_recording_check(
         (Some(Attribution::ProjectOnly { project_id }), Some(problem)) => Check::warn(
             LABEL,
             format!(
-                "{problem}: new sessions here record to project {project_id} only, not to this repo — run `tracevault sync` while logged in"
+                "{problem}: new sessions here record to project {project_id} only, not to this repo — run `{CLI} sync` while logged in"
             ),
         ),
         (Some(Attribution::ProjectOnly { project_id }), None) => Check::ok(
@@ -990,12 +1005,12 @@ fn checkout_recording_check(
         (None, Some(problem)) => Check::err(
             LABEL,
             format!(
-                "nothing will be recorded — {problem} and nothing else binds this checkout; run `tracevault sync` while logged in"
+                "nothing will be recorded — {problem} and nothing else binds this checkout; run `{CLI} sync` while logged in"
             ),
         ),
         (None, None) => Check::warn(
             LABEL,
-            "no session named and nothing binds this checkout locally — a new session here is bound by its hooks to the repo of this checkout's origin remote if the server has it registered (otherwise run `tracevault sync` while logged in), or by `tracevault repo switch <path>`",
+            crate::program::say("no session named and nothing binds this checkout locally — a new session here is bound by its hooks to the repo of this checkout's origin remote if the server has it registered (otherwise run `tracevault sync` while logged in), or by `tracevault repo switch <path>`"),
         ),
     }
 }
@@ -1257,7 +1272,7 @@ async fn server_repo_checks(
         Some(RepoLookup::MissingRepoId) => {
             out.push(Check::err(
                 "Repo registered on server",
-                ".visdom/tracing.toml has no repo_id, so sessions here are not attributed to this repo — run `tracevault sync` while logged in to register the repo and write it",
+                crate::program::say(".visdom/tracing.toml has no repo_id, so sessions here are not attributed to this repo — run `tracevault sync` while logged in to register the repo and write it"),
             ));
             return out;
         }
@@ -1290,7 +1305,7 @@ async fn server_repo_checks(
         None => {
             out.push(Check::err(
                 "Repo registered on server",
-                format!("repo id {id} (from {source}) not found on the server. Run `tracevault sync` while logged in."),
+                format!("repo id {id} (from {source}) not found on the server. Run `{CLI} sync` while logged in."),
             ));
             return out;
         }
@@ -1329,7 +1344,7 @@ async fn server_repo_checks(
                     }
                     (Some(local), Some(remote)) => out.push(Check::warn(
                         "Remote URL matches",
-                        format!("local={local} vs server={remote} — run `tracevault sync`"),
+                        format!("local={local} vs server={remote} — run `{CLI} sync`"),
                     )),
                     (Some(local), None) => out.push(Check::warn(
                         "Remote URL matches",
@@ -1444,7 +1459,7 @@ fn session_checks(project_root: &Path) -> Vec<Check> {
         Check::warn(
             "Pending events",
             format!(
-                "{pending_event_count} event(s) in {sessions_with_pending}/{total_sessions} session(s) — run `tracevault flush`"
+                "{pending_event_count} event(s) in {sessions_with_pending}/{total_sessions} session(s) — run `{CLI} flush`"
             ),
         )
     }]
@@ -1765,7 +1780,7 @@ mod tests {
         assert!(cfg.is_none());
         assert!(checks
             .iter()
-            .any(|c| c.level == Level::Error && c.label == "TraceVault initialized"));
+            .any(|c| c.level == Level::Error && c.label == "Visdom initialized"));
         // The Git-hooks Skip must NOT claim "global/workspace mode" when the
         // user is truly unconfigured (no global install, no binding).
         let git_hooks = checks
@@ -1794,7 +1809,7 @@ mod tests {
         );
         assert!(checks
             .iter()
-            .any(|c| c.label == "TraceVault initialized" && c.level == Level::Skip));
+            .any(|c| c.label == "Visdom initialized" && c.level == Level::Skip));
     }
 
     #[test]

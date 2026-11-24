@@ -4,6 +4,7 @@
 //! (`--path` flag → subagent worktree override → session active → bound
 //! `.visdom/tracing.toml`). See design §2/§3/§4.
 
+use crate::program::TOP;
 use std::path::Path;
 use std::process::Command;
 
@@ -231,7 +232,7 @@ pub async fn resolve_path_to_codebase(
     };
     if codebase.repos.is_empty() {
         return Err(format!(
-            "codebase {} is registered but has no tracked repo; run `tracevault init` in a checkout",
+            "codebase {} is registered but has no tracked repo; run `{TOP} init` in a checkout",
             codebase.display_name()
         )
         .into());
@@ -466,12 +467,12 @@ pub enum ProjectSource {
 impl ProjectSource {
     /// The command that rewrites a binding stored by this tier, for a
     /// warning about a stored `project_id` that is not a valid id.
-    pub fn rewrite_command(self) -> &'static str {
-        match self {
+    pub fn rewrite_command(self) -> String {
+        crate::program::say(match self {
             ProjectSource::Workspace => "tracevault init --workspace --project <name>",
             ProjectSource::UserDefault => "tracevault project switch --user <name>",
             _ => "tracevault project switch <name>",
-        }
+        })
     }
 }
 
@@ -480,6 +481,7 @@ impl std::fmt::Display for ProjectSource {
         let label = match self {
             ProjectSource::ProjectFlag => "--project override",
             ProjectSource::Subagent => "subagent worktree override",
+            ProjectSource::Env if crate::program::is_visdom() => "VISDOM_PROJECT (environment)",
             ProjectSource::Env => "TRACEVAULT_PROJECT (environment)",
             ProjectSource::SessionActive => "session (project switch)",
             ProjectSource::Workspace => "workspace .visdom/tracing.toml",
@@ -648,7 +650,7 @@ pub async fn resolve_effective_project(
             }
             ResolveProjectOutcome::Ambiguous => {
                 return Err(
-                    "this repo belongs to multiple projects; select one with `tracevault project switch <name>` or the `--project` override"
+                    crate::program::say("this repo belongs to multiple projects; select one with `tracevault project switch <name>` or the `--project` override")
                         .to_string()
                         .into(),
                 );

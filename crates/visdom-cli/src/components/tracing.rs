@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use tracevault_cli::agent::Agent;
-use tracevault_cli::commands::init::{has_tracevault_hooks, POST_COMMIT_MARKER, PRE_PUSH_MARKER};
+use tracevault_cli::commands::init::{
+    has_marker, has_tracevault_hooks, POST_COMMIT_MARKER, PRE_PUSH_MARKER,
+};
 use tracevault_cli::config::TracevaultConfig;
 
 use super::{CheckContext, CredentialState};
@@ -251,7 +253,7 @@ fn missing_git_hooks(root: &Path) -> Result<Option<String>, String> {
     ] {
         let path = hooks.join(name);
         match std::fs::read(&path) {
-            Ok(bytes) if String::from_utf8_lossy(&bytes).contains(marker) => {}
+            Ok(bytes) if has_marker(&String::from_utf8_lossy(&bytes), marker) => {}
             Ok(_) => missing.push(name),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push(name),
             Err(e) => return Err(format!("{}: {e}", path.display())),

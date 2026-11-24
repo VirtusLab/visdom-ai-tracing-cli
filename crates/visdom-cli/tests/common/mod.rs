@@ -63,7 +63,14 @@ impl Sandbox {
             .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
             .env("CODEX_HOME", self.home.path().join(".codex"))
             .stdin(Stdio::null());
-        for name in ["SERVER_URL", "API_KEY", "SESSION_ID", "NO_BROWSER"] {
+        for name in [
+            "SERVER_URL",
+            "API_KEY",
+            "SESSION_ID",
+            "NO_BROWSER",
+            "PROJECT",
+            "PROJECT_ATTRIBUTION",
+        ] {
             cmd.env_remove(format!("TRACEVAULT_{name}"));
             cmd.env_remove(format!("VISDOM_{name}"));
         }

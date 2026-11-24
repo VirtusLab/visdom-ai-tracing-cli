@@ -310,7 +310,7 @@ fn global_init_leaves_a_foreign_exporter_alone_and_prints_the_collector_route() 
         ],
     );
     assert!(o.status.success(), "stderr={}", stderr(&o));
-    assert!(stderr(&o).contains("otlphttp/tracevault"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("otlphttp/visdom"), "{}", stderr(&o));
     assert!(stderr(&o).contains("collector.corp"), "{}", stderr(&o));
 
     let s = settings(home.path());
