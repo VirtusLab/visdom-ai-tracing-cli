@@ -547,3 +547,49 @@ fn events_keep_routing_by_the_config_of_their_cwd() {
     );
     assert!(!fx.session_dir(&fx.child).exists());
 }
+
+/// A session an earlier release started keeps its `.tracevault/` directory
+/// (and its state in the legacy state dir) while this release's hooks carry
+/// it on: the transcript offset continues, nothing is sent twice, and no
+/// second directory appears under `.visdom/` — where new sessions go.
+#[test]
+fn a_session_an_earlier_release_started_carries_on_in_its_directory() {
+    let fx = Fixture::new();
+    let (base, rx) = spawn_server();
+    fx.session_start(&base, &fx.child, "startup");
+    fx.assistant(1);
+    fx.tool_use(&base, &fx.child);
+
+    // As that release would have left it.
+    let new_dir = fx.session_dir(&fx.child);
+    let legacy_dir = fx.child.join(".tracevault/sessions").join(SESSION_ID);
+    std::fs::create_dir_all(legacy_dir.parent().unwrap()).unwrap();
+    std::fs::rename(&new_dir, &legacy_dir).unwrap();
+    let legacy_state = fx.state.join("tracevault/sessions");
+    std::fs::create_dir_all(&legacy_state).unwrap();
+    std::fs::rename(
+        fx.state
+            .join("visdom/sessions")
+            .join(format!("{SESSION_ID}.toml")),
+        legacy_state.join(format!("{SESSION_ID}.toml")),
+    )
+    .unwrap();
+    // Another session of this release sits beside it under `.visdom/`.
+    std::fs::create_dir_all(fx.child.join(".visdom/sessions/another")).unwrap();
+
+    fx.assistant(2);
+    fx.tool_use(&base, &fx.child);
+    fx.assistant(3);
+    fx.tool_use(&base, &fx.child);
+
+    assert_eq!(
+        sent_lines(&rx),
+        vec![1, 2, 3],
+        "the offset carries on: every line once, in order"
+    );
+    assert!(legacy_dir.join(".stream_offset").is_file());
+    assert!(
+        !new_dir.exists(),
+        "the session must not get a second directory under .visdom/"
+    );
+}

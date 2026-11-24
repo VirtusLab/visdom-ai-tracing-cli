@@ -58,6 +58,15 @@ pub struct ContextPaths {
 }
 
 impl ContextPaths {
+    /// Create the directory context is saved into, with the `.gitignore`
+    /// that keeps it out of commits: a checkout an earlier release set up
+    /// has no `.visdom/` yet, and its root `.gitignore` only names
+    /// `.tracevault/`.
+    fn prepare_state_dir(&self) -> io::Result<()> {
+        std::fs::create_dir_all(&self.state_dir)?;
+        crate::config::TracevaultConfig::ensure_gitignore(&self.state_dir)
+    }
+
     /// Whether the checkout has been set up: its `.visdom/` exists, or the
     /// `.tracevault/` of an earlier release does.
     pub fn is_set_up(&self) -> bool {
@@ -270,6 +279,7 @@ impl Context {
 
     /// Save to the global context path.
     pub fn save_global(&self, paths: &ContextPaths) -> io::Result<()> {
+        paths.prepare_state_dir()?;
         self.save_to(&paths.global_path())
     }
 
@@ -278,6 +288,7 @@ impl Context {
         let wt_path = paths.worktree_path().ok_or_else(|| {
             io::Error::other("cannot save per-worktree context from primary checkout")
         })?;
+        paths.prepare_state_dir()?;
         self.save_to(&wt_path)
     }
 
@@ -584,6 +595,8 @@ mod tests {
         // Saving goes to the new place and leaves the old file as it was.
         worktree.save_worktree(&paths).unwrap();
         assert!(root.join(".visdom/worktrees/feature/context.json").exists());
+        // And the new directory keeps itself out of commits.
+        assert!(root.join(".visdom/.gitignore").exists());
         assert_eq!(
             std::fs::read_to_string(root.join(".tracevault/worktrees/feature/context.json"))
                 .unwrap(),

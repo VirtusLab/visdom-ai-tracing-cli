@@ -289,7 +289,21 @@ impl Credentials {
         // that file would keep an earlier `tracevault` signed in as whoever
         // it names.
         if let Some(legacy) = Self::legacy_path() {
-            let _ = fs::remove_file(&legacy);
+            match fs::remove_file(&legacy) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // Not silently: an earlier `tracevault` would go on using it.
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "the new login is saved, but the previous one at {} could not be \
+                             removed ({e}); remove it by hand",
+                            legacy.display()
+                        ),
+                    ))
+                }
+            }
             Self::remove_temp_files_beside(&legacy, None);
         }
         Ok(())

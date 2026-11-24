@@ -20,7 +20,7 @@ fn carry(from: &Path, to: &Path) -> Option<String> {
     let moved = to
         .parent()
         .map_or(Ok(()), fs::create_dir_all)
-        .and_then(|()| fs::rename(from, to));
+        .and_then(|()| move_without_replacing(from, to));
     Some(match moved {
         Ok(()) => format!("Moved {} to {}", from.display(), to.display()),
         Err(e) => format!(
@@ -29,6 +29,18 @@ fn carry(from: &Path, to: &Path) -> Option<String> {
             to.display()
         ),
     })
+}
+
+/// Move `from` to `to`, never over something that appeared at `to` in the
+/// meantime (a `login` or a context edit running beside this `init`): a file
+/// is hard-linked into place, which fails when the name is taken, and then
+/// unlinked; a directory is renamed, which fails on a non-empty one.
+fn move_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+    if from.is_dir() {
+        return fs::rename(from, to);
+    }
+    fs::hard_link(from, to)?;
+    fs::remove_file(from)
 }
 
 /// Remove `dir` when nothing is left in it but the files named in `ignorable`.
