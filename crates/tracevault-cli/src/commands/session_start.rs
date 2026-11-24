@@ -98,10 +98,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     injected
 }
 
-/// Record the `.tracevault/` root `cwd` resolves to as the session's storage
+/// Record the `.visdom/` root `cwd` resolves to as the session's storage
 /// root (see [`crate::session_state::SessionState::storage_root`]) — unless
 /// nothing resolves there: a [`Fallback`](crate::paths::ProjectRootSource::Fallback)
-/// root would put a stray `.tracevault/` in, say, the home directory and keep
+/// root would put a stray `.visdom/` in, say, the home directory and keep
 /// the session out of the repo it then works in, so that session keeps
 /// resolving per event. Best-effort; returns whether it wrote.
 fn record_storage_root(
@@ -171,7 +171,7 @@ mod tests {
     fn record_storage_root_records_an_ancestor_tracevault_dir() {
         let state = tempfile::tempdir().unwrap();
         let umbrella = tempfile::tempdir().unwrap();
-        std::fs::create_dir(umbrella.path().join(".tracevault")).unwrap();
+        std::fs::create_dir(umbrella.path().join(".visdom")).unwrap();
         let sub = umbrella.path().join("notes");
         std::fs::create_dir(&sub).unwrap();
         assert!(record_storage_root(state.path(), &sub, "sess-1").unwrap());

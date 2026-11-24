@@ -389,7 +389,7 @@ fn select_with_external(
 /// Add a session dir that lives outside `sessions_dir` to the sessions a
 /// push is checked against, unless it is gone, pushed, or already there.
 ///
-/// A session keeps its dir in the `.tracevault/` it STARTED in (VIS-1257), so
+/// A session keeps its dir in the `.visdom/` it STARTED in (VIS-1257), so
 /// one started in an umbrella directory that then works in this checkout has
 /// no dir here. A dir inside `sessions_dir` was already considered by the
 /// worktree selection, and its verdict stands.
@@ -398,7 +398,10 @@ fn add_external_session(
     sessions_dir: &Path,
     dir: std::path::PathBuf,
 ) {
-    if dir.parent() == Some(sessions_dir) || !dir.is_dir() || dir.join(".pushed").exists() {
+    let local = dir
+        .parent()
+        .is_some_and(|parent| crate::session_state::is_local_sessions_dir(parent, sessions_dir));
+    if local || !dir.is_dir() || dir.join(".pushed").exists() {
         return;
     }
     if !selected.contains(&dir) {
@@ -493,7 +496,7 @@ fn streamed_elsewhere_warning(
 ///
 /// `project_root` — the git-resolved PRIMARY worktree root (from
 ///   `paths::resolve_project_root`). Used to load config/credentials, locate
-///   `.tracevault/sessions/`, and resolve the server-registered repo (by its
+///   `.visdom/sessions/`, and resolve the server-registered repo (by its
 ///   origin remote, else by the primary checkout's basename; a sibling
 ///   worktree's own directory basename would not match the registered repo).
 /// `cwd` — the ACTUAL working directory where the CLI was invoked. Used for
@@ -528,11 +531,11 @@ pub async fn check_policies(
     // guessing — see `connectivity_message` below.
     let repo = resolve_pushed_repo(&client, project_root).await?;
 
-    // Collect unpushed session dirs from the shared primary .tracevault/.
-    let sessions_dir = project_root.join(".tracevault").join("sessions");
+    // Collect unpushed session dirs from the shared primary .visdom/.
+    let sessions_dir = crate::layout::sessions_dir(project_root);
     let mut unpushed_dirs: Vec<std::path::PathBuf> = Vec::new();
-    if sessions_dir.exists() {
-        for entry in fs::read_dir(&sessions_dir)? {
+    for dir in crate::layout::existing_sessions_dirs(project_root) {
+        for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
@@ -549,7 +552,7 @@ pub async fn check_policies(
     // evaluated against sessions belonging to other worktrees.
     let worktree_top = crate::paths::worktree_toplevel(cwd);
     //
-    // Sessions that keep their dir in the `.tracevault/` they started in (an
+    // Sessions that keep their dir in the `.visdom/` they started in (an
     // umbrella dir, VIS-1257) and worked in this worktree, plus the session
     // running this push, wherever its dir is, belong to it too — found
     // first, so they count before falling back to every local session.
@@ -574,7 +577,7 @@ pub async fn check_policies(
             .as_ref()
             .and_then(crate::resolution::binding_from_config),
         Err(e) => {
-            eprintln!("Warning: ignoring malformed .tracevault/config.toml: {e}");
+            eprintln!("Warning: ignoring malformed .visdom/tracing.toml: {e}");
             None
         }
     };
@@ -703,7 +706,7 @@ fn connectivity_message(raw: &str) -> String {
     {
         return with_action(
             raw,
-            "Could not reach the TraceVault server. Check network and `server_url` in .tracevault/config.toml.",
+            "Could not reach the TraceVault server. Check network and `server_url` in .visdom/tracing.toml.",
         );
     }
     // Unrecognized — surface the raw error verbatim, no invented advice.
@@ -773,14 +776,14 @@ mod worktree_tests {
     #[test]
     fn adds_an_external_session_only_when_it_lives_elsewhere() {
         let tmp = tempfile::tempdir().unwrap();
-        let here = tmp.path().join("repo/.tracevault/sessions");
+        let here = tmp.path().join("repo/.visdom/sessions");
         let local = seed(&here, "local", Some("/wt/b"));
         let elsewhere = seed(
-            &tmp.path().join("umbrella/.tracevault/sessions"),
+            &tmp.path().join("umbrella/.visdom/sessions"),
             "s",
             Some("/u"),
         );
-        let pushed = seed(&tmp.path().join("umbrella/.tracevault/sessions"), "p", None);
+        let pushed = seed(&tmp.path().join("umbrella/.visdom/sessions"), "p", None);
         std::fs::write(pushed.join(".pushed"), "").unwrap();
 
         let mut selected = vec![];
@@ -1613,7 +1616,7 @@ mod pushed_repo_tests {
         guard.remove("TRACEVAULT_API_KEY");
         guard.remove("TRACEVAULT_SERVER_URL");
         let (server, rx) = crate::test_helpers::spawn_seq(responses);
-        let creds_dir = home.path().join("tracevault");
+        let creds_dir = home.path().join("visdom");
         std::fs::create_dir_all(&creds_dir).unwrap();
         std::fs::write(
             creds_dir.join("credentials.json"),
@@ -1645,7 +1648,7 @@ mod pushed_repo_tests {
         }
         let top = crate::paths::worktree_toplevel(&repo);
         for id in sessions {
-            let dir = repo.join(".tracevault").join("sessions").join(id);
+            let dir = repo.join(".visdom").join("sessions").join(id);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("origin"), &top).unwrap();
         }

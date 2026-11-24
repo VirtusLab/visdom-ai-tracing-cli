@@ -400,7 +400,7 @@ async fn switch(
 /// The project `project status` treats as effective: exactly the capture-time
 /// chain ingest uses ([`capture_project_binding`]: `--project` flag →
 /// subagent worktree override → `TRACEVAULT_PROJECT` → session
-/// `active_project` → workspace `.tracevault/config.toml` `project_id` → user
+/// `active_project` → workspace `.visdom/tracing.toml` `project_id` → user
 /// default).
 /// Pure — `status` supplies `user_default` from `user_project_default::load()`
 /// and `env_project` from `commands::stream::env_project_binding()`, the same
@@ -467,7 +467,7 @@ fn enrich_project_name(
 
 /// Warning for a `TRACEVAULT_PROJECT` that holds a NAME rather than a UUID.
 ///
-/// Same rule as the legacy `.tracevault/config.toml` `default_project`
+/// Same rule as the legacy `.visdom/tracing.toml` `default_project`
 /// (`commands::migrate::legacy_default_project_notice`): resolving a name needs a `list_projects` round trip, the per-event capture
 /// path never makes one, so the variable decides nothing and attribution
 /// falls through to the next tier. `status` therefore does NOT resolve it
@@ -1209,7 +1209,7 @@ mod tests {
         );
         assert_eq!(
             invalid_capture_id_warning(&b, ProjectSource::Workspace),
-            "warning: project payments — workspace .tracevault/config.toml, but the saved project_id is not a valid id and is dropped at capture time; run `tracevault init --workspace --project <name>` to rewrite it"
+            "warning: project payments — workspace .visdom/tracing.toml, but the saved project_id is not a valid id and is dropped at capture time; run `tracevault init --workspace --project <name>` to rewrite it"
         );
     }
 
@@ -1691,7 +1691,7 @@ mod tests {
     /// which closes after the first `accept()`) would fail fast, and the
     /// switch would error instead of succeeding.
     ///
-    /// Credentials are supplied two ways at once: a `.tracevault/config.toml`
+    /// Credentials are supplied two ways at once: a `.visdom/tracing.toml`
     /// in `cwd`, and `TRACEVAULT_SERVER_URL`/`_API_KEY` env vars pinned (via
     /// the guard below) at the same mock server/values. The env vars sit
     /// above the config file in `resolve_credentials`'s precedence, so
@@ -1734,10 +1734,10 @@ mod tests {
             r#"[{"id":"11111111-1111-4111-8111-111111111111","name":"payments"}]"#.to_string();
         let base = spawn_once(http_200(&list));
 
-        let config_dir = tmp.path().join(".tracevault");
+        let config_dir = tmp.path().join(".visdom");
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
-            config_dir.join("config.toml"),
+            config_dir.join("tracing.toml"),
             format!("agent = \"claude-code\"\nserver_url = \"{base}\"\napi_key = \"tok\"\n"),
         )
         .unwrap();
@@ -1746,7 +1746,7 @@ mod tests {
         // in `switch` still cleans up the process env. `_env_lock` (taken
         // above) also covers `resolve_credentials`'s *reads* of
         // TRACEVAULT_SERVER_URL/_API_KEY: those env vars sit above
-        // `.tracevault/config.toml` in precedence, so if the developer's
+        // `.visdom/tracing.toml` in precedence, so if the developer's
         // ambient shell happens to already export them (e.g. pointing at a
         // real server), `resolve_credentials` would pick those up instead of
         // this test's config file and the request would go to the wrong
@@ -1957,7 +1957,7 @@ mod tests {
                 Some(u(2)),
             ),
         ];
-        // The workspace `.tracevault/config.toml` `project_id` tier
+        // The workspace `.visdom/tracing.toml` `project_id` tier
         // (VIS-1256): same shared chain, so it is pinned here too. Each case
         // adds the config's `project_id` as a sixth column.
         let session_active = || SessionState {

@@ -51,9 +51,9 @@ pub async fn sync_repo(project_root: &Path) -> Result<(), Box<dyn std::error::Er
                 "Repo already registered (id: {repo_id}, codebase: {}); {}",
                 codebase.display_name(),
                 if bound {
-                    "bound .tracevault/config.toml to it"
+                    "bound .visdom/tracing.toml to it"
                 } else {
-                    "no .tracevault/config.toml here to bind (run `tracevault init` to create one)"
+                    "no .visdom/tracing.toml here to bind (run `tracevault init` to create one)"
                 }
             );
             return Ok(());
@@ -99,7 +99,7 @@ pub async fn sync_repo(project_root: &Path) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-/// Migrate `project_root`'s `.tracevault/config.toml` legacy
+/// Migrate `project_root`'s `.visdom/tracing.toml` legacy
 /// `default_project` NAME to `project_id` + `project_name` (VIS-1256). An
 /// unknown or ambiguous name fails `sync` with the config unchanged; an
 /// unreachable server is a warning (the rest of `sync` treats it the same
@@ -165,7 +165,7 @@ mod tests {
                 ),
             ),
         ]);
-        std::fs::create_dir_all(root.join(".tracevault")).unwrap();
+        std::fs::create_dir_all(root.join(".visdom")).unwrap();
         std::fs::write(
             TracevaultConfig::config_path(root),
             format!("server_url = \"{base}\"\n"),
@@ -201,7 +201,7 @@ mod tests {
             "200 OK",
             &format!(r#"[{{"id":"{pid}","name":"visdom"}}]"#),
         )]);
-        std::fs::create_dir_all(root.join(".tracevault")).unwrap();
+        std::fs::create_dir_all(root.join(".visdom")).unwrap();
         std::fs::write(
             TracevaultConfig::config_path(root),
             format!("server_url = \"{base}\"\ndefault_project = \"visdom\"\nfuture_key = 1\n"),
@@ -239,7 +239,7 @@ mod tests {
             "200 OK",
             r#"[{"id":"00000000-0000-4000-8000-0000000000aa","name":"visdom"}]"#,
         )]);
-        std::fs::create_dir_all(root.join(".tracevault")).unwrap();
+        std::fs::create_dir_all(root.join(".visdom")).unwrap();
         let content = format!("server_url = \"{base}\"\ndefault_project = \"typo\"\n");
         std::fs::write(TracevaultConfig::config_path(root), &content).unwrap();
         let mut guard = crate::test_helpers::EnvVarGuard::new();

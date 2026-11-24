@@ -12,7 +12,7 @@ use crate::config::TracevaultConfig;
 /// moves the phase cursor forward, discarding events from the previous phase.
 ///
 /// `project_root` — the git-resolved PRIMARY worktree root (from
-///   `paths::resolve_project_root`). Used to locate `.tracevault/`.
+///   `paths::resolve_project_root`). Used to locate `.visdom/`.
 /// `cwd` — the ACTUAL working directory where the CLI was invoked. Used to
 ///   determine the current worktree toplevel for session disambiguation. In a
 ///   sibling linked worktree `cwd` differs from `project_root`, so both are
@@ -36,14 +36,14 @@ pub async fn open_verification_phase(
     env_session_id: Option<&str>,
 ) -> Result<(), String> {
     // Optional, like on the hook path: a session bound with `repo switch`
-    // resolves without a `.tracevault/config.toml`. A malformed one is still
+    // resolves without a `.visdom/tracing.toml`. A malformed one is still
     // an error — the hook refuses to send under it too.
     let config = TracevaultConfig::try_load(project_root)
-        .map_err(|e| format!("malformed .tracevault/config.toml: {e}"))?;
+        .map_err(|e| format!("malformed .visdom/tracing.toml: {e}"))?;
 
-    let sessions_dir = project_root.join(".tracevault").join("sessions");
+    let sessions_dir = crate::layout::sessions_dir(project_root);
     let worktree_top = crate::paths::worktree_toplevel(cwd);
-    // A session's own dir may live in the `.tracevault/` it started in, not
+    // A session's own dir may live in the `.visdom/` it started in, not
     // this checkout's (VIS-1257).
     let session_dir_of = |id: &str| crate::session_state::session_dir(project_root, id);
     let invoking = explicit_session_id
@@ -75,7 +75,7 @@ pub async fn open_verification_phase(
     } else {
         // Auto-detect with worktree disambiguation.
         //
-        // Since all worktrees share the primary `.tracevault/sessions/` dir, the
+        // Since all worktrees share the primary `.visdom/sessions/` dir, the
         // most-recently-modified heuristic can silently open the wrong session.
         // Instead:
         //   1. Compute the current worktree toplevel.
@@ -87,7 +87,7 @@ pub async fn open_verification_phase(
         // Use `cwd` (the actual invocation directory), not `project_root`
         // (the primary root), so that in a sibling worktree we correctly
         // compare against the sibling's toplevel, not the primary's.
-        // Plus sessions kept in the `.tracevault/` they started in (an
+        // Plus sessions kept in the `.visdom/` they started in (an
         // umbrella dir) that ran here (VIS-1257).
         let mut matching = find_sessions_by_origin(&sessions_dir, &worktree_top);
         matching.extend(crate::session_state::anchored_session_dirs(
@@ -170,7 +170,7 @@ pub async fn open_verification_phase(
     // Through `resolve_client`, like every other command — NOT by pairing
     // `Credentials::load()` with `config.server_url` directly.
     //
-    // This is a security fix, not tidiness. `.tracevault/config.toml` is
+    // This is a security fix, not tidiness. `.visdom/tracing.toml` is
     // TRACKED in user repos (the `.gitignore` this CLI writes covers only
     // `sessions/`, `cache/` and `*.local.toml`), so a pull request that edited
     // `server_url` made any reviewer who ran `tracevault verify-start` in that
@@ -254,9 +254,8 @@ fn belongs_here(dir: &Path, worktree_top: &str) -> bool {
 /// the fallback for legacy, unmarked sessions, and picking another worktree's
 /// session would open the window under that worktree's repo binding.
 fn find_latest_session(sessions_dir: &Path, worktree_top: &str) -> Option<PathBuf> {
-    let entries = fs::read_dir(sessions_dir).ok()?;
-    entries
-        .filter_map(|e| e.ok())
+    crate::layout::session_entries(sessions_dir)
+        .into_iter()
         .filter(|e| e.path().is_dir())
         .filter(|e| belongs_here(&e.path(), worktree_top))
         .max_by_key(|e| {
@@ -291,11 +290,8 @@ fn origin_match(session_dir: &Path, worktree_top: &str) -> OriginMatch {
 /// `worktree_top`: their `origin` marker matches it (exact string match after
 /// trimming), or their worktree list names it.
 fn find_sessions_by_origin(sessions_dir: &Path, worktree_top: &str) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(sessions_dir) else {
-        return vec![];
-    };
-    entries
-        .filter_map(|e| e.ok())
+    crate::layout::session_entries(sessions_dir)
+        .into_iter()
         .filter(|e| e.path().is_dir())
         // `ran_in`: the `origin` marker names it, or an anchored session
         // lists it among the worktrees it ran in (VIS-1257).
@@ -366,7 +362,7 @@ mod tests {
     // ── worktree-aware selection with real git worktrees ──────────────────────
 
     /// check/verify-start from a sibling worktree resolves sessions_dir to the
-    /// primary `.tracevault/` directory, not the worktree dir.
+    /// primary `.visdom/` directory, not the worktree dir.
     #[test]
     fn sessions_dir_from_sibling_worktree_is_under_primary() {
         let tmp = tempfile::tempdir().unwrap();
@@ -384,7 +380,7 @@ mod tests {
             repo.canonicalize().unwrap(),
             "sibling worktree must resolve to primary repo root"
         );
-        let sessions_dir = resolved.root.join(".tracevault").join("sessions");
+        let sessions_dir = resolved.root.join(".visdom").join("sessions");
         assert!(
             sessions_dir.starts_with(&repo),
             "sessions_dir must be under primary repo root"
@@ -406,7 +402,7 @@ mod tests {
         let primary_top = repo.canonicalize().unwrap().to_string_lossy().into_owned();
         let wt_top = wt.canonicalize().unwrap().to_string_lossy().into_owned();
 
-        let sessions_dir = repo.join(".tracevault").join("sessions");
+        let sessions_dir = repo.join(".visdom").join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
         make_session_dir(&sessions_dir, "session-primary", Some(&primary_top));
         make_session_dir(&sessions_dir, "session-sibling", Some(&wt_top));
@@ -537,7 +533,7 @@ mod tests {
 
     /// `verify-start` used to pair `Credentials::load()` with
     /// `config.server_url` directly, bypassing everything `resolve_credentials`
-    /// enforces. Since `.tracevault/config.toml` is TRACKED in user repos, a PR
+    /// enforces. Since `.visdom/tracing.toml` is TRACKED in user repos, a PR
     /// that edited `server_url` made any reviewer running this command POST
     /// their Keycloak access token to an arbitrary host.
     ///
@@ -565,7 +561,7 @@ mod tests {
         ]);
 
         // The saved login is for `login_server`.
-        let creds_dir = home.path().join("tracevault");
+        let creds_dir = home.path().join("visdom");
         std::fs::create_dir_all(&creds_dir).unwrap();
         std::fs::write(
             creds_dir.join("credentials.json"),
@@ -579,10 +575,10 @@ mod tests {
 
         // The repo's committed config points somewhere else — the malicious PR.
         let repo = tempfile::tempdir().unwrap();
-        let tv = repo.path().join(".tracevault");
+        let tv = repo.path().join(".visdom");
         std::fs::create_dir_all(tv.join("sessions").join("sess-1")).unwrap();
         std::fs::write(
-            tv.join("config.toml"),
+            tv.join("tracing.toml"),
             "repo_id = \"11111111-1111-4111-8111-111111111111\"\n\
              server_url = \"https://attacker.invalid\"\n",
         )
@@ -618,7 +614,7 @@ mod tests {
         guard.remove("TRACEVAULT_API_KEY");
         guard.set("TRACEVAULT_SERVER_URL", "https://instance-a.example.com");
 
-        let creds_dir = home.path().join("tracevault");
+        let creds_dir = home.path().join("visdom");
         std::fs::create_dir_all(&creds_dir).unwrap();
         std::fs::write(
             creds_dir.join("credentials.json"),
@@ -629,10 +625,10 @@ mod tests {
         .unwrap();
 
         let repo = tempfile::tempdir().unwrap();
-        let tv = repo.path().join(".tracevault");
+        let tv = repo.path().join(".visdom");
         std::fs::create_dir_all(tv.join("sessions").join("sess-1")).unwrap();
         std::fs::write(
-            tv.join("config.toml"),
+            tv.join("tracing.toml"),
             "repo_id = \"11111111-1111-4111-8111-111111111111\"\n",
         )
         .unwrap();
@@ -673,7 +669,7 @@ mod tests {
             "200 OK",
             r#"{"session_db_id":"22222222-2222-4222-8222-222222222222","event_db_id":null,"status":"ok"}"#,
         )]);
-        let creds_dir = home.path().join("tracevault");
+        let creds_dir = home.path().join("visdom");
         std::fs::create_dir_all(&creds_dir).unwrap();
         std::fs::write(
             creds_dir.join("credentials.json"),
@@ -691,13 +687,13 @@ mod tests {
     /// them recorded (by `origin` marker) as belonging to this worktree.
     fn checkout_with_sessions(ids: &[&str]) -> tempfile::TempDir {
         let repo = tempfile::tempdir().unwrap();
-        let tv = repo.path().join(".tracevault");
+        let tv = repo.path().join(".visdom");
         let top = crate::paths::worktree_toplevel(repo.path());
         for id in ids {
             make_session_dir(&tv.join("sessions"), id, Some(&top));
         }
         std::fs::write(
-            tv.join("config.toml"),
+            tv.join("tracing.toml"),
             format!("repo_id = \"{CONFIG_REPO}\"\n"),
         )
         .unwrap();
@@ -770,7 +766,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let top = crate::paths::worktree_toplevel(repo.path());
         make_session_dir(
-            &repo.path().join(".tracevault").join("sessions"),
+            &repo.path().join(".visdom").join("sessions"),
             "sess-1",
             Some(&top),
         );

@@ -37,7 +37,8 @@ open = "5"
 dirs = "6"
 # `preserve_order`: `TracevaultConfig::save` keeps a hand-edited config.toml's key order.
 toml = { version = "0.8", features = ["preserve_order"] }
+# 3.15: the first release without AIKIDO-2025-10003 (predictable temporary names).
+tempfile = "3.15"
 
 [dev-dependencies]
-tempfile = "3"
 tokio.workspace = true

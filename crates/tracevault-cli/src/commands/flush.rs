@@ -202,17 +202,12 @@ fn origin_config_project(origin: &Path) -> Option<crate::session_state::ProjectB
         .and_then(crate::resolution::project_from_config)
 }
 
-/// The workspace project tier (`.tracevault/config.toml` `project_id`) of the
+/// The workspace project tier (`.visdom/tracing.toml` `project_id`) of the
 /// project root a session directory lives under
-/// (`<root>/.tracevault/sessions/<id>`), for a session dir with no `origin`
+/// (`<root>/.visdom/sessions/<id>`), for a session dir with no `origin`
 /// marker. `None` when the layout does not match or the config has none.
 fn session_dir_config_project(session_dir: &Path) -> Option<crate::session_state::ProjectBinding> {
-    let sessions = session_dir.parent()?;
-    let tv_dir = sessions.parent()?;
-    if sessions.file_name()? != "sessions" || tv_dir.file_name()? != ".tracevault" {
-        return None;
-    }
-    let root = tv_dir.parent()?;
+    let root = crate::layout::session_dir_root(session_dir)?;
     crate::config::TracevaultConfig::load(root)
         .as_ref()
         .and_then(crate::resolution::project_from_config)
@@ -295,7 +290,7 @@ async fn drain_queue(
 
     // Label the progress and warning lines with the session directory the
     // queue lives in. It is the same id the hook stamped on every event here
-    // (`run_stream` writes the queue under `.tracevault/sessions/<id>/`), but
+    // (`run_stream` writes the queue under `.visdom/sessions/<id>/`), but
     // taken from the path rather than the payload: the label is a directory
     // name, not data read out of the event.
     let queue_dir_name = pending_path
@@ -364,8 +359,8 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
     // any legacy queue can't be attributed and is left in place.
     let bound_repo_id = crate::config::TracevaultConfig::load(project_root).and_then(|c| c.repo_id);
 
-    let sessions_dir = project_root.join(".tracevault").join("sessions");
-    if !sessions_dir.exists() {
+    let sessions_dirs = crate::layout::existing_sessions_dirs(project_root);
+    if sessions_dirs.is_empty() {
         println!("No sessions directory found. Nothing to flush.");
         return Ok(());
     }
@@ -373,7 +368,12 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
     let mut total_sent = 0u64;
     let mut total_failed = 0u64;
 
-    let session_entries: Vec<_> = fs::read_dir(&sessions_dir)?
+    let session_entries: Vec<_> = sessions_dirs
+        .iter()
+        .map(fs::read_dir)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .collect();
@@ -485,7 +485,7 @@ mod tests {
 
     /// From a sibling worktree the resolved project root must point at the
     /// PRIMARY checkout, so `flush` looks for sessions under
-    /// `<primary>/.tracevault/sessions/` rather than a non-existent sibling dir.
+    /// `<primary>/.visdom/sessions/` rather than a non-existent sibling dir.
     ///
     /// This test asserts only the resolution layer — draining the queue requires
     /// a live server, so the full end-to-end drain path is not exercised here.
@@ -501,7 +501,7 @@ mod tests {
 
         // Place a pending.jsonl in the primary sessions dir.
         let session_id = "aabbccdd-0000-0000-0000-000000000001";
-        let sessions_dir = repo.join(".tracevault").join("sessions").join(session_id);
+        let sessions_dir = repo.join(".visdom").join("sessions").join(session_id);
         fs::create_dir_all(&sessions_dir).unwrap();
         fs::write(sessions_dir.join("pending.jsonl"), "").unwrap();
 
@@ -510,12 +510,12 @@ mod tests {
         let expected_sessions = repo
             .canonicalize()
             .unwrap()
-            .join(".tracevault")
+            .join(".visdom")
             .join("sessions");
         let got_sessions = resolved_root
             .canonicalize()
             .unwrap()
-            .join(".tracevault")
+            .join(".visdom")
             .join("sessions");
 
         assert_eq!(
@@ -994,10 +994,10 @@ mod send_tests {
     }
 
     /// VIS-1256: a queue under a workspace directory recovers the workspace
-    /// tier (`.tracevault/config.toml` `project_id` at the session dir's
+    /// tier (`.visdom/tracing.toml` `project_id` at the session dir's
     /// root) exactly as the live send did, and drains a repo queue to the
     /// project-scoped endpoint carrying the repo id. A session dir outside
-    /// the `<root>/.tracevault/sessions/<id>` layout has no config tier.
+    /// the `<root>/.visdom/sessions/<id>` layout has no config tier.
     #[tokio::test]
     async fn queue_binding_recovers_the_workspace_project_from_the_session_dir() {
         let _env_lock = lock_env_mutation().await;
@@ -1011,10 +1011,10 @@ mod send_tests {
 
         let pid = uuid::Uuid::from_u128(0x1256);
         let root = tmp.path().join("umbrella");
-        let session_dir = root.join(".tracevault/sessions/flush-workspace");
+        let session_dir = root.join(".visdom/sessions/flush-workspace");
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(
-            root.join(".tracevault/config.toml"),
+            root.join(".visdom/tracing.toml"),
             format!("project_id = \"{pid}\"\nproject_name = \"visdom\"\n"),
         )
         .unwrap();
@@ -1039,7 +1039,7 @@ mod send_tests {
             "repo id carried: {captured}"
         );
 
-        // Not under `.tracevault/sessions/`: no config tier.
+        // Not under `.visdom/sessions/`: no config tier.
         let stray = tmp.path().join("elsewhere/flush-workspace");
         fs::create_dir_all(&stray).unwrap();
         assert_eq!(session_dir_config_project(&stray), None);
@@ -1316,7 +1316,7 @@ mod send_tests {
         )
         .unwrap();
 
-        let session_dir = root.join(".tracevault").join("sessions").join(session_id);
+        let session_dir = root.join(".visdom").join("sessions").join(session_id);
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(
             session_dir.join("origin"),

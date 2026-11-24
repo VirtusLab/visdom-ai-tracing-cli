@@ -10,7 +10,7 @@ use std::process::Command;
 
 /// Active context written by `tracevault context set` and read by the CC hook.
 ///
-/// Stored as pretty-printed JSON at `.tracevault/context.json`.
+/// Stored as pretty-printed JSON at `.visdom/context.json`.
 /// BTreeMap is used for `params` so keys are always in sorted order on disk,
 /// giving stable, human-readable diffs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -48,28 +48,44 @@ pub enum WorktreeScope {
     Linked { key: String },
 }
 
-/// Resolved paths for context storage, rooted in the primary worktree's `.tracevault/`.
+/// Resolved paths for context storage, rooted in the primary worktree's `.visdom/`.
 #[derive(Debug, Clone)]
 pub struct ContextPaths {
-    /// `<primary_root>/.tracevault/`
-    pub tracevault_dir: PathBuf,
+    /// `<primary_root>/.visdom/`
+    pub state_dir: PathBuf,
     /// Primary or Linked.
     pub scope: WorktreeScope,
 }
 
 impl ContextPaths {
-    /// `<tracevault_dir>/context.json` — the global (repo-wide) context file.
-    pub fn global_path(&self) -> PathBuf {
-        self.tracevault_dir.join("context.json")
+    /// Create the directory context is saved into, with the `.gitignore`
+    /// that keeps it out of commits: a checkout an earlier release set up
+    /// has no `.visdom/` yet, and its root `.gitignore` only names
+    /// `.tracevault/`.
+    fn prepare_state_dir(&self) -> io::Result<()> {
+        std::fs::create_dir_all(&self.state_dir)?;
+        crate::config::TracevaultConfig::ensure_gitignore(&self.state_dir)
     }
 
-    /// `<tracevault_dir>/worktrees/<key>/context.json` when in a linked worktree;
+    /// Whether the checkout has been set up: its `.visdom/` exists, or the
+    /// `.tracevault/` of an earlier release does.
+    pub fn is_set_up(&self) -> bool {
+        self.state_dir.exists()
+            || crate::layout::legacy_twin(&self.state_dir).is_some_and(|dir| dir.exists())
+    }
+
+    /// `<state_dir>/context.json` — the global (repo-wide) context file.
+    pub fn global_path(&self) -> PathBuf {
+        self.state_dir.join("context.json")
+    }
+
+    /// `<state_dir>/worktrees/<key>/context.json` when in a linked worktree;
     /// `None` when in the primary worktree.
     pub fn worktree_path(&self) -> Option<PathBuf> {
         match &self.scope {
             WorktreeScope::Primary => None,
             WorktreeScope::Linked { key } => Some(
-                self.tracevault_dir
+                self.state_dir
                     .join("worktrees")
                     .join(key)
                     .join("context.json"),
@@ -123,23 +139,30 @@ fn git_rev_parse(start_dir: &Path) -> Option<(PathBuf, PathBuf)> {
     Some((git_common_dir, git_dir))
 }
 
+/// The directory `root`'s context files are written to. A file an earlier
+/// release left in `.tracevault/` is still read — each file on its own, see
+/// [`Context::load_from`] — until something is saved in its place.
+fn context_dir(root: &Path) -> PathBuf {
+    crate::layout::repo_dir(root)
+}
+
 /// Resolve worktree-aware context paths from `start_dir`.
 ///
 /// Resolution order:
 /// 1. Run `git rev-parse --git-common-dir --git-dir` to locate the primary worktree.
-///    - `tracevault_dir = parent(git_common_dir)/.tracevault`
+///    - `state_dir = parent(git_common_dir)/.visdom`
 ///    - If `git_dir == git_common_dir` → Primary scope.
 ///    - Else → Linked scope with `key = basename(git_dir)`.
 /// 2. Fallback (git not available or not a repo): delegate to
 ///    [`crate::paths::resolve_project_root`] which walks up from `start_dir` to
-///    the nearest `.tracevault/` (or returns `start_dir` as last resort).
+///    the nearest `.visdom/` (or returns `start_dir` as last resort).
 ///    Treat as Primary scope in both cases.
 pub fn resolve_context_paths(start_dir: &Path) -> ContextPaths {
     // --- Git-aware path ---
     if let Some((git_common_dir, git_dir)) = git_rev_parse(start_dir) {
         // primary_root = parent of git_common_dir (e.g. parent of `.git` = repo root)
         if let Some(primary_root) = git_common_dir.parent() {
-            let tracevault_dir = primary_root.join(".tracevault");
+            let state_dir = context_dir(primary_root);
 
             let scope = if git_dir == git_common_dir {
                 WorktreeScope::Primary
@@ -152,17 +175,14 @@ pub fn resolve_context_paths(start_dir: &Path) -> ContextPaths {
                 WorktreeScope::Linked { key }
             };
 
-            return ContextPaths {
-                tracevault_dir,
-                scope,
-            };
+            return ContextPaths { state_dir, scope };
         }
     }
 
     // --- Fallback: delegate to the shared resolver (ancestor-walk or start_dir) ---
     let fallback = crate::paths::resolve_project_root(start_dir);
     ContextPaths {
-        tracevault_dir: fallback.root.join(".tracevault"),
+        state_dir: context_dir(&fallback.root),
         scope: WorktreeScope::Primary,
     }
 }
@@ -180,6 +200,9 @@ impl Context {
     /// Use `ContextPaths::global_path()` or `ContextPaths::worktree_path()` to
     /// obtain the correct path for the current worktree context.
     pub fn load_from(path: &Path) -> Context {
+        // A file an earlier release wrote under the `tracevault` names is
+        // read until one is saved under the new name.
+        let path = &crate::layout::existing_or_twin(path);
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Context::default(),
@@ -248,7 +271,7 @@ impl Context {
     /// Returns `Some(ctx)` only when the file exists and was successfully (or partially) loaded.
     pub fn load_worktree(paths: &ContextPaths) -> Option<Context> {
         let wt_path = paths.worktree_path()?;
-        if !wt_path.exists() {
+        if !crate::layout::existing_or_twin(&wt_path).exists() {
             return None;
         }
         Some(Self::load_from(&wt_path))
@@ -256,6 +279,7 @@ impl Context {
 
     /// Save to the global context path.
     pub fn save_global(&self, paths: &ContextPaths) -> io::Result<()> {
+        paths.prepare_state_dir()?;
         self.save_to(&paths.global_path())
     }
 
@@ -264,6 +288,7 @@ impl Context {
         let wt_path = paths.worktree_path().ok_or_else(|| {
             io::Error::other("cannot save per-worktree context from primary checkout")
         })?;
+        paths.prepare_state_dir()?;
         self.save_to(&wt_path)
     }
 
@@ -378,7 +403,7 @@ mod tests {
     #[test]
     fn save_and_load_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx_path = dir.path().join(".tracevault").join("context.json");
+        let ctx_path = dir.path().join(".visdom").join("context.json");
         let mut params = BTreeMap::new();
         params.insert("key1".to_string(), Some("value1".to_string()));
         params.insert("key2".to_string(), Some("value2".to_string()));
@@ -397,7 +422,7 @@ mod tests {
     #[test]
     fn load_missing_file_returns_default() {
         let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join(".tracevault").join("context.json");
+        let missing = dir.path().join(".visdom").join("context.json");
         let ctx = Context::load_from(&missing);
         assert_eq!(ctx, Context::default());
     }
@@ -405,7 +430,7 @@ mod tests {
     #[test]
     fn label_dedup_on_save() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx_path = dir.path().join(".tracevault").join("context.json");
+        let ctx_path = dir.path().join(".visdom").join("context.json");
         let ctx = Context {
             flow_id: None,
             labels: vec![
@@ -430,7 +455,7 @@ mod tests {
     #[test]
     fn load_malformed_json_returns_default() {
         let dir = tempfile::tempdir().unwrap();
-        let tv_dir = dir.path().join(".tracevault");
+        let tv_dir = dir.path().join(".visdom");
         std::fs::create_dir_all(&tv_dir).unwrap();
         let ctx_path = tv_dir.join("context.json");
         std::fs::write(&ctx_path, b"not valid json {{{{").unwrap();
@@ -442,9 +467,9 @@ mod tests {
     #[test]
     fn save_creates_tracevault_dir_if_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx_path = dir.path().join(".tracevault").join("context.json");
-        // Ensure .tracevault does NOT exist yet
-        assert!(!dir.path().join(".tracevault").exists());
+        let ctx_path = dir.path().join(".visdom").join("context.json");
+        // Ensure .visdom does NOT exist yet
+        assert!(!dir.path().join(".visdom").exists());
 
         let ctx = Context::default();
         ctx.save_to(&ctx_path).unwrap();
@@ -455,7 +480,7 @@ mod tests {
     #[test]
     fn params_tombstone_round_trips_as_null() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".tracevault").join("context.json");
+        let path = dir.path().join(".visdom").join("context.json");
         let mut params = BTreeMap::new();
         params.insert("keep".to_string(), Some("v".to_string()));
         params.insert("drop".to_string(), None); // tombstone
@@ -478,7 +503,7 @@ mod tests {
     #[test]
     fn legacy_string_params_load_as_some() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".tracevault").join("context.json");
+        let path = dir.path().join(".visdom").join("context.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, r#"{"flow_id":null,"labels":[],"params":{"k":"v"}}"#).unwrap();
         let ctx = Context::load_from(&path);
@@ -531,5 +556,69 @@ mod tests {
         assert_eq!(eff.flow_id, Some("g".to_string()));
         assert_eq!(eff.labels, vec!["a"]);
         assert_eq!(eff.params["k"], "1");
+    }
+
+    #[test]
+    fn legacy_context_is_read_file_by_file_and_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let json = |notes: &str| format!(r#"{{"labels":["{notes}"],"params":{{}}}}"#);
+        let write = |rel: &str, notes: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, json(notes)).unwrap();
+        };
+        // The global file is already under the new name; the worktree's one
+        // is still where an earlier release wrote it.
+        write(".visdom/context.json", "new global");
+        write(".tracevault/context.json", "old global");
+        write(".tracevault/worktrees/feature/context.json", "old worktree");
+        let paths = ContextPaths {
+            state_dir: root.join(".visdom"),
+            scope: WorktreeScope::Linked {
+                key: "feature".into(),
+            },
+        };
+
+        let global = Context::load_global(&paths);
+        let mut worktree = Context::load_worktree(&paths).expect("the legacy worktree file");
+        assert_eq!(
+            serde_json::to_value(&global).unwrap(),
+            serde_json::to_value(Context::load_from(&root.join(".visdom/context.json"))).unwrap()
+        );
+        assert_ne!(
+            serde_json::to_value(&worktree).unwrap(),
+            serde_json::to_value(Context::default()).unwrap(),
+            "the worktree context an earlier release wrote must still be read"
+        );
+
+        // Saving goes to the new place and leaves the old file as it was.
+        worktree.save_worktree(&paths).unwrap();
+        assert!(root.join(".visdom/worktrees/feature/context.json").exists());
+        // And the new directory keeps itself out of commits.
+        assert!(root.join(".visdom/.gitignore").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join(".tracevault/worktrees/feature/context.json"))
+                .unwrap(),
+            json("old worktree")
+        );
+        worktree = Context::default();
+        worktree.save_global(&paths).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join(".tracevault/context.json")).unwrap(),
+            json("old global")
+        );
+    }
+
+    #[test]
+    fn a_checkout_set_up_by_an_earlier_release_counts_as_set_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ContextPaths {
+            state_dir: dir.path().join(".visdom"),
+            scope: WorktreeScope::Primary,
+        };
+        assert!(!paths.is_set_up());
+        std::fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
+        assert!(paths.is_set_up());
     }
 }

@@ -2,16 +2,16 @@
 ///
 /// This module provides a single [`resolve_project_root`] function that all CLI
 /// paths (stream, check, verify-start, context, …) use to locate the primary
-/// `.tracevault/` directory.  The resolution strategy is:
+/// `.visdom/` directory.  The resolution strategy is:
 ///
 /// 1. **Git-aware (primary):** run `git rev-parse --git-common-dir` from
 ///    `start`; the primary worktree root is `parent(canonicalized git-common-dir)`.
 ///    This works correctly from a primary checkout, a nested worktree, AND a
-///    sibling linked worktree (where the primary `.tracevault/` is not an
+///    sibling linked worktree (where the primary `.visdom/` is not an
 ///    ancestor of the working directory).
 ///
 /// 2. **Fallback (non-git):** ancestor-walk from `start` to the nearest
-///    `.tracevault/` directory (matching the existing `stream.rs` behaviour).
+///    `.visdom/` directory (matching the existing `stream.rs` behaviour).
 ///    Returns `start` itself if nothing is found.
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -23,7 +23,7 @@ use std::process::Command;
 /// The resolved project root and how it was found.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectRoot {
-    /// The directory that directly contains (or should contain) `.tracevault/`.
+    /// The directory that directly contains (or should contain) `.visdom/`.
     pub root: PathBuf,
     /// How the root was discovered.
     pub source: ProjectRootSource,
@@ -35,9 +35,9 @@ pub enum ProjectRootSource {
     /// Resolved via `git rev-parse --git-common-dir` (works from any worktree).
     Git,
     /// Git is not available or `start` is not in a git repo; root was found by
-    /// walking ancestors for the nearest `.tracevault/` directory.
+    /// walking ancestors for the nearest `.visdom/` directory.
     AncestorWalk,
-    /// Neither git nor an ancestor `.tracevault/` was found; `start` itself is
+    /// Neither git nor an ancestor `.visdom/` was found; `start` itself is
     /// returned as the root (matching the existing `unwrap_or(start)` fallback).
     Fallback,
 }
@@ -61,9 +61,9 @@ pub fn resolve_project_root(start: &Path) -> ProjectRoot {
         };
     }
 
-    // --- Strategy 2: ancestor walk for .tracevault/ ---
+    // --- Strategy 2: ancestor walk for .visdom/ ---
     for ancestor in start.ancestors() {
-        if ancestor.join(".tracevault").is_dir() {
+        if crate::layout::has_repo_dir(ancestor) {
             return ProjectRoot {
                 root: ancestor.to_path_buf(),
                 source: ProjectRootSource::AncestorWalk,
@@ -203,7 +203,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         // Sibling worktree is OUTSIDE the primary repo directory tree —
-        // the primary `.tracevault/` is NOT an ancestor.
+        // the primary `.visdom/` is NOT an ancestor.
         let wt = tmp.path().join("sibling-wt");
 
         std::fs::create_dir_all(&repo).unwrap();
@@ -221,14 +221,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Fallback: non-git directory with .tracevault/ ancestor
+    // Fallback: non-git directory with .visdom/ ancestor
     // -----------------------------------------------------------------------
 
     #[test]
     fn non_git_with_tracevault_ancestor_uses_ancestor_walk() {
         let tmp = tempfile::tempdir().unwrap();
-        // Create .tracevault/ at the tmp root.
-        std::fs::create_dir_all(tmp.path().join(".tracevault")).unwrap();
+        // Create .visdom/ at the tmp root.
+        std::fs::create_dir_all(tmp.path().join(".visdom")).unwrap();
 
         // Start from a subdirectory.
         let subdir = tmp.path().join("a").join("b").join("c");
@@ -240,21 +240,21 @@ mod tests {
         assert_eq!(
             result.root.canonicalize().unwrap(),
             tmp.path().canonicalize().unwrap(),
-            "ancestor walk must find the directory that contains .tracevault/"
+            "ancestor walk must find the directory that contains .visdom/"
         );
     }
 
     #[test]
     fn non_git_no_tracevault_falls_back_to_start() {
         let tmp = tempfile::tempdir().unwrap();
-        // No git repo, no .tracevault/ anywhere under /tmp (usually).
+        // No git repo, no .visdom/ anywhere under /tmp (usually).
         let result = resolve_project_root(tmp.path());
 
         assert_eq!(result.source, ProjectRootSource::Fallback);
         assert_eq!(
             result.root,
             tmp.path(),
-            "with no git and no .tracevault/, root must be start itself"
+            "with no git and no .visdom/, root must be start itself"
         );
     }
 }

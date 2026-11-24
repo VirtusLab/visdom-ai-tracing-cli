@@ -220,7 +220,7 @@ fn visdom_init_in_temp_repo_installs_hooks() {
     );
     let hooks = std::fs::read_to_string(sb.repo.path().join(".codex/hooks.json")).unwrap();
     assert!(hooks.contains("tracevault stream"), "{hooks}");
-    assert!(sb.repo.path().join(".tracevault/config.toml").exists());
+    assert!(sb.repo.path().join(".visdom/tracing.toml").exists());
     // Bazaar is part of init; here its URL is unknown, which is said, not fatal.
     assert!(
         stderr(&output).contains("bazaar URL is unknown"),
@@ -250,7 +250,7 @@ fn broken_credential_file_is_unknown() {
         .unwrap()
         .parent()
         .unwrap()
-        .join("tracevault");
+        .join("visdom");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("credentials.json"), "{ truncated").unwrap();
     let output = sb

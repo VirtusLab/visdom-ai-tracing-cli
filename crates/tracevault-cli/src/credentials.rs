@@ -224,24 +224,43 @@ impl Credentials {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "cannot determine the user config directory: set XDG_CONFIG_HOME (or HOME) so \
-                 credentials can be stored under $XDG_CONFIG_HOME/tracevault/",
+                 credentials can be stored under $XDG_CONFIG_HOME/visdom/",
             )
         })?;
-        Ok(dir.join("tracevault").join("credentials.json"))
+        Ok(crate::layout::user_dir_in(&dir).join("credentials.json"))
+    }
+
+    /// Where an earlier release kept the login: `tracevault/credentials.json`
+    /// beside [`Self::path`]'s directory.
+    fn legacy_path() -> Option<PathBuf> {
+        let path = Self::path().ok()?;
+        Some(crate::layout::legacy_sibling(path.parent()?)?.join("credentials.json"))
+    }
+
+    /// The file the login is in now: [`Self::path`], else the legacy file
+    /// when only that one exists.
+    pub fn existing_path() -> Result<PathBuf, std::io::Error> {
+        let path = Self::path()?;
+        if !path.exists() {
+            if let Some(legacy) = Self::legacy_path().filter(|p| p.exists()) {
+                return Ok(legacy);
+            }
+        }
+        Ok(path)
     }
 
     /// The credential file's path for DISPLAY, when there is nothing useful to
     /// do about a missing config directory (a message is being printed either
     /// way). Never used to read or write.
     pub fn path_for_display() -> String {
-        match Self::path() {
+        match Self::existing_path() {
             Ok(p) => p.display().to_string(),
             Err(_) => "<no user config directory: set XDG_CONFIG_HOME or HOME>".to_string(),
         }
     }
 
     pub fn load() -> Option<Self> {
-        let path = Self::path().ok()?;
+        let path = Self::existing_path().ok()?;
         let content = fs::read_to_string(&path).ok()?;
         serde_json::from_str(&content).ok()
     }
@@ -265,7 +284,33 @@ impl Credentials {
     /// `AlreadyExists`, which we resolve by picking a fresh name rather than
     /// failing the save.
     pub fn save(&self) -> Result<(), std::io::Error> {
-        let path = Self::path()?;
+        self.save_to(&Self::path()?)?;
+        // A new login replaces the one an earlier release kept: left behind,
+        // that file would keep an earlier `tracevault` signed in as whoever
+        // it names.
+        if let Some(legacy) = Self::legacy_path() {
+            match fs::remove_file(&legacy) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // Not silently: an earlier `tracevault` would go on using it.
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "the new login is saved, but the previous one at {} could not be \
+                             removed ({e}); remove it by hand",
+                            legacy.display()
+                        ),
+                    ))
+                }
+            }
+            Self::remove_temp_files_beside(&legacy, None);
+        }
+        Ok(())
+    }
+
+    /// Write the login to `path`, atomically and owner-only.
+    fn save_to(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -310,13 +355,13 @@ impl Credentials {
                 let _ = fs::remove_file(&tmp);
                 return Err(e);
             }
-            if let Err(e) = fs::rename(&tmp, &path) {
+            if let Err(e) = fs::rename(&tmp, path) {
                 let _ = fs::remove_file(&tmp);
                 return Err(e);
             }
             // Bound the accumulation of abandoned temp files, each of which
             // holds a full credential including the refresh token.
-            Self::sweep_stale_temp_files();
+            Self::remove_temp_files_beside(path, Some(Self::TEMP_STALE_AFTER));
             return Ok(());
         }
         Err(last_err.unwrap_or_else(|| {
@@ -338,21 +383,14 @@ impl Credentials {
     /// would make its `rename` fail and turn a benign race into an error).
     const TEMP_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
 
-    /// Best-effort removal of abandoned temp files, oldest-first semantics by
-    /// age threshold. Never reports failure: this is hygiene, and a stray file
-    /// we cannot delete must not fail the save or the logout that triggered it.
-    fn sweep_stale_temp_files() {
-        Self::remove_temp_files(Some(Self::TEMP_STALE_AFTER));
-    }
-
-    /// Remove atomic-write temp files in the credential directory. With
-    /// `min_age`, only files at least that old; without it, all of them (used
-    /// by `delete`, where the user is logging out and nothing should survive).
-    fn remove_temp_files(min_age: Option<std::time::Duration>) {
-        let Some(dir) = Self::path()
-            .ok()
-            .and_then(|p| p.parent().map(PathBuf::from))
-        else {
+    /// Remove atomic-write temp files beside the credentials file `path`.
+    /// With `min_age`, only files at least that old (a save's sweep of
+    /// abandoned ones); without it, all of them (used by `delete`, where the
+    /// user is logging out and nothing should survive). Best-effort, never
+    /// reports failure: this is hygiene, and a stray file we cannot delete
+    /// must not fail the save or the logout that triggered it.
+    fn remove_temp_files_beside(path: &std::path::Path, min_age: Option<std::time::Duration>) {
+        let Some(dir) = path.parent().map(PathBuf::from) else {
             return;
         };
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -442,7 +480,10 @@ impl Credentials {
             return Ok(());
         }
         creds.auth = Some(session.clone());
-        creds.save()
+        // Back into the file it came from: a refresh is not a new login, and
+        // an earlier `tracevault` still reading the legacy file must not be
+        // left holding a refresh token this one has just used up.
+        creds.save_to(&Self::existing_path()?)
     }
 
     /// Remove the credential file — and any atomic-write temp files left
@@ -453,7 +494,7 @@ impl Credentials {
     /// full credential JSON, so a temp file abandoned by an earlier crash
     /// between `open` and `rename` would keep a working offline refresh token
     /// in the config directory after the user asked to be logged out. No age
-    /// threshold here (unlike [`Self::sweep_stale_temp_files`]): the user is
+    /// threshold here (unlike a save's sweep): the user is
     /// logging out, so a save racing this is already a lost race — and its
     /// failed `rename` cannot resurrect the credential file, since the very
     /// next thing that happens is this delete.
@@ -465,7 +506,14 @@ impl Credentials {
         if path.exists() {
             fs::remove_file(&path)?;
         }
-        Self::remove_temp_files(None);
+        Self::remove_temp_files_beside(&path, None);
+        // Logging out forgets the login an earlier release kept, too.
+        if let Some(legacy) = Self::legacy_path() {
+            if legacy.exists() {
+                fs::remove_file(&legacy)?;
+            }
+            Self::remove_temp_files_beside(&legacy, None);
+        }
         Ok(())
     }
 }
@@ -625,7 +673,7 @@ fn resolve_credentials_inner(
 /// actually contacted, so refusing genuinely stops a token reaching a host it
 /// was not issued for. Here the config's URL has ALREADY lost the precedence
 /// race below and is never contacted, so refusing would prevent nothing — while
-/// handing anyone who can land a `.tracevault/config.toml` in a repo you clone a
+/// handing anyone who can land a `.visdom/tracing.toml` in a repo you clone a
 /// way to break every command (see
 /// `verification_phase::tests::a_committed_config_url_cannot_redirect_the_token`,
 /// which pins that a committed config URL is inert). The defect this addresses
@@ -657,10 +705,10 @@ pub(crate) fn config_url_conflict<'a>(
 /// instance.
 fn config_mismatch_warning(file_url: &str, config_url: &str) -> String {
     format!(
-        "tracevault: warning: this repo's .tracevault/config.toml pins '{config_url}', but you \
+        "tracevault: warning: this repo's .visdom/tracing.toml pins '{config_url}', but you \
          are logged in to '{file_url}' — using '{file_url}'. Run `tracevault login --server-url \
          {config_url}` to use the repo's instance, or remove `server_url` from \
-         .tracevault/config.toml to silence this."
+         .visdom/tracing.toml to silence this."
     )
 }
 
@@ -711,7 +759,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut guard = crate::test_helpers::EnvVarGuard::new();
         guard.set("XDG_CONFIG_HOME", dir.path());
-        let creds_dir = dir.path().join("tracevault");
+        let creds_dir = dir.path().join("visdom");
         fs::create_dir_all(&creds_dir).unwrap();
         fs::write(creds_dir.join("credentials.json"), body).unwrap();
         (dir, env_lock, guard)
@@ -723,7 +771,7 @@ mod tests {
 
     /// Write a Keycloak credentials file for `server_url`/`issuer` into `dir`.
     fn write_keycloak_file(dir: &std::path::Path, server_url: &str, issuer: &str, expires_at: i64) {
-        let creds_dir = dir.join("tracevault");
+        let creds_dir = dir.join("visdom");
         fs::create_dir_all(&creds_dir).unwrap();
         fs::write(
             creds_dir.join("credentials.json"),
@@ -762,7 +810,7 @@ mod tests {
             None => guard.remove("TRACEVAULT_SERVER_URL"),
         }
         if let Some(body) = file_body {
-            let creds_dir = dir.path().join("tracevault");
+            let creds_dir = dir.path().join("visdom");
             fs::create_dir_all(&creds_dir).unwrap();
             fs::write(creds_dir.join("credentials.json"), body).unwrap();
         }
@@ -875,10 +923,10 @@ mod tests {
     #[test]
     fn a_config_api_key_containing_equals_signs_is_not_truncated() {
         let (dir, _lock, _guard) = resolve_fixture_with(None, None);
-        let config_dir = dir.path().join(".tracevault");
+        let config_dir = dir.path().join(".visdom");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
-            config_dir.join("config.toml"),
+            config_dir.join("tracing.toml"),
             "server_url = \"https://example.com\"\napi_key = \"tvk_YWJjZA==\"\n",
         )
         .unwrap();
@@ -900,10 +948,10 @@ mod tests {
     #[test]
     fn a_config_lookalike_field_is_not_mistaken_for_the_real_one() {
         let (dir, _lock, _guard) = resolve_fixture_with(None, None);
-        let config_dir = dir.path().join(".tracevault");
+        let config_dir = dir.path().join(".visdom");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
-            config_dir.join("config.toml"),
+            config_dir.join("tracing.toml"),
             "server_url = \"https://real.example.com\"\n\
              [user_context]\n\
              enable = false\n",
@@ -926,10 +974,10 @@ mod tests {
     fn a_config_api_key_is_unaffected_by_a_mismatched_server_url() {
         let (dir, _lock, _guard) =
             resolve_fixture_with(None, Some("https://instance-a.example.com"));
-        let config_dir = dir.path().join(".tracevault");
+        let config_dir = dir.path().join(".visdom");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
-            config_dir.join("config.toml"),
+            config_dir.join("tracing.toml"),
             "server_url = \"https://instance-b.example.com\"\napi_key = \"tvk_from_config\"\n",
         )
         .unwrap();
@@ -962,15 +1010,15 @@ mod tests {
         }
     }
 
-    // ---- config_url_conflict: a repo-local `.tracevault/config.toml`
+    // ---- config_url_conflict: a repo-local `.visdom/tracing.toml`
     // ---- `server_url` sits BELOW the credentials file, so it loses silently.
     // ---- It stays losing — it must only stop being silent.
 
-    /// Write a project-level `.tracevault/config.toml` under `root`.
+    /// Write a project-level `.visdom/tracing.toml` under `root`.
     fn write_project_config(root: &std::path::Path, body: &str) {
-        let config_dir = root.join(".tracevault");
+        let config_dir = root.join(".visdom");
         fs::create_dir_all(&config_dir).unwrap();
-        fs::write(config_dir.join("config.toml"), body).unwrap();
+        fs::write(config_dir.join("tracing.toml"), body).unwrap();
     }
 
     #[test]
@@ -1043,7 +1091,7 @@ mod tests {
             "must name the login: {msg}"
         );
         assert!(
-            msg.contains("config.toml"),
+            msg.contains("tracing.toml"),
             "must name where the pin lives: {msg}"
         );
         assert!(
@@ -1120,7 +1168,7 @@ mod tests {
     ///
     /// `XDG_CONFIG_HOME` is redirected to a tempdir so this reads a fixture
     /// file rather than the developer's real
-    /// `~/.config/tracevault/credentials.json`; `_env_lock` serializes this
+    /// `~/.config/visdom/credentials.json`; `_env_lock` serializes this
     /// against other tests in the crate that mutate the same env var (see
     /// `test_helpers::lock_env_mutation_sync`).
     #[test]
@@ -1130,7 +1178,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", dir.path());
 
-        let creds_dir = dir.path().join("tracevault");
+        let creds_dir = dir.path().join("visdom");
         fs::create_dir_all(&creds_dir).unwrap();
         fs::write(
             creds_dir.join("credentials.json"),
@@ -1289,7 +1337,7 @@ mod tests {
         }
 
         // The atomic-write temp file must not be left behind.
-        let leftovers: Vec<_> = fs::read_dir(dir.path().join("tracevault"))
+        let leftovers: Vec<_> = fs::read_dir(dir.path().join("visdom"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|n| n != "credentials.json")
@@ -1318,7 +1366,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", dir.path());
 
-        let creds_dir = dir.path().join("tracevault");
+        let creds_dir = dir.path().join("visdom");
         fs::create_dir_all(&creds_dir).unwrap();
         let stale = creds_dir.join(format!(".credentials.json.tmp{}", std::process::id()));
         fs::write(&stale, "leftover from a crashed run").unwrap();
@@ -1384,7 +1432,7 @@ mod tests {
         assert_eq!(Credentials::load().unwrap().email, "a4@b.com");
 
         // No temp files left behind by any of the attempts.
-        let leftovers: Vec<_> = fs::read_dir(dir.path().join("tracevault"))
+        let leftovers: Vec<_> = fs::read_dir(dir.path().join("visdom"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|n| n != "credentials.json")
@@ -1406,7 +1454,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", dir.path());
 
-        let creds_dir = dir.path().join("tracevault");
+        let creds_dir = dir.path().join("visdom");
         fs::create_dir_all(&creds_dir).unwrap();
         fs::write(creds_dir.join("credentials.json"), "{}").unwrap();
         // Two leftovers, in both the old pid-only and the current shapes.
@@ -1438,7 +1486,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", dir.path());
 
-        let creds_dir = dir.path().join("tracevault");
+        let creds_dir = dir.path().join("visdom");
         fs::create_dir_all(&creds_dir).unwrap();
         let fresh = creds_dir.join(".credentials.json.tmp999.0.1");
         fs::write(&fresh, "in flight in another process").unwrap();
@@ -1467,7 +1515,7 @@ mod tests {
     /// With no way to locate the user's config directory, `path()` must FAIL
     /// rather than invent one. The old fallback was `PathBuf::from("~/.config")`
     /// — a relative path, since only a shell expands `~` — so `login` created
-    /// `./~/.config/tracevault/` in the current working directory and wrote an
+    /// `./~/.config/visdom/` in the current working directory and wrote an
     /// offline refresh token into it, plausibly inside the user's repo.
     #[test]
     fn path_fails_instead_of_inventing_a_relative_home() {
@@ -1492,7 +1540,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             Credentials::path_in(Some(dir.path().to_path_buf())).unwrap(),
-            dir.path().join("tracevault").join("credentials.json")
+            dir.path().join("visdom").join("credentials.json")
         );
     }
 
@@ -1714,5 +1762,84 @@ mod tests {
         let dbg = format!("{creds:?}");
         assert!(!dbg.contains("secret-rt"), "refresh token leaked: {dbg}");
         assert!(!dbg.contains("secret-at"), "access token leaked: {dbg}");
+    }
+
+    const LEGACY_LOGIN: &str = r#"{"server_url":"https://example.com","email":"a@b.com","auth":{"issuer":"i","client_id":"c","refresh_token":"rt","access_token":"at","access_expires_at":1}}"#;
+
+    /// A config home holding only the login an earlier release wrote, under
+    /// `tracevault/`.
+    fn legacy_login() -> (
+        tempfile::TempDir,
+        tokio::sync::MutexGuard<'static, ()>,
+        crate::test_helpers::EnvVarGuard,
+    ) {
+        let env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let dir = tempfile::tempdir().unwrap();
+        let mut guard = crate::test_helpers::EnvVarGuard::new();
+        guard.set("XDG_CONFIG_HOME", dir.path());
+        fs::create_dir_all(dir.path().join("tracevault")).unwrap();
+        fs::write(dir.path().join("tracevault/credentials.json"), LEGACY_LOGIN).unwrap();
+        (dir, env_lock, guard)
+    }
+
+    #[test]
+    fn a_legacy_login_is_read_and_a_refresh_stays_in_its_file() {
+        let (dir, _lock, _guard) = legacy_login();
+        let mut session = match Credentials::load().unwrap().credential() {
+            Some(Credential::Keycloak(s)) => s,
+            other => panic!("expected Keycloak, got {other:?}"),
+        };
+        session.apply(
+            &TokenSet {
+                access_token: "at2".into(),
+                refresh_token: Some("rt2".into()),
+                expires_in: 300,
+            },
+            1_000,
+        );
+        Credentials::persist_session("https://example.com", &session).unwrap();
+
+        // An earlier `tracevault` reading that file sees the token in use now.
+        let legacy = fs::read_to_string(dir.path().join("tracevault/credentials.json")).unwrap();
+        assert!(legacy.contains("rt2"), "{legacy}");
+        assert!(!dir.path().join("visdom/credentials.json").exists());
+        assert_eq!(
+            Credentials::load().unwrap().auth.unwrap().refresh_token,
+            "rt2"
+        );
+    }
+
+    #[test]
+    fn a_new_login_replaces_the_legacy_one() {
+        let (dir, _lock, _guard) = legacy_login();
+        let mut creds = Credentials::load().unwrap();
+        creds.email = "new@b.com".into();
+        creds.save().unwrap();
+
+        assert!(!dir.path().join("tracevault/credentials.json").exists());
+        assert_eq!(
+            Credentials::path().unwrap(),
+            dir.path().join("visdom/credentials.json")
+        );
+        assert_eq!(Credentials::load().unwrap().email, "new@b.com");
+    }
+
+    #[test]
+    fn logging_out_forgets_the_legacy_login_too() {
+        let (dir, _lock, _guard) = legacy_login();
+        fs::write(
+            dir.path().join("tracevault/.credentials.json.tmp1.0.1"),
+            LEGACY_LOGIN,
+        )
+        .unwrap();
+
+        Credentials::delete().unwrap();
+
+        assert!(Credentials::load().is_none());
+        let left: Vec<_> = fs::read_dir(dir.path().join("tracevault"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 }

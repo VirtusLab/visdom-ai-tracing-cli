@@ -104,7 +104,7 @@ impl Sandbox {
                 "access_expires_at": now + 3600,
             },
         });
-        let path = self.home.path().join(".config/tracevault/credentials.json");
+        let path = self.home.path().join(".config/visdom/credentials.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, credentials.to_string()).unwrap();
     }

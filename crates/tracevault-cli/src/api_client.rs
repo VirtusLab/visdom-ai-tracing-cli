@@ -1040,7 +1040,7 @@ mod tests {
     /// scoped to the client's `base_url`: a helper that hardcoded it would
     /// silently disable persistence in tests whose client points elsewhere.
     fn write_keycloak_file(dir: &std::path::Path, server_url: &str, issuer: &str, expires_at: i64) {
-        let creds_dir = dir.join("tracevault");
+        let creds_dir = dir.join("visdom");
         std::fs::create_dir_all(&creds_dir).unwrap();
         std::fs::write(
             creds_dir.join("credentials.json"),
@@ -1222,7 +1222,7 @@ mod tests {
 
         // On disk: a session refreshed by "another process" — different
         // refresh token, plenty of life left.
-        let creds_dir = dir.path().join("tracevault");
+        let creds_dir = dir.path().join("visdom");
         std::fs::create_dir_all(&creds_dir).unwrap();
         std::fs::write(
             creds_dir.join("credentials.json"),
@@ -1274,7 +1274,7 @@ mod tests {
         // On disk: instance B's session, freshly written by `tv login` in
         // another terminal. Different refresh token, plenty of life left — so
         // an unscoped adopt WOULD take it.
-        let creds_dir = dir.path().join("tracevault");
+        let creds_dir = dir.path().join("visdom");
         std::fs::create_dir_all(&creds_dir).unwrap();
         let b_file = format!(
             r#"{{"server_url":"https://instance-b.example.com","email":"b@b.com","auth":{{"issuer":"{issuer}","client_id":"tracing-cli","refresh_token":"b-rt","access_token":"b-at","access_expires_at":{}}}}}"#,
@@ -1362,7 +1362,7 @@ mod tests {
 
         // On disk: another client already rotated the refresh token, but its
         // access token is ALSO within 60s of expiry.
-        let creds_dir = dir.path().join("tracevault");
+        let creds_dir = dir.path().join("visdom");
         std::fs::create_dir_all(&creds_dir).unwrap();
         std::fs::write(
             creds_dir.join("credentials.json"),
@@ -1414,7 +1414,7 @@ mod tests {
 
         // On disk: another client refreshed and got a new access token, but the
         // SAME refresh token back (no rotation).
-        let creds_dir = dir.path().join("tracevault");
+        let creds_dir = dir.path().join("visdom");
         std::fs::create_dir_all(&creds_dir).unwrap();
         std::fs::write(
             creds_dir.join("credentials.json"),
@@ -1627,7 +1627,7 @@ mod tests {
     async fn get_me_maps_an_unreachable_idp_to_network() {
         // The session is inside the refresh window, so `refresh_locked` calls
         // `Credentials::load()`. Without this redirect that reads the
-        // DEVELOPER's real `~/.config/tracevault/credentials.json` — which on a
+        // DEVELOPER's real `~/.config/visdom/credentials.json` — which on a
         // machine logged in with Keycloak means reading a live token, and makes
         // the test's outcome depend on the developer's own login state.
         let _env_lock = crate::test_helpers::lock_env_mutation().await;

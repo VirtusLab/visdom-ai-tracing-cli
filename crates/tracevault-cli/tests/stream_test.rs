@@ -4,7 +4,7 @@ use tempfile::TempDir;
 
 fn setup_session_dir() -> (TempDir, std::path::PathBuf) {
     let tmp = TempDir::new().unwrap();
-    let session_dir = tmp.path().join(".tracevault/sessions/test-session-123");
+    let session_dir = tmp.path().join(".visdom/sessions/test-session-123");
     fs::create_dir_all(&session_dir).unwrap();
     (tmp, session_dir)
 }

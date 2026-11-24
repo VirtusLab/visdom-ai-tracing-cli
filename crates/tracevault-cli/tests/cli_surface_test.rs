@@ -167,7 +167,7 @@ fn the_capture_hook_records_nothing_for_a_gateway_session() {
         let answer: serde_json::Value = serde_json::from_str(out.trim()).expect("a hook response");
         assert!(answer.is_object(), "{out}");
         assert!(
-            !gateway.path().join(".tracevault").exists(),
+            !gateway.path().join(".visdom").exists(),
             "{marker}: nothing may be written for a gateway session"
         );
     }
@@ -184,7 +184,7 @@ fn the_capture_hook_records_nothing_for_a_gateway_session() {
         let hooks = tempfile::tempdir().unwrap();
         stream_event(hooks.path(), home.path(), environment);
         assert!(
-            hooks.path().join(".tracevault").exists(),
+            hooks.path().join(".visdom").exists(),
             "{environment:?}: a session not through the gateway is recorded locally"
         );
     }

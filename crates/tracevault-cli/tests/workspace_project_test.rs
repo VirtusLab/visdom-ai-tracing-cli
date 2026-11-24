@@ -1,5 +1,5 @@
 //! VIS-1256 end to end: an umbrella directory (not a git repo) whose
-//! `.tracevault/config.toml` carries `project_id` records every session
+//! `.visdom/tracing.toml` carries `project_id` records every session
 //! started under it to that project — from the directory itself and from a
 //! non-git sub-directory — with no per-session step and no extra network call
 //! (only the stream send itself reaches the server). A session's own
@@ -105,7 +105,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// An umbrella dir whose `.tracevault/config.toml` holds `config`.
+    /// An umbrella dir whose `.visdom/tracing.toml` holds `config`.
     fn new(config: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
@@ -113,8 +113,8 @@ impl Fixture {
         let state = root.join("state");
         let umbrella = root.join("umbrella");
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(umbrella.join(".tracevault")).unwrap();
-        std::fs::write(umbrella.join(".tracevault/config.toml"), config).unwrap();
+        std::fs::create_dir_all(umbrella.join(".visdom")).unwrap();
+        std::fs::write(umbrella.join(".visdom/tracing.toml"), config).unwrap();
         let transcript = root.join("transcript.jsonl");
         std::fs::write(&transcript, "{\"n\":1}\n").unwrap();
         Fixture {
@@ -129,7 +129,7 @@ impl Fixture {
 
     /// `project switch` for this session: the session-level binding.
     fn switch_session_project(&self, pid: uuid::Uuid) {
-        let dir = self.state.join("tracevault").join("sessions");
+        let dir = self.state.join("visdom").join("sessions");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(format!("{SESSION_ID}.toml")),
@@ -209,7 +209,7 @@ fn workspace_project_id_records_sessions_from_the_dir_and_below() {
         // A fresh session dir per cwd would hide nothing: both resolve to the
         // umbrella root. Reset the transcript offset by using a new line.
         std::fs::write(&fx.transcript, "{\"n\":1}\n").unwrap();
-        let _ = std::fs::remove_dir_all(fx.umbrella.join(".tracevault/sessions"));
+        let _ = std::fs::remove_dir_all(fx.umbrella.join(".visdom/sessions"));
         let (base, rx) = spawn_server(vec![accepted(), accepted()]);
         let stderr = fx.run_hook(&cwd, &base);
         let reqs: Vec<String> = rx.try_iter().collect();
@@ -233,7 +233,7 @@ fn queued_workspace_event_is_delivered_by_flush() {
     assert_eq!(reqs.len(), 1, "{reqs:?}\nstderr:\n{stderr}");
     let queue = fx
         .umbrella
-        .join(".tracevault/sessions")
+        .join(".visdom/sessions")
         .join(SESSION_ID)
         .join(format!("pending-project-{WORKSPACE_PID}.jsonl"));
     assert!(queue.exists(), "queued per project; stderr:\n{stderr}");

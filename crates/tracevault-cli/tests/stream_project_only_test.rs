@@ -1,5 +1,5 @@
 //! VIS-1255 end to end: a session in an umbrella directory (not a git repo,
-//! holding a `.tracevault/`) with only a PROJECT bound is recorded
+//! holding a `.visdom/`) with only a PROJECT bound is recorded
 //! project-only, queues per project while the server is unreachable or
 //! refuses, and moves to the repo-scoped path when `repo switch` binds a repo
 //! mid-session — without losing a transcript line or sending one to two
@@ -131,7 +131,7 @@ fn allow_stdout() -> String {
     )
 }
 
-/// An umbrella dir (no git) with a `.tracevault/`, a transcript file, and
+/// An umbrella dir (no git) with a `.visdom/`, a transcript file, and
 /// isolated home/config/state dirs.
 struct Fixture {
     _tmp: tempfile::TempDir,
@@ -148,7 +148,7 @@ impl Fixture {
         let state = tmp.path().join("state");
         let umbrella = tmp.path().join("umbrella");
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(umbrella.join(".tracevault")).unwrap();
+        std::fs::create_dir_all(umbrella.join(".visdom")).unwrap();
         let transcript = tmp.path().join("transcript.jsonl");
         std::fs::write(&transcript, "").unwrap();
         Fixture {
@@ -162,7 +162,7 @@ impl Fixture {
 
     fn session_dir(&self) -> PathBuf {
         self.umbrella
-            .join(".tracevault")
+            .join(".visdom")
             .join("sessions")
             .join(SESSION_ID)
     }
@@ -183,9 +183,9 @@ impl Fixture {
     }
 
     /// Write the session state file (`project switch` / `repo switch` write
-    /// the same file, `$XDG_STATE_HOME/tracevault/sessions/<id>.toml`).
+    /// the same file, `$XDG_STATE_HOME/visdom/sessions/<id>.toml`).
     fn write_session_state(&self, pid: uuid::Uuid, repo: bool) {
-        let dir = self.state.join("tracevault").join("sessions");
+        let dir = self.state.join("visdom").join("sessions");
         std::fs::create_dir_all(&dir).unwrap();
         let mut toml = String::new();
         if repo {

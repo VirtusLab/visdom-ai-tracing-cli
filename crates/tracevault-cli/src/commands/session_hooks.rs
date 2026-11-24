@@ -77,7 +77,7 @@ const HEAD_LEN: usize = 9_500;
 /// Cap injected context. Oversize policy text is truncated to its first
 /// `HEAD_LEN` chars with a suffix pointing at `tracevault repo status` —
 /// unlike `tracevault agent-policies`, `repo status` works in workspace mode
-/// (no `.tracevault/config.toml` required), so the fallback is reachable in
+/// (no `.visdom/tracing.toml` required), so the fallback is reachable in
 /// every install mode.
 pub fn cap_context(s: String) -> String {
     if s.chars().count() > MAX_CONTEXT {
@@ -364,7 +364,7 @@ mod tests {
         // Head is preserved (truncated policy text is still useful context)…
         assert!(capped.starts_with(&"a".repeat(HEAD_LEN)));
         // …and the fallback points at a command that works without
-        // `.tracevault/config.toml` (workspace mode), unlike
+        // `.visdom/tracing.toml` (workspace mode), unlike
         // `tracevault agent-policies`.
         assert!(capped.contains("tracevault repo status"));
         assert!(!capped.contains("agent-policies"));
@@ -413,7 +413,7 @@ mod tests {
     //
     // `resolve_and_inject` is network/IO-bound, so coverage here stays thin:
     // this exercises the no-binding path (empty session state, no
-    // `.tracevault/config.toml`, non-git cwd), which `should_inject` already
+    // `.visdom/tracing.toml`, non-git cwd), which `should_inject` already
     // proves resolves to "don't inject" — so this must return `Ok(())`
     // without ever reaching the network. No env mutation: `cwd` is an
     // isolated tempdir and the session id is unique to this test.

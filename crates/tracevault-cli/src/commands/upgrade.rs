@@ -320,7 +320,7 @@ mod tests {
         )
         .unwrap();
         let paths = Paths {
-            config_root: home.path().join(".config/tracevault"),
+            config_root: home.path().join(".config/visdom"),
             claude_dir: home.path().join(".claude"),
             project_root: Some(repo),
             worktree_root: None,
@@ -488,7 +488,7 @@ mod tests {
         // E.g. a Codex-only install, whose hooks also run `session-start`.
         let home = tempfile::tempdir().unwrap();
         let paths = Paths {
-            config_root: home.path().join(".config/tracevault"),
+            config_root: home.path().join(".config/visdom"),
             claude_dir: home.path().join(".claude"),
             project_root: Some(home.path().join("repo")),
             worktree_root: None,
@@ -514,7 +514,7 @@ mod tests {
         )
         .unwrap();
         let paths = Paths {
-            config_root: home.path().join(".config/tracevault"),
+            config_root: home.path().join(".config/visdom"),
             claude_dir,
             project_root: None,
             worktree_root: None,

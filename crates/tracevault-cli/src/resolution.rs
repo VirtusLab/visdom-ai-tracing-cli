@@ -2,7 +2,7 @@
 //! `RepoBinding` (via the path's git remote + the server), and pick the
 //! effective binding for an event/command from the precedence chain
 //! (`--path` flag → subagent worktree override → session active → bound
-//! `.tracevault/config.toml`). See design §2/§3/§4.
+//! `.visdom/tracing.toml`). See design §2/§3/§4.
 
 use std::path::Path;
 use std::process::Command;
@@ -75,7 +75,7 @@ pub(crate) enum ResolveRepoByNameError {
 }
 
 /// Resolve the server-registered repo of `project_root`: the repo its
-/// `.tracevault/config.toml` binds, if the server lists it, else the one named
+/// `.visdom/tracing.toml` binds, if the server lists it, else the one named
 /// like its git-toplevel basename ([`git_repo_name`]). Calls `GET /repos`.
 /// The config comes first because `init`/`sync` bind a remote's existing repo
 /// record whatever it is named (VIS-1018), so the checkout's name need not
@@ -305,7 +305,7 @@ pub async fn plan_registration(
         None => RegistrationPlan::Ambiguous(codebase),
     })
 }
-/// The repo id a checkout's own `.tracevault/config.toml` binds, if any. `path`
+/// The repo id a checkout's own `.visdom/tracing.toml` binds, if any. `path`
 /// may be anywhere in the checkout, or in one of its linked worktrees.
 pub fn checkout_config_repo_id(path: &Path) -> Option<uuid::Uuid> {
     let root = crate::paths::resolve_project_root(path).root;
@@ -320,7 +320,7 @@ pub fn checkout_config_repo_id(path: &Path) -> Option<uuid::Uuid> {
 /// the server has no matching codebase (pre-registered-only).
 ///
 /// When the codebase has several live repos, the one the checkout's own
-/// `.tracevault/config.toml` binds wins — the repo its hooks stream to —
+/// `.visdom/tracing.toml` binds wins — the repo its hooks stream to —
 /// else the lowest id (deterministic). Callers that must not guess (`repo
 /// switch`) use [`resolve_path_to_codebase`] and [`ResolvedCodebase::choose`].
 pub async fn resolve_path_to_binding(
@@ -400,7 +400,7 @@ pub struct ProjectResolveInputs<'a> {
     pub env_project: Option<ProjectBinding>,
     pub session: &'a SessionState,
     pub worktree_path: Option<&'a str>,
-    /// The workspace tier: `.tracevault/config.toml` `project_id`, read by
+    /// The workspace tier: `.visdom/tracing.toml` `project_id`, read by
     /// [`project_from_config`] — local, never a name lookup.
     pub config_project: Option<ProjectBinding>,
 }
@@ -414,7 +414,7 @@ pub enum BindingSource {
     Subagent,
     /// The session's session-level active binding.
     SessionActive,
-    /// A pinned `.tracevault/config.toml` (bound mode).
+    /// A pinned `.visdom/tracing.toml` (bound mode).
     Bound,
     /// A session-independent user-level default (`repo switch --user`).
     UserDefault,
@@ -426,7 +426,7 @@ impl std::fmt::Display for BindingSource {
             BindingSource::RepoFlag => "--path override",
             BindingSource::Subagent => "subagent worktree override",
             BindingSource::SessionActive => "session (repo switch)",
-            BindingSource::Bound => "bound .tracevault/config.toml",
+            BindingSource::Bound => "bound .visdom/tracing.toml",
             BindingSource::UserDefault => "user default (repo switch --user)",
         };
         f.write_str(label)
@@ -443,12 +443,12 @@ pub enum ProjectSource {
     /// The `TRACEVAULT_PROJECT` environment variable — a per-process
     /// assertion, re-asserted at every launch and never written to disk.
     /// Outranks every remembered tier so a stale `user_project.toml` or a
-    /// `.tracevault/config.toml` baked into a pod image cannot outrank the
+    /// `.visdom/tracing.toml` baked into a pod image cannot outrank the
     /// launcher that started the process.
     Env,
     /// The session's project-level active binding.
     SessionActive,
-    /// The directory's `.tracevault/config.toml` `project_id` (VIS-1256):
+    /// The directory's `.visdom/tracing.toml` `project_id` (VIS-1256):
     /// every session started under that directory belongs to this project
     /// unless something more specific (e.g. a `project switch`) says
     /// otherwise.
@@ -482,7 +482,7 @@ impl std::fmt::Display for ProjectSource {
             ProjectSource::Subagent => "subagent worktree override",
             ProjectSource::Env => "TRACEVAULT_PROJECT (environment)",
             ProjectSource::SessionActive => "session (project switch)",
-            ProjectSource::Workspace => "workspace .tracevault/config.toml",
+            ProjectSource::Workspace => "workspace .visdom/tracing.toml",
             ProjectSource::Deduced => "repo deduction",
             ProjectSource::UserDefault => "user default (project switch --user)",
         };
@@ -544,7 +544,7 @@ pub fn effective_project(inputs: &ProjectResolveInputs) -> Option<(ProjectBindin
 }
 
 /// Inputs to the capture-time project chain. The config tier is the
-/// `.tracevault/config.toml` `project_id` (a UUID, via
+/// `.visdom/tracing.toml` `project_id` (a UUID, via
 /// [`project_from_config`]); the legacy `default_project` NAME is never an
 /// input — resolving it needs a network call, and the stream hook (which
 /// fires per event) never does one. `init`/`sync` migrate it to `project_id`
@@ -562,7 +562,7 @@ pub struct CaptureProjectInputs<'a> {
     pub session: &'a SessionState,
     pub worktree_path: Option<&'a str>,
     /// The workspace tier: [`project_from_config`] of the
-    /// `.tracevault/config.toml` at the event's project root. Passed in so the
+    /// `.visdom/tracing.toml` at the event's project root. Passed in so the
     /// function stays pure.
     pub config_project: Option<ProjectBinding>,
     /// `user_project_default::load()` — passed in so the function stays pure.
@@ -571,7 +571,7 @@ pub struct CaptureProjectInputs<'a> {
 
 /// THE capture-time project chain: `--project` flag → subagent worktree
 /// override → `TRACEVAULT_PROJECT` → session `active_project` → workspace
-/// `.tracevault/config.toml` `project_id` → user default → none. Pure, no network. `commands::stream::capture_project` (ingest) and
+/// `.visdom/tracing.toml` `project_id` → user default → none. Pure, no network. `commands::stream::capture_project` (ingest) and
 /// `commands::project::status` both call this, so they cannot drift.
 pub fn capture_project_binding(
     inputs: &CaptureProjectInputs<'_>,
@@ -709,14 +709,14 @@ pub(crate) fn recorded_session_binding(
     .filter(|b| crate::commands::stream::binding_repo_id_is_valid(&b.repo_id))
 }
 
-/// A RepoBinding from a pinned `.tracevault/config.toml` (bound mode), if it has
+/// A RepoBinding from a pinned `.visdom/tracing.toml` (bound mode), if it has
 /// a repo_id. Pure — caller supplies the already-loaded config.
 /// Carries through the `remote_id`/`codebase_name` `init` persisted (best-effort,
 /// display-only) so bound-mode `status` can print the codebase without an extra
 /// network round-trip; `git_url` stays `None` here — bound mode has no live
 /// origin URL to hand back (that's the older `git_url` fallback's job, covering
 /// bindings that predate `codebase_name`).
-/// The workspace project tier of a `.tracevault/config.toml`: its
+/// The workspace project tier of a `.visdom/tracing.toml`: its
 /// `project_id`, with the recorded `project_name` for display. `None` when
 /// the config has no `project_id` — in particular for a config that still
 /// carries only the legacy `default_project` name, which is never resolved
@@ -1227,7 +1227,7 @@ mod tests {
         );
         assert_eq!(
             BindingSource::Bound.to_string(),
-            "bound .tracevault/config.toml"
+            "bound .visdom/tracing.toml"
         );
         assert_eq!(
             BindingSource::UserDefault.to_string(),

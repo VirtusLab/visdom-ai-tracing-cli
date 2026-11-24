@@ -1,10 +1,10 @@
 //! VIS-1257: a session that starts in an umbrella directory (not a git repo,
-//! has `.tracevault/`) and later `cd`s into a child git repo must keep ONE
+//! has `.visdom/`) and later `cd`s into a child git repo must keep ONE
 //! session directory for its whole life.
 //!
 //! Claude Code's hook `cwd` follows the session's shell `cd`, and the stream
 //! hook used to resolve the session directory from that `cwd` on every event.
-//! The two `.tracevault/sessions/<id>/` directories that resulted each had
+//! The two `.visdom/sessions/<id>/` directories that resulted each had
 //! their own `.stream_offset`, so every switch re-sent the transcript from
 //! the other directory's offset.
 //!
@@ -115,8 +115,8 @@ fn spawn_server_refusing(refuse: usize) -> (String, mpsc::Receiver<(String, Stre
     (format!("http://{addr}"), rx)
 }
 
-/// `umbrella/` (no git, has `.tracevault/`) containing the git repo
-/// `umbrella/child/` (its own `.tracevault/config.toml`), isolated
+/// `umbrella/` (no git, has `.visdom/`) containing the git repo
+/// `umbrella/child/` (its own `.visdom/tracing.toml`), isolated
 /// home/config/state dirs, and the session bound to `REPO_ID` the way
 /// `tracevault repo switch` binds it — so every event is sent, wherever the
 /// session's shell is.
@@ -143,7 +143,7 @@ impl Fixture {
         for d in [&home, &child, &project] {
             std::fs::create_dir_all(d).unwrap();
         }
-        std::fs::create_dir_all(umbrella.join(".tracevault")).unwrap();
+        std::fs::create_dir_all(umbrella.join(".visdom")).unwrap();
         for args in [
             vec!["init", "-q"],
             vec!["config", "user.email", "test@example.com"],
@@ -159,13 +159,13 @@ impl Fixture {
                 .success();
             assert!(ok, "git {args:?} must succeed");
         }
-        std::fs::create_dir_all(child.join(".tracevault")).unwrap();
+        std::fs::create_dir_all(child.join(".visdom")).unwrap();
         std::fs::write(
-            child.join(".tracevault").join("config.toml"),
+            child.join(".visdom").join("tracing.toml"),
             format!("repo_id = \"{REPO_ID}\"\n"),
         )
         .unwrap();
-        let sessions = state.join("tracevault").join("sessions");
+        let sessions = state.join("visdom").join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         std::fs::write(
             sessions.join(format!("{SESSION_ID}.toml")),
@@ -187,7 +187,7 @@ impl Fixture {
     }
 
     fn session_dir(&self, root: &Path) -> PathBuf {
-        root.join(".tracevault").join("sessions").join(SESSION_ID)
+        root.join(".visdom").join("sessions").join(SESSION_ID)
     }
 
     fn assistant(&self, n: usize) {
@@ -364,9 +364,9 @@ fn a_session_without_a_recorded_start_keeps_resolving_from_cwd() {
     assert!(fx.session_dir(&fx.child).join(".stream_offset").is_file());
 }
 
-/// A session started where no `.tracevault/` resolves (no git repo, none in
+/// A session started where no `.visdom/` resolves (no git repo, none in
 /// an ancestor) records nothing: anchoring there would create a stray
-/// `.tracevault/` and hide the session from the repo it then works in.
+/// `.visdom/` and hide the session from the repo it then works in.
 #[test]
 fn a_session_started_outside_any_tracevault_dir_is_not_anchored() {
     let fx = Fixture::new();
@@ -380,7 +380,7 @@ fn a_session_started_outside_any_tracevault_dir_is_not_anchored() {
 
     assert_eq!(sent_lines(&rx), vec![1]);
     assert!(fx.session_dir(&fx.child).join(".stream_offset").is_file());
-    assert!(!outside.join(".tracevault").exists());
+    assert!(!outside.join(".visdom").exists());
 }
 
 fn git_init(dir: &Path) {
@@ -402,7 +402,7 @@ fn git_init(dir: &Path) {
     }
 }
 
-/// A session started in a git repo with no `.tracevault/` yet keeps its dir
+/// A session started in a git repo with no `.visdom/` yet keeps its dir
 /// there too: the first event, from another repo, creates it at the start.
 #[test]
 fn a_session_started_in_a_repo_without_tracevault_is_anchored_there() {
@@ -500,7 +500,7 @@ fn a_queue_left_in_the_umbrella_is_drained_from_the_child_repo() {
 }
 
 /// Only the storage is anchored: which repo an event goes to still follows
-/// the event's `cwd`, through that checkout's `.tracevault/config.toml`.
+/// the event's `cwd`, through that checkout's `.visdom/tracing.toml`.
 #[test]
 fn events_keep_routing_by_the_config_of_their_cwd() {
     const UMBRELLA_REPO: &str = "22222222-2222-2222-2222-222222222222";
@@ -508,12 +508,12 @@ fn events_keep_routing_by_the_config_of_their_cwd() {
     // Not bound with `repo switch`: each checkout's config decides.
     std::fs::remove_file(
         fx.state
-            .join("tracevault/sessions")
+            .join("visdom/sessions")
             .join(format!("{SESSION_ID}.toml")),
     )
     .unwrap();
     std::fs::write(
-        fx.umbrella.join(".tracevault/config.toml"),
+        fx.umbrella.join(".visdom/tracing.toml"),
         format!("repo_id = \"{UMBRELLA_REPO}\"\n"),
     )
     .unwrap();
@@ -546,4 +546,50 @@ fn events_keep_routing_by_the_config_of_their_cwd() {
         "the child event goes to the child's repo, the umbrella event to the umbrella's: {sent:?}"
     );
     assert!(!fx.session_dir(&fx.child).exists());
+}
+
+/// A session an earlier release started keeps its `.tracevault/` directory
+/// (and its state in the legacy state dir) while this release's hooks carry
+/// it on: the transcript offset continues, nothing is sent twice, and no
+/// second directory appears under `.visdom/` — where new sessions go.
+#[test]
+fn a_session_an_earlier_release_started_carries_on_in_its_directory() {
+    let fx = Fixture::new();
+    let (base, rx) = spawn_server();
+    fx.session_start(&base, &fx.child, "startup");
+    fx.assistant(1);
+    fx.tool_use(&base, &fx.child);
+
+    // As that release would have left it.
+    let new_dir = fx.session_dir(&fx.child);
+    let legacy_dir = fx.child.join(".tracevault/sessions").join(SESSION_ID);
+    std::fs::create_dir_all(legacy_dir.parent().unwrap()).unwrap();
+    std::fs::rename(&new_dir, &legacy_dir).unwrap();
+    let legacy_state = fx.state.join("tracevault/sessions");
+    std::fs::create_dir_all(&legacy_state).unwrap();
+    std::fs::rename(
+        fx.state
+            .join("visdom/sessions")
+            .join(format!("{SESSION_ID}.toml")),
+        legacy_state.join(format!("{SESSION_ID}.toml")),
+    )
+    .unwrap();
+    // Another session of this release sits beside it under `.visdom/`.
+    std::fs::create_dir_all(fx.child.join(".visdom/sessions/another")).unwrap();
+
+    fx.assistant(2);
+    fx.tool_use(&base, &fx.child);
+    fx.assistant(3);
+    fx.tool_use(&base, &fx.child);
+
+    assert_eq!(
+        sent_lines(&rx),
+        vec![1, 2, 3],
+        "the offset carries on: every line once, in order"
+    );
+    assert!(legacy_dir.join(".stream_offset").is_file());
+    assert!(
+        !new_dir.exists(),
+        "the session must not get a second directory under .visdom/"
+    );
 }

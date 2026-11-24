@@ -14,9 +14,14 @@ use std::path::{Path, PathBuf};
 
 use crate::session_state::ProjectBinding;
 
-/// `dirs::config_dir()/tracevault/user_project.toml` — beside `credentials.json`.
+/// `dirs::config_dir()/visdom/user_project.toml` — beside `credentials.json`.
 pub fn default_project_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("tracevault").join("user_project.toml"))
+    dirs::config_dir().map(|d| crate::layout::user_dir_in(&d).join("user_project.toml"))
+}
+
+/// The directory an earlier release kept the binding in.
+fn legacy_dir() -> Option<PathBuf> {
+    crate::layout::legacy_sibling(default_project_path()?.parent()?)
 }
 
 fn load_from(dir: &Path) -> Option<ProjectBinding> {
@@ -47,8 +52,12 @@ fn clear_at(path: &Path) -> std::io::Result<()> {
 /// Load the user-level default binding; `None` if unset or malformed.
 pub fn load() -> Option<ProjectBinding> {
     let path = default_project_path()?;
-    let dir = path.parent()?;
-    load_from(dir)
+    if !path.exists() {
+        if let Some(legacy) = legacy_dir() {
+            return load_from(&legacy);
+        }
+    }
+    load_from(path.parent()?)
 }
 
 /// Persist the user-level default binding, creating the config dir if needed.
@@ -63,6 +72,10 @@ pub fn save(binding: &ProjectBinding) -> Result<(), Box<dyn std::error::Error>> 
 pub fn clear() -> Result<(), Box<dyn std::error::Error>> {
     let path = default_project_path().ok_or("cannot determine user config dir")?;
     clear_at(&path)?;
+    // Otherwise the binding an earlier release left would come back.
+    if let Some(legacy) = legacy_dir() {
+        clear_at(&legacy.join("user_project.toml"))?;
+    }
     Ok(())
 }
 
@@ -142,5 +155,30 @@ mod tests {
         };
         save_in(dir.path(), &binding).unwrap();
         assert_eq!(load_from(dir.path()), Some(binding));
+    }
+
+    #[test]
+    fn clearing_removes_the_legacy_default_too() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        let pb = |name: &str| ProjectBinding {
+            project_id: "id".into(),
+            project_name: name.into(),
+            updated_at: "t".into(),
+            forced_until: None,
+        };
+        let legacy = tmp.path().join("tracevault");
+        save_in(&legacy, &pb("old")).unwrap();
+        assert_eq!(load(), Some(pb("old")));
+        save(&pb("new")).unwrap();
+        assert_eq!(load(), Some(pb("new")));
+
+        clear().unwrap();
+
+        assert!(!legacy.join("user_project.toml").exists());
+        assert!(!tmp.path().join("visdom/user_project.toml").exists());
+        assert_eq!(load(), None);
     }
 }

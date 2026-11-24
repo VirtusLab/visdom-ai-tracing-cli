@@ -84,18 +84,18 @@ fn resolution_from_primary_is_primary_scope() {
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
 
-    // Create .tracevault/ so fallback walk-up also works, but git path should
+    // Create .visdom/ so fallback walk-up also works, but git path should
     // still be used and point to repo_dir.
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
 
     let paths = resolve_context_paths(&repo_dir);
 
-    // tracevault_dir must be repo_dir/.tracevault
-    let expected_tv = repo_dir.canonicalize().unwrap().join(".tracevault");
+    // state_dir must be repo_dir/.visdom
+    let expected_tv = repo_dir.canonicalize().unwrap().join(".visdom");
     assert_eq!(
-        paths.tracevault_dir.canonicalize().unwrap(),
+        paths.state_dir.canonicalize().unwrap(),
         expected_tv,
-        "tracevault_dir should be repo_dir/.tracevault"
+        "state_dir should be repo_dir/.visdom"
     );
 
     // Scope must be Primary
@@ -119,18 +119,18 @@ fn resolution_from_linked_worktree_is_linked_scope() {
     let wt_dir = tmp.path().join("wt");
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
     add_worktree(&repo_dir, &wt_dir);
 
     // Resolve from the LINKED worktree directory.
     let paths = resolve_context_paths(&wt_dir);
 
-    // tracevault_dir must still be repo_dir/.tracevault (via common-dir parent).
-    let expected_tv = repo_dir.canonicalize().unwrap().join(".tracevault");
+    // state_dir must still be repo_dir/.visdom (via common-dir parent).
+    let expected_tv = repo_dir.canonicalize().unwrap().join(".visdom");
     assert_eq!(
-        paths.tracevault_dir.canonicalize().unwrap(),
+        paths.state_dir.canonicalize().unwrap(),
         expected_tv,
-        "tracevault_dir should always point to primary repo's .tracevault/"
+        "state_dir should always point to primary repo's .visdom/"
     );
 
     // Scope must be Linked.
@@ -148,7 +148,7 @@ fn resolution_from_linked_worktree_is_linked_scope() {
                     .unwrap_or_else(|_| paths.worktree_path().unwrap()),
                 // Can't canonicalize a non-existent file; compare without that.
                 expected_wt_path,
-                "worktree_path should be tracevault_dir/worktrees/<key>/context.json"
+                "worktree_path should be state_dir/worktrees/<key>/context.json"
             );
         }
         WorktreeScope::Primary => panic!("linked worktree must resolve to Linked scope"),
@@ -196,7 +196,7 @@ fn merge_rules_flow_labels_params_with_real_worktree() {
     let wt_dir = tmp.path().join("wt");
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
     add_worktree(&repo_dir, &wt_dir);
 
     // Write global context.
@@ -238,7 +238,7 @@ fn effective_from_primary_equals_global() {
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
 
     let global = make_ctx(Some("g"), &["a"], &[("k", "1")]);
     let paths = resolve_context_paths(&repo_dir);
@@ -261,7 +261,7 @@ fn worktree_file_namespaced_does_not_affect_global() {
     let wt_dir = tmp.path().join("wt");
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
     add_worktree(&repo_dir, &wt_dir);
 
     // Write global.
@@ -291,9 +291,9 @@ fn worktree_file_namespaced_does_not_affect_global() {
 
 #[test]
 fn git_failure_fallback_walks_up_to_tracevault() {
-    // A non-git tempdir with a .tracevault/ should use that directory.
+    // A non-git tempdir with a .visdom/ should use that directory.
     let tmp = tempfile::tempdir().unwrap();
-    let tv_dir = tmp.path().join(".tracevault");
+    let tv_dir = tmp.path().join(".visdom");
     std::fs::create_dir_all(&tv_dir).unwrap();
 
     // Subdirectory inside the non-git tree.
@@ -302,15 +302,15 @@ fn git_failure_fallback_walks_up_to_tracevault() {
 
     let paths = resolve_context_paths(&subdir);
 
-    let expected_tv = tmp.path().canonicalize().unwrap().join(".tracevault");
+    let expected_tv = tmp.path().canonicalize().unwrap().join(".visdom");
     // If we can canonicalize the resolved dir, check it; otherwise compare as-is.
     let resolved_tv = paths
-        .tracevault_dir
+        .state_dir
         .canonicalize()
-        .unwrap_or_else(|_| paths.tracevault_dir.clone());
+        .unwrap_or_else(|_| paths.state_dir.clone());
     assert_eq!(
         resolved_tv, expected_tv,
-        "fallback should walk up to nearest .tracevault/"
+        "fallback should walk up to nearest .visdom/"
     );
     assert_eq!(
         paths.scope,
@@ -325,14 +325,14 @@ fn git_failure_fallback_walks_up_to_tracevault() {
 
 #[test]
 fn git_failure_fallback_no_panic_on_no_tracevault() {
-    // A non-git tempdir WITHOUT a .tracevault/ should not panic.
+    // A non-git tempdir WITHOUT a .visdom/ should not panic.
     let tmp = tempfile::tempdir().unwrap();
-    // Ensure there's no .tracevault/ in any parent (tmp dirs are usually under /tmp).
+    // Ensure there's no .visdom/ in any parent (tmp dirs are usually under /tmp).
     let paths = resolve_context_paths(tmp.path());
     // Should return Primary scope (last-resort path).
     assert_eq!(paths.scope, WorktreeScope::Primary);
-    // tracevault_dir should end with ".tracevault".
-    assert_eq!(paths.tracevault_dir.file_name().unwrap(), ".tracevault");
+    // state_dir should end with ".visdom".
+    assert_eq!(paths.state_dir.file_name().unwrap(), ".visdom");
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +346,7 @@ fn save_to_creates_nested_worktrees_dir() {
     let wt_dir = tmp.path().join("wt");
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
     add_worktree(&repo_dir, &wt_dir);
 
     let linked_paths = resolve_context_paths(&wt_dir);
@@ -375,7 +375,7 @@ fn effective_with_parts_returns_all_three() {
     let wt_dir = tmp.path().join("wt");
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
     add_worktree(&repo_dir, &wt_dir);
 
     // Write contexts.
@@ -416,7 +416,7 @@ fn set_from_linked_worktree_writes_worktree_file_not_global() {
     let wt_dir = tmp.path().join("wt");
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
     add_worktree(&repo_dir, &wt_dir);
 
     // Write a known global context first.
@@ -466,7 +466,7 @@ fn set_global_flag_from_linked_worktree_writes_global_file() {
     let wt_dir = tmp.path().join("wt");
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
     add_worktree(&repo_dir, &wt_dir);
 
     // `set --global` from the linked worktree.
@@ -508,7 +508,7 @@ fn set_from_primary_writes_global_file() {
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
 
     run_set(
         &repo_dir,
@@ -540,7 +540,7 @@ fn linked_worktree_effective_is_merge_of_global_and_worktree() {
     let wt_dir = tmp.path().join("wt");
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
     add_worktree(&repo_dir, &wt_dir);
 
     // Write global context from primary.
@@ -609,7 +609,7 @@ fn update_from_linked_worktree_writes_worktree_file() {
     let wt_dir = tmp.path().join("wt");
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
     add_worktree(&repo_dir, &wt_dir);
 
     // Set an initial per-worktree context.
@@ -653,7 +653,7 @@ fn clear_from_linked_worktree_deletes_worktree_file_not_global() {
     let wt_dir = tmp.path().join("wt");
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
     add_worktree(&repo_dir, &wt_dir);
 
     // Global context.
@@ -738,7 +738,7 @@ fn clear_from_linked_worktree_with_no_file_is_noop() {
     let wt_dir = tmp.path().join("wt");
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
     add_worktree(&repo_dir, &wt_dir);
 
     // Do NOT write any per-worktree context (file absent from the start).
@@ -776,7 +776,7 @@ fn two_linked_worktrees_are_isolated() {
 
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
     add_worktree(&repo_dir, &wt_a_dir);
     add_worktree(&repo_dir, &wt_b_dir);
 
@@ -914,7 +914,7 @@ fn update_remove_label_and_param_at_worktree_scope() {
 
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
     add_worktree(&repo_dir, &wt_dir);
 
     // Set a known global context that we want to remain untouched.
@@ -1005,7 +1005,7 @@ fn apply_context_stamps_effective_merged_context() {
     let wt_dir = tmp.path().join("wt");
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_git_repo(&repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
     add_worktree(&repo_dir, &wt_dir);
 
     // Set global context from primary.

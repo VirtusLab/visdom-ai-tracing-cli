@@ -114,7 +114,7 @@ mod tests {
         _guard.set("XDG_CONFIG_HOME", dir.path());
 
         if let Some(body) = body {
-            let creds_dir = dir.path().join("tracevault");
+            let creds_dir = dir.path().join("visdom");
             fs::create_dir_all(&creds_dir).unwrap();
             fs::write(creds_dir.join("credentials.json"), body).unwrap();
         }

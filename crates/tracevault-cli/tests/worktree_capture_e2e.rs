@@ -2,7 +2,7 @@
 ///
 /// Proves the headline Phase-1 guarantee: TWO Claude Code instances in TWO
 /// separate sibling worktrees of one repo both capture correctly under the
-/// primary `.tracevault/`, with no silent drops and correct per-worktree
+/// primary `.visdom/`, with no silent drops and correct per-worktree
 /// session attribution.
 ///
 /// # What is exercised
@@ -17,8 +17,8 @@
 /// # Assertions (mirroring the task spec)
 ///
 /// 1. From each sibling worktree, `resolve_project_root` → primary root;
-///    `resolve_session_paths` → session_dir under `<primary>/.tracevault/sessions/<sid>/`.
-/// 2. Both session dirs live under the SAME primary `.tracevault/sessions/`,
+///    `resolve_session_paths` → session_dir under `<primary>/.visdom/sessions/<sid>/`.
+/// 2. Both session dirs live under the SAME primary `.visdom/sessions/`,
 ///    with DISTINCT session IDs → no collision.
 /// 3. Each session's `origin` marker = its own worktree toplevel (canonicalized).
 /// 4. verify-start disambiguation: from worktree A, find_sessions_by_origin
@@ -119,7 +119,7 @@ fn sessions_matching_origin(sessions_dir: &Path, worktree_top: &str) -> Vec<std:
 
 /// Assertion 1 & 2: from EACH sibling worktree, resolve_project_root returns
 /// the primary root; resolve_session_paths places session dirs under that same
-/// primary `.tracevault/sessions/`.  Session IDs are distinct → no collision.
+/// primary `.visdom/sessions/`.  Session IDs are distinct → no collision.
 #[test]
 fn sibling_worktrees_resolve_to_primary_and_no_collision() {
     let tmp = tempfile::tempdir().unwrap();
@@ -129,9 +129,9 @@ fn sibling_worktrees_resolve_to_primary_and_no_collision() {
 
     fs::create_dir_all(&primary).unwrap();
     init_git_repo(&primary);
-    // .tracevault/ exists ONLY in the primary — the key condition that the old
+    // .visdom/ exists ONLY in the primary — the key condition that the old
     // ancestor-walk broke on from a sibling worktree.
-    fs::create_dir_all(primary.join(".tracevault")).unwrap();
+    fs::create_dir_all(primary.join(".visdom")).unwrap();
 
     add_worktree(&primary, &wt_a);
     add_worktree(&primary, &wt_b);
@@ -180,15 +180,15 @@ fn sibling_worktrees_resolve_to_primary_and_no_collision() {
         "wt_b: project_root from resolve_session_paths must be primary"
     );
 
-    // Session dirs must be under the primary .tracevault/sessions/
-    let expected_sessions = primary.join(".tracevault").join("sessions");
+    // Session dirs must be under the primary .visdom/sessions/
+    let expected_sessions = primary.join(".visdom").join("sessions");
     assert!(
         session_dir_a.starts_with(&primary),
         "wt_a: session_dir must be under primary"
     );
     assert!(
         session_dir_a.starts_with(&expected_sessions),
-        "wt_a: session_dir must be under .tracevault/sessions/"
+        "wt_a: session_dir must be under .visdom/sessions/"
     );
     assert!(
         !session_dir_a.starts_with(&wt_a),
@@ -201,7 +201,7 @@ fn sibling_worktrees_resolve_to_primary_and_no_collision() {
     );
     assert!(
         session_dir_b.starts_with(&expected_sessions),
-        "wt_b: session_dir must be under .tracevault/sessions/"
+        "wt_b: session_dir must be under .visdom/sessions/"
     );
     assert!(
         !session_dir_b.starts_with(&wt_b),
@@ -214,20 +214,12 @@ fn sibling_worktrees_resolve_to_primary_and_no_collision() {
         "session dirs for distinct IDs must not collide"
     );
     assert!(
-        session_dir_a.ends_with(
-            std::path::Path::new(".tracevault")
-                .join("sessions")
-                .join(sid_a)
-        ),
-        "wt_a: session_dir must end with .tracevault/sessions/{sid_a}"
+        session_dir_a.ends_with(std::path::Path::new(".visdom").join("sessions").join(sid_a)),
+        "wt_a: session_dir must end with .visdom/sessions/{sid_a}"
     );
     assert!(
-        session_dir_b.ends_with(
-            std::path::Path::new(".tracevault")
-                .join("sessions")
-                .join(sid_b)
-        ),
-        "wt_b: session_dir must end with .tracevault/sessions/{sid_b}"
+        session_dir_b.ends_with(std::path::Path::new(".visdom").join("sessions").join(sid_b)),
+        "wt_b: session_dir must end with .visdom/sessions/{sid_b}"
     );
 }
 
@@ -317,7 +309,7 @@ fn verify_start_disambiguation_selects_correct_worktree_session() {
     let sid_a = "sid-disambig-a";
     let sid_b = "sid-disambig-b";
 
-    // Create both session dirs under the primary .tracevault/sessions/
+    // Create both session dirs under the primary .visdom/sessions/
     let (_, session_dir_a) = resolve_session_paths(&wt_a, sid_a);
     let (_, session_dir_b) = resolve_session_paths(&wt_b, sid_b);
     fs::create_dir_all(&session_dir_a).unwrap();
@@ -329,7 +321,7 @@ fn verify_start_disambiguation_selects_correct_worktree_session() {
     fs::write(session_dir_a.join("origin"), &origin_a).unwrap();
     fs::write(session_dir_b.join("origin"), &origin_b).unwrap();
 
-    let sessions_dir = primary.join(".tracevault").join("sessions");
+    let sessions_dir = primary.join(".visdom").join("sessions");
 
     // From wt_a: disambiguation must select sid_a only
     let wt_a_top = worktree_toplevel(&wt_a);
@@ -370,14 +362,14 @@ fn verify_start_disambiguation_selects_correct_worktree_session() {
 // 5: non-git / uninitialized dirs degrade gracefully
 // ---------------------------------------------------------------------------
 
-/// Assertion 5a: non-git dir with no `.tracevault/` → Fallback, no panic.
+/// Assertion 5a: non-git dir with no `.visdom/` → Fallback, no panic.
 /// `resolve_session_paths` returns session_dir relative to start — the caller
 /// (run_stream) will fail to load config and exit gracefully without blocking
 /// the tool.
 #[test]
 fn non_git_dir_degrades_gracefully_no_panic() {
     let tmp = tempfile::tempdir().unwrap();
-    // No git, no .tracevault/ — must not panic.
+    // No git, no .visdom/ — must not panic.
     let result = resolve_project_root(tmp.path());
     assert_eq!(
         result.source,
@@ -397,12 +389,12 @@ fn non_git_dir_degrades_gracefully_no_panic() {
     );
 }
 
-/// Assertion 5b: a dir that has a `.tracevault/` ancestor but is not a git
+/// Assertion 5b: a dir that has a `.visdom/` ancestor but is not a git
 /// repo → AncestorWalk source, no panic.
 #[test]
 fn non_git_with_tracevault_ancestor_resolves_no_panic() {
     let tmp = tempfile::tempdir().unwrap();
-    fs::create_dir_all(tmp.path().join(".tracevault")).unwrap();
+    fs::create_dir_all(tmp.path().join(".visdom")).unwrap();
     let subdir = tmp.path().join("nested").join("dir");
     fs::create_dir_all(&subdir).unwrap();
 
@@ -410,12 +402,12 @@ fn non_git_with_tracevault_ancestor_resolves_no_panic() {
     assert_eq!(
         result.source,
         ProjectRootSource::AncestorWalk,
-        "non-git with .tracevault/ ancestor must use AncestorWalk"
+        "non-git with .visdom/ ancestor must use AncestorWalk"
     );
     assert_eq!(
         result.root.canonicalize().unwrap(),
         tmp.path().canonicalize().unwrap(),
-        "AncestorWalk root must be the dir containing .tracevault/"
+        "AncestorWalk root must be the dir containing .visdom/"
     );
     // resolve_session_paths must not panic.
     let (_root, _session_dir) = resolve_session_paths(&subdir, "sess-ancestor");
@@ -437,9 +429,9 @@ fn full_two_worktree_capture_scenario() {
 
     fs::create_dir_all(&primary).unwrap();
     init_git_repo(&primary);
-    // .tracevault/ ONLY in primary — the scenario that broke with the old
+    // .visdom/ ONLY in primary — the scenario that broke with the old
     // ancestor-walk resolver.
-    fs::create_dir_all(primary.join(".tracevault")).unwrap();
+    fs::create_dir_all(primary.join(".visdom")).unwrap();
     add_worktree(&primary, &wt_a);
     add_worktree(&primary, &wt_b);
 
@@ -462,8 +454,8 @@ fn full_two_worktree_capture_scenario() {
         primary_canonical,
         "beta: project_root must be primary"
     );
-    // Both session dirs are under the PRIMARY .tracevault/sessions/
-    let sessions_dir = primary.join(".tracevault").join("sessions");
+    // Both session dirs are under the PRIMARY .visdom/sessions/
+    let sessions_dir = primary.join(".visdom").join("sessions");
     assert!(sess_a.starts_with(&primary), "alpha sess under primary");
     assert!(sess_b.starts_with(&primary), "beta sess under primary");
     assert_ne!(sess_a, sess_b, "session dirs must be distinct");

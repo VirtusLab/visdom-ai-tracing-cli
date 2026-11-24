@@ -52,12 +52,12 @@ fn init_git_repo(dir: &Path) {
 }
 
 /// Build a `tracevault init`-shaped project: a real git repo with a
-/// `.tracevault/` dir and a default `config.toml` (user-context disabled,
+/// `.visdom/` dir and a default `config.toml` (user-context disabled,
 /// matching the compat default for a config that hasn't opted in yet).
 fn init_project(repo_dir: &Path) {
     std::fs::create_dir_all(repo_dir).unwrap();
     init_git_repo(repo_dir);
-    std::fs::create_dir_all(repo_dir.join(".tracevault")).unwrap();
+    std::fs::create_dir_all(repo_dir.join(".visdom")).unwrap();
     std::fs::write(
         TracevaultConfig::config_path(repo_dir),
         TracevaultConfig::default().to_toml(),
@@ -84,7 +84,7 @@ fn user_context_enabled_via_source_merges_under_repo_overrides() {
     );
 
     // The user-level context file lives outside the repo (cross-repo, like
-    // `~/.config/tracevault/context.json`) — point `context source` at it.
+    // `~/.config/visdom/context.json`) — point `context source` at it.
     let user_home = tempfile::tempdir().unwrap();
     let user_ctx_path = user_home.path().join("context.json");
 

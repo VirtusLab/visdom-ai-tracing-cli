@@ -51,7 +51,7 @@ fn check_from_sibling_excludes_other_worktree_sessions() {
     let primary_top = worktree_toplevel(&repo);
     let sibling_top = worktree_toplevel(&wt);
 
-    let sessions = repo.join(".tracevault").join("sessions");
+    let sessions = repo.join(".visdom").join("sessions");
     for (id, origin) in [
         ("primary-sess", Some(primary_top.as_str())),
         ("sibling-sess", Some(sibling_top.as_str())),

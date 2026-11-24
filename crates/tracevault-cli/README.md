@@ -17,7 +17,7 @@ tracevault check       # Evaluate policies before push
 tracevault flush       # Retry any events that failed to stream live (honours the session's project binding; never re-attributes a refused event)
 ```
 
-**Per-repo initialization** — `tracevault init` sets up a repository with `.tracevault/` config,
+**Per-repo initialization** — `tracevault init` sets up a repository with `.visdom/` config,
 git hooks, and Claude Code hooks including a `SessionStart` hook (exports the session ID and injects
 the repo's policies at session start) and a `UserPromptSubmit` hook (re-injects policies when the
 session's effective repo changes).
@@ -33,13 +33,13 @@ single-repo flow.
 
 **Global installation** — `tracevault init --global` installs TraceVault hooks once into
 `~/.claude/settings.json` (deep-merged; appends to existing hooks and does not clobber) for use
-across ALL Claude Code sessions without per-repo setup. Does not create `.tracevault/config.toml`.
+across ALL Claude Code sessions without per-repo setup. Does not create `.visdom/tracing.toml`.
 Adds two session-level hooks: `SessionStart` exports the session ID and injects the bound repo's
 policies, and `UserPromptSubmit` re-injects policies when the session's effective repo changes.
 
 **User-level context** — `tracevault init --global` also enables a user-level context at
-`~/.config/tracevault/context.json` (an empty context is created immediately) plus
-`~/.config/tracevault/config.toml` pointing at it. This is the base layer beneath any per-repo
+`~/.config/visdom/context.json` (an empty context is created immediately) plus
+`~/.config/visdom/tracing.toml` pointing at it. This is the base layer beneath any per-repo
 context — flow/labels/params set here apply across every repo, even before you `cd` into or
 register one. Populate it with `tracevault context set --user --flow <id> --label <label> --param <key>=<value>`
 (works with no checkout). Pass `--no-user-context` to `init --global` to skip enabling it, or
@@ -55,7 +55,7 @@ persist the opt-out explicitly.
 - `tracevault repo switch <path>` — bind the current session's tracing to the repo at `<path>`
   (must be pre-registered with TraceVault) and print its policies. When the checkout's codebase
   has several repo records, switch keeps the one already in use (the session's current binding,
-  else a checkout's `.tracevault/config.toml`) and errors if none of them is; pick one
+  else a checkout's `.visdom/tracing.toml`) and errors if none of them is; pick one
   explicitly with `--repo-id <id>`.
 - `tracevault repo switch --name <project>` — bind by the repo's registered name instead, with
   no checkout required. Useful for headless/detached workers that don't have the target repo
@@ -66,7 +66,7 @@ persist the opt-out explicitly.
 - `tracevault init --workspace --project <name>` — bind a directory (typically an umbrella
   folder of checkouts, not itself a repo) to a project: every session started under it is
   recorded to that project with no per-session step. Writes `project_id` to
-  `.tracevault/config.toml` there; no repo, no hooks.
+  `.visdom/tracing.toml` there; no repo, no hooks.
 
 **Session identity** — these commands resolve the session via `--session-id` or the
 `TRACEVAULT_SESSION_ID` environment variable (set by `tracevault init --global`).
@@ -78,7 +78,7 @@ or falls back to the most recent session **that has a workspace binding** (shown
 information — it may belong to another repo; pass `--session-id` to target one).
 
 **Precedence** (high → low): `--path` override → subagent worktree override → session binding
-(`repo switch`) → bound `.tracevault/config.toml`.
+(`repo switch`) → bound `.visdom/tracing.toml`.
 
 **Note:** Repos must be pre-registered with TraceVault. Workspace mode resolves a repo by its
 git remote URL; it does not create new registrations.

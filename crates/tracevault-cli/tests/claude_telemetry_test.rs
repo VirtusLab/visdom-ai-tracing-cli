@@ -40,7 +40,7 @@ fn stderr(o: &Output) -> String {
 }
 
 fn write_credentials(home: &Path, body: serde_json::Value) {
-    let dir = home.join(".config").join("tracevault");
+    let dir = home.join(".config").join("visdom");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("credentials.json"), body.to_string()).unwrap();
 }
@@ -168,7 +168,7 @@ fn otel_headers_refreshes_an_expiring_session_and_persists_it() {
         serde_json::json!({"Authorization": "Bearer at_new"})
     );
     let saved =
-        std::fs::read_to_string(home.path().join(".config/tracevault/credentials.json")).unwrap();
+        std::fs::read_to_string(home.path().join(".config/visdom/credentials.json")).unwrap();
     assert!(
         saved.contains("at_new") && saved.contains("rt_new"),
         "{saved}"
@@ -375,7 +375,7 @@ const LOGIN: [(&str, &str); 2] = [
 ];
 
 fn state(home: &Path) -> serde_json::Value {
-    let path = home.join(".config/tracevault/install-state.json");
+    let path = home.join(".config/visdom/install-state.json");
     serde_json::from_str(&std::fs::read_to_string(path).unwrap_or_else(|_| "{}".into())).unwrap()
 }
 
@@ -485,7 +485,7 @@ fn pretend_older_install(home: &Path) {
     s["configured_version"] = serde_json::json!("0.0.1");
     s.as_object_mut().unwrap().remove("repos");
     std::fs::write(
-        home.join(".config/tracevault/install-state.json"),
+        home.join(".config/visdom/install-state.json"),
         s.to_string(),
     )
     .unwrap();
@@ -552,7 +552,7 @@ fn old_install(home: &Path) -> TempDir {
         .to_string(),
     )
     .unwrap();
-    assert!(!home.join(".config/tracevault/install-state.json").exists());
+    assert!(!home.join(".config/visdom/install-state.json").exists());
     repo
 }
 

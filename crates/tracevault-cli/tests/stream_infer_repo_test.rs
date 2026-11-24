@@ -128,7 +128,7 @@ fn project(repos: &[&str]) -> String {
     http("200 OK", &format!(r#"{{"repos":[{}]}}"#, repos.join(",")))
 }
 
-/// An umbrella dir (no git) holding a `.tracevault/` and a child checkout
+/// An umbrella dir (no git) holding a `.visdom/` and a child checkout
 /// whose origin is `git@github.com:org/child.git`, plus a transcript file
 /// and isolated home/config/state dirs.
 struct Fixture {
@@ -149,7 +149,7 @@ impl Fixture {
         let umbrella = tmp.path().join("umbrella");
         let child = umbrella.join("child");
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(umbrella.join(".tracevault")).unwrap();
+        std::fs::create_dir_all(umbrella.join(".visdom")).unwrap();
         std::fs::create_dir_all(child.join("src")).unwrap();
         git(&child, &["init", "-q"]);
         git(
@@ -160,7 +160,7 @@ impl Fixture {
         std::fs::write(&transcript, "").unwrap();
         let pid = uuid::Uuid::from_u128(0x1258);
         // `project switch` writes the same session state file.
-        let sessions = state.join("tracevault").join("sessions");
+        let sessions = state.join("visdom").join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         std::fs::write(
             sessions.join(format!("{SESSION_ID}.toml")),
@@ -183,7 +183,7 @@ impl Fixture {
     fn state_file(&self) -> String {
         std::fs::read_to_string(
             self.state
-                .join("tracevault")
+                .join("visdom")
                 .join("sessions")
                 .join(format!("{SESSION_ID}.toml")),
         )
@@ -295,7 +295,7 @@ fn an_umbrella_session_attributes_child_checkout_events_to_the_child_repo() {
     // `check` / `verify-start` in the child find the session by this record.
     let worktrees = std::fs::read_to_string(
         fx.umbrella
-            .join(".tracevault")
+            .join(".visdom")
             .join("sessions")
             .join(SESSION_ID)
             .join("worktrees"),
@@ -364,7 +364,7 @@ fn unavailable() -> String {
 fn queued(fx: &Fixture, queue: &str) -> usize {
     std::fs::read_to_string(
         fx.umbrella
-            .join(".tracevault")
+            .join(".visdom")
             .join("sessions")
             .join(SESSION_ID)
             .join(queue),
@@ -516,7 +516,7 @@ fn a_buffered_event_stays_with_its_inferred_repo() {
 fn an_explicit_repo_binding_is_never_overridden() {
     let fx = Fixture::new();
     let pid = fx.pid;
-    let sessions = fx.state.join("tracevault").join("sessions");
+    let sessions = fx.state.join("visdom").join("sessions");
     std::fs::write(
         sessions.join(format!("{SESSION_ID}.toml")),
         format!(
