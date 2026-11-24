@@ -17,7 +17,7 @@ use crate::config::{self, RepoConfig, UserConfig};
 use crate::finding::{command_line, needs_attention, render_text, Finding, Fix, FixAction};
 use crate::fixes::{apply_fixes, FixExecutor, FixOutcome, FixPolicy};
 use crate::gateway;
-use crate::instructions::{self, Facts};
+use crate::instructions::{self, Facts, Told};
 use crate::mode::{configured_mode, effective_mode, ResolvedMode, TracingMode, MODE_ENV};
 use crate::suite::{self, PolicyState, SuiteMap};
 
@@ -343,8 +343,7 @@ impl Session {
     /// saying whether its LLM traffic goes through the AI Gateway.
     pub fn facts(&self, through_gateway: bool) -> Facts {
         Facts {
-            tracing: self.ctx.server_url.is_some()
-                && self.ctx.credential == CredentialState::Present,
+            tracing: tracing::working(&self.ctx),
             bazaar: bazaar::registered_name(
                 self.bazaar_url.as_ref().ok().and_then(|url| url.as_deref()),
                 self.adapter.as_ref(),
@@ -356,20 +355,25 @@ impl Session {
 
     /// `args` for the agent, with what it is told about Visdom's tools, if
     /// it is told anything.
-    pub fn agent_args(&self, args: &[String], through_gateway: bool) -> Vec<String> {
-        let told = self
-            .agent_instructions
-            .then(|| instructions::compose(&self.facts(through_gateway)))
-            .flatten();
-        match told {
+    pub fn agent_args(&self, args: &[String], through_gateway: bool) -> Told {
+        if !self.agent_instructions {
+            return Told::Nothing(args.to_vec());
+        }
+        let mut facts = self.facts(through_gateway);
+        // The caller's own options may take the registered servers away from
+        // this one session.
+        if instructions::without_registered_mcp(self.ctx.agent, args) {
+            facts.bazaar = None;
+        }
+        match instructions::compose(&facts) {
             Some(text) => instructions::agent_args(
                 self.ctx.agent,
                 &text,
                 args,
                 &self.ctx.codex_home,
-                self.ctx.workdir.checkout.as_deref(),
+                &self.ctx.workdir.start_dir,
             ),
-            None => args.to_vec(),
+            None => Told::Nothing(args.to_vec()),
         }
     }
 

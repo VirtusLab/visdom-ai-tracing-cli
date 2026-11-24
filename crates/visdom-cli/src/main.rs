@@ -15,6 +15,7 @@ use visdom_cli::finding::{exit_code, render_json, render_text};
 use visdom_cli::fixes::FixExecutor;
 use visdom_cli::fixes::{policy_for, FixPolicy};
 use visdom_cli::gateway::{ensure_key, key_store_path_in, KeyStore};
+use visdom_cli::instructions::Told;
 use visdom_cli::interactive::InitScope;
 use visdom_cli::mode::{
     configured_mode, ModeReason, TracingMode, TrafficPolicy, GATEWAY_SESSION_ENV, MODE_ENV,
@@ -744,6 +745,28 @@ fn env_script(runtime: &tokio::runtime::Runtime, agent: Option<Agent>) -> ! {
     }
 }
 
+/// The agent's arguments with what it is told about Visdom's tools. Where
+/// that is left to a configuration file of the agent's, the developer is told
+/// which, once.
+fn told_args(session: &Session, agent_args: &[String], through_gateway: bool) -> Vec<String> {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    match session.agent_args(agent_args, through_gateway) {
+        Told::With(args) | Told::Nothing(args) => args,
+        Told::LeftTo { file, args } => {
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "visdom: {} sets {}'s developer instructions, and visdom does not replace \
+                     them: the agent is not told about Visdom's tools. `visdom instructions` \
+                     prints the text to add there.",
+                    file.display(),
+                    session.ctx.agent.label()
+                );
+            }
+            args
+        }
+    }
+}
+
 /// The agent's command for this session: through the AI Gateway when that is
 /// the mode and the gateway is ready. A gateway that is not ready stops the
 /// launch only when the workspace requires it; a developer who merely chose
@@ -756,7 +779,7 @@ fn agent_command(
     let hooks = |session: &Session| {
         let mut cmd = session
             .adapter
-            .launch(&session.agent_args(agent_args, false));
+            .launch(&told_args(session, agent_args, false));
         // Said outright, so nothing left in the environment (this may be an
         // agent's own shell, inside a gateway session) can switch the hooks'
         // capture off for a session that does not use the gateway.
@@ -772,7 +795,7 @@ fn agent_command(
         session
             .adapter
             .launch_via_gateway(
-                &session.agent_args(agent_args, true),
+                &told_args(session, agent_args, true),
                 &prepared.launch,
                 &|name| std::env::var(name).ok(),
             )

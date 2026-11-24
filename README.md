@@ -100,12 +100,14 @@ from the environment** (`VISDOM_TRACING_MODE`, `VISDOM_GATEWAY_URL`, `VISDOM_GAT
 An agent does not use what it does not know it has. So `visdom` tells the agent it starts what
 this session has of Visdom's and when to use it, in a short text ahead of your own instructions:
 
-- **Tracing** (when you are logged in): the session is bound to a repository whose policies
+- **Tracing** (when you are logged in and the agent's hooks are installed, which is what binds a
+  session to its repository — in both tracing modes): the session is bound to a repository whose policies
   apply; `visdom trace agent-policies` prints them, `visdom trace repo switch <path>` comes before
   work in another repository, `visdom trace repo status` shows the binding, and — with hooks
   tracing — `visdom trace check` comes before a push.
 - **Bazaar** (when its MCP server is registered for the agent): what it holds and when to ask it,
-  under the name the server is registered with.
+  under the name the server is registered with. Not when you start Claude Code without its
+  registered servers (`--strict-mcp-config`, `--bare`).
 - **The AI Gateway** (when the session goes through it): the provider settings are left alone.
 
 Only what was found working is mentioned, and where none of it is there the agent is started
@@ -117,7 +119,15 @@ text is an option of the agent's own command line.
 | Agent | How | Your own |
 |---|---|---|
 | Claude Code | `--append-system-prompt` | An `--append-system-prompt` you pass after `--` is kept, after `visdom`'s text (Claude Code itself would keep only the last one). |
-| Codex | `-c developer_instructions=…` | Your `developer_instructions` are kept, after `visdom`'s text: from `-c`, else the profile you name (`-p`), the project's `.codex/config.toml` or your `config.toml`. |
+| Codex | `-c developer_instructions=…` | Your `developer_instructions` are kept, after `visdom`'s text: from `-c`, else the profile you name (`-p`), your `config.toml` or the machine's `/etc/codex/config.toml`. |
+
+Codex has one `developer_instructions`, and an option replaces it. So where a file that is not
+your own sets it — a `.codex/config.toml` in the directory Codex works in or above it, or a
+`[profiles.*]` table in your `config.toml` — `visdom` adds nothing and says so: whether Codex
+reads a project's file is its decision (the project's trust), and `visdom` neither overrules that
+file nor turns its content into an option. Put the output of `visdom instructions` there
+yourself, or pass your own with `-c`. Instructions an organisation manages for Codex are not
+visible to `visdom` and would be replaced: use `agent_instructions = false` there.
 
 `visdom --no-instructions` starts the agent without it once; `agent_instructions = false` in the
 user config leaves it out always. An agent started without `visdom` (see `visdom env`) is not told
