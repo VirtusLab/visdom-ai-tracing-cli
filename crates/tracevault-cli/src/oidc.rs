@@ -1,11 +1,11 @@
 //! OIDC / OAuth 2.0 plumbing for interactive (human) login.
 //!
 //! The CLI authenticates humans with Keycloak's RFC 8628 device
-//! authorization grant: it asks the TraceVault server which realm to talk to
+//! authorization grant: it asks the Visdom server which realm to talk to
 //! (`/api/v1/auth/public-config`), discovers the realm's endpoints, starts a
 //! device authorization, polls the token endpoint until the user finishes in
 //! the browser, and thereafter keeps the access token fresh with the refresh
-//! token. The TraceVault server itself is not part of the token exchange —
+//! token. The Visdom server itself is not part of the token exchange —
 //! it only publishes the issuer and client id.
 //!
 //! Everything here is transport + protocol only: no printing, no credential
@@ -23,6 +23,7 @@
 //! "here is the body" error path would eventually be reached from a success
 //! response that failed to deserialize.
 
+use crate::program::TOP;
 use serde::Deserialize;
 use std::fmt;
 use std::time::Duration;
@@ -44,7 +45,7 @@ const SLOW_DOWN_INCREMENT_SECS: u64 = 5;
 /// `interval` (RFC 8628 §3.2 default).
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 
-/// What the TraceVault server publishes about its identity provider.
+/// What the Visdom server publishes about its identity provider.
 ///
 /// This type exists only for the CONFIGURED case: "no Keycloak here" is an
 /// error ([`OidcError::NoKeycloak`]), not a `PublicConfig` with empty fields,
@@ -203,7 +204,7 @@ struct OauthErrorBody {
 /// [`OidcError::Transport`] (we never got a usable answer).
 #[derive(Debug)]
 pub enum OidcError {
-    /// `/auth/public-config` answered `{"oidc_enabled": false}`: this TraceVault
+    /// `/auth/public-config` answered `{"oidc_enabled": false}`: this Visdom
     /// instance has no Keycloak at all, so interactive login is impossible and
     /// an API key must be used instead. Permanent until an operator changes the
     /// deployment. See [`fetch_public_config`].
@@ -250,13 +251,13 @@ impl fmt::Display for OidcError {
         match self {
             Self::NoKeycloak => write!(
                 f,
-                "this TraceVault server has no Keycloak/SSO configured, so interactive login is \
+                "this Visdom server has no Keycloak/SSO configured, so interactive login is \
                  unavailable"
             ),
             Self::IdpUnavailable { detail } => write!(
                 f,
                 "the identity provider is temporarily unavailable ({detail}) — this is not a \
-                 configuration problem; retry `tracevault login` in a moment"
+                 configuration problem; retry `{TOP} login` in a moment"
             ),
             Self::IssuerMismatch { expected, found } => write!(
                 f,
@@ -265,17 +266,17 @@ impl fmt::Display for OidcError {
             ),
             Self::SessionExpired => write!(
                 f,
-                "your session has expired — run `tracevault login` to sign in again"
+                "your session has expired — run `{TOP} login` to sign in again"
             ),
             Self::AccessDenied => write!(f, "the login was denied in the browser (access_denied)"),
             Self::DeviceCodeExpired => write!(
                 f,
-                "the login code expired before it was approved — run `tracevault login` again"
+                "the login code expired before it was approved — run `{TOP} login` again"
             ),
             Self::PollTimeout { waited_secs } => write!(
                 f,
                 "gave up waiting for browser approval after {waited_secs}s — run \
-                 `tracevault login` again"
+                 `{TOP} login` again"
             ),
             Self::EndpointUnavailable { what } => write!(
                 f,
@@ -316,7 +317,7 @@ pub fn canonical_issuer(issuer: &str) -> String {
     issuer.trim().trim_end_matches('/').to_string()
 }
 
-/// Ask the TraceVault server which realm to authenticate against.
+/// Ask the Visdom server which realm to authenticate against.
 ///
 /// "Is this instance configured for SSO, and against which realm?"
 ///
@@ -397,7 +398,7 @@ pub async fn fetch_public_config(
 ///    Loopback is exempt so local Keycloak development works.
 /// 2. The document's self-reported `issuer` must match the one we asked for
 ///    (both canonicalised). Otherwise a redirect or a copy-pasted wrong realm
-///    silently mints tokens the TraceVault server will reject, with no clue why.
+///    silently mints tokens the Visdom server will reject, with no clue why.
 /// 3. Every endpoint must share the issuer's ORIGIN. A misconfigured or tampered
 ///    document could otherwise name an unrelated host as the token endpoint and
 ///    collect the refresh token there.

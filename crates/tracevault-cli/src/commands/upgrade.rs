@@ -6,7 +6,7 @@
 //! binary is newer:
 //!
 //! - **per hook location** (the session's repo, and the global
-//!   `~/.claude/settings.json`): re-merges TraceVault's hooks into each Claude
+//!   `~/.claude/settings.json`): re-merges Visdom's hooks into each Claude
 //!   Code settings file that already holds them, so hooks a newer `init` adds
 //!   (e.g. `SessionEnd`, VIS-1108) reach existing installs. Repos the user
 //!   never opens again keep their old hook set.
@@ -24,6 +24,7 @@
 
 use crate::commands::claude_telemetry::{self, Environment, InstallOutcome, TelemetryState};
 use crate::install_state::{self, InstallState, RepoState};
+use crate::program::{CLI, TOP};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -96,13 +97,13 @@ pub fn run(
 
     if state != before {
         if let Err(e) = install_state::save_in(&paths.config_root, &state) {
-            eprintln!("tracevault: cannot record the upgrade step: {e}");
+            eprintln!("{TOP}: cannot record the upgrade step: {e}");
         }
     }
     notice
 }
 
-/// A place TraceVault's Claude Code hooks may be installed: a repo
+/// A place Visdom's Claude Code hooks may be installed: a repo
 /// (`.claude/settings.json` / `settings.local.json`) or the user's global
 /// settings. `key` names it in the install state.
 struct HookLocation {
@@ -133,7 +134,7 @@ fn hook_locations(paths: &Paths) -> Vec<HookLocation> {
     out
 }
 
-/// The `files` that hold TraceVault hooks; `Err` when one of them cannot be
+/// The `files` that hold Visdom hooks; `Err` when one of them cannot be
 /// read or parsed, so the location is not recorded as having none.
 fn files_with_hooks<'a>(files: impl IntoIterator<Item = &'a PathBuf>) -> Result<Vec<PathBuf>, ()> {
     let mut found = Vec::new();
@@ -143,10 +144,7 @@ fn files_with_hooks<'a>(files: impl IntoIterator<Item = &'a PathBuf>) -> Result<
             Ok(true) => found.push(file.clone()),
             Ok(false) => {}
             Err(e) => {
-                eprintln!(
-                    "tracevault: cannot check the hooks in {}: {e}",
-                    file.display()
-                );
+                eprintln!("{TOP}: cannot check the hooks in {}: {e}", file.display());
                 failed = true;
             }
         }
@@ -162,7 +160,7 @@ fn files_with_hooks<'a>(files: impl IntoIterator<Item = &'a PathBuf>) -> Result<
 /// file that holds our commands (both can, e.g. after a checkout brought in a
 /// shared `settings.json`). The files found are recorded, for the next
 /// sessions of this version (whether the location is installed) and for
-/// `status`. Returns whether `location` holds TraceVault's Claude Code hooks.
+/// `status`. Returns whether `location` holds Visdom's Claude Code hooks.
 fn upgrade_hook_location(state: &mut InstallState, location: &HookLocation, version: &str) -> bool {
     let recorded = state.repos.get(&location.key);
     let due = install_state::is_newer(version, recorded.map(|r| r.version.as_str()));
@@ -178,10 +176,7 @@ fn upgrade_hook_location(state: &mut InstallState, location: &HookLocation, vers
     let mut done = true;
     for file in &files {
         if let Err(e) = crate::commands::init::refresh_claude_hooks(file) {
-            eprintln!(
-                "tracevault: cannot update the hooks in {}: {e}",
-                file.display()
-            );
+            eprintln!("{TOP}: cannot update the hooks in {}: {e}", file.display());
             done = false;
         }
     }
@@ -220,7 +215,7 @@ fn upgrade_machine(
     let settings = match read_settings(&paths.claude_dir.join("settings.json")) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("tracevault: Claude Code telemetry not turned on: {e}");
+            eprintln!("{TOP}: Claude Code telemetry not turned on: {e}");
             return None;
         }
     };
@@ -236,8 +231,8 @@ fn upgrade_machine(
         let content = claude_telemetry::content_logging_settings(&settings, env);
         if !content.is_empty() {
             eprintln!(
-                "tracevault: Claude Code telemetry left off: it is set to export content ({}); \
-                 run `tracevault telemetry on` to send it to TraceVault anyway",
+                "{TOP}: Claude Code telemetry left off: it is set to export content ({}); \
+                 run `{CLI} telemetry on` to send it to Visdom anyway",
                 content.join("; ")
             );
             settled(state);
@@ -247,7 +242,7 @@ fn upgrade_machine(
     let url = match server_url() {
         Ok(url) => url,
         Err(e) => {
-            eprintln!("tracevault: Claude Code telemetry not turned on: {e}");
+            eprintln!("{TOP}: Claude Code telemetry not turned on: {e}");
             return None;
         }
     };
@@ -260,7 +255,7 @@ fn upgrade_machine(
             }
             if was_off {
                 state.telemetry_auto_enabled = Some(version.to_string());
-                Some(TELEMETRY_NOTICE.to_string())
+                Some(crate::program::say(TELEMETRY_NOTICE))
             } else {
                 None
             }
@@ -270,7 +265,7 @@ fn upgrade_machine(
             None
         }
         Err(e) => {
-            eprintln!("tracevault: Claude Code telemetry not turned on: {e}");
+            eprintln!("{TOP}: Claude Code telemetry not turned on: {e}");
             None
         }
     }

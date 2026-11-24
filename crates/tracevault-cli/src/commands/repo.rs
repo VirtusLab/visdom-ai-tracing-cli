@@ -1,5 +1,6 @@
 //! `tracevault repo` — workspace/detached-mode repo binding commands.
 
+use crate::program::{CLI, ENV, TOP};
 use std::path::Path;
 
 use crate::api_client::{resolve_client, ApiClient};
@@ -10,7 +11,7 @@ use crate::resolution::{
 };
 use crate::session_state::{self, RepoBinding, SessionState};
 
-/// Sub-actions for `tracevault repo` (workspace/detached mode).
+/// Sub-actions for `repo` (workspace/detached mode).
 #[derive(clap::Subcommand)]
 pub enum RepoCmd {
     /// Bind tracing to a registered repo for the current session and print its
@@ -22,7 +23,7 @@ pub enum RepoCmd {
         #[arg(group = "target")]
         path: Option<String>,
         /// Deprecated: name-only binding is no longer supported and always
-        /// errors; bind by checkout path instead (`tracevault repo switch <path>`).
+        /// errors; bind by checkout path instead (`repo switch <path>`).
         #[arg(long, group = "target")]
         name: Option<String>,
         /// Which of the codebase's repo records to bind, when <path>'s
@@ -35,13 +36,13 @@ pub enum RepoCmd {
         /// binding. Implied when no session id is available.
         #[arg(long)]
         user: bool,
-        /// Session to target; defaults to $TRACEVAULT_SESSION_ID (in Amp: $AMP_CURRENT_THREAD_ID).
+        /// Session to target; defaults to the session id the session-start hook exported (in Amp: $AMP_CURRENT_THREAD_ID).
         #[arg(long)]
         session_id: Option<String>,
     },
     /// Show the repo the current session is bound to.
     Status {
-        /// Session to target; defaults to $TRACEVAULT_SESSION_ID (in Amp: $AMP_CURRENT_THREAD_ID).
+        /// Session to target; defaults to the session id the session-start hook exported (in Amp: $AMP_CURRENT_THREAD_ID).
         #[arg(long)]
         session_id: Option<String>,
         /// One-off: resolve this checkout path instead of the session binding.
@@ -53,14 +54,14 @@ pub enum RepoCmd {
         /// Clear the user-level default instead of the session binding.
         #[arg(long)]
         user: bool,
-        /// Session to target; defaults to $TRACEVAULT_SESSION_ID (in Amp: $AMP_CURRENT_THREAD_ID).
+        /// Session to target; defaults to the session id the session-start hook exported (in Amp: $AMP_CURRENT_THREAD_ID).
         #[arg(long)]
         session_id: Option<String>,
     },
 }
 
 /// Resolve the current session id: the explicit flag wins, else
-/// `$TRACEVAULT_SESSION_ID` (set by the SessionStart hook of `init --global`),
+/// `the session id the session-start hook exported` (set by the SessionStart hook of `init --global`),
 /// else, in Amp's shell, `$AMP_CURRENT_THREAD_ID` (see
 /// [`crate::session_state::env_session_id`]).
 pub fn resolve_session_id(explicit: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
@@ -68,9 +69,11 @@ pub fn resolve_session_id(explicit: Option<&str>) -> Result<String, Box<dyn std:
         return Ok(s.to_string());
     }
     crate::session_state::env_session_id().ok_or_else(|| {
-        "no session id available: pass --session-id or set TRACEVAULT_SESSION_ID \
-         (installed by `tracevault init --global`; Amp sessions use $AMP_CURRENT_THREAD_ID)"
-            .into()
+        crate::program::say(
+            "no session id available: pass --session-id or set TRACEVAULT_SESSION_ID \
+         (installed by `tracevault init --global`; Amp sessions use $AMP_CURRENT_THREAD_ID)",
+        )
+        .into()
     })
 }
 
@@ -115,7 +118,7 @@ async fn resolve_switch_codebase(
         .await?
         .ok_or_else(|| {
             format!(
-                "repo at {} is not registered with TraceVault; nothing to bind",
+                "repo at {} is not registered with Visdom; nothing to bind",
                 path.display()
             )
             .into()
@@ -161,7 +164,7 @@ fn pick_switch_repo(
         RepoChoice::Ambiguous => Err(format!(
             "codebase {} has {} repo records: {}. None of them is this binding's current \
              repo or a checkout's .visdom/tracing.toml repo, so switch will not guess; \
-             choose one with `tracevault repo switch <path> --repo-id <id>`",
+             choose one with `{CLI} repo switch <path> --repo-id <id>`",
             codebase.display_name(),
             codebase.repos.len(),
             codebase.repo_list()
@@ -202,7 +205,7 @@ fn reset(user: bool, session_id: Option<&str>) -> Result<(), Box<dyn std::error:
     println!("cleared workspace repo binding for session {id}");
     println!(
         "it stays unbound (no automatic binding from the checkout's remote) until \
-         `tracevault repo switch`"
+         `{CLI} repo switch`"
     );
     Ok(())
 }
@@ -229,14 +232,15 @@ fn switch_target<'a>(
     match (path, name) {
         (Some(p), _) if !p.trim().is_empty() => Ok(SwitchTarget::Path(p)),
         (Some(_), _) => Err("repo path must not be empty".into()),
-        (None, Some(_)) => Err(
+        (None, Some(_)) => Err(crate::program::say(
             "`--name` binding is deprecated and no longer supported; bind by checkout path \
-             (`tracevault repo switch <path>`) so the codebase is resolved from its git remote"
-                .into(),
-        ),
-        (None, None) => {
-            Err("provide a checkout path to bind (`tracevault repo switch <path>`)".into())
-        }
+             (`tracevault repo switch <path>`) so the codebase is resolved from its git remote",
+        )
+        .into()),
+        (None, None) => Err(crate::program::say(
+            "provide a checkout path to bind (`tracevault repo switch <path>`)",
+        )
+        .into()),
     }
 }
 
@@ -395,7 +399,7 @@ async fn resolve_repo_flag(
     };
     let Some(server_url) = server_url else {
         eprintln!(
-            "--path {path}: no server URL configured (run `tracevault login`); showing binding \
+            "--path {path}: no server URL configured (run `{TOP} login`); showing binding \
              without the --path override"
         );
         return None;
@@ -426,9 +430,9 @@ async fn resolve_repo_flag(
 fn format_status(binding: Option<(&RepoBinding, BindingSource)>) -> String {
     match binding {
         Some((b, source)) => format!("bound to repo {} via {source}", b.repo_id),
-        None => {
-            "not bound to any repo (workspace mode; run `tracevault repo switch <path>`)".into()
-        }
+        None => crate::program::say(
+            "not bound to any repo (workspace mode; run `tracevault repo switch <path>`)",
+        ),
     }
 }
 
@@ -445,7 +449,7 @@ async fn status(
         Ok(id) => session_state::load(&id),
         Err(_) => {
             eprintln!(
-                "warning: no session id (pass --session-id or set TRACEVAULT_SESSION_ID); \
+                "warning: no session id (pass --session-id or set {ENV}_SESSION_ID); \
                  showing binding without session context"
             );
             SessionState::default()

@@ -1,6 +1,7 @@
 use crate::api_client::ApiClient;
 use crate::config::{user_config_path_in, TracevaultConfig, UserContext};
 use crate::context::Context;
+use crate::program::{CLI, ENV, TOP};
 use crate::resolution::{git_remote_url, git_repo_name, RegistrationPlan};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -116,7 +117,7 @@ pub fn validate_init_flags(
     Ok(())
 }
 
-/// Set up TraceVault in `project_root`. An existing `.visdom/tracing.toml`
+/// Set up Visdom in `project_root`. An existing `.visdom/tracing.toml`
 /// is kept and only overridden where this run says so: `server_url` and
 /// `user_context` (`None` = no flag given) replace the stored values; every
 /// other field, and any field not overridden, survives (VIS-1046).
@@ -136,7 +137,7 @@ pub async fn init_in_directory(
         ));
     }
 
-    // Refuse to initialize from a linked worktree: TraceVault's `.visdom/`,
+    // Refuse to initialize from a linked worktree: Visdom's `.visdom/`,
     // git hooks, and Claude settings all belong in the primary checkout (which
     // every worktree shares). Initializing here would create a stray
     // `.visdom/` in this worktree instead. (In a linked worktree `.git` is a
@@ -145,7 +146,7 @@ pub async fn init_in_directory(
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
-                "Run `tracevault init` from the primary checkout ({}), not a linked worktree. \
+                "Run `{TOP} init` from the primary checkout ({}), not a linked worktree. \
                  cd there and run it again — all worktrees share the primary's .visdom/.",
                 primary.display()
             ),
@@ -160,7 +161,7 @@ pub async fn init_in_directory(
             io::ErrorKind::InvalidData,
             format!(
                 "cannot read the existing .visdom/tracing.toml ({e}). Fix or remove it, \
-                 then run `tracevault init` again."
+                 then run `{TOP} init` again."
             ),
         )
     })?;
@@ -195,7 +196,7 @@ pub async fn init_in_directory(
             // not hand it to a different `--server-url`.
             match credential_url_mismatch(resolved_url.as_deref(), server_url) {
                 Some(msg) => eprintln!(
-                    "Warning: not migrating default_project: {msg}. Run `tracevault sync` \
+                    "Warning: not migrating default_project: {msg}. Run `{CLI} sync` \
                      once logged in to that server."
                 ),
                 None => {
@@ -228,7 +229,7 @@ pub async fn init_in_directory(
         crate::agent::Agent::OpenCode => (None, ".opencode/".to_string()),
         // Only the plugin's own directory: `.amp/` also holds the project's
         // Amp settings, which a team may well commit.
-        crate::agent::Agent::Amp => (None, AMP_PLUGIN_GITIGNORE_ENTRY.to_string()),
+        crate::agent::Agent::Amp => (None, amp_plugin_gitignore_entry(project_root)),
     };
 
     // Create .visdom/ directory
@@ -249,7 +250,7 @@ pub async fn init_in_directory(
     let remote_url = git_remote_url(project_root);
     if remote_url.is_none() {
         eprintln!("Warning: no git remote 'origin' configured. Skipping server registration.");
-        eprintln!("Run 'git remote add origin <url>' then 'tracevault sync' to register.");
+        eprintln!("Run 'git remote add origin <url>' then '{CLI} sync' to register.");
     }
 
     // Write config: the existing one with this run's flags applied, defaults
@@ -299,7 +300,7 @@ pub async fn init_in_directory(
         }
         crate::agent::Agent::Amp => {
             let path = install_amp_plugin(Some(project_root))?;
-            println!("Installed the TraceVault Amp plugin in {}", path.display());
+            println!("Installed the Visdom Amp plugin in {}", path.display());
             println!("{}", amp_headless_notice());
         }
     }
@@ -370,7 +371,7 @@ pub async fn init_in_directory(
             Err(e) => {
                 eprintln!(
                     "Warning: could not check the server for an existing repo of this remote \
-                     ({e}); not registering. Run `tracevault init` again once the server is \
+                     ({e}); not registering. Run `{TOP} init` again once the server is \
                      reachable."
                 );
             }
@@ -399,7 +400,7 @@ async fn migrate_config_in_init(
         Err(ResolveNameError::Unreachable(e)) => {
             eprintln!(
                 "Warning: could not migrate default_project (could not list projects: {e}); \
-                 it stays unused for capture until `tracevault sync` succeeds."
+                 it stays unused for capture until `{CLI} sync` succeeds."
             );
             Ok(())
         }
@@ -429,7 +430,7 @@ pub async fn migrate_cwd_config(cwd: &Path) -> Result<(), io::Error> {
     else {
         eprintln!(
             "Warning: {} has a legacy default_project that needs a login to migrate; run \
-             `tracevault sync` there once logged in.",
+             `{CLI} sync` there once logged in.",
             TracevaultConfig::config_path(&root).display()
         );
         return Ok(());
@@ -443,7 +444,7 @@ pub async fn migrate_cwd_config(cwd: &Path) -> Result<(), io::Error> {
 }
 
 /// `Some(reason)` when an explicit `--server-url` names a different
-/// TraceVault instance than the one the credential was resolved for: a
+/// Visdom instance than the one the credential was resolved for: a
 /// lookup there would hand that instance's token or key to another host.
 /// `None` when there is no explicit URL, no resolved one, or both agree —
 /// and when the key comes from `TRACEVAULT_API_KEY`: like
@@ -460,7 +461,7 @@ fn credential_url_mismatch(resolved: Option<&str>, explicit: Option<&str>) -> Op
     (!crate::credentials::same_server(resolved, explicit)).then(|| {
         format!(
             "the credential in use is for {resolved}, not --server-url {explicit}; log in \
-             there first (`tracevault login --server-url {explicit}`) or omit --server-url"
+             there first (`{TOP} login --server-url {explicit}`) or omit --server-url"
         )
     })
 }
@@ -506,7 +507,7 @@ pub async fn init_workspace(
                 format!(
                     "{} is inside the git repo {}; sessions here read that repo's \
                      .visdom/tracing.toml, so a workspace binding here would never be used. \
-                     Run `tracevault init --workspace` from the repo root or from a directory \
+                     Run `{TOP} init --workspace` from the repo root or from a directory \
                      that is not inside a repo.",
                     dir.display(),
                     resolved.root.display()
@@ -520,7 +521,7 @@ pub async fn init_workspace(
             io::ErrorKind::InvalidData,
             format!(
                 "cannot read the existing .visdom/tracing.toml ({e}). Fix or remove it, \
-                 then run `tracevault init --workspace` again."
+                 then run `{TOP} init --workspace` again."
             ),
         )
     })?;
@@ -539,8 +540,8 @@ pub async fn init_workspace(
             format!(
                 "Not logged in. `init --workspace` resolves the project name on the server, \
                  so nothing was written.\nLog in, then run it again:\n\n    \
-                 tracevault login --server-url {}\n    \
-                 tracevault init --workspace --project {project_name}",
+                 {TOP} login --server-url {}\n    \
+                 {TOP} init --workspace --project {project_name}",
                 url.as_deref().unwrap_or("<URL>")
             ),
         ));
@@ -577,11 +578,11 @@ pub async fn init_workspace(
 pub fn not_logged_in_message(url: Option<&str>) -> String {
     let url = url.unwrap_or("<URL>");
     format!(
-        "Not logged in. Without a login TraceVault cannot register this repo, and its hooks \
+        "Not logged in. Without a login Visdom cannot register this repo, and its hooks \
          would record nothing, so nothing was installed.\n\
          Log in, then run init again:\n\
-         \n    tracevault login --server-url {url}\n    tracevault init\n\n\
-         (In CI, set TRACEVAULT_API_KEY instead of logging in.)"
+         \n    {TOP} login --server-url {url}\n    {TOP} init\n\n\
+         (In CI, set {ENV}_API_KEY instead of logging in.)"
     )
 }
 
@@ -673,10 +674,12 @@ fn registration_failure_message(err: &dyn std::error::Error) -> String {
     if msg.starts_with("Server returned 403 ") {
         "Warning: you are not authorized to register this repo.".to_string()
     } else if msg.starts_with("Server returned 404 ") {
-        "Warning: could not register repo on server (404) — this endpoint may not exist on \
+        crate::program::say(
+            "Warning: could not register repo on server (404) — this endpoint may not exist on \
          this server yet, possibly a CLI/server version mismatch. Run `tracevault sync` again \
-         once the server is upgraded."
-            .to_string()
+         once the server is upgraded.",
+        )
+        .to_string()
     } else {
         format!("Warning: could not register repo on server: {err}")
     }
@@ -736,20 +739,22 @@ fn install_git_hook(project_root: &Path) -> Result<(), io::Error> {
     // already-installed hooks keep working without re-running `tracevault
     // init`.
     let tracevault_block = format!(
-        "{PRE_PUSH_MARKER}\n\
+        "{marker}\n\
          # Capture git's pre-push ref list once; `check` uses it to determine\n\
          # which files are being pushed.\n\
-         tracevault_prepush_stdin=$(cat)\n\
+         {var}=$(cat)\n\
          {cli} sync 2>/dev/null || true\n\
-         printf '%s' \"$tracevault_prepush_stdin\" | {cli} check || {{ echo \"tracevault: policy check failed\"; exit 1; }}\n",
+         printf '%s' \"${var}\" | {cli} check || {{ echo \"{TOP}: policy check failed\"; exit 1; }}\n",
         cli = crate::program::name(crate::program::is_visdom()),
+        marker = marker_to_install(PRE_PUSH_MARKER),
+        var = PREPUSH_VARS[usize::from(crate::program::is_visdom())],
     );
 
     if hook_path.exists() {
         let existing = fs::read_to_string(&hook_path)?;
 
         // Already has new-style hook
-        if existing.contains(PRE_PUSH_MARKER) {
+        if has_marker(&existing, PRE_PUSH_MARKER) {
             return respell_git_hook(&hook_path, &existing, PRE_PUSH_MARKER);
         }
 
@@ -809,58 +814,105 @@ pub const POST_COMMIT_MARKER: &str = "# tracevault:post-commit";
 /// The subcommands our git hook blocks run.
 const GIT_HOOK_SUBCOMMANDS: [&str; 3] = ["sync", "check", "commit-push"];
 
+/// `marker` (one of the marker constants, which are the `tracevault`
+/// spellings) as `visdom` writes it: `# visdom:enforce`.
+pub fn marker_for_visdom(marker: &str) -> String {
+    marker.replacen("tracevault:", "visdom:", 1)
+}
+
+/// The marker a fresh install by the running binary writes.
+fn marker_to_install(marker: &str) -> String {
+    if crate::program::is_visdom() {
+        marker_for_visdom(marker)
+    } else {
+        marker.to_string()
+    }
+}
+
+/// Whether `content` holds the block `marker` starts, under either spelling
+/// of the marker.
+pub fn has_marker(content: &str, marker: &str) -> bool {
+    content.contains(marker) || content.contains(&marker_for_visdom(marker))
+}
+
+/// The shell variable a pre-push block keeps git's ref list in, as each
+/// binary names it.
+const PREPUSH_VARS: [&str; 2] = ["tracevault_prepush_stdin", "visdom_prepush_stdin"];
+
 /// A line of one of our git hook blocks that runs a command of ours,
 /// spelled for `visdom`. `None` for any other line. The blocks hold exactly
-/// these: `tracevault <sub> …` at the start of a line, and the pre-push
-/// check fed from the captured ref list.
+/// these: `tracevault <sub> …` (or `visdom trace <sub> …`) at the start of a
+/// line, and the pre-push check fed from the captured ref list.
 fn git_hook_line_for_visdom(line: &str) -> Option<String> {
     use crate::program::{TRACEVAULT, VISDOM_TRACE};
-    const PIPED: &str = "printf '%s' \"$tracevault_prepush_stdin\" | ";
-    let (head, command) = match line.strip_prefix(PIPED) {
-        Some(command) => (PIPED, command),
-        None => ("", line),
-    };
-    let rest = command.strip_prefix(TRACEVAULT)?.strip_prefix(' ')?;
+    let piped = PREPUSH_VARS
+        .iter()
+        .map(|var| format!("printf '%s' \"${var}\" | "))
+        .find(|piped| line.starts_with(piped.as_str()));
+    let command = &line[piped.as_ref().map_or(0, String::len)..];
+    let rest = [VISDOM_TRACE, TRACEVAULT]
+        .iter()
+        .find_map(|name| command.strip_prefix(name)?.strip_prefix(' '))?;
     let ours = GIT_HOOK_SUBCOMMANDS.iter().any(|sub| {
         rest.strip_prefix(sub)
             .is_some_and(|after| after.starts_with(' ') || after.trim_end().is_empty())
     });
+    let head = if piped.is_some() {
+        format!("printf '%s' \"${}\" | ", PREPUSH_VARS[1])
+    } else {
+        String::new()
+    };
+    let rest = rest.replace(
+        "echo \"tracevault: policy check failed\"",
+        "echo \"visdom: policy check failed\"",
+    );
     ours.then(|| format!("{head}{VISDOM_TRACE} {rest}"))
 }
 
-/// Whether `line` belongs to one of our git hook blocks without running a
-/// command of ours: its comments and the capture of git's ref list.
-fn is_git_hook_block_filler(line: &str) -> bool {
-    line.starts_with('#') || line.starts_with("tracevault_prepush_stdin=")
+/// A line that belongs to one of our git hook blocks without running a
+/// command of ours — its comments and the capture of git's ref list —
+/// spelled for `visdom`. `None` for any other line.
+fn git_hook_filler_for_visdom(line: &str) -> Option<String> {
+    if line.starts_with('#') {
+        return Some(line.to_string());
+    }
+    let rest = PREPUSH_VARS
+        .iter()
+        .find_map(|var| line.strip_prefix(var)?.strip_prefix('='))?;
+    Some(format!("{}={rest}", PREPUSH_VARS[1]))
 }
 
-/// `content` (a git hook) with the `tracevault …` commands of the block that
-/// starts at `marker` calling `visdom trace …` instead. The block is the
-/// marker line and the lines right after it that are the block's own (see
+/// `content` (a git hook) with the block that starts at `marker` (under
+/// either spelling) as `visdom` writes it: the `visdom:` marker, and
+/// `visdom trace …` for the `tracevault …` commands. The block is the marker
+/// line and the lines right after it that are the block's own (see
 /// [`git_hook_line_for_visdom`]); it ends at the first line that is not, so
 /// whatever the user wrote before or after it — even a line that mentions
-/// `tracevault` — is left alone. `None` when nothing in the block calls
-/// `tracevault`.
+/// `tracevault` — is left alone. `None` when the block already is so.
 fn git_hook_block_for_visdom(content: &str, marker: &str) -> Option<String> {
+    let visdom_marker = marker_for_visdom(marker);
     let mut out = String::with_capacity(content.len() + 32);
-    let (mut in_block, mut changed) = (false, false);
+    let mut in_block = false;
     for line in content.split_inclusive('\n') {
-        if line.trim_end() == marker {
+        let text = line.trim_end();
+        if text == marker || text == visdom_marker {
             in_block = true;
-            out.push_str(line);
+            out.push_str(&visdom_marker);
+            out.push_str(&line[text.len()..]);
             continue;
         }
         if in_block {
-            if let Some(ours) = git_hook_line_for_visdom(line) {
-                out.push_str(&ours);
-                changed = true;
-                continue;
+            match git_hook_line_for_visdom(line).or_else(|| git_hook_filler_for_visdom(line)) {
+                Some(ours) => {
+                    out.push_str(&ours);
+                    continue;
+                }
+                None => in_block = false,
             }
-            in_block = is_git_hook_block_filler(line);
         }
         out.push_str(line);
     }
-    changed.then_some(out)
+    (out != content).then_some(out)
 }
 
 /// An installed git hook block is left as it is — except that `visdom`
@@ -881,14 +933,15 @@ fn install_post_commit_hook(project_root: &Path) -> Result<(), io::Error> {
 
     let hook_path = hooks_dir.join("post-commit");
     let tracevault_block = format!(
-        "{POST_COMMIT_MARKER}\n{} commit-push 2>/dev/null &\n",
+        "{}\n{} commit-push 2>/dev/null &\n",
+        marker_to_install(POST_COMMIT_MARKER),
         crate::program::name(crate::program::is_visdom())
     );
 
     if hook_path.exists() {
         let existing = fs::read_to_string(&hook_path)?;
 
-        if existing.contains(POST_COMMIT_MARKER) {
+        if has_marker(&existing, POST_COMMIT_MARKER) {
             return respell_git_hook(&hook_path, &existing, POST_COMMIT_MARKER);
         }
 
@@ -956,7 +1009,7 @@ pub fn tracevault_hooks() -> serde_json::Value {
                 "type": "command",
                 "command": "tracevault stream --event pre-tool-use",
                 "timeout": 10,
-                "statusMessage": "TraceVault: streaming pre-tool event"
+                "statusMessage": "Visdom: streaming pre-tool event"
             }]
         }],
         "PostToolUse": [{
@@ -965,7 +1018,7 @@ pub fn tracevault_hooks() -> serde_json::Value {
                 "type": "command",
                 "command": "tracevault stream --event post-tool-use",
                 "timeout": 10,
-                "statusMessage": "TraceVault: streaming post-tool event"
+                "statusMessage": "Visdom: streaming post-tool event"
             }]
         }],
         "Notification": [{
@@ -974,7 +1027,7 @@ pub fn tracevault_hooks() -> serde_json::Value {
                 "type": "command",
                 "command": "tracevault stream --event notification",
                 "timeout": 10,
-                "statusMessage": "TraceVault: streaming notification"
+                "statusMessage": "Visdom: streaming notification"
             }]
         }],
         "Stop": [{
@@ -983,7 +1036,7 @@ pub fn tracevault_hooks() -> serde_json::Value {
                 "type": "command",
                 "command": "tracevault stream --event stop",
                 "timeout": 10,
-                "statusMessage": "TraceVault: finalizing session"
+                "statusMessage": "Visdom: finalizing session"
             }]
         }],
         // Claude Code writes its `cost-state` line at exit, after `Stop`; this
@@ -994,7 +1047,7 @@ pub fn tracevault_hooks() -> serde_json::Value {
                 "type": "command",
                 "command": "tracevault stream --event session-end",
                 "timeout": 10,
-                "statusMessage": "TraceVault: sending session cost"
+                "statusMessage": "Visdom: sending session cost"
             }]
         }],
         // Every hook above also sends new subagent transcript lines; this one
@@ -1005,7 +1058,7 @@ pub fn tracevault_hooks() -> serde_json::Value {
                 "type": "command",
                 "command": "tracevault stream --event subagent-stop",
                 "timeout": 10,
-                "statusMessage": "TraceVault: streaming subagent transcript"
+                "statusMessage": "Visdom: streaming subagent transcript"
             }]
         }],
         "SessionStart": [{
@@ -1014,7 +1067,7 @@ pub fn tracevault_hooks() -> serde_json::Value {
                 "type": "command",
                 "command": "tracevault session-start",
                 "timeout": 10,
-                "statusMessage": "TraceVault: session start"
+                "statusMessage": "Visdom: session start"
             }]
         }],
         "UserPromptSubmit": [{
@@ -1023,7 +1076,7 @@ pub fn tracevault_hooks() -> serde_json::Value {
                 "type": "command",
                 "command": "tracevault user-prompt",
                 "timeout": 10,
-                "statusMessage": "TraceVault: policy reinforcement"
+                "statusMessage": "Visdom: policy reinforcement"
             }]
         }]
     })
@@ -1058,19 +1111,19 @@ pub fn codex_hooks() -> serde_json::Value {
     serde_json::json!({
         "SessionStart": [{
             "matcher": "",
-            "hooks": [{ "type": "command", "command": "tracevault session-start", "timeout": 10, "statusMessage": "TraceVault: session start" }]
+            "hooks": [{ "type": "command", "command": "tracevault session-start", "timeout": 10, "statusMessage": "Visdom: session start" }]
         }],
         "UserPromptSubmit": [{
             "matcher": "",
-            "hooks": [{ "type": "command", "command": "tracevault user-prompt", "timeout": 10, "statusMessage": "TraceVault: policy reinforcement" }]
+            "hooks": [{ "type": "command", "command": "tracevault user-prompt", "timeout": 10, "statusMessage": "Visdom: policy reinforcement" }]
         }],
         "PostToolUse": [{
             "matcher": "",
-            "hooks": [{ "type": "command", "command": "tracevault stream --event post-tool-use --agent codex", "timeout": 10, "statusMessage": "TraceVault: streaming post-tool event" }]
+            "hooks": [{ "type": "command", "command": "tracevault stream --event post-tool-use --agent codex", "timeout": 10, "statusMessage": "Visdom: streaming post-tool event" }]
         }],
         "Stop": [{
             "matcher": "",
-            "hooks": [{ "type": "command", "command": "tracevault stream --event stop --agent codex", "timeout": 10, "statusMessage": "TraceVault: finalizing session" }]
+            "hooks": [{ "type": "command", "command": "tracevault stream --event stop --agent codex", "timeout": 10, "statusMessage": "Visdom: finalizing session" }]
         }]
     })
 }
@@ -1084,16 +1137,51 @@ const GSD_EXT_MANIFEST_JSON: &str =
     include_str!("../../assets/gsd-extension/extension-manifest.json");
 
 /// Path of the stable directory (under the user's config dir) that holds the
-/// TraceVault GSD extension source, shared by `install_gsd_extension` so the
+/// Visdom GSD extension source, shared by `install_gsd_extension` so the
 /// write and the `gsd install` invocation always agree on where it lives.
 fn gsd_extension_source_dir() -> io::Result<PathBuf> {
     let config_dir = dirs::config_dir().or_else(|| dirs::home_dir().map(|h| h.join(".config")));
     let config_dir = config_dir
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no config or home dir"))?;
-    Ok(config_dir.join("tracevault").join("gsd-extension"))
+    let visdom = crate::layout::user_dir_in(&config_dir).join("gsd-extension");
+    let earlier = config_dir
+        .join(crate::layout::LEGACY_USER_DIR)
+        .join("gsd-extension");
+    Ok(
+        if crate::program::installs_visdom(visdom.join("index.ts").exists()) {
+            visdom
+        } else {
+            earlier
+        },
+    )
 }
 
-/// Install the TraceVault pi/GSD extension and register it with GSD so it
+/// Where an earlier release kept the GSD extension source, when this install
+/// uses the `visdom` directory instead and that one is still there: GSD
+/// registers a source by its path, so the earlier registration has to be
+/// removed or both would load.
+fn earlier_gsd_extension_source_dir(source_dir: &Path) -> Option<PathBuf> {
+    let earlier = crate::layout::legacy_sibling(source_dir.parent()?)?.join("gsd-extension");
+    earlier.is_dir().then_some(earlier)
+}
+
+/// A GSD extension file (`package.json`, `extension-manifest.json`) naming
+/// the extension `visdom` when installed into the `visdom` directory.
+fn gsd_extension_file(source: &str, source_dir: &Path) -> String {
+    let visdom = source_dir
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == crate::layout::USER_DIR);
+    if visdom {
+        source
+            .replacen("\"id\": \"tracevault\"", "\"id\": \"visdom\"", 1)
+            .replacen("\"name\": \"tracevault\"", "\"name\": \"visdom\"", 1)
+    } else {
+        source.to_string()
+    }
+}
+
+/// Install the Visdom pi/GSD extension and register it with GSD so it
 /// actually loads.
 ///
 /// GSD (pi) only loads an extension that (a) has an `extension-manifest.json`
@@ -1124,10 +1212,13 @@ pub fn install_gsd_extension(project_root: Option<&Path>) -> io::Result<()> {
     let source_dir = gsd_extension_source_dir()?;
     fs::create_dir_all(&source_dir)?;
     write_plugin(&source_dir.join("index.ts"), GSD_EXT_INDEX_TS)?;
-    fs::write(source_dir.join("package.json"), GSD_EXT_PACKAGE_JSON)?;
+    fs::write(
+        source_dir.join("package.json"),
+        gsd_extension_file(GSD_EXT_PACKAGE_JSON, &source_dir),
+    )?;
     fs::write(
         source_dir.join("extension-manifest.json"),
-        GSD_EXT_MANIFEST_JSON,
+        gsd_extension_file(GSD_EXT_MANIFEST_JSON, &source_dir),
     )?;
 
     // Best-effort cleanup of the OLD, broken install (hand-written registry
@@ -1157,20 +1248,35 @@ pub fn install_gsd_extension(project_root: Option<&Path>) -> io::Result<()> {
     match cmd.output() {
         Ok(output) if output.status.success() => {
             println!(
-                "TraceVault: installed and registered the GSD extension ({}).",
+                "Visdom: installed and registered the GSD extension ({}).",
                 source_dir.display()
             );
+            // Only now the registration of the earlier source, in the scope
+            // just installed (this repository, or the machine): removed
+            // first, a failed install would leave GSD with no capture at
+            // all. Best-effort. The earlier source itself stays — other
+            // repositories may have it registered, and lose capture if it
+            // went.
+            if let Some(earlier) = earlier_gsd_extension_source_dir(&source_dir) {
+                let mut remove = std::process::Command::new("gsd");
+                remove.arg("remove").arg(&earlier);
+                if let Some(root) = project_root {
+                    remove.arg("-l");
+                    remove.current_dir(root);
+                }
+                let _ = remove.output();
+            }
         }
         Ok(output) => {
             eprintln!(
-                "TraceVault: installed the GSD extension source to {}, but `gsd install` failed:\n{}Ensure `gsd` is on PATH and run: `{retry_hint}` to enable capture.",
+                "Visdom: installed the GSD extension source to {}, but `gsd install` failed:\n{}Ensure `gsd` is on PATH and run: `{retry_hint}` to enable capture.",
                 source_dir.display(),
                 String::from_utf8_lossy(&output.stderr),
             );
         }
         Err(e) => {
             eprintln!(
-                "TraceVault: installed the GSD extension source to {}, but could not run `gsd install` ({e}). Ensure `gsd` is on PATH and run: `{retry_hint}` to enable capture.",
+                "Visdom: installed the GSD extension source to {}, but could not run `gsd install` ({e}). Ensure `gsd` is on PATH and run: `{retry_hint}` to enable capture.",
                 source_dir.display(),
             );
         }
@@ -1179,11 +1285,11 @@ pub fn install_gsd_extension(project_root: Option<&Path>) -> io::Result<()> {
     Ok(())
 }
 
-/// TraceVault OpenCode plugin source, embedded from the checked-in assets
+/// Visdom OpenCode plugin source, embedded from the checked-in assets
 /// this installer writes verbatim (mirrors the GSD extension embeds above).
 const OPENCODE_PLUGIN_INDEX: &str = include_str!("../../assets/opencode-plugin/index.ts");
 
-/// Install the TraceVault OpenCode plugin. `project_root = Some(dir)` installs
+/// Install the Visdom OpenCode plugin. `project_root = Some(dir)` installs
 /// project-local at `<dir>/.opencode/plugins/tracevault.ts`; `None` installs
 /// global at `~/.config/opencode/plugins/tracevault.ts` (using the same
 /// config-dir resolution as `gsd_extension_source_dir` above). OpenCode
@@ -1221,7 +1327,32 @@ pub fn install_opencode_plugin(project_root: Option<&Path>) -> io::Result<()> {
 
 fn write_opencode_plugin_files(plugins_dir: &Path) -> io::Result<()> {
     fs::create_dir_all(plugins_dir)?;
-    write_plugin(&plugins_dir.join("tracevault.ts"), OPENCODE_PLUGIN_INDEX)
+    let name = plugin_name(plugins_dir.join("visdom.ts").exists());
+    write_plugin(
+        &plugins_dir.join(format!("{name}.ts")),
+        OPENCODE_PLUGIN_INDEX,
+    )?;
+    if name == "visdom" {
+        // OpenCode would load the earlier file as a second plugin.
+        match fs::remove_file(plugins_dir.join("tracevault.ts")) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The name a plugin is installed under: the directory or file in the
+/// agent's plugins directory. `visdom` installs it as `visdom` and removes
+/// the `tracevault` one beside it (the agent would load both); `tracevault`
+/// installs it as `tracevault` — unless the `visdom` one is already there,
+/// which it then keeps up to date instead (see `crate::program`).
+fn plugin_name(visdom_one_exists: bool) -> &'static str {
+    if crate::program::installs_visdom(visdom_one_exists) {
+        "visdom"
+    } else {
+        crate::program::TRACEVAULT
+    }
 }
 
 /// The line of a plugin's source that names the command it runs, as the
@@ -1248,6 +1379,9 @@ pub fn plugin_source(source: &str, visdom: bool) -> String {
         .fold(source.to_string(), |text, (ours, theirs)| {
             text.replacen(ours, theirs, 1)
         })
+        // What the plugin shows of itself: its log prefix and description.
+        .replace("[tracevault]", "[visdom]")
+        .replace("(tracevault stream", "(visdom trace stream")
 }
 
 /// Whether the plugin file at `path` runs `visdom`.
@@ -1266,14 +1400,19 @@ fn write_plugin(path: &Path, source: &str) -> io::Result<()> {
     fs::write(path, plugin_source(source, visdom))
 }
 
-/// TraceVault Amp plugin source, embedded from the checked-in assets and
+/// Visdom Amp plugin source, embedded from the checked-in assets and
 /// written verbatim by `install_amp_plugin`.
 pub const AMP_PLUGIN_INDEX: &str = include_str!("../../assets/amp-plugin/index.ts");
 
-/// Root `.gitignore` entry for the repo-local Amp plugin.
-const AMP_PLUGIN_GITIGNORE_ENTRY: &str = ".amp/plugins/tracevault/";
+/// Root `.gitignore` entry for the Amp plugin `init` installs in
+/// `project_root`: the plugin's own directory, `.amp/plugins/<name>/`.
+fn amp_plugin_gitignore_entry(project_root: &Path) -> String {
+    let plugins_dir = project_root.join(".amp").join("plugins");
+    let name = plugin_name(plugins_dir.join("visdom").join("index.ts").exists());
+    format!(".amp/plugins/{name}/")
+}
 
-/// Install the TraceVault Amp plugin as `tracevault/index.ts` in an Amp
+/// Install the Visdom Amp plugin as `tracevault/index.ts` in an Amp
 /// plugins directory: `<project_root>/.amp/plugins/` for a repo, or with
 /// `None` the user-level one Amp loads for every session,
 /// `$XDG_CONFIG_HOME/amp/plugins/` or `~/.config/amp/plugins/`. Amp uses
@@ -1293,10 +1432,21 @@ pub fn install_amp_plugin(project_root: Option<&Path>) -> io::Result<PathBuf> {
             })?
             .join("plugins"),
     };
-    let plugin_dir = plugins_dir.join("tracevault");
+    let name = plugin_name(plugins_dir.join("visdom").join("index.ts").exists());
+    let plugin_dir = plugins_dir.join(name);
     fs::create_dir_all(&plugin_dir)?;
     let path = plugin_dir.join("index.ts");
     write_plugin(&path, AMP_PLUGIN_INDEX)?;
+    if name == "visdom" {
+        // Amp would load the earlier directory as a second plugin.
+        let earlier = plugins_dir.join(crate::program::TRACEVAULT);
+        match fs::remove_file(earlier.join("index.ts")) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        // Only when nothing else is in it.
+        let _ = fs::remove_dir(&earlier);
+    }
     Ok(path)
 }
 
@@ -1384,7 +1534,7 @@ pub fn cleanup_stale_gsd_registration(gsd_home: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Bring the TraceVault hooks in `hooks_path` to `ours` via [`merge_hooks`]
+/// Bring the Visdom hooks in `hooks_path` to `ours` via [`merge_hooks`]
 /// (foreign hooks and other keys are kept), written through
 /// [`update_json_file`]. The one
 /// install path for every hook file — per-repo Claude (`settings.json` or
@@ -1490,7 +1640,7 @@ pub(crate) fn update_json_file(
         }
     }
     Err(io::Error::other(format!(
-        "{} kept changing while TraceVault updated {what}; re-run `tracevault init`",
+        "{} kept changing while Visdom updated {what}; re-run `{TOP} init`",
         path.display()
     )))
 }
@@ -1543,7 +1693,7 @@ pub fn install_codex_hooks(project_root: &Path) -> io::Result<()> {
     merge_hooks_into_file(&codex_dir.join("hooks.json"), &codex_hooks())
 }
 
-/// Install TraceVault's Codex hooks into `<codex_dir>/hooks.json` and append a
+/// Install Visdom's Codex hooks into `<codex_dir>/hooks.json` and append a
 /// workspace-mode instruction block to `<codex_dir>/AGENTS.md` (idempotent,
 /// atomic), mirroring the Claude global install's `settings.json` + `CLAUDE.md`.
 /// Intended for `tracevault init --global --agent codex`. Codex reads `AGENTS.md`
@@ -1564,11 +1714,11 @@ const GLOBAL_CLAUDE_MD_MARKER: &str = "<!-- tracevault:workspace-mode -->";
 
 const GLOBAL_CLAUDE_MD_BLOCK: &str = "\
 <!-- tracevault:workspace-mode -->
-## TraceVault (workspace mode)
+## Visdom (workspace mode)
 A session started in a registered repo's checkout is bound to that repo automatically. To work
 on a different repo, run `tracevault repo switch <path>` to bind tracing and fetch that repo's
 policies; treat its output as binding. Use `--path <path>` on `tracevault repo status` for a
-one-off. Repos must already be registered with TraceVault. In a directory bound to a project
+one-off. Repos must already be registered with Visdom. In a directory bound to a project
 with `tracevault init --workspace`, sessions are recorded to that project without it, so
 `repo switch` there is optional: it only adds the repo and its policies.
 ";
@@ -1593,6 +1743,17 @@ on a different repo, run `tracevault repo switch <path>` to bind tracing and fet
 policies; treat its output as binding. Use `--path <path>` on `tracevault repo status` for a
 one-off. Repos must already be registered with TraceVault.
 ",
+    // The text before the product was called Visdom.
+    "\
+<!-- tracevault:workspace-mode -->
+## TraceVault (workspace mode)
+A session started in a registered repo's checkout is bound to that repo automatically. To work
+on a different repo, run `tracevault repo switch <path>` to bind tracing and fetch that repo's
+policies; treat its output as binding. Use `--path <path>` on `tracevault repo status` for a
+one-off. Repos must already be registered with TraceVault. In a directory bound to a project
+with `tracevault init --workspace`, sessions are recorded to that project without it, so
+`repo switch` there is optional: it only adds the repo and its policies.
+",
 ];
 
 /// `content` with an earlier install's block (an exact
@@ -1603,28 +1764,43 @@ one-off. Repos must already be registered with TraceVault.
 /// `visdom` (the blocks are written with `tracevault …`).
 fn workspace_block(block: &str, visdom: bool) -> String {
     if visdom {
-        block.replace("`tracevault ", "`visdom trace ")
+        block.replace("`tracevault ", "`visdom trace ").replace(
+            GLOBAL_CLAUDE_MD_MARKER,
+            &marker_for_visdom(GLOBAL_CLAUDE_MD_MARKER),
+        )
     } else {
         block.to_string()
     }
 }
 
+/// `block` as it may stand in a file that names `visdom`: with the `visdom`
+/// marker, or — written by the release that first installed `visdom trace …`
+/// commands — still with the `tracevault` one.
+fn visdom_workspace_blocks(block: &str) -> [String; 2] {
+    [
+        workspace_block(block, true),
+        block.replace("`tracevault ", "`visdom trace "),
+    ]
+}
+
 fn replace_managed_block(content: &str) -> String {
+    let known = || std::iter::once(&GLOBAL_CLAUDE_MD_BLOCK).chain(PREVIOUS_GLOBAL_CLAUDE_MD_BLOCKS);
     // The block names the binary that installs it — and `visdom` still, once
     // it does (see `crate::program`).
     let visdom = crate::program::installs_visdom(
-        content.contains(&workspace_block(GLOBAL_CLAUDE_MD_BLOCK, true))
-            || PREVIOUS_GLOBAL_CLAUDE_MD_BLOCKS
-                .iter()
-                .any(|old| content.contains(&workspace_block(old, true))),
+        known()
+            .flat_map(|block| visdom_workspace_blocks(block))
+            .any(|block| content.contains(&block)),
     );
     let current = workspace_block(GLOBAL_CLAUDE_MD_BLOCK, visdom);
     if content.contains(&current) {
         return content.to_string();
     }
-    std::iter::once(&GLOBAL_CLAUDE_MD_BLOCK)
-        .chain(PREVIOUS_GLOBAL_CLAUDE_MD_BLOCKS)
-        .flat_map(|old| [workspace_block(old, false), workspace_block(old, true)])
+    known()
+        .flat_map(|old| {
+            let [marked, unmarked] = visdom_workspace_blocks(old);
+            [old.to_string(), marked, unmarked]
+        })
         .find(|old| content.contains(old))
         .map_or_else(
             || content.to_string(),
@@ -1654,7 +1830,7 @@ fn append_workspace_md(md_path: &Path) -> io::Result<()> {
     } else {
         String::new()
     };
-    if existing.contains(GLOBAL_CLAUDE_MD_MARKER) {
+    if has_marker(&existing, GLOBAL_CLAUDE_MD_MARKER) {
         // An earlier install's block: bring it to the current text in place
         // (VIS-1256 changed it), leaving everything around it untouched.
         let replaced = replace_managed_block(&existing);
@@ -1695,7 +1871,7 @@ pub(crate) fn safe_join(base: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(joined)
 }
 
-/// An inner hook belongs to TraceVault when its `command` starts with
+/// An inner hook belongs to Visdom when its `command` starts with
 /// `tracevault ` — every hook command `init` has ever installed does, and a
 /// user's own hook running something else never does. This is what lets a
 /// re-run replace exactly our entries (old matcher, timeout, status message,
@@ -1759,7 +1935,7 @@ fn hooks_spelled(ours: &serde_json::Value, visdom: bool) -> serde_json::Value {
     ours
 }
 
-/// Remove TraceVault-owned inner hooks from one event's matcher groups. A
+/// Remove Visdom-owned inner hooks from one event's matcher groups. A
 /// group that held only our hooks is dropped; a group shared with foreign
 /// hooks keeps them and everything else it had. Groups without any of our
 /// hooks are left untouched. Returns the position of the first dropped group,
@@ -1783,7 +1959,7 @@ fn strip_tracevault_hooks(entries: &mut Vec<serde_json::Value>) -> Option<usize>
     slot
 }
 
-/// Bring `settings["hooks"]` to exactly `ours` for TraceVault's entries while
+/// Bring `settings["hooks"]` to exactly `ours` for Visdom's entries while
 /// keeping every foreign hook: our inner hooks (see [`is_tracevault_hook`])
 /// are removed from every event, then the current `ours` entries are put back
 /// in their place (appended for an event that had none). Re-running converges
@@ -1872,7 +2048,7 @@ fn merge_hooks(
 }
 
 /// Whether the hook file at `path` (Claude Code settings or Codex `hooks.json`)
-/// holds any TraceVault hook.
+/// holds any Visdom hook.
 /// A missing file holds none; one that cannot be read or parsed is an error
 /// (it may hold some).
 pub fn has_tracevault_hooks(path: &Path) -> io::Result<bool> {
@@ -1888,14 +2064,14 @@ pub fn has_tracevault_hooks(path: &Path) -> io::Result<bool> {
         .is_some_and(|hooks| hooks_in(hooks).any(is_tracevault_hook)))
 }
 
-/// Bring the TraceVault hooks in the Claude Code settings file at `path` to
+/// Bring the Visdom hooks in the Claude Code settings file at `path` to
 /// the current set ([`tracevault_hooks`]), exactly as `init` would. Used by
 /// the upgrade step (VIS-1109) on a file that already holds our hooks.
 pub(crate) fn refresh_claude_hooks(path: &Path) -> io::Result<()> {
     merge_hooks_into_file(path, &tracevault_hooks())
 }
 
-/// Install TraceVault's Claude Code hooks into `claude_dir/settings.json`
+/// Install Visdom's Claude Code hooks into `claude_dir/settings.json`
 /// (deep-merged, never clobbering existing hooks/keys) and append a
 /// workspace-mode instruction block to `claude_dir/CLAUDE.md` (idempotent,
 /// guarded by a marker comment). Intended for `tracevault init --global`,
@@ -2692,7 +2868,7 @@ mod tests {
 
     /// A settings file a user might really have: other keys, foreign hooks in
     /// their own groups and in a group shared with ours, keys in non-sorted
-    /// order, and a stale TraceVault install.
+    /// order, and a stale Visdom install.
     const FOREIGN_SETTINGS: &str = r#"{
   "permissions": { "allow": ["Bash(ls)"] },
   "hooks": {
@@ -2762,7 +2938,7 @@ mod tests {
                 .get(event)
                 .map(|o| o.as_array().unwrap().iter().collect())
                 .unwrap_or_default();
-            assert_eq!(mine, want, "TraceVault entries under {event}");
+            assert_eq!(mine, want, "Visdom entries under {event}");
         }
         for event in ours.keys() {
             assert!(hooks.contains_key(event), "missing {event}");
@@ -3813,10 +3989,10 @@ mod tests {
         assert_eq!(
             respelled,
             "#!/bin/sh\ntracevault check # the user's own line\n\n\
-             # tracevault:enforce\n\
-             tracevault_prepush_stdin=$(cat)\n\
+             # visdom:enforce\n\
+             visdom_prepush_stdin=$(cat)\n\
              visdom trace sync 2>/dev/null || true\n\
-             printf '%s' \"$tracevault_prepush_stdin\" | visdom trace check || { echo \"tracevault: policy check failed\"; exit 1; }\n\
+             printf '%s' \"$visdom_prepush_stdin\" | visdom trace check || { echo \"visdom: policy check failed\"; exit 1; }\n\
              \ntracevault sync # also the user's\n"
         );
         // Nothing left to change.
@@ -3827,7 +4003,7 @@ mod tests {
                 POST_COMMIT_MARKER
             )
             .as_deref(),
-            Some("#!/bin/sh\n# tracevault:post-commit\nvisdom trace commit-push 2>/dev/null &\n")
+            Some("#!/bin/sh\n# visdom:post-commit\nvisdom trace commit-push 2>/dev/null &\n")
         );
     }
 
@@ -3913,9 +4089,54 @@ mod tests {
         assert_eq!(
             git_hook_block_for_visdom(hook, POST_COMMIT_MARKER).as_deref(),
             Some(
-                "#!/bin/sh\n# tracevault:post-commit\nvisdom trace commit-push 2>/dev/null &\n\
+                "#!/bin/sh\n# visdom:post-commit\nvisdom trace commit-push 2>/dev/null &\n\
                  custom-tracevault check\ntracevault check-something\ntracevault sync\n"
             )
         );
+    }
+
+    #[test]
+    fn the_gsd_extension_is_named_after_the_directory_it_is_installed_in() {
+        let visdom = Path::new("/cfg/visdom/gsd-extension");
+        let earlier = Path::new("/cfg/tracevault/gsd-extension");
+        assert!(gsd_extension_file(GSD_EXT_MANIFEST_JSON, visdom).contains("\"id\": \"visdom\""));
+        assert!(gsd_extension_file(GSD_EXT_PACKAGE_JSON, visdom).contains("\"name\": \"visdom\""));
+        assert_eq!(
+            gsd_extension_file(GSD_EXT_MANIFEST_JSON, earlier),
+            GSD_EXT_MANIFEST_JSON
+        );
+        assert_eq!(
+            gsd_extension_file(GSD_EXT_PACKAGE_JSON, earlier),
+            GSD_EXT_PACKAGE_JSON
+        );
+    }
+
+    #[test]
+    fn markers_are_recognised_under_either_spelling() {
+        assert_eq!(marker_for_visdom(PRE_PUSH_MARKER), "# visdom:enforce");
+        assert!(has_marker(
+            "#!/bin/sh\n# visdom:post-commit\n",
+            POST_COMMIT_MARKER
+        ));
+        assert!(has_marker(
+            "#!/bin/sh\n# tracevault:post-commit\n",
+            POST_COMMIT_MARKER
+        ));
+        assert!(!has_marker(
+            "#!/bin/sh\n# visdom:enforce\n",
+            POST_COMMIT_MARKER
+        ));
+        // The block before the product was called Visdom is brought up to
+        // date, keeping the binary it names.
+        let old = PREVIOUS_GLOBAL_CLAUDE_MD_BLOCKS.last().unwrap();
+        assert!(old.contains("## TraceVault (workspace mode)"));
+        assert_eq!(replace_managed_block(old), GLOBAL_CLAUDE_MD_BLOCK);
+        let old_visdom = old.replace("`tracevault ", "`visdom trace ");
+        let now = replace_managed_block(&old_visdom);
+        assert!(
+            now.starts_with("<!-- visdom:workspace-mode -->\n## Visdom (workspace mode)"),
+            "{now}"
+        );
+        assert!(!now.contains("tracevault"), "{now}");
     }
 }

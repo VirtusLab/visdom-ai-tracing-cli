@@ -1,3 +1,4 @@
+use crate::program::{CLI, ENV, TOP};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -109,7 +110,7 @@ pub async fn open_verification_phase(
                 return Err(format!(
                     "Multiple sessions belong to this worktree ({worktree_top}): {}. \
                      Pass --session-id to select one, or run verify-start from the agent \
-                     session itself (it reads $TRACEVAULT_SESSION_ID, or $AMP_CURRENT_THREAD_ID in Amp).",
+                     session itself (it reads ${ENV}_SESSION_ID, or $AMP_CURRENT_THREAD_ID in Amp).",
                     ids.join(", ")
                 ));
             }
@@ -206,9 +207,9 @@ pub async fn open_verification_phase(
         .ok_or_else(|| {
             format!(
                 "No repo resolved for session {session_id}: it is not bound with \
-                 `tracevault repo switch` and no repo_id is configured, so its tool events \
-                 are not sent to any repo. Run `tracevault repo switch <path>` or \
-                 `tracevault init`."
+                 `{CLI} repo switch` and no repo_id is configured, so its tool events \
+                 are not sent to any repo. Run `{CLI} repo switch <path>` or \
+                 `{TOP} init`."
             )
         })?
         .repo_id;
@@ -220,7 +221,7 @@ pub async fn open_verification_phase(
 
     println!("✓ Verification phase opened for session {session_id}");
     println!("  Tool calls from this point are evaluated by verification_phase-scoped policies.");
-    println!("  Run `tracevault verify-start` again to reset the phase if needed.");
+    println!("  Run `{CLI} verify-start` again to reset the phase if needed.");
 
     Ok(())
 }

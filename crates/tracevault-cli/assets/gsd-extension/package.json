@@ -1,7 +1,7 @@
 {
   "name": "tracevault",
   "version": "0.1.0",
-  "description": "TraceVault capture extension for pi/GSD",
+  "description": "Visdom capture extension for pi/GSD",
   "type": "module",
   "main": "index.ts",
   "peerDependencies": { "@gsd/pi-coding-agent": "*" }

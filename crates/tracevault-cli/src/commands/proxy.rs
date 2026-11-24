@@ -1,4 +1,4 @@
-//! `tracevault proxy info` — print the TraceVault LLM proxy configuration
+//! `tracevault proxy info` — print the Visdom LLM proxy configuration
 //! a user needs to point their AI tool (Claude Code, GSD2, Cursor, etc.) at
 //! the proxy.
 //!
@@ -6,6 +6,7 @@
 //! to be copy-pasted directly into a shell or tool config.
 
 use crate::credentials::{Credential, Credentials};
+use crate::program::{ENV, TOP};
 
 const ANSI_BOLD: &str = "\x1b[1m";
 const ANSI_DIM: &str = "\x1b[2m";
@@ -18,8 +19,8 @@ pub fn run_proxy_info() -> i32 {
         Some(c) => c,
         None => {
             eprintln!(
-                "Not logged in. Run `tracevault login --server-url <url>` first \
-                 to obtain a TraceVault session token, then try again."
+                "Not logged in. Run `{TOP} login --server-url <url>` first \
+                 to obtain a Visdom session token, then try again."
             );
             eprintln!(
                 "Credentials file expected at: {}",
@@ -43,8 +44,8 @@ pub fn run_proxy_info() -> i32 {
                 creds_path
             );
             eprintln!(
-                "Run `tracevault login --server-url <url>`, or set TRACEVAULT_API_KEY to a \
-                 TraceVault API key (tvk_...)."
+                "Run `{TOP} login --server-url <url>`, or set {ENV}_API_KEY to a \
+                 Visdom API key (tvk_...)."
             );
             return 1;
         }
@@ -53,7 +54,7 @@ pub fn run_proxy_info() -> i32 {
     let server_url = creds.server_url.trim_end_matches('/');
     let proxy_url = format!("{server_url}/proxy/anthropic");
 
-    println!("{ANSI_BOLD}TraceVault LLM Proxy{ANSI_RESET}");
+    println!("{ANSI_BOLD}Visdom LLM Proxy{ANSI_RESET}");
     println!();
     println!("  Server:           {server_url}");
     println!("  Proxy base URL:   {ANSI_BOLD}{proxy_url}{ANSI_RESET}");
@@ -68,7 +69,7 @@ pub fn run_proxy_info() -> i32 {
     println!();
     println!("       {ANSI_BOLD}export ANTHROPIC_BASE_URL=\"{proxy_url}\"{ANSI_RESET}");
     println!(
-        "       {ANSI_BOLD}export ANTHROPIC_API_KEY=\"<your TraceVault session token>\"{ANSI_RESET}"
+        "       {ANSI_BOLD}export ANTHROPIC_API_KEY=\"<your Visdom session token>\"{ANSI_RESET}"
     );
     println!();
     // `ANTHROPIC_API_KEY` is static tool configuration, so it needs a static
@@ -77,7 +78,7 @@ pub fn run_proxy_info() -> i32 {
     match credential {
         Credential::ApiKey(_) => {
             println!(
-                "     {ANSI_DIM}Your TraceVault token lives in {} as the \"token\" field.{ANSI_RESET}",
+                "     {ANSI_DIM}Your Visdom token lives in {} as the \"token\" field.{ANSI_RESET}",
                 creds_path
             );
         }
@@ -87,12 +88,12 @@ pub fn run_proxy_info() -> i32 {
             println!(
                 "     {ANSI_DIM}This machine is signed in with a Keycloak session, whose access \
                  token expires every few minutes — it cannot be pasted here as a static value. \
-                 Use a TraceVault API key (tvk_...) for the proxy instead.{ANSI_RESET}"
+                 Use a Visdom API key (tvk_...) for the proxy instead.{ANSI_RESET}"
             );
         }
     }
     println!();
-    println!("  3. Run your AI tool as usual. Requests go through TraceVault and are");
+    println!("  3. Run your AI tool as usual. Requests go through Visdom and are");
     println!("     forwarded to api.anthropic.com using the Anthropic key you stored");
     println!("     in step 1.");
 

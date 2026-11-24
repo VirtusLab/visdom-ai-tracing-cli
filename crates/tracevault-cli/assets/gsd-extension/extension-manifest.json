@@ -1,8 +1,8 @@
 {
   "id": "tracevault",
-  "name": "TraceVault",
+  "name": "Visdom",
   "version": "0.1.0",
-  "description": "TraceVault capture extension for pi/GSD",
+  "description": "Visdom capture extension for pi/GSD",
   "tier": "user",
   "requires": { "platform": ">=2.29.0" },
   "provides": { "hooks": ["session_start", "tool_execution_start", "tool_execution_end", "stop"] }

@@ -12,6 +12,7 @@
 
 use crate::api_client::{ApiClient, ProjectListItem};
 use crate::config::TracevaultConfig;
+use crate::program::CLI;
 
 /// Exact, case-sensitive name → the one project carrying it. An unknown
 /// name lists the available ones; a name several projects share is an
@@ -169,12 +170,12 @@ pub fn legacy_default_project_notice(config: &TracevaultConfig) -> Option<String
     Some(if has_valid_project_id(config) {
         format!(
             "default_project \"{name}\" in .visdom/tracing.toml is ignored (its project_id \
-             wins); run `tracevault sync` to remove it"
+             wins); run `{CLI} sync` to remove it"
         )
     } else {
         format!(
             "default_project \"{name}\" is not used for capture until migrated; run \
-             `tracevault sync`"
+             `{CLI} sync`"
         )
     })
 }

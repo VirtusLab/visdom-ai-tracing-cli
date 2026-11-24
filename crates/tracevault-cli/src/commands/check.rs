@@ -1,5 +1,6 @@
 use crate::api_client::{ApiClient, CheckPoliciesRequest, SessionCheckData};
 use crate::credentials::resolve_credentials;
+use crate::program::CLI;
 use crate::resolution::{resolve_repo_by_name, ResolveRepoByNameError};
 use std::collections::HashSet;
 use std::fs;
@@ -453,10 +454,9 @@ async fn resolve_pushed_repo(
         Err(ResolveRepoByNameError::ListFailed(e)) => {
             Err(connectivity_message(&e.to_string()).into())
         }
-        Err(ResolveRepoByNameError::NotFound { repo_name }) => Err(format!(
-            "Repo '{repo_name}' not found on server. Run `tracevault sync` first."
-        )
-        .into()),
+        Err(ResolveRepoByNameError::NotFound { repo_name }) => {
+            Err(format!("Repo '{repo_name}' not found on server. Run `{CLI} sync` first.").into())
+        }
     }
 }
 
@@ -487,7 +487,7 @@ fn streamed_elsewhere_warning(
     Some(format!(
         "Warning: an unpushed session streamed its events to {scope} ({}), not to the repo \
          this push is checked under ({}). Its verification-phase data will not be found; \
-         run `tracevault repo switch <this checkout>` in that session.",
+         run `{CLI} repo switch <this checkout>` in that session.",
         b.repo_id, pushed.id
     ))
 }
@@ -508,14 +508,15 @@ pub async fn check_policies(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (server_url, credential) = resolve_credentials(project_root)?;
 
-    let server_url = server_url
-        .ok_or("No server URL configured. Run `tracevault login --server-url=<url>` to set one.")?;
+    let server_url = server_url.ok_or(crate::program::say(
+        "No server URL configured. Run `tracevault login --server-url=<url>` to set one.",
+    ))?;
 
     if credential.is_none() {
-        return Err(
-            "Not logged in. Run `tracevault login --server-url=<server_url>` to authenticate."
-                .into(),
-        );
+        return Err(crate::program::say(
+            "Not logged in. Run `tracevault login --server-url=<server_url>` to authenticate.",
+        )
+        .into());
     }
 
     let client = ApiClient::with_credential(&server_url, credential);
@@ -524,7 +525,7 @@ pub async fn check_policies(
     //
     // Connectivity errors here (auth expired, server down, network
     // unreachable) propagate so the pre-push hook exits non-zero — if a
-    // repo is opted into TraceVault, every push must be evaluated, full
+    // repo is opted into Visdom, every push must be evaluated, full
     // stop. Letting pushes slip when TV is unreachable would defeat the
     // point of enforcement. We attach an actionable next step to each
     // error so the user (or agent) knows the recovery command without
@@ -665,7 +666,7 @@ fn connectivity_message(raw: &str) -> String {
     if lower.contains("401") || lower.contains("unauthorized") {
         return with_action(
             raw,
-            "Session token may be expired. Run `tracevault login --server-url=<server_url>` to refresh.",
+            &crate::program::say("Session token may be expired. Run `tracevault login --server-url=<server_url>` to refresh."),
         );
     }
     // 403 — authenticated but not allowed. Re-login won't help; the token
@@ -673,7 +674,7 @@ fn connectivity_message(raw: &str) -> String {
     if lower.contains("403") || lower.contains("forbidden") {
         return with_action(
             raw,
-            "Your token is not authorized for this repo's policies. Confirm the token/service account has access and rerun `tracevault login`.",
+            &crate::program::say("Your token is not authorized for this repo's policies. Confirm the token/service account has access and rerun `tracevault login`."),
         );
     }
     // 404 — the route itself wasn't found. Neither call that reaches this
@@ -694,7 +695,7 @@ fn connectivity_message(raw: &str) -> String {
     if is_server_error(&lower) {
         return with_action(
             raw,
-            "TraceVault server returned an error. The team has likely been paged; retry shortly.",
+            "Visdom server returned an error. The team has likely been paged; retry shortly.",
         );
     }
     // Transport-level failure with no HTTP status — DNS, refused, timeout.
@@ -706,7 +707,7 @@ fn connectivity_message(raw: &str) -> String {
     {
         return with_action(
             raw,
-            "Could not reach the TraceVault server. Check network and `server_url` in .visdom/tracing.toml.",
+            "Could not reach the Visdom server. Check network and `server_url` in .visdom/tracing.toml.",
         );
     }
     // Unrecognized — surface the raw error verbatim, no invented advice.

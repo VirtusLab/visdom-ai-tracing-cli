@@ -25,6 +25,7 @@
 //! same reason a session is sent only under the attribution its own hooks
 //! recorded (see [`stream::catch_up_may_send`]).
 
+use crate::program::TOP;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -219,7 +220,7 @@ pub async fn sweep(
             Ok(stream::Sent::Skipped) => {}
             Ok(stream::Sent::Queued) => break,
             Err(e) => {
-                eprintln!("tracevault: cannot send the end of an earlier session: {e}");
+                eprintln!("{TOP}: cannot send the end of an earlier session: {e}");
                 break;
             }
         }

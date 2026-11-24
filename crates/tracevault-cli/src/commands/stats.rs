@@ -1,10 +1,11 @@
+use crate::program::TOP;
 use std::fs;
 use std::path::Path;
 
 pub fn show_stats(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let sessions_dirs = crate::layout::existing_sessions_dirs(project_root);
     if sessions_dirs.is_empty() {
-        println!("No sessions found. Run `tracevault init` first.");
+        println!("No sessions found. Run `{TOP} init` first.");
         return Ok(());
     }
 
@@ -27,7 +28,7 @@ pub fn show_stats(project_root: &Path) -> Result<(), Box<dyn std::error::Error>>
         }
     }
 
-    println!("TraceVault Stats");
+    println!("Visdom Stats");
     println!("================");
     println!("Sessions:     {total_sessions}");
     println!("Total events: {total_events}");

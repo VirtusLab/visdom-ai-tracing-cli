@@ -1,9 +1,9 @@
 /**
- * TraceVault OpenCode plugin.
+ * Visdom OpenCode plugin.
  *
  * OpenCode has no shell-hook config and no single JSONL transcript, so this
  * plugin subscribes to OpenCode's plugin hooks, translates each event into
- * TraceVault's normalized record shape, and shells out to the `tracevault` CLI
+ * Visdom's normalized record shape, and shells out to the `tracevault` CLI
  * with those records inline (fileless). The CLI owns credentials, repo binding,
  * retry, and offset tracking; this plugin carries no config of its own.
  */

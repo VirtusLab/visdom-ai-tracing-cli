@@ -16,6 +16,7 @@
 //! single-tenant `org_slug`) keeps working untouched.
 
 use crate::oidc::TokenSet;
+use crate::program::{ENV, TOP};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
@@ -29,7 +30,7 @@ pub const REFRESH_WINDOW_SECS: i64 = 60;
 /// A live Keycloak session for the human who ran `tracevault login`.
 ///
 /// `issuer` and `client_id` are stored alongside the tokens because a
-/// refresh needs them and must not depend on the TraceVault server being
+/// refresh needs them and must not depend on the Visdom server being
 /// reachable to re-read its public config.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct KeycloakSession {
@@ -38,7 +39,7 @@ pub struct KeycloakSession {
     /// SECRET. Long-lived (`offline_access`); this is the credential that
     /// makes unattended hooks work.
     pub refresh_token: String,
-    /// SECRET. Short-lived bearer presented to the TraceVault server.
+    /// SECRET. Short-lived bearer presented to the Visdom server.
     pub access_token: String,
     /// Absolute unix seconds at which `access_token` stops being valid.
     pub access_expires_at: i64,
@@ -81,7 +82,7 @@ impl fmt::Debug for KeycloakSession {
     }
 }
 
-/// Whether two TraceVault base URLs identify the same instance.
+/// Whether two Visdom base URLs identify the same instance.
 ///
 /// Needed because the two sides reach us differently formatted from the same
 /// user-supplied string: `ApiClient` trims trailing slashes from its
@@ -539,7 +540,7 @@ impl Credentials {
 /// # Errors
 ///
 /// Fails when the resolved server URL and a credential read from the
-/// credentials file are for different TraceVault instances (see
+/// credentials file are for different Visdom instances (see
 /// [`server_mismatch_error`]). This covers EITHER kind of file-sourced
 /// credential — the distinction that matters is not Keycloak-vs-key but
 /// named-on-this-invocation vs. read-from-the-file. Failing is deliberate
@@ -637,7 +638,7 @@ fn resolve_credentials_inner(
                 // The two precedence chains above disagree: the URL can come
                 // from the env while the credential comes from the file. Every
                 // credential in that file — a Keycloak access token or a `tvk_`
-                // API key alike — was issued by ONE TraceVault instance, so
+                // API key alike — was issued by ONE Visdom instance, so
                 // handing it to a client pointed elsewhere transmits a secret to
                 // a host it was never issued for, which then has it in its logs.
                 //
@@ -705,14 +706,14 @@ pub(crate) fn config_url_conflict<'a>(
 /// instance.
 fn config_mismatch_warning(file_url: &str, config_url: &str) -> String {
     format!(
-        "tracevault: warning: this repo's .visdom/tracing.toml pins '{config_url}', but you \
-         are logged in to '{file_url}' — using '{file_url}'. Run `tracevault login --server-url \
+        "{TOP}: warning: this repo's .visdom/tracing.toml pins '{config_url}', but you \
+         are logged in to '{file_url}' — using '{file_url}'. Run `{TOP} login --server-url \
          {config_url}` to use the repo's instance, or remove `server_url` from \
          .visdom/tracing.toml to silence this."
     )
 }
 
-/// The error for "the saved credential is for a different TraceVault instance".
+/// The error for "the saved credential is for a different Visdom instance".
 ///
 /// Applies to any FILE-SOURCED credential, Keycloak session or `tvk_` key
 /// alike: both are secrets issued by one instance, and a key would not even
@@ -731,11 +732,11 @@ fn config_mismatch_warning(file_url: &str, config_url: &str) -> String {
 fn server_mismatch_error(file_url: &str, target: &str) -> Box<dyn std::error::Error> {
     format!(
         "refusing to use the saved credentials: the credentials file is for '{file_url}', but \
-         this command is targeting '{target}'. A credential issued by one TraceVault instance \
+         this command is targeting '{target}'. A credential issued by one Visdom instance \
          must not be sent to another.\n\
-         Either unset TRACEVAULT_SERVER_URL to use '{file_url}', or run `tracevault login \
+         Either unset {ENV}_SERVER_URL to use '{file_url}', or run `{TOP} login \
          --server-url {target}`. If '{target}' is the same instance reached through a different \
-         address (e.g. a port-forward), set TRACEVAULT_API_KEY to a `tvk_` key for it instead."
+         address (e.g. a port-forward), set {ENV}_API_KEY to a `tvk_` key for it instead."
     )
     .into()
 }
@@ -1650,7 +1651,7 @@ mod tests {
         assert_eq!(auth.access_expires_at, 1_300);
     }
 
-    /// One credentials file, several possible TraceVault instances: persisting
+    /// One credentials file, several possible Visdom instances: persisting
     /// a refresh for instance A must not clobber a file that now belongs to
     /// instance B, which would silently sign the user out of B.
     #[test]

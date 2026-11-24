@@ -2,6 +2,7 @@
 //! commands. Mirrors `commands::repo`'s `switch`/`status` structure, but binds
 //! the project-attribution axis (design §7/Task 7) rather than the repo axis.
 
+use crate::program::{CLI, ENV};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -12,7 +13,7 @@ use crate::resolution::{
 };
 use crate::session_state::{self, ProjectBinding, SessionState};
 
-/// Sub-actions for `tracevault project` (project-attribution axis).
+/// Sub-actions for `project` (project-attribution axis).
 #[derive(clap::Subcommand)]
 pub enum ProjectCmd {
     /// Bind project attribution to a registered project for the current
@@ -26,7 +27,7 @@ pub enum ProjectCmd {
         /// isn't tied to any one checkout).
         #[arg(long)]
         user: bool,
-        /// Session to target; defaults to $TRACEVAULT_SESSION_ID (in Amp: $AMP_CURRENT_THREAD_ID).
+        /// Session to target; defaults to the session id the session-start hook exported (in Amp: $AMP_CURRENT_THREAD_ID).
         #[arg(long)]
         session_id: Option<String>,
         /// Who owns attribution. `explicit` stamps the named project
@@ -43,7 +44,7 @@ pub enum ProjectCmd {
     },
     /// Show the project the current session is attributed to.
     Status {
-        /// Session to target; defaults to $TRACEVAULT_SESSION_ID (in Amp: $AMP_CURRENT_THREAD_ID).
+        /// Session to target; defaults to the session id the session-start hook exported (in Amp: $AMP_CURRENT_THREAD_ID).
         #[arg(long)]
         session_id: Option<String>,
         /// What-if, display only: resolve this project name and feed it in at
@@ -309,7 +310,7 @@ fn format_force_line(forced_until: &str) -> String {
 /// * printing the force line unconditionally, so a shell with
 ///   `TRACEVAULT_PROJECT_ATTRIBUTION=explicit` and NO persisted force got
 ///   "attribution mode: explicit …" followed by "attribution: derived
-///   (TraceVault checks repo/project membership)" (finding 3);
+///   (Visdom checks repo/project membership)" (finding 3);
 /// * guarding it on `forced_until.is_some()`, which a LAPSED force still
 ///   satisfies, so the same shell with an EXPIRED persisted force got
 ///   "attribution mode: explicit …" followed by "attribution: derived (a
@@ -328,7 +329,7 @@ fn attribution_report(b: &ProjectBinding) -> Vec<String> {
         crate::api_client::AttributionMode::Explicit => {
             "this caller owns attribution; membership is not checked"
         }
-        crate::api_client::AttributionMode::Derived => "TraceVault checks repo/project membership",
+        crate::api_client::AttributionMode::Derived => "Visdom checks repo/project membership",
     };
     let mut lines = vec![format!("attribution mode: {mode} ({gloss})")];
     if let Some(forced_until) = b.forced_until.as_deref() {
@@ -475,7 +476,7 @@ fn enrich_project_name(
 /// the status/ingest disagreement this command exists to remove.
 fn env_name_form_warning(raw: &str) -> String {
     format!(
-        "warning: TRACEVAULT_PROJECT '{raw}' is a NAME; only the UUID form is used for attribution at capture time, so this value is ignored — export the project's id instead, or bind it with `tracevault project switch <name>`"
+        "warning: {ENV}_PROJECT '{raw}' is a NAME; only the UUID form is used for attribution at capture time, so this value is ignored — export the project's id instead, or bind it with `{CLI} project switch <name>`"
     )
 }
 
@@ -555,7 +556,7 @@ fn format_deduction(
                 )
             } else {
                 format!(
-                    "{PREFIX} ambiguous (multiple projects) — if a repo is bound, events will be refused until you run `tracevault project switch <name>`"
+                    "{PREFIX} ambiguous (multiple projects) — if a repo is bound, events will be refused until you run `{CLI} project switch <name>`"
                 )
             }
         }
@@ -608,9 +609,11 @@ async fn status_report(
         Ok(id) => session_state::load(&id),
         Err(_) => {
             report.warnings.push(
-                "warning: no session id (pass --session-id or set TRACEVAULT_SESSION_ID); \
-                 showing binding without session context"
-                    .to_string(),
+                crate::program::say(
+                    "warning: no session id (pass --session-id or set TRACEVAULT_SESSION_ID); \
+                 showing binding without session context",
+                )
+                .to_string(),
             );
             SessionState::default()
         }
@@ -918,7 +921,7 @@ mod tests {
     /// unconditionally, so a shell with
     /// `TRACEVAULT_PROJECT_ATTRIBUTION=explicit` and no persisted force got
     /// two lines that contradicted each other — "attribution mode: explicit"
-    /// immediately followed by "attribution: derived (TraceVault checks
+    /// immediately followed by "attribution: derived (Visdom checks
     /// repo/project membership)" — while every hook in that shell sent
     /// `explicit`. The lapse detail describes a PERSISTED force, so it may
     /// only be printed when one exists.
@@ -1706,7 +1709,7 @@ mod tests {
     /// `XDG_CONFIG_HOME` is redirected so this doesn't read the developer's
     /// real `credentials.json` (which could otherwise short-circuit
     /// `resolve_credentials` before the config file/env vars are consulted,
-    /// and race for real on a machine with actual TraceVault credentials)
+    /// and race for real on a machine with actual Visdom credentials)
     /// and so the resulting user-default write lands in a tempdir, not
     /// `~/.config`. `user_project_default`'s own real-path round-trip test
     /// mutates the same var, so both hold `test_helpers::lock_env_mutation()`
@@ -2170,7 +2173,7 @@ mod tests {
             report.lines,
             vec![
                 "project: project-b via user default (project switch --user)".to_string(),
-                "attribution mode: derived (TraceVault checks repo/project membership)"
+                "attribution mode: derived (Visdom checks repo/project membership)"
                     .to_string(),
                 // No repo binds this checkout (no config, no session), so
                 // ingest sends repo-less to B — and status says so (VIS-1255).

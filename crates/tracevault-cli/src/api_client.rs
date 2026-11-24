@@ -1,4 +1,5 @@
 use crate::credentials::{resolve_credentials, Credential, Credentials, KeycloakSession};
+use crate::program::TOP;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
@@ -47,7 +48,7 @@ impl fmt::Display for AuthError {
         match self {
             Self::SessionExpired => write!(
                 f,
-                "your session has expired — run `tracevault login` to sign in again"
+                "your session has expired — run `{TOP} login` to sign in again"
             ),
             Self::Refresh(m) => write!(f, "could not refresh the access token: {m}"),
         }
@@ -82,7 +83,7 @@ fn now_unix() -> i64 {
 /// function the only place a mode is decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttributionMode {
-    /// TraceVault checks repo→project membership itself. The default, and
+    /// Visdom checks repo→project membership itself. The default, and
     /// what an absent header also means.
     Derived,
     /// The caller owns attribution and the server skips the membership
@@ -441,7 +442,7 @@ impl ApiClient {
     /// # Both directions are scoped to this client's server
     ///
     /// There is exactly ONE credentials file, but a machine can be pointed at
-    /// more than one TraceVault instance. So the adopt only reads, and
+    /// more than one Visdom instance. So the adopt only reads, and
     /// `persist_session` only writes, when that file's `server_url` is this
     /// client's `base_url` (see [`crate::credentials::same_server`]).
     /// Unscoped, a long-running `tracevault stream` against instance A plus a
@@ -996,8 +997,9 @@ fn version_skew_404_error(what: &str) -> Box<dyn std::error::Error> {
 /// resolve-then-construct shape has exactly one implementation.
 pub fn resolve_client(project_root: &Path) -> Result<ApiClient, Box<dyn Error>> {
     let (server_url, credential) = resolve_credentials(project_root)?;
-    let server_url = server_url
-        .ok_or("no server URL configured: set TRACEVAULT_SERVER_URL or run `tracevault login`")?;
+    let server_url = server_url.ok_or(crate::program::say(
+        "no server URL configured: set TRACEVAULT_SERVER_URL or run `tracevault login`",
+    ))?;
     Ok(ApiClient::with_credential(&server_url, credential))
 }
 
@@ -1250,7 +1252,7 @@ mod tests {
         assert_eq!(token.as_deref(), Some("other-process-at"));
     }
     /// There is one credentials file but a machine can target several
-    /// TraceVault instances. A file belonging to instance B must NOT be adopted
+    /// Visdom instances. A file belonging to instance B must NOT be adopted
     /// by a client talking to instance A (that would send B's token to A), and
     /// A's refreshed session must NOT overwrite B's file (that would sign the
     /// user out of B).

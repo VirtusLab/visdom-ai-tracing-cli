@@ -1,5 +1,6 @@
 use crate::api_client::{ApiClient, CiVerifyRequest};
 use crate::credentials::resolve_credentials;
+use crate::program::CLI;
 use crate::resolution::{resolve_repo_by_name, ResolveRepoByNameError};
 use std::path::Path;
 use std::process::Command;
@@ -55,14 +56,17 @@ pub async fn verify(
     let server_url =
         match server_url {
             Some(url) => url,
-            None => return Err(
-                "No server URL configured. Set TRACEVAULT_SERVER_URL or run 'tracevault login'."
-                    .into(),
-            ),
+            None => return Err(crate::program::say(
+                "No server URL configured. Set TRACEVAULT_SERVER_URL or run 'tracevault login'.",
+            )
+            .into()),
         };
 
     if credential.is_none() {
-        return Err("No auth token. Set TRACEVAULT_API_KEY or run 'tracevault login'.".into());
+        return Err(crate::program::say(
+            "No auth token. Set TRACEVAULT_API_KEY or run 'tracevault login'.",
+        )
+        .into());
     }
 
     let client = ApiClient::with_credential(&server_url, credential);
@@ -73,7 +77,7 @@ pub async fn verify(
         .map_err(|e| match e {
             ResolveRepoByNameError::ListFailed(err) => err,
             ResolveRepoByNameError::NotFound { repo_name } => format!(
-                "Repo '{}' not found on server. Run 'tracevault sync' first.",
+                "Repo '{}' not found on server. Run '{CLI} sync' first.",
                 repo_name
             )
             .into(),

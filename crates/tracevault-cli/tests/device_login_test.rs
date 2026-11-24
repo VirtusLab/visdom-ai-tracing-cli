@@ -81,7 +81,7 @@ where
     (base, rx)
 }
 
-/// The exact call sequence `tracevault login` performs: ask the TraceVault
+/// The exact call sequence `tracevault login` performs: ask the Visdom
 /// server for the realm, discover it, start a device authorization, then poll
 /// until the user approves. The first poll answers `authorization_pending`,
 /// so this also proves the loop survives the normal case of a human who
@@ -92,7 +92,7 @@ async fn device_login_sequence_completes_through_the_public_api() {
         vec![
             // 1. Which realm does this server trust? (The server publishes
             //    itself as the issuer here only because the fake IdP and the
-            //    fake TraceVault server are the same socket.)
+            //    fake Visdom server are the same socket.)
             http_json(
                 "200 OK",
                 &format!(

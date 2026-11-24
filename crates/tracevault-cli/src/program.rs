@@ -73,6 +73,89 @@ pub fn spelled(command: &str, visdom: bool) -> String {
     }
 }
 
+/// The command name in a message, for the running binary: `{CLI} repo
+/// switch` reads `tracevault repo switch` or `visdom trace repo switch`.
+pub struct Cli;
+/// See [`Cli`].
+pub const CLI: Cli = Cli;
+
+impl std::fmt::Display for Cli {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(name(is_visdom()))
+    }
+}
+
+/// The binary's own name in a message, for the commands `visdom` has at its
+/// top level and for message prefixes: `{TOP} login`, `{TOP}: warning: …`.
+pub struct Top;
+/// See [`Top`].
+pub const TOP: Top = Top;
+
+impl std::fmt::Display for Top {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if is_visdom() { "visdom" } else { TRACEVAULT })
+    }
+}
+
+/// The prefix of the environment variables in a message: `{ENV}_API_KEY`
+/// reads `TRACEVAULT_API_KEY` or `VISDOM_API_KEY` (which `visdom` accepts
+/// for it).
+pub struct Env;
+/// See [`Env`].
+pub const ENV: Env = Env;
+
+impl std::fmt::Display for Env {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if is_visdom() { "VISDOM" } else { "TRACEVAULT" })
+    }
+}
+
+/// `text` — a message written with `tracevault …` commands and
+/// `TRACEVAULT_…` variables — as the running binary says it. For messages
+/// that are not format strings; those use [`CLI`], [`TOP`] and [`ENV`].
+pub fn say(text: &str) -> String {
+    say_as(text, is_visdom())
+}
+
+fn say_as(text: &str, visdom: bool) -> String {
+    if !visdom {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut rest = text;
+    while let Some(at) = rest.find(TRACEVAULT) {
+        let (before, from) = rest.split_at(at);
+        out.push_str(before);
+        let after = &from[TRACEVAULT.len()..];
+        let word_start = !before
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/');
+        let sub: String = after
+            .strip_prefix(' ')
+            .map(|a| {
+                a.chars()
+                    .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                    .collect()
+            })
+            .unwrap_or_default();
+        if word_start && ["login", "logout", "init"].contains(&sub.as_str()) {
+            out.push_str("visdom");
+        } else if word_start && (!sub.is_empty() || after.starts_with(": ")) {
+            out.push_str(if sub.is_empty() {
+                "visdom"
+            } else {
+                VISDOM_TRACE
+            });
+        } else {
+            out.push_str(TRACEVAULT);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out.replace("TRACEVAULT_", "VISDOM_")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +193,25 @@ mod tests {
             "visdom trace session-start"
         );
         assert_eq!(spelled("my-own-hook --flag", true), "my-own-hook --flag");
+    }
+
+    #[test]
+    fn a_message_is_said_with_the_running_binarys_names() {
+        let text = "tracevault: no login. Set TRACEVAULT_API_KEY or run `tracevault login`, \
+                    then `tracevault repo switch <path>` (see .tracevault/ and my-tracevault tool)";
+        assert_eq!(say_as(text, false), text);
+        assert_eq!(
+            say_as(text, true),
+            "visdom: no login. Set VISDOM_API_KEY or run `visdom login`, \
+             then `visdom trace repo switch <path>` (see .tracevault/ and my-tracevault tool)"
+        );
+        assert_eq!(
+            say_as("run 'tracevault init' first", true),
+            "run 'visdom init' first"
+        );
+        assert_eq!(
+            format!("`{CLI} sync`, `{TOP} login`, {ENV}_PROJECT"),
+            "`tracevault sync`, `tracevault login`, TRACEVAULT_PROJECT"
+        );
     }
 }

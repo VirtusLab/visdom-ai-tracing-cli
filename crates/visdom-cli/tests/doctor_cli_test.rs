@@ -374,10 +374,85 @@ fn visdom_init_takes_over_hooks_that_call_tracevault() {
     assert!(!settings.contains("\"tracevault "), "{settings}");
     assert_eq!(
         std::fs::read_to_string(repo.join(".git/hooks/pre-push")).unwrap(),
-        "#!/bin/sh\nmy-own-check\n# tracevault:enforce\nvisdom trace sync 2>/dev/null || true\nvisdom trace check || exit 1\n"
+        "#!/bin/sh\nmy-own-check\n# visdom:enforce\nvisdom trace sync 2>/dev/null || true\nvisdom trace check || exit 1\n"
     );
     assert_eq!(
         std::fs::read_to_string(repo.join(".git/hooks/post-commit")).unwrap(),
-        "#!/bin/sh\n# tracevault:post-commit\nvisdom trace commit-push 2>/dev/null &\n"
+        "#!/bin/sh\n# visdom:post-commit\nvisdom trace commit-push 2>/dev/null &\n"
     );
+}
+
+/// `visdom trace init` for an agent that takes a plugin installs it under the
+/// `visdom` name, running `visdom trace …`, and removes the `tracevault` one
+/// an earlier `init` left — the agent would load both.
+#[test]
+fn visdom_installs_plugins_under_its_own_name_and_removes_the_earlier_ones() {
+    let init = |agent: &str, sb: &Sandbox| {
+        let output = sb
+            .visdom(sb.repo.path())
+            .args(["trace", "init", "--agent", agent])
+            .env("VISDOM_API_KEY", "tvk_test")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            stdout(&output),
+            stderr(&output)
+        );
+    };
+
+    let sb = Sandbox::new();
+    let plugins = sb.repo.path().join(".amp/plugins");
+    std::fs::create_dir_all(plugins.join("tracevault")).unwrap();
+    std::fs::write(plugins.join("tracevault/index.ts"), "// earlier").unwrap();
+    init("amp", &sb);
+    let plugin = std::fs::read_to_string(plugins.join("visdom/index.ts")).unwrap();
+    assert!(plugin.contains("const CLI = ['visdom', 'trace']"));
+    assert!(!plugins.join("tracevault").exists());
+    let gitignore = std::fs::read_to_string(sb.repo.path().join(".gitignore")).unwrap();
+    assert!(
+        gitignore.lines().any(|l| l == ".amp/plugins/visdom/"),
+        "{gitignore}"
+    );
+
+    let sb = Sandbox::new();
+    let plugins = sb.repo.path().join(".opencode/plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    std::fs::write(plugins.join("tracevault.ts"), "// earlier").unwrap();
+    init("opencode", &sb);
+    let plugin = std::fs::read_to_string(plugins.join("visdom.ts")).unwrap();
+    assert!(plugin.contains("const CLI = [\"visdom\", \"trace\"];"));
+    assert!(!plugins.join("tracevault.ts").exists());
+}
+
+/// What `visdom init --global` leaves in the agent's own files names nothing
+/// `tracevault`: the hooks, and the workspace-mode block with its marker.
+#[test]
+fn a_machine_wide_visdom_setup_names_only_visdom() {
+    let sb = Sandbox::new();
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["trace", "init", "--global", "--no-claude-telemetry"])
+        .env("VISDOM_API_KEY", "tvk_test")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let said = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(!said.to_lowercase().contains("tracevault"), "{said}");
+    for file in [".claude/settings.json", ".claude/CLAUDE.md"] {
+        let text = std::fs::read_to_string(sb.home.path().join(file)).unwrap();
+        assert!(
+            !text.to_lowercase().contains("tracevault"),
+            "{file}: {text}"
+        );
+    }
+    let md = std::fs::read_to_string(sb.home.path().join(".claude/CLAUDE.md")).unwrap();
+    assert!(md.contains("<!-- visdom:workspace-mode -->"), "{md}");
+    assert!(md.contains("`visdom trace repo switch <path>`"), "{md}");
 }

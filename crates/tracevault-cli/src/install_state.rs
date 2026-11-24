@@ -1,4 +1,4 @@
-//! User-level install state (VIS-1109): what this machine's TraceVault setup
+//! User-level install state (VIS-1109): what this machine's Visdom setup
 //! was last brought to, so a newer CLI knows to run its upgrade step once
 //! (`commands::upgrade`), and the user's Claude Code telemetry opt-out, so
 //! nothing ever turns telemetry back on after `--no-claude-telemetry`.
@@ -25,7 +25,7 @@ pub struct InstallState {
     /// asking, for `status` to say so. Cleared by an explicit on/off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry_auto_enabled: Option<String>,
-    /// Whether TraceVault added the helper interval to `~/.claude/settings.json`
+    /// Whether Visdom added the helper interval to `~/.claude/settings.json`
     /// (so turning telemetry off removes it) or found the user's own there.
     /// `None` for installs made before this was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -39,7 +39,7 @@ pub struct InstallState {
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoState {
     pub version: String,
-    /// Settings files (absolute paths) holding TraceVault's Claude Code hooks.
+    /// Settings files (absolute paths) holding Visdom's Claude Code hooks.
     #[serde(default)]
     pub hook_files: Vec<PathBuf>,
 }
@@ -141,7 +141,7 @@ impl Lock {
             }
             if std::time::Instant::now() >= deadline {
                 return Err(std::io::Error::other(format!(
-                    "{} is held by another TraceVault process; try again",
+                    "{} is held by another Visdom process; try again",
                     Self::lock_path(config_root).display()
                 )));
             }

@@ -3,6 +3,7 @@
 //! the pure decision logic for when to inject, and the shared
 //! resolve-binding-then-inject flow used by both hook commands.
 
+use crate::program::CLI;
 use std::io::Read as _;
 use std::path::Path;
 
@@ -82,7 +83,7 @@ const HEAD_LEN: usize = 9_500;
 pub fn cap_context(s: String) -> String {
     if s.chars().count() > MAX_CONTEXT {
         let head: String = s.chars().take(HEAD_LEN).collect();
-        format!("{head}\n\n…(truncated; run `tracevault repo status` to see full policies)")
+        format!("{head}\n\n…(truncated; run `{CLI} repo status` to see full policies)")
     } else {
         s
     }

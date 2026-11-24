@@ -11,6 +11,7 @@
 //! is remembered in `SessionState::auto_bind_checked`. A failed lookup
 //! (network, server error, timeout) records nothing, so a later hook retries.
 
+use crate::program::CLI;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -49,9 +50,9 @@ async fn look_up(
     let checkout = crate::paths::worktree_toplevel(path);
     let unregistered = || {
         Lookup::Unregistered(format!(
-            "TraceVault: this session is not recorded: the origin remote of {checkout} is not \
-             registered with the TraceVault server. Register it by running `tracevault sync` in \
-             the checkout, then bind this session with `tracevault repo switch {checkout}`."
+            "Visdom: this session is not recorded: the origin remote of {checkout} is not \
+             registered with the Visdom server. Register it by running `{CLI} sync` in \
+             the checkout, then bind this session with `{CLI} repo switch {checkout}`."
         ))
     };
     let Some(codebase) = resolve_url_to_codebase(git_url, client).await? else {
@@ -73,8 +74,8 @@ async fn look_up(
     Ok(match codebase.choose(&preferred) {
         RepoChoice::Only(id) | RepoChoice::Preferred(id, _) => Lookup::Bound(codebase.binding(id)),
         RepoChoice::Ambiguous => Lookup::Ambiguous(format!(
-            "TraceVault: this session is not recorded: codebase {} has {} repo records ({}) and \
-             nothing says which one {checkout} is. Bind one with `tracevault repo switch \
+            "Visdom: this session is not recorded: codebase {} has {} repo records ({}) and \
+             nothing says which one {checkout} is. Bind one with `{CLI} repo switch \
              {checkout} --repo-id <id>`.",
             codebase.display_name(),
             codebase.repos.len(),

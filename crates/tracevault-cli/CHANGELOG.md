@@ -315,7 +315,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
-- rename product TraceVault → Visdom Trace across all documentation
+- rename product Visdom → Visdom Trace across all documentation
 
 ### Fixed
 

@@ -1,3 +1,4 @@
+use crate::program::TOP;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io;
@@ -208,7 +209,7 @@ impl Context {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Context::default(),
             Err(e) => {
                 eprintln!(
-                    "tracevault: warning: could not read context file {}: {e}",
+                    "{TOP}: warning: could not read context file {}: {e}",
                     path.display()
                 );
                 return Context::default();
@@ -218,7 +219,7 @@ impl Context {
             Ok(ctx) => ctx,
             Err(e) => {
                 eprintln!(
-                    "tracevault: warning: malformed context file {} (using empty context): {e}",
+                    "{TOP}: warning: malformed context file {} (using empty context): {e}",
                     path.display()
                 );
                 Context::default()
