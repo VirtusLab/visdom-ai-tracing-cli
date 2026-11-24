@@ -1382,7 +1382,7 @@ fn a_workspace_init_binds_the_folder_and_sets_up_the_gateway() {
     // machine-wide hooks are not installed behind the developer's back.
     let hooks =
         std::fs::read_to_string(sb.home.path().join(".claude/settings.json")).unwrap_or_default();
-    assert!(!hooks.contains("tracevault stream"), "{hooks}");
+    assert!(!hooks.contains(" stream --event"), "{hooks}");
 }
 
 const PROJECTS: (&str, u16, &str) = (

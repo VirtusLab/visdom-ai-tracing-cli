@@ -56,6 +56,12 @@ import type { PluginAPI } from '@ampcode/plugin'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
+/**
+ * The command this plugin runs. The installer rewrites this line when the
+ * `visdom` binary installs the plugin (`visdom trace …`).
+ */
+const CLI = ['tracevault']
+
 export const description = 'TraceVault: sends this Amp session to TraceVault (tracevault stream --agent amp)'
 
 /**
@@ -441,9 +447,9 @@ function runTracevault(
 				resolve()
 			}
 		}
-		const what = `tracevault ${args.join(' ')}`
+		const what = `${CLI.join(' ')} ${args.join(' ')}`
 		try {
-			const child = spawn('tracevault', args, { cwd, stdio: ['pipe', onStdout ? 'pipe' : 'ignore', 'pipe'] })
+			const child = spawn(CLI[0], [...CLI.slice(1), ...args], { cwd, stdio: ['pipe', onStdout ? 'pipe' : 'ignore', 'pipe'] })
 			child.stdout?.setEncoding('utf8')
 			child.stdout?.on('data', (chunk) => {
 				try {

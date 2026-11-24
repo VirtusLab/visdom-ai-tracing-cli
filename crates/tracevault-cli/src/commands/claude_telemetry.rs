@@ -37,8 +37,16 @@ const HELPER_INTERVAL_MS: &str = "180000";
 /// The validity `otel-headers` guarantees a token has: one helper interval
 /// plus a minute of slack, so the header outlives the gap to the next run.
 pub const HEADER_MIN_VALID_SECS: i64 = 180 + 60;
-/// What our helper command starts with. Anything else is the user's own.
-const HELPER_PREFIX: &str = "tracevault otel-headers";
+/// The subcommand our helper command runs, after `tracevault` or
+/// `visdom trace`. Anything else is the user's own.
+const HELPER_SUBCOMMAND: &str = "otel-headers";
+
+/// What follows `otel-headers` when `helper` is our command.
+fn helper_arguments(helper: &str) -> Option<&str> {
+    crate::program::subcommand(helper)?
+        .strip_prefix(HELPER_SUBCOMMAND)
+        .filter(|rest| rest.is_empty() || rest.starts_with(' '))
+}
 
 /// `<server>/otlp/v1/logs`.
 pub fn logs_endpoint(server_url: &str) -> String {
@@ -48,8 +56,14 @@ pub fn logs_endpoint(server_url: &str) -> String {
 /// The `otelHeadersHelper` command. It names the server so `otel-headers`
 /// can refuse to hand a token for another instance to this endpoint.
 pub fn helper_command(server_url: &str) -> String {
+    helper_command_for(server_url, crate::program::is_visdom())
+}
+
+/// [`helper_command`] for the binary chosen by `visdom`.
+fn helper_command_for(server_url: &str, visdom: bool) -> String {
     format!(
-        "{HELPER_PREFIX} --server-url {}",
+        "{} {HELPER_SUBCOMMAND} --server-url {}",
+        crate::program::name(visdom),
         server_url.trim_end_matches('/')
     )
 }
@@ -77,7 +91,9 @@ fn validate_server_url(server_url: &str) -> Result<(), String> {
 }
 
 fn is_our_helper(value: &Value) -> bool {
-    value.as_str().is_some_and(|s| s.starts_with(HELPER_PREFIX))
+    value
+        .as_str()
+        .is_some_and(|s| helper_arguments(s).is_some())
 }
 
 /// The receiver of the server our helper command names, if `helper` is ours
@@ -85,7 +101,7 @@ fn is_our_helper(value: &Value) -> bool {
 fn helper_logs_endpoint(helper: Option<&Value>) -> Option<String> {
     helper
         .and_then(Value::as_str)
-        .and_then(|h| h.strip_prefix(HELPER_PREFIX))
+        .and_then(helper_arguments)
         .and_then(|rest| rest.trim().strip_prefix("--server-url "))
         .map(|server| logs_endpoint(server.trim()))
 }
@@ -281,9 +297,16 @@ pub fn merge_telemetry(
     }
     env.entry(HELPER_INTERVAL)
         .or_insert_with(|| json!(HELPER_INTERVAL_MS));
+    // The helper names the binary that installs it — and `visdom` still,
+    // once it does (see `crate::program`).
+    let visdom = crate::program::installs_visdom(
+        root.get(HEADERS_HELPER)
+            .and_then(Value::as_str)
+            .is_some_and(crate::program::is_visdom_command),
+    );
     root.insert(
         HEADERS_HELPER.to_string(),
-        json!(helper_command(server_url)),
+        json!(helper_command_for(server_url, visdom)),
     );
     Ok(InstallOutcome::Configured)
 }
@@ -1288,5 +1311,26 @@ pub(crate) mod tests {
         );
         assert!(text.contains("\"api_request\""), "{text}");
         assert!(text.contains("  - X=1"), "{text}");
+    }
+
+    #[test]
+    fn the_helper_is_ours_under_either_binary_name() {
+        for helper in [
+            "tracevault otel-headers --server-url https://tv.example.com",
+            "visdom trace otel-headers --server-url https://tv.example.com",
+        ] {
+            assert!(is_our_helper(&json!(helper)), "{helper}");
+            assert_eq!(
+                helper_logs_endpoint(Some(&json!(helper))).as_deref(),
+                Some("https://tv.example.com/otlp/v1/logs"),
+                "{helper}"
+            );
+        }
+        assert!(!is_our_helper(&json!("visdom trace otel-headers-mine")));
+        assert!(!is_our_helper(&json!("my-helper otel-headers")));
+        assert_eq!(
+            helper_command_for("https://tv.example.com/", true),
+            "visdom trace otel-headers --server-url https://tv.example.com"
+        );
     }
 }

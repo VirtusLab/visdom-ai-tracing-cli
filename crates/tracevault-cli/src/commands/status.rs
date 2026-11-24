@@ -409,9 +409,13 @@ fn git_hook_check(project_root: &Path, name: &str, marker: &str) -> Check {
 
 /// True if a Claude settings.json body wires any tracevault hook command.
 fn settings_has_tracevault_hooks(contents: &str) -> bool {
-    contents.contains("tracevault stream")
-        || contents.contains("tracevault session-start")
-        || contents.contains("tracevault user-prompt")
+    [crate::program::TRACEVAULT, crate::program::VISDOM_TRACE]
+        .iter()
+        .any(|cli| {
+            ["stream", "session-start", "user-prompt"]
+                .iter()
+                .any(|sub| contents.contains(&format!("{cli} {sub}")))
+        })
 }
 
 /// Whether a Claude `settings.json` wires tracevault hooks — distinguishing a

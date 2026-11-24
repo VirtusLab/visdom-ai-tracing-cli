@@ -13,6 +13,7 @@ pub mod install_state;
 pub mod layout;
 pub mod oidc;
 pub mod paths;
+pub mod program;
 pub mod resolution;
 pub mod session_state;
 pub mod subagents;

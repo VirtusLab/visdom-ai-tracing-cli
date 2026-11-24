@@ -219,7 +219,7 @@ fn visdom_init_in_temp_repo_installs_hooks() {
         stderr(&output)
     );
     let hooks = std::fs::read_to_string(sb.repo.path().join(".codex/hooks.json")).unwrap();
-    assert!(hooks.contains("tracevault stream"), "{hooks}");
+    assert!(hooks.contains("visdom trace stream"), "{hooks}");
     assert!(sb.repo.path().join(".visdom/tracing.toml").exists());
     // Bazaar is part of init; here its URL is unknown, which is said, not fatal.
     assert!(
@@ -321,4 +321,63 @@ fn visdom_init_fails_when_bazaar_registration_fails() {
     );
     // Tracing was still set up.
     assert!(sb.repo.path().join(".codex/hooks.json").exists());
+}
+
+/// A checkout the `tracevault` binary set up: `visdom init` makes everything
+/// it installed call `visdom trace …`, so `tracevault` is no longer needed on
+/// `PATH`, and leaves the user's own hooks alone.
+#[test]
+fn visdom_init_takes_over_hooks_that_call_tracevault() {
+    let sb = Sandbox::new();
+    let repo = sb.repo.path();
+    std::fs::create_dir_all(repo.join(".claude")).unwrap();
+    std::fs::write(
+        repo.join(".claude/settings.local.json"),
+        r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"tracevault stream --event stop"},{"type":"command","command":"my-own-hook"}]}]}}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo.join(".git/hooks")).unwrap();
+    std::fs::write(
+        repo.join(".git/hooks/pre-push"),
+        "#!/bin/sh\nmy-own-check\n# tracevault:enforce\ntracevault sync 2>/dev/null || true\ntracevault check || exit 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".git/hooks/post-commit"),
+        "#!/bin/sh\n# tracevault:post-commit\ntracevault commit-push 2>/dev/null &\n",
+    )
+    .unwrap();
+
+    let output = sb
+        .visdom(repo)
+        .args(["init", "--agent", "claude-code"])
+        .env("VISDOM_API_KEY", "tvk_test")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let settings = std::fs::read_to_string(repo.join(".claude/settings.local.json")).unwrap();
+    assert!(
+        settings.contains("visdom trace stream --event stop"),
+        "{settings}"
+    );
+    // The full set went into the default file, calling `visdom` as well.
+    let shared = std::fs::read_to_string(repo.join(".claude/settings.json")).unwrap();
+    assert!(shared.contains("visdom trace session-start"), "{shared}");
+    assert!(!shared.contains("\"tracevault "), "{shared}");
+    assert!(settings.contains("my-own-hook"), "{settings}");
+    assert!(!settings.contains("\"tracevault "), "{settings}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".git/hooks/pre-push")).unwrap(),
+        "#!/bin/sh\nmy-own-check\n# tracevault:enforce\nvisdom trace sync 2>/dev/null || true\nvisdom trace check || exit 1\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".git/hooks/post-commit")).unwrap(),
+        "#!/bin/sh\n# tracevault:post-commit\nvisdom trace commit-push 2>/dev/null &\n"
+    );
 }

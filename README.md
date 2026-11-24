@@ -236,8 +236,24 @@ Settings:
   for the `TRACEVAULT_*` variables of the same name and win over them.
 
 `tracevault` keeps working during the transition and both binaries share one login
-(`visdom/credentials.json`). Installed hooks keep calling `tracevault …`, so it must stay on
-`PATH`; run interactively it prints a one-line deprecation note on stderr.
+(`visdom/credentials.json`). Run interactively, `tracevault` prints a one-line deprecation note
+on stderr.
+
+### Which command the hooks call
+
+What `init` installs for an agent or for git to run later — the Claude Code and Codex hooks,
+the git `pre-push` and `post-commit` hooks, the Amp, OpenCode and GSD plugins, the Claude Code
+telemetry helper and the workspace-mode block in `CLAUDE.md` / `AGENTS.md` — names the binary
+that installed it: `visdom init` installs `visdom trace …` commands, `tracevault init` installs
+`tracevault …` ones. A machine set up with `visdom` therefore needs only `visdom` on `PATH`.
+
+`visdom init` also takes over what `tracevault init` installed in the same place: it rewrites
+the `tracevault …` commands of ours to `visdom trace …` (in both Claude Code settings files of
+a repository, and in our blocks of the git hooks) and leaves your own hooks alone. It goes one
+way only: `tracevault init`, and the automatic refresh of the hooks after an upgrade, keep
+commands that already call `visdom`. Each place is taken over by the `init` that covers it —
+`visdom init` in a repository does not touch the machine-wide hooks; `visdom init --global`
+does.
 
 ### Files from before the `visdom` names
 
@@ -278,7 +294,8 @@ or from crates.io:
 cargo install tracevault-cli visdom-cli
 ```
 
-Install both: `visdom-cli` provides `visdom` only, and the hooks it sets up call `tracevault`.
+`visdom-cli` provides `visdom` and is enough on its own: the hooks `visdom init` sets up call
+`visdom trace …`. Install `tracevault-cli` as well only while something still calls `tracevault`.
 
 ## Quick start
 

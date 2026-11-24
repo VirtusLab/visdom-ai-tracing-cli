@@ -26,10 +26,16 @@ function enqueue(sessionId: string, task: () => Promise<void>): Promise<void> {
   return next;
 }
 
+/**
+ * The command this plugin runs. The installer rewrites this line when the
+ * `visdom` binary installs the plugin (`visdom trace …`).
+ */
+const CLI = ["tracevault"];
+
 function runTracevault(args: string[], stdinJson: unknown, cwd: string): Promise<void> {
   return new Promise((resolve) => {
     try {
-      const child = spawn("tracevault", args, { cwd, stdio: ["pipe", "ignore", "ignore"] });
+      const child = spawn(CLI[0], [...CLI.slice(1), ...args], { cwd, stdio: ["pipe", "ignore", "ignore"] });
       child.on("error", (e) => { console.error(`[tracevault] spawn: ${String(e)}`); resolve(); });
       child.on("close", () => resolve());
       // The stdin stream can emit its own async 'error' (EPIPE / write-after-end

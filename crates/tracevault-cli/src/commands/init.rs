@@ -740,8 +740,9 @@ fn install_git_hook(project_root: &Path) -> Result<(), io::Error> {
          # Capture git's pre-push ref list once; `check` uses it to determine\n\
          # which files are being pushed.\n\
          tracevault_prepush_stdin=$(cat)\n\
-         tracevault sync 2>/dev/null || true\n\
-         printf '%s' \"$tracevault_prepush_stdin\" | tracevault check || {{ echo \"tracevault: policy check failed\"; exit 1; }}\n"
+         {cli} sync 2>/dev/null || true\n\
+         printf '%s' \"$tracevault_prepush_stdin\" | {cli} check || {{ echo \"tracevault: policy check failed\"; exit 1; }}\n",
+        cli = crate::program::name(crate::program::is_visdom()),
     );
 
     if hook_path.exists() {
@@ -749,7 +750,7 @@ fn install_git_hook(project_root: &Path) -> Result<(), io::Error> {
 
         // Already has new-style hook
         if existing.contains(PRE_PUSH_MARKER) {
-            return Ok(());
+            return respell_git_hook(&hook_path, &existing, PRE_PUSH_MARKER);
         }
 
         // Replace old-style hook block if present
@@ -805,18 +806,66 @@ fn install_git_hook(project_root: &Path) -> Result<(), io::Error> {
 /// Marks the block `init` writes into `.git/hooks/post-commit`.
 pub const POST_COMMIT_MARKER: &str = "# tracevault:post-commit";
 
+/// The subcommands our git hook blocks run.
+const GIT_HOOK_SUBCOMMANDS: [&str; 3] = ["sync", "check", "commit-push"];
+
+/// `content` (a git hook) with the `tracevault …` commands of the block that
+/// starts at `marker` calling `visdom trace …` instead. The block is the
+/// marker and the lines after it up to the first blank line or end of file —
+/// what `init` appends; the rest of the hook is the user's own and is left
+/// alone. `None` when nothing in the block calls `tracevault`.
+fn git_hook_block_for_visdom(content: &str, marker: &str) -> Option<String> {
+    let mut out = String::with_capacity(content.len() + 32);
+    let (mut in_block, mut changed) = (false, false);
+    for line in content.split_inclusive('\n') {
+        if line.contains(marker) {
+            in_block = true;
+        } else if in_block && line.trim().is_empty() {
+            in_block = false;
+        }
+        let mut line = line.to_string();
+        if in_block {
+            for sub in GIT_HOOK_SUBCOMMANDS {
+                let ours = format!("{} {sub}", crate::program::TRACEVAULT);
+                if line.contains(&ours) {
+                    let theirs = format!("{} {sub}", crate::program::VISDOM_TRACE);
+                    line = line.replace(&ours, &theirs);
+                    changed = true;
+                }
+            }
+        }
+        out.push_str(&line);
+    }
+    changed.then_some(out)
+}
+
+/// An installed git hook block is left as it is — except that `visdom`
+/// makes a block that still calls `tracevault` call `visdom trace`.
+fn respell_git_hook(hook_path: &Path, existing: &str, marker: &str) -> Result<(), io::Error> {
+    if !crate::program::is_visdom() {
+        return Ok(());
+    }
+    match git_hook_block_for_visdom(existing, marker) {
+        Some(content) => fs::write(hook_path, content),
+        None => Ok(()),
+    }
+}
+
 fn install_post_commit_hook(project_root: &Path) -> Result<(), io::Error> {
     let hooks_dir = project_root.join(".git/hooks");
     fs::create_dir_all(&hooks_dir)?;
 
     let hook_path = hooks_dir.join("post-commit");
-    let tracevault_block = format!("{POST_COMMIT_MARKER}\ntracevault commit-push 2>/dev/null &\n");
+    let tracevault_block = format!(
+        "{POST_COMMIT_MARKER}\n{} commit-push 2>/dev/null &\n",
+        crate::program::name(crate::program::is_visdom())
+    );
 
     if hook_path.exists() {
         let existing = fs::read_to_string(&hook_path)?;
 
         if existing.contains(POST_COMMIT_MARKER) {
-            return Ok(());
+            return respell_git_hook(&hook_path, &existing, POST_COMMIT_MARKER);
         }
 
         let mut content = existing;
@@ -847,7 +896,32 @@ fn install_claude_hooks(
 ) -> Result<(), io::Error> {
     let claude_dir = project_root.join(".claude");
     fs::create_dir_all(&claude_dir)?;
-    merge_hooks_into_file(&claude_dir.join(target.filename()), &tracevault_hooks())
+    merge_hooks_into_file(&claude_dir.join(target.filename()), &tracevault_hooks())?;
+    // An earlier `init` may have put our hooks into the other settings file:
+    // `visdom` takes those over too, or they would go on calling `tracevault`.
+    if crate::program::is_visdom() {
+        for other in [ClaudeSettingsTarget::Shared, ClaudeSettingsTarget::Local] {
+            if other.filename() != target.filename() {
+                hooks_file_for_visdom(&claude_dir.join(other.filename()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Make every hook of ours in the settings file at `path` call `visdom
+/// trace …`. Nothing is added: a file without our hooks, or without the
+/// file, stays as it is.
+fn hooks_file_for_visdom(path: &Path) -> io::Result<()> {
+    if !matches!(has_tracevault_hooks(path), Ok(true)) {
+        return Ok(());
+    }
+    update_json_file(path, "its hooks", |root| {
+        if let Some(hooks) = root.get_mut("hooks") {
+            *hooks = hooks_spelled(hooks, true);
+        }
+        Ok(())
+    })
 }
 
 pub fn tracevault_hooks() -> serde_json::Value {
@@ -1025,7 +1099,7 @@ pub fn install_gsd_extension(project_root: Option<&Path>) -> io::Result<()> {
 
     let source_dir = gsd_extension_source_dir()?;
     fs::create_dir_all(&source_dir)?;
-    fs::write(source_dir.join("index.ts"), GSD_EXT_INDEX_TS)?;
+    write_plugin(&source_dir.join("index.ts"), GSD_EXT_INDEX_TS)?;
     fs::write(source_dir.join("package.json"), GSD_EXT_PACKAGE_JSON)?;
     fs::write(
         source_dir.join("extension-manifest.json"),
@@ -1123,8 +1197,49 @@ pub fn install_opencode_plugin(project_root: Option<&Path>) -> io::Result<()> {
 
 fn write_opencode_plugin_files(plugins_dir: &Path) -> io::Result<()> {
     fs::create_dir_all(plugins_dir)?;
-    fs::write(plugins_dir.join("tracevault.ts"), OPENCODE_PLUGIN_INDEX)?;
-    Ok(())
+    write_plugin(&plugins_dir.join("tracevault.ts"), OPENCODE_PLUGIN_INDEX)
+}
+
+/// The line of a plugin's source that names the command it runs, as the
+/// source is written, and what it becomes for `visdom`. Both quote styles
+/// the plugins use.
+const PLUGIN_CLI_LINES: [(&str, &str); 2] = [
+    (
+        "const CLI = [\"tracevault\"];",
+        "const CLI = [\"visdom\", \"trace\"];",
+    ),
+    (
+        "const CLI = ['tracevault']",
+        "const CLI = ['visdom', 'trace']",
+    ),
+];
+
+/// A plugin's `source` running the command of the binary chosen by `visdom`.
+pub fn plugin_source(source: &str, visdom: bool) -> String {
+    if !visdom {
+        return source.to_string();
+    }
+    PLUGIN_CLI_LINES
+        .iter()
+        .fold(source.to_string(), |text, (ours, theirs)| {
+            text.replacen(ours, theirs, 1)
+        })
+}
+
+/// Whether the plugin file at `path` runs `visdom`.
+fn plugin_runs_visdom(path: &Path) -> bool {
+    fs::read_to_string(path).is_ok_and(|text| {
+        PLUGIN_CLI_LINES
+            .iter()
+            .any(|(_, visdom)| text.contains(visdom))
+    })
+}
+
+/// Write a plugin's `source` to `path`, running the binary that installs it —
+/// and `visdom` still, once the plugin there does (see `crate::program`).
+fn write_plugin(path: &Path, source: &str) -> io::Result<()> {
+    let visdom = crate::program::installs_visdom(plugin_runs_visdom(path));
+    fs::write(path, plugin_source(source, visdom))
 }
 
 /// TraceVault Amp plugin source, embedded from the checked-in assets and
@@ -1157,7 +1272,7 @@ pub fn install_amp_plugin(project_root: Option<&Path>) -> io::Result<PathBuf> {
     let plugin_dir = plugins_dir.join("tracevault");
     fs::create_dir_all(&plugin_dir)?;
     let path = plugin_dir.join("index.ts");
-    fs::write(&path, AMP_PLUGIN_INDEX)?;
+    write_plugin(&path, AMP_PLUGIN_INDEX)?;
     Ok(path)
 }
 
@@ -1460,16 +1575,36 @@ one-off. Repos must already be registered with TraceVault.
 /// [`PREVIOUS_GLOBAL_CLAUDE_MD_BLOCKS`] text) replaced by the current
 /// [`GLOBAL_CLAUDE_MD_BLOCK`]. A block that matches none of them — the
 /// current one, or one the user edited — is left exactly as it is.
+/// A workspace-mode block naming the commands of the binary chosen by
+/// `visdom` (the blocks are written with `tracevault …`).
+fn workspace_block(block: &str, visdom: bool) -> String {
+    if visdom {
+        block.replace("`tracevault ", "`visdom trace ")
+    } else {
+        block.to_string()
+    }
+}
+
 fn replace_managed_block(content: &str) -> String {
-    if content.contains(GLOBAL_CLAUDE_MD_BLOCK) {
+    // The block names the binary that installs it — and `visdom` still, once
+    // it does (see `crate::program`).
+    let visdom = crate::program::installs_visdom(
+        content.contains(&workspace_block(GLOBAL_CLAUDE_MD_BLOCK, true))
+            || PREVIOUS_GLOBAL_CLAUDE_MD_BLOCKS
+                .iter()
+                .any(|old| content.contains(&workspace_block(old, true))),
+    );
+    let current = workspace_block(GLOBAL_CLAUDE_MD_BLOCK, visdom);
+    if content.contains(&current) {
         return content.to_string();
     }
-    PREVIOUS_GLOBAL_CLAUDE_MD_BLOCKS
-        .iter()
-        .find(|old| content.contains(*old))
+    std::iter::once(&GLOBAL_CLAUDE_MD_BLOCK)
+        .chain(PREVIOUS_GLOBAL_CLAUDE_MD_BLOCKS)
+        .flat_map(|old| [workspace_block(old, false), workspace_block(old, true)])
+        .find(|old| content.contains(old))
         .map_or_else(
             || content.to_string(),
-            |old| content.replacen(old, GLOBAL_CLAUDE_MD_BLOCK, 1),
+            |old| content.replacen(&old, &current, 1),
         )
 }
 
@@ -1511,7 +1646,10 @@ fn append_workspace_md(md_path: &Path) -> io::Result<()> {
     if !content.is_empty() {
         content.push('\n');
     }
-    content.push_str(GLOBAL_CLAUDE_MD_BLOCK);
+    content.push_str(&workspace_block(
+        GLOBAL_CLAUDE_MD_BLOCK,
+        crate::program::is_visdom(),
+    ));
     fs::write(md_path, content)
 }
 
@@ -1538,12 +1676,46 @@ pub(crate) fn safe_join(base: &Path, name: &str) -> io::Result<PathBuf> {
 /// user's own hook running something else never does. This is what lets a
 /// re-run replace exactly our entries (old matcher, timeout, status message,
 /// a dropped event) and nothing else.
-const TRACEVAULT_COMMAND_PREFIX: &str = "tracevault ";
-
+/// One of our hooks: its command is `tracevault …` or `visdom trace …`.
 fn is_tracevault_hook(hook: &serde_json::Value) -> bool {
-    hook.get("command")
-        .and_then(|c| c.as_str())
-        .is_some_and(|c| c.starts_with(TRACEVAULT_COMMAND_PREFIX))
+    hook_command(hook).is_some_and(|c| crate::program::subcommand(c).is_some())
+}
+
+fn hook_command(hook: &serde_json::Value) -> Option<&str> {
+    hook.get("command").and_then(|c| c.as_str())
+}
+
+/// Every hook in a `hooks` object (`{event: [{hooks: [hook…]}…]}`).
+fn hooks_in(hooks: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    hooks
+        .as_object()
+        .into_iter()
+        .flat_map(|events| events.values())
+        .filter_map(|groups| groups.as_array())
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(|h| h.as_array()))
+        .flatten()
+}
+
+/// `ours` (written with `tracevault …` commands) with every command spelled
+/// for the binary these hooks should call.
+fn hooks_spelled(ours: &serde_json::Value, visdom: bool) -> serde_json::Value {
+    let mut ours = ours.clone();
+    let groups = ours
+        .as_object_mut()
+        .into_iter()
+        .flat_map(|events| events.values_mut())
+        .filter_map(|groups| groups.as_array_mut())
+        .flatten();
+    for group in groups {
+        let hooks = group.get_mut("hooks").and_then(|h| h.as_array_mut());
+        for hook in hooks.into_iter().flatten() {
+            if let Some(command) = hook_command(hook).map(|c| crate::program::spelled(c, visdom)) {
+                hook["command"] = command.into();
+            }
+        }
+    }
+    ours
 }
 
 /// Remove TraceVault-owned inner hooks from one event's matcher groups. A
@@ -1598,13 +1770,20 @@ fn merge_hooks(
     let hooks_value = settings_obj
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}));
-    let hooks_obj = hooks_value.as_object_mut().ok_or_else(|| {
-        io::Error::new(
+    if !hooks_value.is_object() {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{} \"hooks\" key is not a JSON object", path.display()),
-        )
-    })?;
+        ));
+    }
 
+    // The hooks call the binary that installs them — and keep calling
+    // `visdom` once any of them does (see `crate::program`).
+    let already_visdom = hooks_in(hooks_value)
+        .filter_map(hook_command)
+        .any(crate::program::is_visdom_command);
+    let ours = hooks_spelled(ours, crate::program::installs_visdom(already_visdom));
+    let hooks_obj = hooks_value.as_object_mut().expect("checked above");
     let empty = serde_json::Map::new();
     let ours_obj = ours.as_object().unwrap_or(&empty);
 
@@ -1664,14 +1843,7 @@ pub fn has_tracevault_hooks(path: &Path) -> io::Result<bool> {
         serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(settings
         .get("hooks")
-        .and_then(|h| h.as_object())
-        .into_iter()
-        .flat_map(|events| events.values())
-        .filter_map(|groups| groups.as_array())
-        .flatten()
-        .filter_map(|group| group.get("hooks").and_then(|h| h.as_array()))
-        .flatten()
-        .any(is_tracevault_hook))
+        .is_some_and(|hooks| hooks_in(hooks).any(is_tracevault_hook)))
 }
 
 /// Bring the TraceVault hooks in the Claude Code settings file at `path` to
@@ -3521,5 +3693,140 @@ mod tests {
 
         assert_eq!(repo_id, None);
         assert!(!registered(&requests));
+    }
+
+    /// Every command of ours in a settings value.
+    fn our_commands(settings: &serde_json::Value) -> Vec<String> {
+        hooks_in(&settings["hooks"])
+            .filter(|hook| is_tracevault_hook(hook))
+            .filter_map(hook_command)
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn hooks_are_spelled_for_the_binary_that_installs_them() {
+        let visdom = hooks_spelled(&tracevault_hooks(), true);
+        let commands: Vec<_> = hooks_in(&visdom).filter_map(hook_command).collect();
+        assert!(!commands.is_empty());
+        assert!(
+            commands.iter().all(|c| c.starts_with("visdom trace ")),
+            "{commands:?}"
+        );
+        assert!(commands.contains(&"visdom trace stream --event stop"));
+        assert_eq!(
+            hooks_spelled(&tracevault_hooks(), false),
+            tracevault_hooks()
+        );
+    }
+
+    /// This test process is the `tracevault` binary's library: hooks that
+    /// already call `visdom` must stay that way through a merge (an automatic
+    /// refresh started by a `tracevault` hook, a `tracevault init` re-run),
+    /// and a user's own hook is still nobody's business.
+    #[test]
+    fn merge_hooks_keeps_hooks_that_already_call_visdom() {
+        let mut settings = serde_json::json!({"hooks": {
+            "Stop": [{"matcher": "", "hooks": [
+                {"type": "command", "command": "visdom trace stream --event stop"},
+                {"type": "command", "command": "my-own-hook"}]}],
+        }});
+        merge_hooks(
+            &mut settings,
+            &tracevault_hooks(),
+            Path::new("settings.json"),
+        )
+        .unwrap();
+
+        let commands = our_commands(&settings);
+        assert!(commands.len() > 1, "{commands:?}");
+        assert!(
+            commands.iter().all(|c| c.starts_with("visdom trace ")),
+            "{commands:?}"
+        );
+        let all: Vec<_> = hooks_in(&settings["hooks"])
+            .filter_map(hook_command)
+            .collect();
+        assert!(all.contains(&"my-own-hook"), "{all:?}");
+        // And it is stable.
+        let once = settings.clone();
+        merge_hooks(
+            &mut settings,
+            &tracevault_hooks(),
+            Path::new("settings.json"),
+        )
+        .unwrap();
+        assert_eq!(settings, once);
+    }
+
+    #[test]
+    fn a_git_hook_block_is_respelled_for_visdom_and_the_rest_left_alone() {
+        let hook = "#!/bin/sh\ntracevault check # the user's own line\n\n\
+                    # tracevault:enforce\n\
+                    tracevault_prepush_stdin=$(cat)\n\
+                    tracevault sync 2>/dev/null || true\n\
+                    printf '%s' \"$tracevault_prepush_stdin\" | tracevault check || { echo \"tracevault: policy check failed\"; exit 1; }\n\
+                    \ntracevault sync # also the user's\n";
+        let respelled = git_hook_block_for_visdom(hook, PRE_PUSH_MARKER).unwrap();
+        assert_eq!(
+            respelled,
+            "#!/bin/sh\ntracevault check # the user's own line\n\n\
+             # tracevault:enforce\n\
+             tracevault_prepush_stdin=$(cat)\n\
+             visdom trace sync 2>/dev/null || true\n\
+             printf '%s' \"$tracevault_prepush_stdin\" | visdom trace check || { echo \"tracevault: policy check failed\"; exit 1; }\n\
+             \ntracevault sync # also the user's\n"
+        );
+        // Nothing left to change.
+        assert_eq!(git_hook_block_for_visdom(&respelled, PRE_PUSH_MARKER), None);
+        assert_eq!(
+            git_hook_block_for_visdom(
+                "#!/bin/sh\n# tracevault:post-commit\ntracevault commit-push 2>/dev/null &\n",
+                POST_COMMIT_MARKER
+            )
+            .as_deref(),
+            Some("#!/bin/sh\n# tracevault:post-commit\nvisdom trace commit-push 2>/dev/null &\n")
+        );
+    }
+
+    #[test]
+    fn every_plugin_can_be_written_to_run_visdom() {
+        for source in [AMP_PLUGIN_INDEX, OPENCODE_PLUGIN_INDEX, GSD_EXT_INDEX_TS] {
+            assert_eq!(plugin_source(source, false), source);
+            let visdom = plugin_source(source, true);
+            assert_ne!(visdom, source);
+            assert!(
+                PLUGIN_CLI_LINES
+                    .iter()
+                    .any(|(_, line)| visdom.contains(line)),
+                "the plugin has no CLI line to rewrite"
+            );
+            // The command is named in that one line only.
+            assert!(
+                !visdom.contains("spawn(\"tracevault\"") && !visdom.contains("spawn('tracevault'")
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.ts");
+        fs::write(&path, plugin_source(AMP_PLUGIN_INDEX, true)).unwrap();
+        // Written again by the `tracevault` library, it still runs `visdom`.
+        write_plugin(&path, AMP_PLUGIN_INDEX).unwrap();
+        assert!(plugin_runs_visdom(&path));
+    }
+
+    #[test]
+    fn the_workspace_block_keeps_naming_visdom_once_it_does() {
+        let visdom_block = workspace_block(GLOBAL_CLAUDE_MD_BLOCK, true);
+        assert!(visdom_block.contains("`visdom trace repo switch <path>`"));
+        assert!(!visdom_block.contains("`tracevault "));
+        let content = format!("# Mine\n\n{visdom_block}\nmore\n");
+        assert_eq!(replace_managed_block(&content), content);
+        // An earlier text of the block that names `visdom` is brought up to
+        // date without going back to `tracevault`.
+        let old = workspace_block(PREVIOUS_GLOBAL_CLAUDE_MD_BLOCKS[0], true);
+        assert_eq!(
+            replace_managed_block(&format!("# Mine\n\n{old}")),
+            format!("# Mine\n\n{visdom_block}")
+        );
     }
 }
