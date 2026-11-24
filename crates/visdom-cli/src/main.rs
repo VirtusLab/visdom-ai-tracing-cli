@@ -542,7 +542,8 @@ fn init_gateway(
     // from the developer's own config is not the folder's, and would follow
     // every later change of theirs.
     let workspace_names_project = workspace_dir.as_deref().is_some_and(|dir| {
-        config::load_repo_config_in(dir).is_ok_and(|folder| folder.gateway.project.is_some())
+        config::load_repo_config_in(dir)
+            .is_ok_and(|folder| folder.gateway.project.is_some_and(|p| !p.trim().is_empty()))
     });
     let workspace_file = workspace_dir.as_deref().map(config::repo_config_path_in);
     let for_workspace = workspace_file.is_some();
@@ -608,6 +609,23 @@ fn init_gateway(
             "project under [gateway] in {}",
             project_file.display()
         ));
+        // A folder's new config file comes before one further up, which may
+        // be where the gateway mode was chosen: said in the new file too, or
+        // the next `visdom` here would start with hooks.
+        let chosen_in_files = session.mode.reason == ModeReason::Chosen && flag.is_none();
+        if for_workspace
+            && chosen_in_files
+            && gather(&env, Some(agent), None, runtime).mode.mode != TracingMode::Gateway
+        {
+            if let Err(e) = interactive::save_tracing_mode(project_file, TracingMode::Gateway) {
+                eprintln!("visdom: the tracing mode could not be saved: {e}");
+                exit(1);
+            }
+            eprintln!(
+                "Saved tracing_mode = \"gateway\" to {}",
+                project_file.display()
+            );
+        }
     }
     let model_key = format!("{}_model", config::agent_config_key(agent));
     if sources.model.is_none() {

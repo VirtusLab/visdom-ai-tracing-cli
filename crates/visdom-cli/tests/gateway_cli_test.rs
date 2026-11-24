@@ -1384,3 +1384,116 @@ fn a_workspace_init_binds_the_folder_and_sets_up_the_gateway() {
         std::fs::read_to_string(sb.home.path().join(".claude/settings.json")).unwrap_or_default();
     assert!(!hooks.contains("tracevault stream"), "{hooks}");
 }
+
+const PROJECTS: (&str, u16, &str) = (
+    "GET /api/v1/projects",
+    200,
+    r#"[{"id":"11111111-2222-3333-4444-555555555555","name":"my-platform"}]"#,
+);
+
+/// A workspace may be a checkout's top level: its gateway project is kept in
+/// that checkout's `.visdom/config.toml` — the inherited one written down,
+/// one already named there (an empty value is none) left as it is.
+#[test]
+fn a_workspace_at_a_checkouts_top_level_keeps_its_gateway_project_there() {
+    let settings = policy("enforced");
+    let routes = [
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, settings.as_str()),
+        PROJECTS,
+        SETTINGS,
+        TWO_PROJECTS,
+        ISSUE,
+        MODELS,
+    ];
+    let init = |sb: &Sandbox| {
+        sb.visdom(sb.repo.path())
+            .args(["init", "--workspace", "--project", "my-platform"])
+            .output()
+            .unwrap()
+    };
+    let own =
+        |sb: &Sandbox| std::fs::read_to_string(sb.repo.path().join(".visdom/config.toml")).unwrap();
+
+    for before in [None, Some("[gateway]\nproject = \"  \"\n")] {
+        let server = MockServer::start(&routes);
+        let sb = Sandbox::new();
+        sb.log_in(&server.url, PERSON_TOKEN);
+        sb.write_user_config("[gateway]\nproject = \"alpha\"\n");
+        if let Some(before) = before {
+            std::fs::create_dir_all(sb.repo.path().join(".visdom")).unwrap();
+            std::fs::write(sb.repo.path().join(".visdom/config.toml"), before).unwrap();
+        }
+        let output = init(&sb);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert!(
+            own(&sb).contains("project = \"alpha\""),
+            "{before:?}: {}",
+            own(&sb)
+        );
+    }
+
+    let server = MockServer::start(&routes);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    sb.write_user_config("[gateway]\nproject = \"alpha\"\n");
+    std::fs::create_dir_all(sb.repo.path().join(".visdom")).unwrap();
+    std::fs::write(
+        sb.repo.path().join(".visdom/config.toml"),
+        "[gateway]\nproject = \"beta\"\n",
+    )
+    .unwrap();
+    let output = init(&sb);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(own(&sb).contains("project = \"beta\""), "{}", own(&sb));
+    assert!(!own(&sb).contains("alpha"), "{}", own(&sb));
+}
+
+/// A folder's new config comes before one further up. Where that one chose
+/// the gateway, the choice is carried into the new file, so that the folder
+/// does not fall back to hooks after an init that called the gateway ready.
+#[test]
+fn a_workspaces_new_config_keeps_the_mode_chosen_further_up() {
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        PROJECTS,
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let (sb, log) = sandbox(&server);
+    let above = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(above.path().join(".visdom")).unwrap();
+    std::fs::write(
+        above.path().join(".visdom/config.toml"),
+        "tracing_mode = \"gateway\"\n",
+    )
+    .unwrap();
+    let folder = above.path().join("platform");
+    std::fs::create_dir_all(&folder).unwrap();
+    let output = sb
+        .visdom(&folder)
+        .args(["init", "--workspace", "--project", "my-platform"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("AI Gateway ready"),
+        "{}",
+        stdout(&output)
+    );
+    let own = std::fs::read_to_string(folder.join(".visdom/config.toml")).unwrap();
+    assert!(own.contains("tracing_mode = \"gateway\""), "{own}");
+    assert!(own.contains("project = \"alpha\""), "{own}");
+
+    let output = sb.visdom(&folder).output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        lines(&log).contains(&"VISDOM_GATEWAY_SESSION=claude-code".to_string()),
+        "{:?}",
+        lines(&log)
+    );
+}
