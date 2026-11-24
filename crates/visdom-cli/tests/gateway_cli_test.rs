@@ -1353,6 +1353,8 @@ fn a_workspace_init_binds_the_folder_and_sets_up_the_gateway() {
     ]);
     let sb = Sandbox::new();
     sb.log_in(&server.url, PERSON_TOKEN);
+    // The developer's own default, from an earlier setup.
+    sb.write_user_config("[gateway]\nproject = \"alpha\"\n");
     let folder = tempfile::tempdir().unwrap();
     let output = sb
         .visdom(folder.path())
@@ -1360,6 +1362,15 @@ fn a_workspace_init_binds_the_folder_and_sets_up_the_gateway() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    // The folder keeps its gateway project itself: a later change of the
+    // developer's default does not move it.
+    let own = std::fs::read_to_string(folder.path().join(".visdom/config.toml")).unwrap();
+    assert!(own.contains("project = \"alpha\""), "{own}");
+    assert!(
+        stdout(&output).contains(".visdom/config.toml"),
+        "{}",
+        stdout(&output)
+    );
     let bound = std::fs::read_to_string(folder.path().join(".tracevault/config.toml")).unwrap();
     assert!(
         bound.contains("11111111-2222-3333-4444-555555555555"),

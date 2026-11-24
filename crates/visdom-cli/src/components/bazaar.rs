@@ -161,9 +161,13 @@ pub fn check(
             )]
         }
     };
+    // A setup for the whole machine is done by a registration for all of the
+    // user's projects: one for this project directory alone (or committed to
+    // this repository) leaves every other directory without bazaar.
     let all_matching: Vec<&McpEntry> = entries
         .iter()
         .filter(|e| e.url.as_deref().is_some_and(|u| same_bazaar(u, url)))
+        .filter(|e| register_scope != McpScope::User || e.scope == McpScope::User)
         .collect();
     let matching: Vec<&McpEntry> = all_matching
         .iter()
@@ -502,6 +506,32 @@ mod tests {
         assert_eq!(finding.severity, Severity::Ok);
         assert!(finding.message.contains("`visdom`"), "{finding:?}");
         assert!(finding.fix.is_none());
+    }
+
+    /// Set up for the whole machine, a registration this project directory
+    /// has for itself does not count: the user-wide one is still to be made.
+    #[test]
+    fn a_machine_wide_setup_needs_the_registration_at_user_scope() {
+        let local = entry("bazaar", URL, Some(BAZAAR_CLIENT_ID), McpScope::Local);
+        let adapter = fake(vec![local.clone()]);
+        let check_for = |adapter: &Fake, scope| {
+            check(
+                Ok(Some(URL)),
+                adapter,
+                &repo(),
+                Path::new("/cfg/visdom/config.toml"),
+                scope,
+            )
+            .remove(0)
+        };
+        assert_eq!(check_for(&adapter, McpScope::Local).severity, Severity::Ok);
+        let finding = check_for(&adapter, McpScope::User);
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.fix.is_some(), "{finding:?}");
+
+        let user = entry("visdom", URL, Some(BAZAAR_CLIENT_ID), McpScope::User);
+        let adapter = fake(vec![local, user]);
+        assert_eq!(check_for(&adapter, McpScope::User).severity, Severity::Ok);
     }
 
     #[test]

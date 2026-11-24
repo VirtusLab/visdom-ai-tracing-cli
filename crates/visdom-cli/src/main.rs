@@ -535,8 +535,17 @@ fn init_gateway(
     let env = Environment::current();
     // The gateway project of a folder of checkouts is that folder's, kept in
     // its own `.visdom/config.toml`; otherwise it is the developer's.
-    let workspace_file = (scope == InitScope::Workspace && git_toplevel(&env.cwd).is_none())
-        .then(|| config::repo_config_path_in(&env.cwd));
+    // (A workspace may be a checkout's top level; the file is there then.)
+    let workspace_dir = (scope == InitScope::Workspace)
+        .then(|| git_toplevel(&env.cwd).unwrap_or_else(|| env.cwd.clone()));
+    // Whether the folder names its project itself already: one inherited
+    // from the developer's own config is not the folder's, and would follow
+    // every later change of theirs.
+    let workspace_names_project = workspace_dir.as_deref().is_some_and(|dir| {
+        config::load_repo_config_in(dir).is_ok_and(|folder| folder.gateway.project.is_some())
+    });
+    let workspace_file = workspace_dir.as_deref().map(config::repo_config_path_in);
+    let for_workspace = workspace_file.is_some();
     let project_file =
         &workspace_file.unwrap_or_else(|| config::user_config_path_in(&env.config_root));
     let mut session = gather(&env, Some(agent), flag, runtime);
@@ -591,7 +600,7 @@ fn init_gateway(
             session.user_config_path.display()
         ))
     };
-    if sources.project.is_none() {
+    if sources.project.is_none() || (for_workspace && !workspace_names_project) {
         // The only project open today: written down, so that being given
         // access to another one later does not leave the choice open.
         save_gateway(project_file, "project", &plan.project.slug);
