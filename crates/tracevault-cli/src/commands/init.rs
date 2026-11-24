@@ -809,32 +809,56 @@ pub const POST_COMMIT_MARKER: &str = "# tracevault:post-commit";
 /// The subcommands our git hook blocks run.
 const GIT_HOOK_SUBCOMMANDS: [&str; 3] = ["sync", "check", "commit-push"];
 
+/// A line of one of our git hook blocks that runs a command of ours,
+/// spelled for `visdom`. `None` for any other line. The blocks hold exactly
+/// these: `tracevault <sub> …` at the start of a line, and the pre-push
+/// check fed from the captured ref list.
+fn git_hook_line_for_visdom(line: &str) -> Option<String> {
+    use crate::program::{TRACEVAULT, VISDOM_TRACE};
+    const PIPED: &str = "printf '%s' \"$tracevault_prepush_stdin\" | ";
+    let (head, command) = match line.strip_prefix(PIPED) {
+        Some(command) => (PIPED, command),
+        None => ("", line),
+    };
+    let rest = command.strip_prefix(TRACEVAULT)?.strip_prefix(' ')?;
+    let ours = GIT_HOOK_SUBCOMMANDS.iter().any(|sub| {
+        rest.strip_prefix(sub)
+            .is_some_and(|after| after.starts_with(' ') || after.trim_end().is_empty())
+    });
+    ours.then(|| format!("{head}{VISDOM_TRACE} {rest}"))
+}
+
+/// Whether `line` belongs to one of our git hook blocks without running a
+/// command of ours: its comments and the capture of git's ref list.
+fn is_git_hook_block_filler(line: &str) -> bool {
+    line.starts_with('#') || line.starts_with("tracevault_prepush_stdin=")
+}
+
 /// `content` (a git hook) with the `tracevault …` commands of the block that
 /// starts at `marker` calling `visdom trace …` instead. The block is the
-/// marker and the lines after it up to the first blank line or end of file —
-/// what `init` appends; the rest of the hook is the user's own and is left
-/// alone. `None` when nothing in the block calls `tracevault`.
+/// marker line and the lines right after it that are the block's own (see
+/// [`git_hook_line_for_visdom`]); it ends at the first line that is not, so
+/// whatever the user wrote before or after it — even a line that mentions
+/// `tracevault` — is left alone. `None` when nothing in the block calls
+/// `tracevault`.
 fn git_hook_block_for_visdom(content: &str, marker: &str) -> Option<String> {
     let mut out = String::with_capacity(content.len() + 32);
     let (mut in_block, mut changed) = (false, false);
     for line in content.split_inclusive('\n') {
-        if line.contains(marker) {
+        if line.trim_end() == marker {
             in_block = true;
-        } else if in_block && line.trim().is_empty() {
-            in_block = false;
+            out.push_str(line);
+            continue;
         }
-        let mut line = line.to_string();
         if in_block {
-            for sub in GIT_HOOK_SUBCOMMANDS {
-                let ours = format!("{} {sub}", crate::program::TRACEVAULT);
-                if line.contains(&ours) {
-                    let theirs = format!("{} {sub}", crate::program::VISDOM_TRACE);
-                    line = line.replace(&ours, &theirs);
-                    changed = true;
-                }
+            if let Some(ours) = git_hook_line_for_visdom(line) {
+                out.push_str(&ours);
+                changed = true;
+                continue;
             }
+            in_block = is_git_hook_block_filler(line);
         }
-        out.push_str(&line);
+        out.push_str(line);
     }
     changed.then_some(out)
 }
@@ -1676,9 +1700,23 @@ pub(crate) fn safe_join(base: &Path, name: &str) -> io::Result<PathBuf> {
 /// user's own hook running something else never does. This is what lets a
 /// re-run replace exactly our entries (old matcher, timeout, status message,
 /// a dropped event) and nothing else.
-/// One of our hooks: its command is `tracevault …` or `visdom trace …`.
+/// The subcommands the hooks `init` installs run (now or in an earlier
+/// release).
+const HOOK_SUBCOMMANDS: [&str; 3] = ["stream", "session-start", "user-prompt"];
+
+/// One of our hooks: its command is `tracevault …` or `visdom trace …`
+/// running a subcommand `init` installs. Any other command — a user's own
+/// `visdom trace flush` in a hook, say — is theirs, and is neither removed
+/// nor respelled.
 fn is_tracevault_hook(hook: &serde_json::Value) -> bool {
-    hook_command(hook).is_some_and(|c| crate::program::subcommand(c).is_some())
+    hook_command(hook)
+        .and_then(crate::program::subcommand)
+        .is_some_and(|rest| {
+            HOOK_SUBCOMMANDS.iter().any(|sub| {
+                rest.strip_prefix(sub)
+                    .is_some_and(|after| after.is_empty() || after.starts_with(' '))
+            })
+        })
 }
 
 fn hook_command(hook: &serde_json::Value) -> Option<&str> {
@@ -1710,6 +1748,9 @@ fn hooks_spelled(ours: &serde_json::Value, visdom: bool) -> serde_json::Value {
     for group in groups {
         let hooks = group.get_mut("hooks").and_then(|h| h.as_array_mut());
         for hook in hooks.into_iter().flatten() {
+            if !is_tracevault_hook(hook) {
+                continue;
+            }
             if let Some(command) = hook_command(hook).map(|c| crate::program::spelled(c, visdom)) {
                 hook["command"] = command.into();
             }
@@ -1780,6 +1821,7 @@ fn merge_hooks(
     // The hooks call the binary that installs them — and keep calling
     // `visdom` once any of them does (see `crate::program`).
     let already_visdom = hooks_in(hooks_value)
+        .filter(|hook| is_tracevault_hook(hook))
         .filter_map(hook_command)
         .any(crate::program::is_visdom_command);
     let ours = hooks_spelled(ours, crate::program::installs_visdom(already_visdom));
@@ -3827,6 +3869,53 @@ mod tests {
         assert_eq!(
             replace_managed_block(&format!("# Mine\n\n{old}")),
             format!("# Mine\n\n{visdom_block}")
+        );
+    }
+
+    #[test]
+    fn a_users_own_tracing_command_in_a_hook_is_not_ours() {
+        let own = |command: &str| serde_json::json!({"type": "command", "command": command});
+        assert!(is_tracevault_hook(&own("visdom trace stream --event stop")));
+        assert!(is_tracevault_hook(&own("tracevault session-start")));
+        assert!(!is_tracevault_hook(&own("visdom trace flush")));
+        assert!(!is_tracevault_hook(&own("tracevault streamer")));
+        assert!(!is_tracevault_hook(&own("visdom doctor")));
+
+        let mut settings = serde_json::json!({"hooks": {
+            "PreCompact": [{"matcher": "", "hooks": [own("visdom trace flush")]}],
+            "Stop": [{"matcher": "", "hooks": [own("tracevault flush"), own("tracevault stream --event stop")]}],
+        }});
+        merge_hooks(
+            &mut settings,
+            &tracevault_hooks(),
+            Path::new("settings.json"),
+        )
+        .unwrap();
+
+        let all: Vec<_> = hooks_in(&settings["hooks"])
+            .filter_map(hook_command)
+            .collect();
+        assert!(all.contains(&"visdom trace flush"), "{all:?}");
+        assert!(all.contains(&"tracevault flush"), "{all:?}");
+        // Their `visdom trace flush` does not make ours call `visdom`.
+        assert!(all.contains(&"tracevault stream --event stop"), "{all:?}");
+        // And respelling for `visdom` leaves their commands as they wrote them.
+        let respelled = hooks_spelled(&settings["hooks"], true);
+        let all: Vec<_> = hooks_in(&respelled).filter_map(hook_command).collect();
+        assert!(all.contains(&"tracevault flush"), "{all:?}");
+        assert!(all.contains(&"visdom trace stream --event stop"), "{all:?}");
+    }
+
+    #[test]
+    fn a_users_line_right_after_a_git_hook_block_is_left_alone() {
+        let hook = "#!/bin/sh\n# tracevault:post-commit\ntracevault commit-push 2>/dev/null &\n\
+                    custom-tracevault check\ntracevault check-something\ntracevault sync\n";
+        assert_eq!(
+            git_hook_block_for_visdom(hook, POST_COMMIT_MARKER).as_deref(),
+            Some(
+                "#!/bin/sh\n# tracevault:post-commit\nvisdom trace commit-push 2>/dev/null &\n\
+                 custom-tracevault check\ntracevault check-something\ntracevault sync\n"
+            )
         );
     }
 }

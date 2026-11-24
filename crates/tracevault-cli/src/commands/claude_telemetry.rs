@@ -1333,4 +1333,36 @@ pub(crate) mod tests {
             "visdom trace otel-headers --server-url https://tv.example.com"
         );
     }
+
+    /// This test process is the `tracevault` binary's library, as the
+    /// automatic upgrade is when a `tracevault` hook starts it: a helper that
+    /// already calls `visdom` must come out of the merge calling `visdom`.
+    #[test]
+    fn a_refresh_keeps_a_helper_that_calls_visdom() {
+        let visdom_helper = helper_command_for(SERVER, true);
+        let (s, outcome) = merged(
+            json!({ HEADERS_HELPER: visdom_helper }),
+            &Environment::default(),
+        );
+        assert_eq!(outcome, InstallOutcome::Configured);
+        assert_eq!(s[HEADERS_HELPER], json!(visdom_helper));
+        // Moving to another server keeps the binary, too.
+        let mut moved = s.clone();
+        merge_telemetry(
+            &mut moved,
+            "https://other.example.com",
+            &Environment::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            moved[HEADERS_HELPER],
+            json!("visdom trace otel-headers --server-url https://other.example.com")
+        );
+        // A helper of ours that calls `tracevault` stays that way here.
+        let (s, _) = merged(
+            json!({ HEADERS_HELPER: helper_command_for(SERVER, false) }),
+            &Environment::default(),
+        );
+        assert_eq!(s[HEADERS_HELPER], json!(helper_command_for(SERVER, false)));
+    }
 }
