@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/visdom-v1.0.0...visdom-v1.1.0) - 2026-11-24
+
+### Added
+
+- *(visdom)* the agent visdom starts is told what the session has of Visdom's (VIS-1297)
+- *(visdom)* run as visdom, nothing the CLI says or installs names tracevault (VIS-1297)
+- *(visdom)* what visdom init installs calls visdom trace, not tracevault (VIS-1297)
+- keep files under .visdom/ and visdom/, still reading the tracevault ones (VIS-1297)
+- *(visdom)* init asks what to set up, and sets all of it up for a machine or a workspace (VIS-1297)
+- *(visdom)* init leaves the AI Gateway ready, and env for an agent started by hand (VIS-1297)
+
+### Fixed
+
+- *(visdom)* the agent's own options decide what it is told of (VIS-1297)
+- *(visdom)* Codex options written attached are read; a server the caller's options change is not told of (VIS-1297)
+- *(visdom)* a project's Codex instructions are left in charge; tracing is told of only where a session is bound (VIS-1297)
+- *(visdom)* the earlier GSD registration goes only after the new one is in; tests for the new variables (VIS-1297)
+- name the login file where it is (VIS-1297)
+- *(visdom)* a workspace's new config does not drop the mode or keep an empty project (VIS-1297)
+- *(visdom)* a machine or workspace setup does not stop at what one directory already has (VIS-1297)
+- *(visdom)* the gateway marker names the agent that was routed (VIS-1297)
+- *(visdom)* a model alias the project does not have, or a mode that cannot be saved, is not a ready gateway (VIS-1297)
+- *(visdom)* init does not call a gateway ready that the next start cannot use (VIS-1297)
+
+### Other
+
+- *(visdom)* a workspace init binds the folder and sets up the gateway (VIS-1297)
+
 ## [1.0.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/visdom-v0.29.5...visdom-v1.0.0) - 2026-11-23
 
 The first stable release of `visdom`. From here it has its own version, apart from

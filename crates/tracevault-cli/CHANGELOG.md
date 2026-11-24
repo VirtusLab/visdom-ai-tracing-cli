@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.7](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.29.6...v0.29.7) - 2026-11-24
+
+### Added
+
+- *(visdom)* run as visdom, nothing the CLI says or installs names tracevault (VIS-1297)
+- *(visdom)* what visdom init installs calls visdom trace, not tracevault (VIS-1297)
+- keep files under .visdom/ and visdom/, still reading the tracevault ones (VIS-1297)
+- *(visdom)* init asks what to set up, and sets all of it up for a machine or a workspace (VIS-1297)
+
+### Fixed
+
+- *(visdom)* the earlier GSD registration goes only after the new one is in; tests for the new variables (VIS-1297)
+- *(visdom)* only the hooks init installs are ours, and a git hook block ends where its own lines end (VIS-1297)
+- a moved file appears whole or not at all, and one that changed meanwhile stays (VIS-1297)
+- relocation writes into a newly created file instead of hard-linking, and leaves symbolic links alone (VIS-1297)
+- context edits keep .visdom ignored, relocation never replaces a new file, a legacy login that cannot be removed is an error (VIS-1297)
+- legacy context is read file by file and never written; legacy sessions are caught up and counted (VIS-1297)
+- name the login file where it is (VIS-1297)
+- *(stream)* the capture hook still takes the marker visdom 1.0.0 sets (VIS-1297)
+- *(visdom)* the gateway marker names the agent that was routed (VIS-1297)
+
+### Other
+
+- require tempfile 3.15, the first release without AIKIDO-2025-10003 (VIS-1297)
+
 ## [0.29.6](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.29.5...v0.29.6) - 2026-11-23
 
 ### Added
