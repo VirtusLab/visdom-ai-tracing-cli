@@ -43,30 +43,45 @@ fn is_symlink(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
 }
 
-/// Move `from` to `to`, never over something that appeared at `to` in the
-/// meantime (a `login` or a context edit running beside this `init`). A file
-/// is written into a newly created `to` — creating it fails when the name is
-/// taken, and a writer that renames its own file into place meanwhile simply
-/// wins — with the mode `from` has, and `from` is then removed. A directory
-/// is renamed, which fails on a non-empty one.
-fn move_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+/// Put a complete copy of the file `from` at `to`, never over something
+/// that is or appears there (a `login` or a context edit running beside this
+/// `init`): the copy is written and synced under a temporary name in `to`'s
+/// directory — created owner-only, then given `from`'s mode — and takes the
+/// name `to` only once whole, in one step that fails when the name is taken.
+/// A copy that fails part-way leaves nothing behind, so the legacy file keeps
+/// being read. Returns what was copied.
+fn publish_copy(from: &Path, to: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Write as _;
-    let meta = fs::symlink_metadata(from)?;
-    if meta.is_dir() {
+    let content = fs::read(from)?;
+    let dir = to
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no directory to move into"))?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".carried-over.")
+        .tempfile_in(dir)?;
+    tmp.write_all(&content)?;
+    tmp.as_file()
+        .set_permissions(fs::metadata(from)?.permissions())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist_noclobber(to).map_err(|e| e.error)?;
+    Ok(content)
+}
+
+/// Move `from` to `to`, never over something that appeared at `to` in the
+/// meantime. A directory is renamed, which fails on a non-empty one. A file
+/// is [`publish_copy`]-ed and then removed — unless it changed while it was
+/// being copied (an earlier `tracevault` refreshing the login it still
+/// reads): then the copy is withdrawn and the file stays, still read where
+/// it is, for the next `init` to move.
+fn move_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(from)?.is_dir() {
         return fs::rename(from, to);
     }
-    let content = fs::read(from)?;
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        // At creation, not after: the login must never be readable by others.
-        options.mode(meta.permissions().mode() & 0o777);
+    let copied = publish_copy(from, to)?;
+    if fs::read(from)? != copied {
+        fs::remove_file(to)?;
+        return Err(std::io::Error::other("it changed while being moved"));
     }
-    let mut file = options.open(to)?;
-    file.write_all(&content)?;
-    file.sync_all()?;
     fs::remove_file(from)
 }
 
@@ -176,7 +191,7 @@ pub fn carry_over_user_in(user_dir: &Path) -> Vec<String> {
     let (from, to) = (legacy.join("context.json"), user_dir.join("context.json"));
     if from.exists() && !to.exists() {
         lines.push(
-            match fs::create_dir_all(user_dir).and_then(|()| fs::copy(&from, &to)) {
+            match fs::create_dir_all(user_dir).and_then(|()| publish_copy(&from, &to)) {
                 Ok(_) => format!(
                     "Copied {} to {} (the old file is left for configs that name it by path)",
                     from.display(),
@@ -354,5 +369,51 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&to).unwrap(), "new");
         assert_eq!(fs::read_to_string(&from).unwrap(), "old");
+    }
+
+    /// Everything in `dir`, to tell that a failed step left nothing behind.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_copy_that_cannot_be_published_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("old");
+        fs::write(&from, "old").unwrap();
+        let into = dir.path().join("into");
+        fs::create_dir_all(&into).unwrap();
+        // The name is taken: by a file somebody wrote meanwhile.
+        fs::write(into.join("new"), "theirs").unwrap();
+
+        assert!(publish_copy(&from, &into.join("new")).is_err());
+
+        assert_eq!(fs::read_to_string(into.join("new")).unwrap(), "theirs");
+        assert_eq!(names(&into), ["new"], "no temporary file may stay");
+        // A source that cannot be read publishes nothing either.
+        assert!(publish_copy(&dir.path().join("missing"), &into.join("other")).is_err());
+        assert_eq!(names(&into), ["new"]);
+    }
+
+    #[test]
+    fn a_user_context_written_meanwhile_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("tracevault");
+        let user = dir.path().join("visdom");
+        write(&legacy.join("context.json"), "old");
+        write(&user.join("context.json"), "theirs");
+
+        carry_over_user_in(&user);
+
+        assert_eq!(
+            fs::read_to_string(user.join("context.json")).unwrap(),
+            "theirs"
+        );
+        assert_eq!(names(&user), ["context.json"]);
     }
 }
