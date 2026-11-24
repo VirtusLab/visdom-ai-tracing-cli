@@ -17,6 +17,14 @@ fn carry(from: &Path, to: &Path) -> Option<String> {
     if !from.exists() || to.exists() {
         return None;
     }
+    // A link is somebody's arrangement, and following one out of the
+    // directory is not this step's business: it stays, and is still read.
+    if is_symlink(from) {
+        return Some(format!(
+            "{} is a symbolic link; it is left where it is and still read there",
+            from.display()
+        ));
+    }
     let moved = to
         .parent()
         .map_or(Ok(()), fs::create_dir_all)
@@ -31,15 +39,34 @@ fn carry(from: &Path, to: &Path) -> Option<String> {
     })
 }
 
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
 /// Move `from` to `to`, never over something that appeared at `to` in the
-/// meantime (a `login` or a context edit running beside this `init`): a file
-/// is hard-linked into place, which fails when the name is taken, and then
-/// unlinked; a directory is renamed, which fails on a non-empty one.
+/// meantime (a `login` or a context edit running beside this `init`). A file
+/// is written into a newly created `to` — creating it fails when the name is
+/// taken, and a writer that renames its own file into place meanwhile simply
+/// wins — with the mode `from` has, and `from` is then removed. A directory
+/// is renamed, which fails on a non-empty one.
 fn move_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
-    if from.is_dir() {
+    use std::io::Write as _;
+    let meta = fs::symlink_metadata(from)?;
+    if meta.is_dir() {
         return fs::rename(from, to);
     }
-    fs::hard_link(from, to)?;
+    let content = fs::read(from)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // At creation, not after: the login must never be readable by others.
+        options.mode(meta.permissions().mode() & 0o777);
+    }
+    let mut file = options.open(to)?;
+    file.write_all(&content)?;
+    file.sync_all()?;
     fs::remove_file(from)
 }
 
@@ -89,7 +116,7 @@ pub fn carry_over_repo(root: &Path) -> Vec<String> {
     {
         let from = entry.path();
         let to = layout::sessions_dir(root).join(entry.file_name());
-        if !from.is_dir() || !from.join(".pushed").exists() || to.exists() {
+        if is_symlink(&from) || !from.is_dir() || !from.join(".pushed").exists() || to.exists() {
             left += 1;
             continue;
         }
@@ -274,5 +301,58 @@ mod tests {
         assert!(lines.iter().any(|l| l.starts_with("Copied ")), "{lines:?}");
         // Nothing left to do the second time.
         assert!(carry_over_user_in(&user).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_login_keeps_its_mode_and_a_link_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("tracevault");
+        let user = dir.path().join("visdom");
+        write(&legacy.join("credentials.json"), "{\"secret\":1}");
+        fs::set_permissions(
+            legacy.join("credentials.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        // A default repo that is a link to a file somewhere else.
+        write(&dir.path().join("elsewhere.toml"), "");
+        std::os::unix::fs::symlink(
+            dir.path().join("elsewhere.toml"),
+            legacy.join("default_repo.toml"),
+        )
+        .unwrap();
+
+        let lines = carry_over_user_in(&user);
+
+        let moved = user.join("credentials.json");
+        assert_eq!(fs::read_to_string(&moved).unwrap(), "{\"secret\":1}");
+        assert_eq!(
+            fs::metadata(&moved).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!legacy.join("credentials.json").exists());
+        assert!(legacy.join("default_repo.toml").exists());
+        assert!(!user.join("default_repo.toml").exists());
+        assert!(dir.path().join("elsewhere.toml").exists());
+        assert!(
+            lines.iter().any(|l| l.contains("symbolic link")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_move_never_replaces_what_is_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("old");
+        let to = dir.path().join("new");
+        fs::write(&from, "old").unwrap();
+        fs::write(&to, "new").unwrap();
+
+        assert!(move_without_replacing(&from, &to).is_err());
+
+        assert_eq!(fs::read_to_string(&to).unwrap(), "new");
+        assert_eq!(fs::read_to_string(&from).unwrap(), "old");
     }
 }
