@@ -133,6 +133,23 @@ pub fn check(ctx: &CheckContext) -> Vec<Finding> {
     findings
 }
 
+/// Whether an agent started here is bound to its repository and can ask for
+/// its policies: there is a login to a tracing server, and the agent's hooks
+/// are installed where it loads them from. The hooks are what binds a session
+/// and names it to the commands the agent runs, in both tracing modes.
+pub fn working(ctx: &CheckContext) -> bool {
+    if ctx.server_url.is_none() || ctx.credential != CredentialState::Present {
+        return false;
+    }
+    let global = global_hook_file(ctx);
+    match (&ctx.workdir.checkout, &ctx.workdir.primary) {
+        (Some(project_dir), Some(root)) => {
+            agent_hooks(ctx, project_dir, root, &global).severity == Severity::Ok
+        }
+        _ => matches!(has_tracevault_hooks(&global), Ok(true)),
+    }
+}
+
 fn auth(ctx: &CheckContext) -> Finding {
     const ID: &str = "tracing.auth";
     match (&ctx.credential, &ctx.server_url) {

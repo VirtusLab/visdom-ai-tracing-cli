@@ -17,6 +17,7 @@ use crate::config::{self, RepoConfig, UserConfig};
 use crate::finding::{command_line, needs_attention, render_text, Finding, Fix, FixAction};
 use crate::fixes::{apply_fixes, FixExecutor, FixOutcome, FixPolicy};
 use crate::gateway;
+use crate::instructions::{self, Facts, Told};
 use crate::mode::{configured_mode, effective_mode, ResolvedMode, TracingMode, MODE_ENV};
 use crate::suite::{self, PolicyState, SuiteMap};
 
@@ -156,6 +157,9 @@ pub struct Session {
     pub gateway_sources: GatewaySources,
     /// Where visdom keeps its own state (`<config dir>`).
     pub config_root: PathBuf,
+    /// Whether the agent is told about Visdom's tools (`agent_instructions`
+    /// in the user config; yes unless that says no).
+    pub agent_instructions: bool,
 }
 
 impl Session {
@@ -331,7 +335,55 @@ impl Session {
                 model: model_source,
             },
             config_root: env.config_root.clone(),
+            agent_instructions: user.agent_instructions.unwrap_or(true),
         })
+    }
+
+    /// What an agent started now would have of Visdom's, `through_gateway`
+    /// saying whether its LLM traffic goes through the AI Gateway.
+    pub fn facts(&self, through_gateway: bool) -> Facts {
+        Facts {
+            tracing: tracing::working(&self.ctx),
+            bazaar: bazaar::registered_name(
+                self.bazaar_url.as_ref().ok().and_then(|url| url.as_deref()),
+                self.adapter.as_ref(),
+                &self.ctx.workdir,
+            ),
+            gateway: through_gateway,
+        }
+    }
+
+    /// `args` for the agent, with what it is told about Visdom's tools, if
+    /// it is told anything.
+    pub fn agent_args(&self, args: &[String], through_gateway: bool) -> Told {
+        if !self.agent_instructions {
+            return Told::Nothing(args.to_vec());
+        }
+        let mut facts = self.facts(through_gateway);
+        // The caller's own options may take the registered servers away from
+        // this one session.
+        let agent = self.ctx.agent;
+        // What was found is of the directory `visdom` was run in: a Codex
+        // sent to work in another one is told nothing of it.
+        if agent == Agent::Codex && instructions::codex_works_elsewhere(args) {
+            return Told::Nothing(args.to_vec());
+        }
+        facts.tracing &= !instructions::without_hooks(agent, args);
+        let profile_changes_mcp = agent == Agent::Codex
+            && instructions::codex_profile_changes_mcp(args, &self.ctx.codex_home);
+        facts.bazaar = facts.bazaar.filter(|name| {
+            !profile_changes_mcp && !instructions::without_registered_mcp(agent, args, name)
+        });
+        match instructions::compose(&facts) {
+            Some(text) => instructions::agent_args(
+                self.ctx.agent,
+                &text,
+                args,
+                &self.ctx.codex_home,
+                &self.ctx.workdir.start_dir,
+            ),
+            None => Told::Nothing(args.to_vec()),
+        }
     }
 
     /// Tracing, then the mode and the gateway, then bazaar.

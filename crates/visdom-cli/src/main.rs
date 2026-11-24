@@ -15,13 +15,14 @@ use visdom_cli::finding::{exit_code, render_json, render_text};
 use visdom_cli::fixes::FixExecutor;
 use visdom_cli::fixes::{policy_for, FixPolicy};
 use visdom_cli::gateway::{ensure_key, key_store_path_in, KeyStore};
+use visdom_cli::instructions::Told;
 use visdom_cli::interactive::InitScope;
 use visdom_cli::mode::{
     configured_mode, ModeReason, TracingMode, TrafficPolicy, GATEWAY_SESSION_ENV, MODE_ENV,
 };
 use visdom_cli::suite::PolicyState;
 use visdom_cli::{config, interactive};
-use visdom_cli::{doctor as checks, env_alias, launch};
+use visdom_cli::{doctor as checks, env_alias, instructions, launch};
 
 fn main() {
     // Before the runtime starts its threads: this changes the environment.
@@ -99,7 +100,28 @@ fn main() {
             gateway_key(&runtime, &console, &project)
         }
         Some(VisdomCommand::Env { agent }) => env_script(&runtime, agent.or(cli.agent)),
-        None => check_and_launch(runtime, cli.agent, cli.mode, cli.yes, &cli.agent_args),
+        Some(VisdomCommand::Instructions { agent, mode }) => {
+            let session = gather(
+                &Environment::current(),
+                agent.or(cli.agent),
+                mode.or(cli.mode),
+                &runtime,
+            );
+            // Through the gateway when that is the mode and it can be used:
+            // what a launch from here would do.
+            let through_gateway = matches!(session.gateway, Some(Ok(_)));
+            if let Some(text) = instructions::compose(&session.facts(through_gateway)) {
+                print!("{text}");
+            }
+        }
+        None => check_and_launch(
+            runtime,
+            cli.agent,
+            cli.mode,
+            cli.yes,
+            !cli.no_instructions,
+            &cli.agent_args,
+        ),
     }
 }
 
@@ -723,6 +745,28 @@ fn env_script(runtime: &tokio::runtime::Runtime, agent: Option<Agent>) -> ! {
     }
 }
 
+/// The agent's arguments with what it is told about Visdom's tools. Where
+/// that is left to a configuration file of the agent's, the developer is told
+/// which, once.
+fn told_args(session: &Session, agent_args: &[String], through_gateway: bool) -> Vec<String> {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    match session.agent_args(agent_args, through_gateway) {
+        Told::With(args) | Told::Nothing(args) => args,
+        Told::LeftTo { file, args } => {
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "visdom: {} sets {}'s developer instructions, and visdom does not replace \
+                     them: the agent is not told about Visdom's tools. `visdom instructions` \
+                     prints the text to add there.",
+                    file.display(),
+                    session.ctx.agent.label()
+                );
+            }
+            args
+        }
+    }
+}
+
 /// The agent's command for this session: through the AI Gateway when that is
 /// the mode and the gateway is ready. A gateway that is not ready stops the
 /// launch only when the workspace requires it; a developer who merely chose
@@ -733,7 +777,9 @@ fn agent_command(
     agent_args: &[String],
 ) -> std::process::Command {
     let hooks = |session: &Session| {
-        let mut cmd = session.adapter.launch(agent_args);
+        let mut cmd = session
+            .adapter
+            .launch(&told_args(session, agent_args, false));
         // Said outright, so nothing left in the environment (this may be an
         // agent's own shell, inside a gateway session) can switch the hooks'
         // capture off for a session that does not use the gateway.
@@ -748,9 +794,11 @@ fn agent_command(
     let prepared = launch::prepare_gateway(session, runtime, &visdom, now()).and_then(|prepared| {
         session
             .adapter
-            .launch_via_gateway(agent_args, &prepared.launch, &|name| {
-                std::env::var(name).ok()
-            })
+            .launch_via_gateway(
+                &told_args(session, agent_args, true),
+                &prepared.launch,
+                &|name| std::env::var(name).ok(),
+            )
             .map(|cmd| (cmd, prepared.notes))
     });
     match prepared {
@@ -789,6 +837,7 @@ fn check_and_launch(
     agent: Option<Agent>,
     mode: Option<TracingMode>,
     yes: bool,
+    instructions: bool,
     agent_args: &[String],
 ) -> ! {
     let env = Environment::current();
@@ -803,6 +852,8 @@ fn check_and_launch(
     } else if policy == FixPolicy::Never && findings.iter().any(|f| f.fix.is_some()) {
         eprintln!("visdom: run `visdom doctor --fix` (or `visdom --yes`) to apply the fixes");
     }
+    // After the fixes: what was just set up is what the agent is told about.
+    session.agent_instructions &= instructions;
     // In the directory visdom was run in, like starting the agent by hand.
     let cmd = agent_command(&session, &runtime, agent_args);
     // The agent takes over this process: no runtime threads may outlive it.

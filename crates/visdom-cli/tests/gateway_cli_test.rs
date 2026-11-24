@@ -306,6 +306,307 @@ fn a_chosen_gateway_that_is_not_ready_falls_back_to_hooks() {
     assert_eq!(args(&log), ["--verbose"]);
 }
 
+/// A workspace that keeps sessions on hooks, so nothing of the gateway's is
+/// needed to start an agent.
+fn hooks_workspace() -> MockServer {
+    let settings = policy("direct");
+    MockServer::start(&[SUITE, ("GET /api/v1/workspace/settings", 200, &settings)])
+}
+
+/// The agent's hooks, installed for the whole machine: what binds a session
+/// to its repository.
+fn install_hooks(sb: &Sandbox, file: &str) {
+    let path = sb.home.path().join(file);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        path,
+        r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"visdom trace session-start"}]}]}}"#,
+    )
+    .unwrap();
+}
+
+const CLAUDE_HOOKS: &str = ".claude/settings.json";
+const CODEX_HOOKS: &str = ".codex/hooks.json";
+
+#[test]
+fn a_session_with_hooks_is_told_how_to_ask_for_its_policies() {
+    let server = hooks_workspace();
+    let (sb, log) = sandbox(&server);
+    install_hooks(&sb, CLAUDE_HOOKS);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--", "--verbose"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        args(&log),
+        ["--append-system-prompt", "# Visdom", "--verbose"]
+    );
+    let told = std::fs::read_to_string(&log).unwrap();
+    assert!(told.contains("visdom trace agent-policies"), "{told}");
+    assert!(told.contains("visdom trace repo switch <path>"), "{told}");
+    assert!(told.contains("visdom trace check"), "{told}");
+    assert!(!told.contains("## AI Gateway"), "{told}");
+    // Nothing is registered for this agent.
+    assert!(!told.contains("Bazaar"), "{told}");
+}
+
+#[test]
+fn a_session_through_the_gateway_is_told_to_leave_the_provider_alone() {
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let (sb, log) = sandbox(&server);
+    install_hooks(&sb, CLAUDE_HOOKS);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway", "--", "--verbose"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let args = args(&log);
+    // After what routes the session, ahead of the caller's options.
+    assert_eq!(args[0], "--settings");
+    assert_eq!(args[2], "--session-id");
+    assert_eq!(
+        args[4..],
+        ["--append-system-prompt", "# Visdom", "--verbose"]
+    );
+    let told = std::fs::read_to_string(&log).unwrap();
+    assert!(told.contains("## AI Gateway"), "{told}");
+    assert!(told.contains("visdom trace repo switch <path>"), "{told}");
+    // A check made by the hooks, which record nothing of this session.
+    assert!(!told.contains("visdom trace check"), "{told}");
+}
+
+#[test]
+fn an_agent_is_told_about_the_bazaar_it_has_under_the_name_it_has_it() {
+    const BAZAAR: &str = "https://ctx.example.com/mcp/remote";
+    let server = hooks_workspace();
+    let (sb, log) = sandbox(&server);
+    std::fs::write(
+        sb.home.path().join(".claude.json"),
+        format!(r#"{{"mcpServers":{{"org-context":{{"type":"http","url":"{BAZAAR}"}}}}}}"#),
+    )
+    .unwrap();
+    let run = |agent_args: &[&str]| {
+        let _ = std::fs::remove_file(&log);
+        let output = sb
+            .visdom(sb.repo.path())
+            .env("VISDOM_BAZAAR_URL", BAZAAR)
+            .arg("--")
+            .args(agent_args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        (args(&log), std::fs::read_to_string(&log).unwrap())
+    };
+
+    // The caller's own addition stays, after visdom's.
+    let (args, told) = run(&["--append-system-prompt", "Answer in Polish.", "-p", "hi"]);
+    assert_eq!(args[0], "--append-system-prompt");
+    assert_eq!(args[args.len() - 2..], ["-p", "hi"], "{args:?}");
+    assert_eq!(
+        args.iter()
+            .filter(|a| *a == "--append-system-prompt")
+            .count(),
+        1,
+        "{args:?}"
+    );
+    assert!(
+        told.contains("## Bazaar: the `org-context` MCP server"),
+        "{told}"
+    );
+    // Without the hooks no session is bound: nothing is said of policies.
+    assert!(!told.contains("visdom trace"), "{told}");
+    let (ours, theirs) = (
+        told.find("visdom doctor").unwrap(),
+        told.find("Answer in Polish.").unwrap(),
+    );
+    assert!(ours < theirs, "{told}");
+
+    // Started without its registered servers, it has no bazaar to be told
+    // of, and then nothing at all.
+    let (args, _) = run(&["--strict-mcp-config", "-p", "hi"]);
+    assert_eq!(args, ["--strict-mcp-config", "-p", "hi"]);
+}
+
+#[test]
+fn an_agent_is_told_nothing_when_that_is_asked_for() {
+    let server = hooks_workspace();
+    let (sb, log) = sandbox(&server);
+    install_hooks(&sb, CLAUDE_HOOKS);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--no-instructions", "--", "--verbose"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(args(&log), ["--verbose"]);
+
+    // A Claude Code that runs no hooks has no bound session to be told of.
+    std::fs::remove_file(&log).unwrap();
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--", "--bare", "-p", "hi"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(args(&log), ["--bare", "-p", "hi"]);
+
+    std::fs::remove_file(&log).unwrap();
+    let config = std::fs::read_to_string(sb.user_config()).unwrap();
+    sb.write_user_config(&format!("agent_instructions = false\n{config}"));
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--", "--verbose"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(args(&log), ["--verbose"]);
+}
+
+#[test]
+fn codex_is_told_in_its_developer_instructions_ahead_of_the_developers_own() {
+    let server = hooks_workspace();
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let (agent, log) = sb.recording_agent(&VARIABLES);
+    sb.write_user_config(&format!("[agents]\ncodex = \"{}\"\n", agent.display()));
+    install_hooks(&sb, CODEX_HOOKS);
+    std::fs::write(
+        sb.home.path().join(".codex/config.toml"),
+        "developer_instructions = \"Keep answers short.\"\n",
+    )
+    .unwrap();
+    let run = || {
+        let _ = std::fs::remove_file(&log);
+        let output = sb
+            .visdom(sb.repo.path())
+            .args(["--agent", "codex", "--", "exec", "say hi"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        (args(&log), stderr(&output))
+    };
+
+    let (args, said) = run();
+    assert_eq!(args[0], "-c");
+    assert_eq!(args[2..], ["exec", "say hi"], "{args:?}");
+    // One line, a TOML string: read back as Codex reads it.
+    let setting: toml::Table = toml::from_str(&args[1]).unwrap();
+    let told = setting["developer_instructions"].as_str().unwrap();
+    assert!(told.starts_with("# Visdom\n"), "{told}");
+    assert!(told.contains("visdom trace agent-policies"), "{told}");
+    assert!(told.ends_with("\n\nKeep answers short."), "{told}");
+    assert!(!said.contains("developer instructions"), "{said}");
+
+    // A project's own are Codex's to read or not (its trust): they are
+    // neither replaced nor made into an option, and the developer is told.
+    let project = sb.repo.path().join(".codex/config.toml");
+    std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+    std::fs::write(&project, "developer_instructions = \"Project rules.\"\n").unwrap();
+    let (args, said) = run();
+    assert_eq!(args, ["exec", "say hi"]);
+    assert!(
+        said.contains(".codex/config.toml sets Codex's developer instructions"),
+        "{said}"
+    );
+    assert!(said.contains("visdom instructions"), "{said}");
+    assert_eq!(said.matches("developer instructions").count(), 1, "{said}");
+}
+
+/// What is added for the agent takes nothing from the routing: Codex goes
+/// through the gateway with the instructions, the caller's own kept, and an
+/// option that would take it elsewhere still stops the launch.
+#[test]
+fn codex_through_the_gateway_is_told_and_still_cannot_be_sent_elsewhere() {
+    let settings = policy("enforced");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let (agent, log) = sb.recording_agent(&VARIABLES);
+    sb.write_user_config(&format!("[agents]\ncodex = \"{}\"\n", agent.display()));
+    install_hooks(&sb, CODEX_HOOKS);
+
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--agent", "codex", "--"])
+        .args([
+            "-c",
+            "developer_instructions=Mine",
+            "-c",
+            "model_provider=openai",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("`-c model_provider=openai`"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(lines(&log).is_empty(), "the agent must not have run");
+
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--agent", "codex", "--"])
+        .args(["-c", "developer_instructions=Mine", "exec", "hi"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(modes(&log), ["VISDOM_TRACING_MODE=gateway"]);
+    let args = args(&log);
+    assert!(args.contains(&r#"model_provider="visdom-gateway""#.to_string()));
+    assert_eq!(args[args.len() - 2..], ["exec", "hi"], "{args:?}");
+    let told: Vec<&String> = args
+        .iter()
+        .filter(|a| a.starts_with("developer_instructions="))
+        .collect();
+    assert_eq!(told.len(), 1, "{args:?}");
+    let setting: toml::Table = toml::from_str(told[0]).unwrap();
+    let told = setting["developer_instructions"].as_str().unwrap();
+    assert!(told.contains("## AI Gateway"), "{told}");
+    assert!(told.ends_with("\n\nMine"), "{told}");
+}
+
+#[test]
+fn instructions_prints_what_an_agent_would_be_told() {
+    let server = hooks_workspace();
+    let (sb, log) = sandbox(&server);
+    let print = || {
+        let output = sb
+            .visdom(sb.repo.path())
+            .arg("instructions")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        stdout(&output)
+    };
+    // Logged in, but no hook binds a session here: nothing to tell.
+    assert_eq!(print(), "");
+
+    install_hooks(&sb, CLAUDE_HOOKS);
+    let told = print();
+    assert!(told.starts_with("# Visdom\n"), "{told}");
+    assert!(told.contains("visdom trace repo switch <path>"), "{told}");
+    assert!(lines(&log).is_empty(), "no agent is started");
+}
+
 #[test]
 fn a_direct_workspace_keeps_sessions_on_hooks() {
     let settings = policy("direct");

@@ -12,6 +12,7 @@ pub mod env_alias;
 pub mod finding;
 pub mod fixes;
 pub mod gateway;
+pub mod instructions;
 pub mod interactive;
 pub mod launch;
 pub mod mode;
