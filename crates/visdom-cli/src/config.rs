@@ -31,6 +31,10 @@ pub struct UserConfig {
     /// The AI Gateway, for `tracing_mode = "gateway"`.
     #[serde(default)]
     pub gateway: GatewayConfig,
+    /// `false`: an agent `visdom` starts is told nothing about Visdom's
+    /// tools (see [`crate::instructions`]). Told by default.
+    #[serde(default)]
+    pub agent_instructions: Option<bool>,
 }
 
 /// `[gateway]`: how to reach and use the AI Gateway.

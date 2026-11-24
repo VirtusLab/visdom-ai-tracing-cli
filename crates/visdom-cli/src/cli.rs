@@ -31,6 +31,11 @@ pub struct VisdomCli {
     /// Apply every offered fix without asking.
     #[arg(long)]
     pub yes: bool,
+    /// Start the agent without telling it about Visdom's tools (see `visdom
+    /// instructions`). To leave them out always: `agent_instructions = false`
+    /// in the user config.
+    #[arg(long)]
+    pub no_instructions: bool,
     #[command(subcommand)]
     pub command: Option<VisdomCommand>,
     /// Arguments passed to the agent unchanged.
@@ -77,6 +82,17 @@ pub enum VisdomCommand {
         /// The agent the commands are for (see `visdom --help`).
         #[arg(long, value_enum)]
         agent: Option<Agent>,
+    },
+    /// Print what an agent started here with `visdom` is told about Visdom's
+    /// tools: the tracing commands, the bazaar MCP server, the AI Gateway —
+    /// each only if this session has it. Prints nothing when it has none.
+    Instructions {
+        /// The agent the text is for (see `visdom --help`).
+        #[arg(long, value_enum)]
+        agent: Option<Agent>,
+        /// The tracing mode it is for (see `visdom --help`).
+        #[arg(long, value_enum)]
+        mode: Option<TracingMode>,
     },
     /// Log in to Visdom
     Login(LoginArgs),

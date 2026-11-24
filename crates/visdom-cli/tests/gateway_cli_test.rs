@@ -136,7 +136,18 @@ fn a_chosen_gateway_session_gets_a_key_a_model_and_its_ids() {
         .to_string();
     assert!(helper.contains("gateway-key"), "{helper}");
     assert_eq!(args[2], "--session-id");
-    assert_eq!(args[4], "--verbose");
+    // What the session has, said to the agent ahead of the caller's options.
+    assert_eq!(
+        args[4..],
+        ["--append-system-prompt", "# Visdom", "--verbose"]
+    );
+    let told = std::fs::read_to_string(&log).unwrap();
+    assert!(told.contains("visdom trace repo switch <path>"), "{told}");
+    assert!(told.contains("## AI Gateway"), "{told}");
+    // A check made by the hooks, which record nothing of this session.
+    assert!(!told.contains("visdom trace check"), "{told}");
+    // Nothing is registered for this agent.
+    assert!(!told.contains("Bazaar"), "{told}");
     // The key reaches the agent through the helper only.
     assert!(
         !recorded.iter().any(|l| l.contains("sk-personal")),
@@ -303,7 +314,147 @@ fn a_chosen_gateway_that_is_not_ready_falls_back_to_hooks() {
         recorded.contains(&"ANTHROPIC_BASE_URL unset".to_string()),
         "{recorded:?}"
     );
+    assert_eq!(
+        args(&log),
+        ["--append-system-prompt", "# Visdom", "--verbose"]
+    );
+    let told = std::fs::read_to_string(&log).unwrap();
+    assert!(told.contains("visdom trace check"), "{told}");
+    assert!(!told.contains("## AI Gateway"), "{told}");
+}
+
+/// A workspace that keeps sessions on hooks, so nothing of the gateway's is
+/// needed to start an agent.
+fn hooks_workspace() -> MockServer {
+    let settings = policy("direct");
+    MockServer::start(&[SUITE, ("GET /api/v1/workspace/settings", 200, &settings)])
+}
+
+#[test]
+fn an_agent_is_told_about_the_bazaar_it_has_under_the_name_it_has_it() {
+    const BAZAAR: &str = "https://ctx.example.com/mcp/remote";
+    let server = hooks_workspace();
+    let (sb, log) = sandbox(&server);
+    std::fs::write(
+        sb.home.path().join(".claude.json"),
+        format!(r#"{{"mcpServers":{{"org-context":{{"type":"http","url":"{BAZAAR}"}}}}}}"#),
+    )
+    .unwrap();
+    let output = sb
+        .visdom(sb.repo.path())
+        .env("VISDOM_BAZAAR_URL", BAZAAR)
+        // The caller's own addition stays, after visdom's.
+        .args([
+            "--",
+            "--append-system-prompt",
+            "Answer in Polish.",
+            "-p",
+            "hi",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let args = args(&log);
+    assert_eq!(args[0], "--append-system-prompt");
+    assert_eq!(args[args.len() - 2..], ["-p", "hi"], "{args:?}");
+    assert_eq!(
+        args.iter()
+            .filter(|a| *a == "--append-system-prompt")
+            .count(),
+        1,
+        "{args:?}"
+    );
+    let told = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        told.contains("## Bazaar: the `org-context` MCP server"),
+        "{told}"
+    );
+    let (ours, theirs) = (
+        told.find("visdom doctor").unwrap(),
+        told.find("Answer in Polish.").unwrap(),
+    );
+    assert!(ours < theirs, "{told}");
+}
+
+#[test]
+fn an_agent_is_told_nothing_when_that_is_asked_for() {
+    let server = hooks_workspace();
+    let (sb, log) = sandbox(&server);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--no-instructions", "--", "--verbose"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(args(&log), ["--verbose"]);
+
+    std::fs::remove_file(&log).unwrap();
+    let config = std::fs::read_to_string(sb.user_config()).unwrap();
+    sb.write_user_config(&format!("agent_instructions = false\n{config}"));
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--", "--verbose"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(args(&log), ["--verbose"]);
+}
+
+#[test]
+fn codex_is_told_in_its_developer_instructions_ahead_of_its_own() {
+    let server = hooks_workspace();
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let (agent, log) = sb.recording_agent(&VARIABLES);
+    sb.write_user_config(&format!("[agents]\ncodex = \"{}\"\n", agent.display()));
+    let codex_home = sb.home.path().join(".codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::write(
+        codex_home.join("config.toml"),
+        "developer_instructions = \"Keep answers short.\"\n",
+    )
+    .unwrap();
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--agent", "codex", "--", "exec", "say hi"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let args = args(&log);
+    assert_eq!(args[0], "-c");
+    assert_eq!(args[2..], ["exec", "say hi"], "{args:?}");
+    // One line, a TOML string: read back as Codex reads it.
+    let setting: toml::Table = toml::from_str(&args[1]).unwrap();
+    let told = setting["developer_instructions"].as_str().unwrap();
+    assert!(told.starts_with("# Visdom\n"), "{told}");
+    assert!(told.contains("visdom trace agent-policies"), "{told}");
+    assert!(told.ends_with("\n\nKeep answers short."), "{told}");
+}
+
+#[test]
+fn instructions_prints_what_an_agent_would_be_told() {
+    let server = hooks_workspace();
+    let (sb, log) = sandbox(&server);
+    let output = sb
+        .visdom(sb.repo.path())
+        .arg("instructions")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let told = stdout(&output);
+    assert!(told.starts_with("# Visdom\n"), "{told}");
+    assert!(told.contains("visdom trace repo switch <path>"), "{told}");
+    assert!(lines(&log).is_empty(), "no agent is started");
+
+    // Nothing to tell where nothing of Visdom's is set up.
+    let bare = Sandbox::new();
+    let output = bare
+        .visdom(bare.repo.path())
+        .arg("instructions")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
 }
 
 #[test]

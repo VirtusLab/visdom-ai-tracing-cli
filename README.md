@@ -19,10 +19,11 @@ visdom doctor --fix         # …and offer the fixes (--yes applies all, --json 
 
 | Command | What it does |
 |---|---|
-| `visdom [--agent <a>] [--mode <m>] [--yes] [-- <agent args>]` | Check, offer each fix, start the agent in the current directory. Findings never stop the agent from starting (one exception: a gateway the workspace requires and that cannot be used, see below). |
+| `visdom [--agent <a>] [--mode <m>] [--yes] [--no-instructions] [-- <agent args>]` | Check, offer each fix, start the agent in the current directory. Findings never stop the agent from starting (one exception: a gateway the workspace requires and that cannot be used, see below). |
 | `visdom doctor [--fix] [--yes] [--json] [--agent <a>] [--mode <m>]` | The same checks without starting anything. |
 | `visdom login` / `visdom logout` | Same as `visdom login` / `logout`. |
 | `visdom init [...]` | Sets up this repository, the whole machine (`--global`) or a folder of checkouts (`--workspace`) — asked when no flag says which: tracing (`visdom trace init`, same flags), then registers the bazaar MCP server for the agent, then asks how your sessions are traced when that is yours to choose — and, through the AI Gateway, leaves the gateway ready to use. |
+| `visdom instructions [--agent <a>] [--mode <m>]` | Prints what an agent started here with `visdom` is told about Visdom's tools (see below). |
 | `visdom env [--agent <a>]` | Prints shell commands that send an agent you start *without* `visdom` through the AI Gateway: `source <(visdom env)`. |
 | `visdom trace <command>` | Every `tracevault` command: `visdom trace status`, `visdom trace verify-start`, … |
 
@@ -93,6 +94,34 @@ gateway that refuses the key, no model alias to ask for, a config that cannot be
 Every one of these settings can be kept in the config file; **what is left out there is taken
 from the environment** (`VISDOM_TRACING_MODE`, `VISDOM_GATEWAY_URL`, `VISDOM_GATEWAY_PROJECT`,
 `VISDOM_GATEWAY_MODEL`), and a variable that is set wins over the file — see Settings below.
+
+### What the agent is told
+
+An agent does not use what it does not know it has. So `visdom` tells the agent it starts what
+this session has of Visdom's and when to use it, in a short text ahead of your own instructions:
+
+- **Tracing** (when you are logged in): the session is bound to a repository whose policies
+  apply; `visdom trace agent-policies` prints them, `visdom trace repo switch <path>` comes before
+  work in another repository, `visdom trace repo status` shows the binding, and — with hooks
+  tracing — `visdom trace check` comes before a push.
+- **Bazaar** (when its MCP server is registered for the agent): what it holds and when to ask it,
+  under the name the server is registered with.
+- **The AI Gateway** (when the session goes through it): the provider settings are left alone.
+
+Only what was found working is mentioned, and where none of it is there the agent is started
+exactly as before. `visdom instructions` prints the text for the current directory.
+
+Nothing is written to `CLAUDE.md`, `AGENTS.md` or any other file, and no hook is involved: the
+text is an option of the agent's own command line.
+
+| Agent | How | Your own |
+|---|---|---|
+| Claude Code | `--append-system-prompt` | An `--append-system-prompt` you pass after `--` is kept, after `visdom`'s text (Claude Code itself would keep only the last one). |
+| Codex | `-c developer_instructions=…` | Your `developer_instructions` are kept, after `visdom`'s text: from `-c`, else the profile you name (`-p`), the project's `.codex/config.toml` or your `config.toml`. |
+
+`visdom --no-instructions` starts the agent without it once; `agent_instructions = false` in the
+user config leaves it out always. An agent started without `visdom` (see `visdom env`) is not told
+anything: `claude --append-system-prompt "$(visdom instructions)"` does it by hand.
 
 ### Hooks or the AI Gateway
 
@@ -211,6 +240,7 @@ Settings:
   bazaar_url = "https://context.example.com/mcp/remote"   # until the server publishes it
 
   tracing_mode = "gateway"                                # or "hooks" (the default)
+  agent_instructions = false                              # start agents without visdom's text
 
   [agents]                 # run another executable for an agent
   claude_code = "/opt/claude/bin/claude"

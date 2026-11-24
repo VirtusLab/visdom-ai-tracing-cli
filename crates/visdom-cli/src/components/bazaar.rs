@@ -80,6 +80,24 @@ pub fn same_bazaar(a: &str, b: &str) -> bool {
     }
 }
 
+/// The name the bazaar at `url` is registered under for the agent started in
+/// `workdir`, when it is registered and not switched off. This is what the
+/// agent will have, whatever `visdom` would rather see (the OAuth client, the
+/// scope): those are the check's findings.
+pub fn registered_name(
+    url: Option<&str>,
+    adapter: &dyn AgentAdapter,
+    workdir: &Workdir,
+) -> Option<String> {
+    let url = url.filter(|url| is_http_url(url))?;
+    adapter
+        .mcp_entries(workdir)
+        .ok()?
+        .into_iter()
+        .find(|e| !e.disabled && e.url.as_deref().is_some_and(|u| same_bazaar(u, url)))
+        .map(|e| e.name)
+}
+
 fn describe(action: &FixAction) -> String {
     match action {
         FixAction::RunCommand { program, args, cwd } => {
