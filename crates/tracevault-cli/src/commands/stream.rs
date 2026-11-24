@@ -1438,8 +1438,14 @@ pub const GATEWAY_SESSION_ENV: &str = "VISDOM_GATEWAY_SESSION";
 /// go quiet: whatever else is started from its shell — another agent, by
 /// hand or by the first one — inherits the variable without being routed
 /// anywhere, and is captured.
+///
+/// `1` is what `visdom` 1.0.0 sets, for whichever agent it started: still
+/// taken, for every agent, so that its gateway sessions are not captured a
+/// second time by a newer `tracevault`.
 pub fn captured_by_gateway(marker: Option<&str>, agent: crate::agent::Agent) -> bool {
-    marker.is_some_and(|m| m.trim().eq_ignore_ascii_case(agent.tool_name()))
+    marker
+        .map(str::trim)
+        .is_some_and(|m| m == "1" || m.eq_ignore_ascii_case(agent.tool_name()))
 }
 
 pub async fn run_stream(

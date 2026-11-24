@@ -176,7 +176,8 @@ claude                               # now goes through the gateway
   for `codex …` typed in that shell, not for a program that runs the `codex` executable itself).
 - It sets `VISDOM_GATEWAY_SESSION` to the agent's name, which switches that agent's capture
   hooks off when it is started from that shell: the gateway records it. Another agent started
-  there is not routed by this script, and is captured by its hooks as usual.
+  there is not routed by this script, and is captured by its hooks as usual. (`visdom` 1.0.0 set
+  the variable to `1` for whichever agent it started; `tracevault` still takes that.)
 - The repository in the attribution headers is the one `visdom env` was run in; run it per
   repository (an `.envrc` does that).
 - It is weaker than `visdom`: `env` in the agent's own settings files still wins over the
