@@ -362,9 +362,9 @@ impl Session {
         let mut facts = self.facts(through_gateway);
         // The caller's own options may take the registered servers away from
         // this one session.
-        if instructions::without_registered_mcp(self.ctx.agent, args) {
-            facts.bazaar = None;
-        }
+        facts.bazaar = facts
+            .bazaar
+            .filter(|name| !instructions::without_registered_mcp(self.ctx.agent, args, name));
         match instructions::compose(&facts) {
             Some(text) => instructions::agent_args(
                 self.ctx.agent,

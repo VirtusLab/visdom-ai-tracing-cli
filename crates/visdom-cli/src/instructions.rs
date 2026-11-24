@@ -171,12 +171,41 @@ fn has_flag(args: &[String], option: &str) -> bool {
         .any(|arg| arg == option)
 }
 
-/// Whether the caller's options start `agent` without the MCP servers
-/// registered for it, so that one found registered is not one this session
-/// has.
-pub fn without_registered_mcp(agent: Agent, args: &[String]) -> bool {
+/// The configuration overrides among Codex's `args` (`-c key=value`, in
+/// every spelling), before the `--` that starts the prompt.
+fn codex_overrides(args: &[String]) -> Vec<&str> {
+    let mut overrides = Vec::new();
+    let mut options = args.iter().take_while(|arg| *arg != "--");
+    while let Some(arg) = options.next() {
+        if arg == "-c" || arg == "--config" {
+            overrides.extend(options.next().map(String::as_str));
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            overrides.push(value);
+        } else if let Some(value) = arg.strip_prefix("-c").filter(|_| !arg.starts_with("--")) {
+            overrides.push(value.strip_prefix('=').unwrap_or(value));
+        }
+    }
+    overrides
+}
+
+/// Whether the caller's options start `agent` without the MCP server
+/// registered for it as `name`, or may: one found registered is then not one
+/// this session is known to have. For Codex that is any override of its
+/// servers as a whole or of this one.
+pub fn without_registered_mcp(agent: Agent, args: &[String], name: &str) -> bool {
     match agent {
-        Agent::Codex => false,
+        Agent::Codex => codex_overrides(args).into_iter().any(|setting| {
+            let key: String = setting
+                .split('=')
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+                .collect();
+            key == "mcp_servers"
+                || key == format!("mcp_servers.{name}")
+                || key.starts_with(&format!("mcp_servers.{name}."))
+        }),
         _ => has_flag(args, "--strict-mcp-config") || has_flag(args, "--bare"),
     }
 }
@@ -258,14 +287,24 @@ fn codex_options(args: &[String]) -> CodexOptions {
             i += taken;
             continue;
         }
+        // A short option's value may be attached to it: `-pwork`, `-C/dir`.
+        let attached = |short: &str| {
+            arg.strip_prefix(short)
+                .filter(|value| !arg.starts_with("--") && !value.is_empty())
+                .map(|value| value.strip_prefix('=').unwrap_or(value).to_string())
+        };
         if arg == "-p" || arg == "--profile" {
             found.profile = next.cloned();
         } else if let Some(name) = arg.strip_prefix("--profile=") {
             found.profile = Some(name.to_string());
+        } else if let Some(name) = attached("-p") {
+            found.profile = Some(name);
         } else if arg == "-C" || arg == "--cd" {
             found.cd = next.cloned();
         } else if let Some(dir) = arg.strip_prefix("--cd=") {
             found.cd = Some(dir.to_string());
+        } else if let Some(dir) = attached("-C") {
+            found.cd = Some(dir);
         }
         found.rest.push(arg.clone());
         i += 1;
@@ -524,21 +563,36 @@ mod tests {
 
     #[test]
     fn a_claude_started_without_its_registered_servers_has_no_bazaar_to_be_told_of() {
-        let strict = strings(&["--strict-mcp-config", "--mcp-config", "mine.json"]);
-        assert!(without_registered_mcp(Agent::ClaudeCode, &strict));
-        assert!(without_registered_mcp(
-            Agent::ClaudeCode,
-            &strings(&["--bare"])
-        ));
-        assert!(!without_registered_mcp(
-            Agent::ClaudeCode,
-            &strings(&["--mcp-config", "more.json"])
-        ));
+        let without =
+            |args: &[&str]| without_registered_mcp(Agent::ClaudeCode, &strings(args), "b");
+        assert!(without(&[
+            "--strict-mcp-config",
+            "--mcp-config",
+            "mine.json"
+        ]));
+        assert!(without(&["--bare"]));
+        assert!(!without(&["--mcp-config", "more.json"]));
         // A prompt that names the option is a prompt.
-        assert!(!without_registered_mcp(
-            Agent::ClaudeCode,
-            &strings(&["--", "--strict-mcp-config"])
-        ));
+        assert!(!without(&["--", "--strict-mcp-config"]));
+    }
+
+    #[test]
+    fn a_codex_whose_options_touch_the_server_is_not_told_of_it() {
+        let without =
+            |args: &[&str]| without_registered_mcp(Agent::Codex, &strings(args), "bazaar");
+        assert!(without(&["-c", "mcp_servers.bazaar.enabled=false"]));
+        assert!(without(&["--config=mcp_servers.bazaar.url=\"https://x\""]));
+        assert!(without(&["-cmcp_servers.\"bazaar\".enabled=false", "exec"]));
+        assert!(without(&["-c", "mcp_servers={}"]));
+        assert!(!without(&["-c", "mcp_servers.bazaar-2.enabled=false"]));
+        assert!(!without(&["-c", "mcp_servers.other.enabled=false"]));
+        assert!(!without(&["-c", "model=\"x\"", "exec"]));
+        assert!(!without(&[
+            "exec",
+            "--",
+            "-c",
+            "mcp_servers.bazaar.enabled=false"
+        ]));
     }
 
     /// A Codex directory, a directory to start in and a machine-wide config
@@ -663,6 +717,7 @@ mod tests {
         .unwrap();
         assert_eq!(value(&["-p", "work", "exec"]), "T\n\nProfile");
         assert_eq!(value(&["--profile=work"]), "T\n\nProfile");
+        assert_eq!(value(&["-pwork", "exec"]), "T\n\nProfile");
         // A profile that sets none leaves the developer's.
         assert_eq!(value(&["-p", "other"]), "T\n\nUser");
         // A profile is a name, never a path out of the Codex directory.
@@ -710,6 +765,14 @@ mod tests {
             Told::LeftTo {
                 file: project.clone(),
                 args: sent.clone()
+            }
+        );
+        let attached = strings(&[&format!("-C{}", repo.display()), "exec"]);
+        assert_eq!(
+            from(elsewhere.path(), &attached),
+            Told::LeftTo {
+                file: project.clone(),
+                args: attached.clone()
             }
         );
         assert!(matches!(from(elsewhere.path(), &args), Told::With(_)));

@@ -513,6 +513,67 @@ fn codex_is_told_in_its_developer_instructions_ahead_of_the_developers_own() {
     assert_eq!(said.matches("developer instructions").count(), 1, "{said}");
 }
 
+/// What is added for the agent takes nothing from the routing: Codex goes
+/// through the gateway with the instructions, the caller's own kept, and an
+/// option that would take it elsewhere still stops the launch.
+#[test]
+fn codex_through_the_gateway_is_told_and_still_cannot_be_sent_elsewhere() {
+    let settings = policy("enforced");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let (agent, log) = sb.recording_agent(&VARIABLES);
+    sb.write_user_config(&format!("[agents]\ncodex = \"{}\"\n", agent.display()));
+    install_hooks(&sb, CODEX_HOOKS);
+
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--agent", "codex", "--"])
+        .args([
+            "-c",
+            "developer_instructions=Mine",
+            "-c",
+            "model_provider=openai",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("`-c model_provider=openai`"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(lines(&log).is_empty(), "the agent must not have run");
+
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--agent", "codex", "--"])
+        .args(["-c", "developer_instructions=Mine", "exec", "hi"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(modes(&log), ["VISDOM_TRACING_MODE=gateway"]);
+    let args = args(&log);
+    assert!(args.contains(&r#"model_provider="visdom-gateway""#.to_string()));
+    assert_eq!(args[args.len() - 2..], ["exec", "hi"], "{args:?}");
+    let told: Vec<&String> = args
+        .iter()
+        .filter(|a| a.starts_with("developer_instructions="))
+        .collect();
+    assert_eq!(told.len(), 1, "{args:?}");
+    let setting: toml::Table = toml::from_str(told[0]).unwrap();
+    let told = setting["developer_instructions"].as_str().unwrap();
+    assert!(told.contains("## AI Gateway"), "{told}");
+    assert!(told.ends_with("\n\nMine"), "{told}");
+}
+
 #[test]
 fn instructions_prints_what_an_agent_would_be_told() {
     let server = hooks_workspace();

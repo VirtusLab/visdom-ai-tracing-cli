@@ -107,8 +107,10 @@ this session has of Visdom's and when to use it, in a short text ahead of your o
   tracing — `visdom trace check` comes before a push.
 - **Bazaar** (when its MCP server is registered for the agent): what it holds and when to ask it,
   under the name the server is registered with. Not when you start Claude Code without its
-  registered servers (`--strict-mcp-config`, `--bare`).
-- **The AI Gateway** (when the session goes through it): the provider settings are left alone.
+  registered servers (`--strict-mcp-config`, `--bare`), or Codex with an option that changes that
+  server (`-c mcp_servers.…`).
+- **The AI Gateway** (when the session goes through it, beside either of the above: alone it gives
+  the agent nothing to use, and nothing is said): the provider settings are left alone.
 
 Only what was found working is mentioned, and where none of it is there the agent is started
 exactly as before. `visdom instructions` prints the text for the current directory.
