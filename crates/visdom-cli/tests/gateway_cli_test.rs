@@ -451,6 +451,16 @@ fn an_agent_is_told_nothing_when_that_is_asked_for() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(args(&log), ["--verbose"]);
 
+    // A Claude Code that runs no hooks has no bound session to be told of.
+    std::fs::remove_file(&log).unwrap();
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--", "--bare", "-p", "hi"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(args(&log), ["--bare", "-p", "hi"]);
+
     std::fs::remove_file(&log).unwrap();
     let config = std::fs::read_to_string(sb.user_config()).unwrap();
     sb.write_user_config(&format!("agent_instructions = false\n{config}"));

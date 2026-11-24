@@ -210,6 +210,31 @@ pub fn without_registered_mcp(agent: Agent, args: &[String], name: &str) -> bool
     }
 }
 
+/// Whether the caller's options start `agent` without its hooks, so that
+/// nothing binds the session: Claude Code's `--bare` skips them.
+pub fn without_hooks(agent: Agent, args: &[String]) -> bool {
+    agent != Agent::Codex && has_flag(args, "--bare")
+}
+
+/// Whether the caller's options have Codex work in another directory than
+/// the one it is started in (`-C`). What that directory has of Visdom's was
+/// not looked at.
+pub fn codex_works_elsewhere(args: &[String]) -> bool {
+    codex_options(args).cd.is_some()
+}
+
+/// Whether the profile the caller names for Codex has anything to say about
+/// its MCP servers: one found registered may then be switched off.
+pub fn codex_profile_changes_mcp(args: &[String], codex_home: &Path) -> bool {
+    codex_options(args)
+        .profile
+        .filter(|name| plain_name(name).is_some())
+        .and_then(|name| {
+            std::fs::read_to_string(codex_home.join(format!("{name}.config.toml"))).ok()
+        })
+        .is_some_and(|text| text.contains("mcp_servers"))
+}
+
 const CODEX_KEY: &str = "developer_instructions";
 
 /// The value of a `-c developer_instructions=…` override, when `setting` is
@@ -574,6 +599,40 @@ mod tests {
         assert!(!without(&["--mcp-config", "more.json"]));
         // A prompt that names the option is a prompt.
         assert!(!without(&["--", "--strict-mcp-config"]));
+    }
+
+    #[test]
+    fn a_bare_claude_runs_no_hooks() {
+        assert!(without_hooks(
+            Agent::ClaudeCode,
+            &strings(&["--bare", "-p"])
+        ));
+        assert!(!without_hooks(Agent::ClaudeCode, &strings(&["-p", "hi"])));
+        assert!(!without_hooks(Agent::Codex, &strings(&["--bare"])));
+    }
+
+    #[test]
+    fn a_codex_sent_elsewhere_or_given_a_profile_with_servers_is_noticed() {
+        assert!(codex_works_elsewhere(&strings(&["-C", "/x", "exec"])));
+        assert!(codex_works_elsewhere(&strings(&["--cd=/x"])));
+        assert!(codex_works_elsewhere(&strings(&["-C/x"])));
+        assert!(!codex_works_elsewhere(&strings(&[
+            "exec", "--", "-C", "/x"
+        ])));
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("work.config.toml"),
+            "[mcp_servers.bazaar]\nenabled = false\n",
+        )
+        .unwrap();
+        std::fs::write(home.path().join("plain.config.toml"), "model = \"x\"\n").unwrap();
+        let changes = |args: &[&str]| codex_profile_changes_mcp(&strings(args), home.path());
+        assert!(changes(&["-p", "work"]));
+        assert!(changes(&["-pwork"]));
+        assert!(!changes(&["-p", "plain"]));
+        assert!(!changes(&["-p", "missing"]));
+        assert!(!changes(&["exec"]));
     }
 
     #[test]

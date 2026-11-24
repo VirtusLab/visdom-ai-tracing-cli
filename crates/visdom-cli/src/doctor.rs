@@ -362,9 +362,18 @@ impl Session {
         let mut facts = self.facts(through_gateway);
         // The caller's own options may take the registered servers away from
         // this one session.
-        facts.bazaar = facts
-            .bazaar
-            .filter(|name| !instructions::without_registered_mcp(self.ctx.agent, args, name));
+        let agent = self.ctx.agent;
+        // What was found is of the directory `visdom` was run in: a Codex
+        // sent to work in another one is told nothing of it.
+        if agent == Agent::Codex && instructions::codex_works_elsewhere(args) {
+            return Told::Nothing(args.to_vec());
+        }
+        facts.tracing &= !instructions::without_hooks(agent, args);
+        let profile_changes_mcp = agent == Agent::Codex
+            && instructions::codex_profile_changes_mcp(args, &self.ctx.codex_home);
+        facts.bazaar = facts.bazaar.filter(|name| {
+            !profile_changes_mcp && !instructions::without_registered_mcp(agent, args, name)
+        });
         match instructions::compose(&facts) {
             Some(text) => instructions::agent_args(
                 self.ctx.agent,

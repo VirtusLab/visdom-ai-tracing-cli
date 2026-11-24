@@ -112,6 +112,10 @@ this session has of Visdom's and when to use it, in a short text ahead of your o
 - **The AI Gateway** (when the session goes through it, beside either of the above: alone it gives
   the agent nothing to use, and nothing is said): the provider settings are left alone.
 
+What you pass the agent counts: Claude Code's `--bare` runs no hooks, so nothing is said of
+tracing; a Codex sent to another directory with `-C` is told nothing, since that directory was not
+looked at; a Codex profile (`-p`) that configures MCP servers leaves bazaar out.
+
 Only what was found working is mentioned, and where none of it is there the agent is started
 exactly as before. `visdom instructions` prints the text for the current directory.
 
