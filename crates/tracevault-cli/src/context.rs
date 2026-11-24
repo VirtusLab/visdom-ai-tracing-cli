@@ -58,6 +58,13 @@ pub struct ContextPaths {
 }
 
 impl ContextPaths {
+    /// Whether the checkout has been set up: its `.visdom/` exists, or the
+    /// `.tracevault/` of an earlier release does.
+    pub fn is_set_up(&self) -> bool {
+        self.state_dir.exists()
+            || crate::layout::legacy_twin(&self.state_dir).is_some_and(|dir| dir.exists())
+    }
+
     /// `<state_dir>/context.json` — the global (repo-wide) context file.
     pub fn global_path(&self) -> PathBuf {
         self.state_dir.join("context.json")
@@ -123,23 +130,11 @@ fn git_rev_parse(start_dir: &Path) -> Option<(PathBuf, PathBuf)> {
     Some((git_common_dir, git_dir))
 }
 
-/// The directory `root`'s context files are in: `.visdom/`, unless an earlier
-/// release left them in a `.visdom/` and nothing has been written to the
-/// new directory yet — context written there keeps being read and edited
-/// there until `init` carries it over.
+/// The directory `root`'s context files are written to. A file an earlier
+/// release left in `.tracevault/` is still read — each file on its own, see
+/// [`Context::load_from`] — until something is saved in its place.
 fn context_dir(root: &Path) -> PathBuf {
-    let new = crate::layout::repo_dir(root);
-    let legacy = crate::layout::legacy_repo_dir(root);
-    let holds_context =
-        |dir: &Path| dir.join("context.json").exists() || dir.join("worktrees").exists();
-    if holds_context(&new) {
-        new
-    } else if holds_context(&legacy) {
-        legacy
-    } else {
-        // No context yet: wherever the checkout was set up.
-        crate::layout::existing_or_new(new, legacy)
-    }
+    crate::layout::repo_dir(root)
 }
 
 /// Resolve worktree-aware context paths from `start_dir`.
@@ -196,6 +191,9 @@ impl Context {
     /// Use `ContextPaths::global_path()` or `ContextPaths::worktree_path()` to
     /// obtain the correct path for the current worktree context.
     pub fn load_from(path: &Path) -> Context {
+        // A file an earlier release wrote under the `tracevault` names is
+        // read until one is saved under the new name.
+        let path = &crate::layout::existing_or_twin(path);
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Context::default(),
@@ -264,7 +262,7 @@ impl Context {
     /// Returns `Some(ctx)` only when the file exists and was successfully (or partially) loaded.
     pub fn load_worktree(paths: &ContextPaths) -> Option<Context> {
         let wt_path = paths.worktree_path()?;
-        if !wt_path.exists() {
+        if !crate::layout::existing_or_twin(&wt_path).exists() {
             return None;
         }
         Some(Self::load_from(&wt_path))
@@ -547,5 +545,67 @@ mod tests {
         assert_eq!(eff.flow_id, Some("g".to_string()));
         assert_eq!(eff.labels, vec!["a"]);
         assert_eq!(eff.params["k"], "1");
+    }
+
+    #[test]
+    fn legacy_context_is_read_file_by_file_and_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let json = |notes: &str| format!(r#"{{"labels":["{notes}"],"params":{{}}}}"#);
+        let write = |rel: &str, notes: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, json(notes)).unwrap();
+        };
+        // The global file is already under the new name; the worktree's one
+        // is still where an earlier release wrote it.
+        write(".visdom/context.json", "new global");
+        write(".tracevault/context.json", "old global");
+        write(".tracevault/worktrees/feature/context.json", "old worktree");
+        let paths = ContextPaths {
+            state_dir: root.join(".visdom"),
+            scope: WorktreeScope::Linked {
+                key: "feature".into(),
+            },
+        };
+
+        let global = Context::load_global(&paths);
+        let mut worktree = Context::load_worktree(&paths).expect("the legacy worktree file");
+        assert_eq!(
+            serde_json::to_value(&global).unwrap(),
+            serde_json::to_value(Context::load_from(&root.join(".visdom/context.json"))).unwrap()
+        );
+        assert_ne!(
+            serde_json::to_value(&worktree).unwrap(),
+            serde_json::to_value(Context::default()).unwrap(),
+            "the worktree context an earlier release wrote must still be read"
+        );
+
+        // Saving goes to the new place and leaves the old file as it was.
+        worktree.save_worktree(&paths).unwrap();
+        assert!(root.join(".visdom/worktrees/feature/context.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join(".tracevault/worktrees/feature/context.json"))
+                .unwrap(),
+            json("old worktree")
+        );
+        worktree = Context::default();
+        worktree.save_global(&paths).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join(".tracevault/context.json")).unwrap(),
+            json("old global")
+        );
+    }
+
+    #[test]
+    fn a_checkout_set_up_by_an_earlier_release_counts_as_set_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ContextPaths {
+            state_dir: dir.path().join(".visdom"),
+            scope: WorktreeScope::Primary,
+        };
+        assert!(!paths.is_set_up());
+        std::fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
+        assert!(paths.is_set_up());
     }
 }

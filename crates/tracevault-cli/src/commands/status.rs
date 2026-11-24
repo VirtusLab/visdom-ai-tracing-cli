@@ -1395,8 +1395,9 @@ fn count_pending_events(session_dir: &Path, include_legacy: bool) -> usize {
 }
 
 fn session_checks(project_root: &Path) -> Vec<Check> {
-    let sessions_dir = project_root.join(".visdom/sessions");
-    if !sessions_dir.exists() {
+    // Sessions an earlier release started are still in `.tracevault/`.
+    let sessions_dirs = crate::layout::existing_sessions_dirs(project_root);
+    if sessions_dirs.is_empty() {
         return vec![Check::skip(
             "Pending events",
             "no .visdom/sessions/ here (project-local check; a detached worker's queue may live under its own working dir)",
@@ -1414,17 +1415,19 @@ fn session_checks(project_root: &Path) -> Vec<Check> {
     let mut sessions_with_pending = 0usize;
     let mut pending_event_count = 0usize;
 
-    if let Ok(read) = fs::read_dir(&sessions_dir) {
-        for entry in read.flatten() {
-            if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            total_sessions += 1;
-            let count = count_pending_events(&entry.path(), include_legacy);
-            if count > 0 {
-                sessions_with_pending += 1;
-                pending_event_count += count;
-            }
+    let entries = sessions_dirs
+        .iter()
+        .filter_map(|dir| fs::read_dir(dir).ok())
+        .flatten();
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        total_sessions += 1;
+        let count = count_pending_events(&entry.path(), include_legacy);
+        if count > 0 {
+            sessions_with_pending += 1;
+            pending_event_count += count;
         }
     }
 
@@ -3498,6 +3501,25 @@ mod tests {
         assert_eq!(
             recording_check(Some("s"), attribution.as_ref()).map(|c| c.level),
             Some(Level::Error)
+        );
+    }
+
+    #[test]
+    fn pending_events_in_a_legacy_session_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join(".tracevault/sessions/old");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("pending-a.jsonl"), "line1\nline2\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".visdom/sessions/new")).unwrap();
+
+        let checks = session_checks(dir.path());
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].level, Level::Warn, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("2 event(s) in 1/2 session(s)"),
+            "{}",
+            checks[0].detail
         );
     }
 }

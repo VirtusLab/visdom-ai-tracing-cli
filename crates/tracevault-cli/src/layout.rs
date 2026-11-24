@@ -160,6 +160,32 @@ pub fn existing_user_tracing_config(user_dir: &Path) -> PathBuf {
     user_path_renamed(user_dir, TRACING_CONFIG, LEGACY_TRACING_CONFIG)
 }
 
+/// Where an earlier release would have kept the file or directory `path`:
+/// the same path with its `.visdom` component spelled `.tracevault`, or — for
+/// a file directly in a `visdom` user directory — the one in the `tracevault`
+/// directory beside it. `None` for a path that is in neither.
+pub fn legacy_twin(path: &Path) -> Option<PathBuf> {
+    let parts: Vec<_> = path.components().collect();
+    if let Some(at) = parts.iter().rposition(|c| c.as_os_str() == REPO_DIR) {
+        let mut twin: PathBuf = parts[..at].iter().collect();
+        twin.push(LEGACY_REPO_DIR);
+        twin.extend(&parts[at + 1..]);
+        return Some(twin);
+    }
+    Some(legacy_sibling(path.parent()?)?.join(path.file_name()?))
+}
+
+/// `path`, or its [`legacy_twin`] when `path` does not exist and the twin
+/// does: the file to **read**.
+pub fn existing_or_twin(path: &Path) -> PathBuf {
+    if !path.exists() {
+        if let Some(twin) = legacy_twin(path).filter(|twin| twin.exists()) {
+            return twin;
+        }
+    }
+    path.to_path_buf()
+}
+
 /// `sessions_dir` (a checkout's `.visdom/sessions`) and, when there is one,
 /// the `.tracevault/sessions` beside it: every directory to scan for the
 /// checkout's sessions. A directory laid out differently is scanned alone.
@@ -295,6 +321,29 @@ mod tests {
         assert_eq!(
             user_path(&injected, "credentials.json"),
             injected.join("credentials.json")
+        );
+    }
+
+    #[test]
+    fn a_legacy_twin_is_the_same_path_under_the_old_name() {
+        assert_eq!(
+            legacy_twin(Path::new("/repo/.visdom/worktrees/wt/context.json")),
+            Some(PathBuf::from("/repo/.tracevault/worktrees/wt/context.json"))
+        );
+        assert_eq!(
+            legacy_twin(Path::new("/home/u/.config/visdom/context.json")),
+            Some(PathBuf::from("/home/u/.config/tracevault/context.json"))
+        );
+        assert_eq!(legacy_twin(Path::new("/somewhere/else/context.json")), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let new = dir.path().join(".visdom/context.json");
+        assert_eq!(existing_or_twin(&new), new);
+        fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
+        fs::write(dir.path().join(".tracevault/context.json"), "{}").unwrap();
+        assert_eq!(
+            existing_or_twin(&new),
+            dir.path().join(".tracevault/context.json")
         );
     }
 }

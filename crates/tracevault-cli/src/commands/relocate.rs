@@ -7,7 +7,7 @@
 //! being read where they are.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::layout;
 
@@ -112,40 +112,44 @@ pub fn carry_over_repo(root: &Path) -> Vec<String> {
 
 /// Carry the user-level `tracevault/` directory beside `user_dir` (the
 /// `visdom/` config directory) over to it: the login, the tracing config (as
-/// `tracing.toml`), the user context, the default repo and project and the
-/// install state.
+/// `tracing.toml`), the default repo and project and the install state, and
+/// a copy of the user context.
 pub fn carry_over_user_in(user_dir: &Path) -> Vec<String> {
     let Some(legacy) = layout::legacy_sibling(user_dir).filter(|dir| dir.is_dir()) else {
         return vec![];
     };
     let mut lines = Vec::new();
-    // A config that names its context file by path keeps naming it: the file
-    // is left where that path says.
-    let named_context: Option<PathBuf> = crate::config::try_load_user_config_in(user_dir)
-        .ok()
-        .flatten()
-        .and_then(|config| config.user_context)
-        .and_then(|context| match context {
-            crate::config::UserContext::Path(path) => Some(PathBuf::from(path)),
-            crate::config::UserContext::Full { path, .. } => path.map(PathBuf::from),
-            crate::config::UserContext::Toggle(_) => None,
-        });
     lines.extend(carry(
         &legacy.join(layout::LEGACY_TRACING_CONFIG),
         &user_dir.join(layout::TRACING_CONFIG),
     ));
     for name in [
         "credentials.json",
-        "context.json",
         "default_repo.toml",
         "user_project.toml",
         "install-state.json",
     ] {
-        let from = legacy.join(name);
-        if name == "context.json" && named_context.as_deref() == Some(from.as_path()) {
-            continue;
-        }
-        lines.extend(carry(&from, &user_dir.join(name)));
+        lines.extend(carry(&legacy.join(name), &user_dir.join(name)));
+    }
+    // The user context is copied, not moved: a config — the user's, or any
+    // repository's, which cannot be found from here — may name the old file
+    // by its path, and must keep finding it.
+    let (from, to) = (legacy.join("context.json"), user_dir.join("context.json"));
+    if from.exists() && !to.exists() {
+        lines.push(
+            match fs::create_dir_all(user_dir).and_then(|()| fs::copy(&from, &to)) {
+                Ok(_) => format!(
+                    "Copied {} to {} (the old file is left for configs that name it by path)",
+                    from.display(),
+                    to.display()
+                ),
+                Err(e) => format!(
+                    "Could not copy {} to {} ({e}); it is still read where it is",
+                    from.display(),
+                    to.display()
+                ),
+            },
+        );
     }
     if remove_if_spent(&legacy, &["install-state.lock"]) {
         lines.push(format!("Removed the empty {}", legacy.display()));
@@ -250,26 +254,13 @@ mod tests {
             fs::read_to_string(user.join("config.toml")).unwrap(),
             "agent = \"codex\"\n"
         );
+        // The user context is copied: a repository's config may name the
+        // old file by path, so it stays, and with it the directory.
         assert!(user.join("context.json").exists());
-        assert!(!legacy.exists(), "{lines:?}");
-    }
-
-    #[test]
-    fn a_context_file_the_config_names_by_path_is_left_there() {
-        let dir = tempfile::tempdir().unwrap();
-        let legacy = dir.path().join("tracevault");
-        let user = dir.path().join("visdom");
-        let context = legacy.join("context.json");
-        write(&context, "{}");
-        write(
-            &legacy.join("config.toml"),
-            &format!("user_context = {:?}\n", context.display().to_string()),
-        );
-
-        carry_over_user_in(&user);
-
-        assert!(context.exists());
-        assert!(!user.join("context.json").exists());
-        assert!(user.join("tracing.toml").exists());
+        assert!(legacy.join("context.json").exists());
+        assert!(!legacy.join("credentials.json").exists());
+        assert!(lines.iter().any(|l| l.starts_with("Copied ")), "{lines:?}");
+        // Nothing left to do the second time.
+        assert!(carry_over_user_in(&user).is_empty());
     }
 }

@@ -134,7 +134,7 @@ pub fn run_set(
     let paths = resolve_context_paths(cwd);
 
     // Require an initialised .visdom/ before mutating.
-    if !paths.state_dir.exists() {
+    if !paths.is_set_up() {
         return Err("no .visdom/ found — run 'tracevault init' first".into());
     }
 
@@ -188,7 +188,7 @@ pub fn run_update(
     let paths = resolve_context_paths(cwd);
 
     // Require an initialised .visdom/ before mutating.
-    if !paths.state_dir.exists() {
+    if !paths.is_set_up() {
         return Err("no .visdom/ found — run 'tracevault init' first".into());
     }
 
@@ -301,7 +301,7 @@ pub fn run_show_in(cwd: &Path, config_root: &Path) -> Result<(), Box<dyn std::er
     // If the tracevault directory doesn't exist yet, hint that init is needed.
     // find_project_root gives the classic walk-up path; if it also fails, the
     // user has not run `tracevault init` yet.
-    if !paths.state_dir.exists() && find_project_root(cwd).is_err() {
+    if !paths.is_set_up() && find_project_root(cwd).is_err() {
         eprintln!("hint: No .visdom/ directory found. Run `tracevault init` first.");
     }
 
@@ -531,7 +531,7 @@ pub fn run_clear(cwd: &Path, global: bool, user: bool) -> Result<(), Box<dyn std
     let paths = resolve_context_paths(cwd);
 
     // Require an initialised .visdom/ before mutating.
-    if !paths.state_dir.exists() {
+    if !paths.is_set_up() {
         return Err("no .visdom/ found — run 'tracevault init' first".into());
     }
 
@@ -547,8 +547,11 @@ pub fn run_clear(cwd: &Path, global: bool, user: bool) -> Result<(), Box<dyn std
         // Per-worktree scope: delete the file so that `load_worktree` returns
         // `None` and `show` prints "(none)" — preserving the absent-vs-empty
         // distinction.
-        if let Some(wt_path) = paths.worktree_path() {
-            match std::fs::remove_file(&wt_path) {
+        // (And the file an earlier release left, or it would come back.)
+        let wt_path = paths.worktree_path();
+        let legacy = wt_path.as_deref().and_then(crate::layout::legacy_twin);
+        for path in wt_path.into_iter().chain(legacy) {
+            match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {} // already absent — fine
                 Err(e) => return Err(format!("failed to clear context: {e}").into()),

@@ -134,4 +134,25 @@ mod tests {
             .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
         assert!(!leftover, "temp file must be renamed away");
     }
+
+    #[test]
+    fn clearing_removes_the_legacy_default_too() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        let legacy = tmp.path().join("tracevault/default_repo.toml");
+        save_to(&legacy, &binding("old")).unwrap();
+        // Read from the legacy file until one is saved.
+        assert_eq!(load(), Some(binding("old")));
+        save(&binding("new")).unwrap();
+        assert_eq!(load(), Some(binding("new")));
+        assert!(legacy.exists());
+
+        clear().unwrap();
+
+        assert!(!legacy.exists());
+        assert!(!tmp.path().join("visdom/default_repo.toml").exists());
+        assert_eq!(load(), None);
+    }
 }

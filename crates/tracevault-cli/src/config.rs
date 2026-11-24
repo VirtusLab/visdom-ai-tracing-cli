@@ -118,10 +118,11 @@ pub fn existing_user_config_path_in(config_root: &Path) -> PathBuf {
 pub fn user_config_path() -> PathBuf {
     user_config_path_in(&tv_config_root())
 }
-/// The default user-context file: `context.json` under `config_root`, or the
-/// legacy directory's when it exists only there.
+/// The default user-context file: `context.json` under `config_root`. One
+/// an earlier release left in the legacy directory is read until this one
+/// is written (see `Context::load_from`).
 pub fn default_user_context_path_in(config_root: &Path) -> PathBuf {
-    crate::layout::user_path(config_root, "context.json")
+    config_root.join("context.json")
 }
 
 /// `~/.config/tracevault/context.json`, alongside credentials.json.
@@ -937,8 +938,14 @@ mod tests {
 
         let cfg = try_load_user_config_in(&user).unwrap().unwrap();
         assert!(matches!(cfg.user_context, Some(UserContext::Path(p)) if p == "/ctx.json"));
+        // The default context file is the new one; the old one is read in
+        // its place until it is written (`Context::load_from`).
         assert_eq!(
             default_user_context_path_in(&user),
+            user.join("context.json")
+        );
+        assert_eq!(
+            crate::layout::existing_or_twin(&default_user_context_path_in(&user)),
             dir.path().join("tracevault/context.json")
         );
         assert_eq!(user_config_path_in(&user), user.join("tracing.toml"));

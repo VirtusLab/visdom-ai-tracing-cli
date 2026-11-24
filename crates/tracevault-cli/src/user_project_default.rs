@@ -156,4 +156,29 @@ mod tests {
         save_in(dir.path(), &binding).unwrap();
         assert_eq!(load_from(dir.path()), Some(binding));
     }
+
+    #[test]
+    fn clearing_removes_the_legacy_default_too() {
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut _guard = crate::test_helpers::EnvVarGuard::new();
+        _guard.set("XDG_CONFIG_HOME", tmp.path());
+        let pb = |name: &str| ProjectBinding {
+            project_id: "id".into(),
+            project_name: name.into(),
+            updated_at: "t".into(),
+            forced_until: None,
+        };
+        let legacy = tmp.path().join("tracevault");
+        save_in(&legacy, &pb("old")).unwrap();
+        assert_eq!(load(), Some(pb("old")));
+        save(&pb("new")).unwrap();
+        assert_eq!(load(), Some(pb("new")));
+
+        clear().unwrap();
+
+        assert!(!legacy.join("user_project.toml").exists());
+        assert!(!tmp.path().join("visdom/user_project.toml").exists());
+        assert_eq!(load(), None);
+    }
 }

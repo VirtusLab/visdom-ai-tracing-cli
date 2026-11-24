@@ -105,8 +105,11 @@ pub fn candidates_with(
     now: SystemTime,
     deadline: Instant,
 ) -> Vec<Candidate> {
-    let sessions = project_root.join(".visdom").join("sessions");
-    let local = std::fs::read_dir(&sessions).into_iter().flatten();
+    // Sessions an earlier release started are still in `.tracevault/`.
+    let local = crate::layout::existing_sessions_dirs(project_root)
+        .into_iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten();
     // `.visdom/sessions` is never pruned: even listing it is bounded by
     // the deadline.
     let mut unsent: Vec<(SystemTime, String, PathBuf, PathBuf, u64)> = local
@@ -170,7 +173,7 @@ pub async fn sweep(
         return;
     }
     let external = crate::session_state::anchored_session_dirs(
-        &project_root.join(".visdom").join("sessions"),
+        &crate::layout::sessions_dir(&project_root),
         &worktree,
     );
     let mut sent_sessions = 0;
@@ -572,5 +575,23 @@ mod tests {
         )));
         assert!(!env_sets_attribution(env("TRACEVAULT_PROJECT", "")));
         assert!(!env_sets_attribution(|_: &str| None));
+    }
+
+    #[test]
+    fn a_session_an_earlier_release_started_is_still_caught_up() {
+        let r = repo();
+        r.session("old", &[ASSISTANT], &[COST_STATE]);
+        // As an earlier release left it: under `.tracevault/`.
+        fs::create_dir_all(r.root.join(".tracevault/sessions")).unwrap();
+        fs::rename(
+            r.root.join(".visdom/sessions/old"),
+            r.root.join(".tracevault/sessions/old"),
+        )
+        .unwrap();
+        r.session("new", &[ASSISTANT], &[COST_STATE]);
+
+        let mut ids = r.ids("other", SystemTime::now());
+        ids.sort();
+        assert_eq!(ids, ["new", "old"]);
     }
 }

@@ -253,7 +253,8 @@ release started keeps its directory until it ends.
 `visdom init` (or `tracevault init`) moves what is left over and says what it moved: the
 login, the user-level files, the checkout's tracing config and context, and every session that
 has been pushed. A session not pushed yet stays in `.tracevault/sessions/` and is still read
-there. `login` writes the new file and removes the old login; `logout` removes both.
+there. The user context file is copied rather than moved, because a repository's config may
+name the old file by its path. `login` writes the new file and removes the old login; `logout` removes both.
 
 Upgrade both binaries together: a `tracevault` from before this change does not read the new
 directories, so after a new `login` or `init` its hooks would find no login and no `repo_id`.
