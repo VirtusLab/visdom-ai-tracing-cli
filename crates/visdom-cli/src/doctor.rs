@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use tracevault_cli::agent::Agent;
 use tracevault_cli::credentials::Credential;
 
-use crate::agents::{adapter_for, AgentAdapter, AgentPaths, Workdir};
+use crate::agents::{adapter_for, AgentAdapter, AgentPaths, McpScope, Workdir};
 use crate::components::gateway::GatewayPlan;
 use crate::components::{
     bazaar, gateway as gateway_checks, tracing, CheckContext, CredentialState,
@@ -40,6 +40,17 @@ pub fn git_toplevel(from: &Path) -> Option<PathBuf> {
         .filter(|o| o.status.success())?;
     let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
     Some(path.canonicalize().unwrap_or(path))
+}
+
+/// The directory whose `.visdom/config.toml` applies in `cwd`: the top of the
+/// git checkout, else — outside any checkout, in a folder of checkouts set up
+/// as a workspace — the nearest directory above that has the file.
+pub fn settings_dir(cwd: &Path) -> Option<PathBuf> {
+    git_toplevel(cwd).or_else(|| {
+        cwd.ancestors()
+            .find(|dir| config::repo_config_path_in(dir).is_file())
+            .map(Path::to_path_buf)
+    })
 }
 
 pub const GATEWAY_URL_ENV: &str = "VISDOM_GATEWAY_URL";
@@ -136,6 +147,9 @@ pub struct Session {
     pub token: Option<String>,
     /// The model alias configured for this agent through the gateway.
     pub gateway_model: Option<String>,
+    /// Where a missing bazaar registration is made: for this project
+    /// directory, or (a machine-wide setup) for all of the user's.
+    pub mcp_scope: McpScope,
     /// The gateway console's address, as far as anybody names one.
     pub console_url: Option<String>,
     /// Who set the gateway's address, project and model.
@@ -159,7 +173,7 @@ impl Session {
             warnings.push(e);
             UserConfig::default()
         });
-        let repo = project_dir
+        let repo = settings_dir(&env.cwd)
             .as_deref()
             .map(config::load_repo_config_in)
             .transpose()
@@ -309,6 +323,7 @@ impl Session {
             suite: suite_map,
             token,
             gateway_model,
+            mcp_scope: McpScope::Local,
             console_url,
             gateway_sources: GatewaySources {
                 console_url: console_source,
@@ -336,6 +351,7 @@ impl Session {
             self.adapter.as_ref(),
             &self.ctx.workdir,
             &self.user_config_path,
+            self.mcp_scope,
         ));
         findings
     }
@@ -592,6 +608,25 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), b"");
         assert!(RealExecutor::new(false, FixPolicy::All).no_questions);
         assert!(!RealExecutor::new(false, FixPolicy::Ask).no_questions);
+    }
+
+    #[test]
+    fn settings_outside_a_checkout_are_the_nearest_folders_above() {
+        let tmp = tempfile::tempdir().unwrap();
+        let below = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&below).unwrap();
+        assert_eq!(settings_dir(&below), None);
+        std::fs::create_dir_all(tmp.path().join(".visdom")).unwrap();
+        std::fs::write(config::repo_config_path_in(tmp.path()), "").unwrap();
+        assert_eq!(settings_dir(&below).as_deref(), Some(tmp.path()));
+        // A checkout's own top level wins, with or without the file.
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&below)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(settings_dir(&below), git_toplevel(&below));
     }
 
     #[test]

@@ -22,7 +22,7 @@ visdom doctor --fix         # …and offer the fixes (--yes applies all, --json 
 | `visdom [--agent <a>] [--mode <m>] [--yes] [-- <agent args>]` | Check, offer each fix, start the agent in the current directory. Findings never stop the agent from starting (one exception: a gateway the workspace requires and that cannot be used, see below). |
 | `visdom doctor [--fix] [--yes] [--json] [--agent <a>] [--mode <m>]` | The same checks without starting anything. |
 | `visdom login` / `visdom logout` | Same as `tracevault login` / `logout`. |
-| `visdom init [...]` | Sets the repository up: tracing (`tracevault init`, same flags), then registers the bazaar MCP server for the agent, then asks how your sessions are traced when that is yours to choose — and, through the AI Gateway, leaves the gateway ready to use. |
+| `visdom init [...]` | Sets up this repository, the whole machine (`--global`) or a folder of checkouts (`--workspace`) — asked when no flag says which: tracing (`tracevault init`, same flags), then registers the bazaar MCP server for the agent, then asks how your sessions are traced when that is yours to choose — and, through the AI Gateway, leaves the gateway ready to use. |
 | `visdom env [--agent <a>]` | Prints shell commands that send an agent you start *without* `visdom` through the AI Gateway: `source <(visdom env)`. |
 | `visdom trace <command>` | Every `tracevault` command: `visdom trace status`, `visdom trace verify-start`, … |
 
@@ -41,6 +41,20 @@ Nothing is changed without a yes: each fix is shown first, `--yes` applies all o
 stdin is not a terminal nothing is applied. `visdom doctor` changes nothing without `--fix`.
 `visdom init` is the exception by definition: asking for it is the yes, for tracing and for the
 bazaar registration alike (the command it runs is printed first).
+
+`visdom init` starts by settling **what it sets up**:
+
+| | Tracing | Bazaar MCP | Gateway project kept in |
+|---|---|---|---|
+| this repository (the default in a checkout) | `tracevault init` here | for this project directory | your user config |
+| every session on this machine (`--global`; the default outside a checkout) | `tracevault init --global` | for all of your projects | your user config |
+| this folder of checkouts (`--workspace --project <name>`) | `tracevault init --workspace`, and — chosen from the question — the machine-wide hooks it needs | for all of your projects | the folder's `.visdom/config.toml` |
+
+On a terminal with neither flag it asks which; without a terminal, or with an option only a
+repository has (`--claude-settings`, `--no-gitignore`), it is the repository. Whichever it is, the
+rest is the same: the agent, the login, bazaar, the tracing mode and the gateway. A folder of
+checkouts is no git checkout, and its `.visdom/config.toml` applies in it and in the directories
+below it that are not checkouts themselves.
 
 On a terminal, `visdom init` asks for what it was not given instead of failing: which agent
 (unless `--agent`, `VISDOM_AGENT` or a config names one), the tracing server URL when you are not

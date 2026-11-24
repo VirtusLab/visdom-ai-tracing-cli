@@ -136,7 +136,7 @@ pub enum Command {
 }
 
 /// Arguments of `init`.
-#[derive(clap::Args)]
+#[derive(clap::Args, Clone)]
 pub struct InitArgs {
     /// TraceVault server URL for repo registration
     #[arg(long)]
