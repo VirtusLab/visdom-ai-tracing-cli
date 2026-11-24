@@ -63,4 +63,26 @@ mod tests {
         });
         assert!(pairs.is_empty());
     }
+
+    #[test]
+    fn the_project_variables_have_a_visdom_spelling_too() {
+        let pairs = alias_pairs(|name| match name {
+            "VISDOM_PROJECT" => Some("11111111-1111-4111-8111-111111111111".to_string()),
+            "VISDOM_PROJECT_ATTRIBUTION" => Some("explicit".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "TRACEVAULT_PROJECT".to_string(),
+                    "11111111-1111-4111-8111-111111111111".to_string()
+                ),
+                (
+                    "TRACEVAULT_PROJECT_ATTRIBUTION".to_string(),
+                    "explicit".to_string()
+                ),
+            ]
+        );
+    }
 }

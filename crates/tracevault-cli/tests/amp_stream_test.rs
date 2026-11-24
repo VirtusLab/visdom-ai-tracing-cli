@@ -236,8 +236,10 @@ fn replay_answering(
         .env("PATH", format!("{}:/bin:/usr/bin", bin.display()))
         .env("TV_LOG", &log)
         .env("REPLAY_CONCURRENT", if concurrent { "1" } else { "0" })
+        // One under each spelling: the plugin reads `VISDOM_*` first, then
+        // the earlier `TRACEVAULT_*`.
         .env("TRACEVAULT_AMP_SPAWN_TIMEOUT_MS", SPAWN_TIMEOUT_MS)
-        .env("TRACEVAULT_AMP_DISPOSE_WAIT_MS", DISPOSE_WAIT_MS)
+        .env("VISDOM_AMP_DISPOSE_WAIT_MS", DISPOSE_WAIT_MS)
         .env("TRACEVAULT_AMP_INJECT_TIMEOUT_MS", INJECT_TIMEOUT_MS)
         .env_remove("TV_LINGER")
         .env_remove("TV_DELAY_CMD")

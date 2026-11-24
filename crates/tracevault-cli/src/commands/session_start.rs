@@ -45,6 +45,11 @@ use crate::commands::session_hooks::{read_hook_event_or_allow, resolve_and_injec
 /// check there are no quote or metacharacters left, so single-quoting closes
 /// the sink.
 pub fn write_session_env(env_file: &Path, session_id: &str) -> std::io::Result<()> {
+    write_session_env_as(env_file, session_id, crate::program::is_visdom())
+}
+
+/// [`write_session_env`] for the binary chosen by `visdom`.
+fn write_session_env_as(env_file: &Path, session_id: &str, visdom: bool) -> std::io::Result<()> {
     use std::io::Write as _;
     if !crate::session_state::is_safe_session_id(session_id) {
         return Ok(());
@@ -53,7 +58,7 @@ pub fn write_session_env(env_file: &Path, session_id: &str) -> std::io::Result<(
     // the variable is exported under that name as well: it is the one the
     // messages name, and `visdom` takes it for the other.
     let mut names = vec!["TRACEVAULT_SESSION_ID"];
-    if crate::program::is_visdom() {
+    if visdom {
         names.push("VISDOM_SESSION_ID");
     }
     let existing = std::fs::read_to_string(env_file).unwrap_or_default();
@@ -276,5 +281,25 @@ mod tests {
             Ok(content) => assert!(content.is_empty()),
             Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
         }
+    }
+
+    #[test]
+    fn run_as_visdom_the_session_id_is_exported_under_both_names_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join("env");
+        // A line an earlier `tracevault` hook of this session already wrote.
+        write_session_env_as(&env_file, "sess-1", false).unwrap();
+        write_session_env_as(&env_file, "sess-1", true).unwrap();
+        write_session_env_as(&env_file, "sess-1", true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&env_file).unwrap(),
+            "export TRACEVAULT_SESSION_ID='sess-1'\nexport VISDOM_SESSION_ID='sess-1'\n"
+        );
+        // A new id is appended under both names, after the old ones: the
+        // shell sources the file in order, so the last wins for each.
+        write_session_env_as(&env_file, "sess-2", true).unwrap();
+        assert!(std::fs::read_to_string(&env_file).unwrap().ends_with(
+            "export TRACEVAULT_SESSION_ID='sess-2'\nexport VISDOM_SESSION_ID='sess-2'\n"
+        ));
     }
 }

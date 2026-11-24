@@ -245,13 +245,13 @@ on stderr.
 What `init` installs for an agent or for git to run later — the Claude Code and Codex hooks,
 the git `pre-push` and `post-commit` hooks, the Amp, OpenCode and GSD plugins, the Claude Code
 telemetry helper and the workspace-mode block in `CLAUDE.md` / `AGENTS.md` — names the binary
-that installed it: `visdom init` installs `visdom trace …` commands, `visdom trace init` installs
-`tracevault …` ones. A machine set up with `visdom` therefore needs only `visdom` on `PATH`.
+that installed it: `visdom init` (and `visdom trace init`) installs `visdom trace …` commands,
+the deprecated `tracevault init` installs `tracevault …` ones. A machine set up with `visdom` therefore needs only `visdom` on `PATH`.
 
-`visdom init` also takes over what `visdom trace init` installed in the same place: it rewrites
+`visdom init` also takes over what `tracevault init` installed in the same place: it rewrites
 the `tracevault …` commands of ours to `visdom trace …` (in both Claude Code settings files of
 a repository, and in our blocks of the git hooks) and leaves your own hooks alone. It goes one
-way only: `visdom trace init`, and the automatic refresh of the hooks after an upgrade, keep
+way only: `tracevault init`, and the automatic refresh of the hooks after an upgrade, keep
 commands that already call `visdom`. Each place is taken over by the `init` that covers it —
 `visdom init` in a repository does not touch the machine-wide hooks; `visdom init --global`
 does.

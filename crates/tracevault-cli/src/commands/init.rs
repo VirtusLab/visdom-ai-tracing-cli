@@ -1221,20 +1221,6 @@ pub fn install_gsd_extension(project_root: Option<&Path>) -> io::Result<()> {
         gsd_extension_file(GSD_EXT_MANIFEST_JSON, &source_dir),
     )?;
 
-    // The registration of the earlier source, in the scope being installed
-    // (this repository, or the machine): best-effort, like the install below.
-    // The earlier source itself stays — other repositories may have it
-    // registered, and lose capture if it went.
-    if let Some(earlier) = earlier_gsd_extension_source_dir(&source_dir) {
-        let mut remove = std::process::Command::new("gsd");
-        remove.arg("remove").arg(&earlier);
-        if let Some(root) = project_root {
-            remove.arg("-l");
-            remove.current_dir(root);
-        }
-        let _ = remove.output();
-    }
-
     // Best-effort cleanup of the OLD, broken install (hand-written registry
     // entries that GSD never actually loaded). Never blocks the rest of the
     // install — see `cleanup_stale_gsd_registration`.
@@ -1265,6 +1251,21 @@ pub fn install_gsd_extension(project_root: Option<&Path>) -> io::Result<()> {
                 "Visdom: installed and registered the GSD extension ({}).",
                 source_dir.display()
             );
+            // Only now the registration of the earlier source, in the scope
+            // just installed (this repository, or the machine): removed
+            // first, a failed install would leave GSD with no capture at
+            // all. Best-effort. The earlier source itself stays — other
+            // repositories may have it registered, and lose capture if it
+            // went.
+            if let Some(earlier) = earlier_gsd_extension_source_dir(&source_dir) {
+                let mut remove = std::process::Command::new("gsd");
+                remove.arg("remove").arg(&earlier);
+                if let Some(root) = project_root {
+                    remove.arg("-l");
+                    remove.current_dir(root);
+                }
+                let _ = remove.output();
+            }
         }
         Ok(output) => {
             eprintln!(
