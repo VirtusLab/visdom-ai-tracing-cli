@@ -4,12 +4,10 @@
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-/// The environment variable that names the mode. `visdom` reads it as a
-/// choice and sets it on the agent it launches, where the capture hooks read
-/// it: under `gateway` they record nothing, the gateway does.
+/// The environment variable that names the developer's choice of mode.
 pub const MODE_ENV: &str = tracevault_cli::commands::stream::TRACING_MODE_ENV;
-/// Set to `1` on an agent started through the AI Gateway, and on nothing
-/// else: what tells the capture hooks to record nothing.
+/// Set on an agent started through the AI Gateway, to that agent's name, and
+/// on nothing else: what tells that agent's capture hooks to record nothing.
 pub const GATEWAY_SESSION_ENV: &str = tracevault_cli::commands::stream::GATEWAY_SESSION_ENV;
 
 /// The capture path of a session. Exactly one is meant to be active.

@@ -165,6 +165,9 @@ pub fn save_gateway_setting(path: &Path, key: &str, value: &str) -> Result<(), S
     let value = toml::Value::String(value.to_string());
     let updated = match table.get_mut("gateway") {
         Some(toml::Value::Table(gateway)) => {
+            // The same setting under its other spelling (`claude-code-model`)
+            // would make the file name it twice, and then not load at all.
+            gateway.remove(&key.replace('_', "-"));
             gateway.insert(key.to_string(), value);
             toml::to_string(&table).map_err(|e| e.to_string())?
         }
@@ -304,6 +307,15 @@ mod tests {
         let user = load_user_config_in(tmp.path()).unwrap();
         assert_eq!(user.gateway.codex_model.as_deref(), Some("gpt-general"));
         assert_eq!(user.agents.codex.as_deref(), Some("cdx"));
+
+        // The other spelling of a key is replaced, not doubled.
+        std::fs::write(&path, "[gateway]\nclaude-code-model = \"\"\n").unwrap();
+        save_gateway_setting(&path, "claude_code_model", "claude-sonnet").unwrap();
+        let user = load_user_config_in(tmp.path()).unwrap();
+        assert_eq!(
+            user.gateway.claude_code_model.as_deref(),
+            Some("claude-sonnet")
+        );
 
         // One that cannot be parsed is left alone.
         std::fs::write(&path, "[gateway\n").unwrap();

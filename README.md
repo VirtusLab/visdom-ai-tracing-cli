@@ -95,7 +95,7 @@ A session reaches AI Tracing one of two ways, and **you choose**:
 Your choice is `--mode`, then `VISDOM_TRACING_MODE`, then `tracing_mode` in the repository's
 `.visdom/config.toml`, then in the user config. That variable is only your preference for
 `visdom`: an agent you start without `visdom` is captured by its hooks whatever it says (what
-switches the capture off is `VISDOM_GATEWAY_SESSION=1`, which `visdom` sets on the agent it has
+switches the capture off is `VISDOM_GATEWAY_SESSION=<agent>`, which `visdom` sets on the agent it has
 routed through the gateway, and nobody else should).
 
 **A workspace admin may decide instead**, with the AI traffic policy in Control Plane:
@@ -174,8 +174,9 @@ claude                               # now goes through the gateway
   and the model alias, and unsets `ANTHROPIC_API_KEY` and the provider switches. For Codex, whose
   provider is given as options, it defines a `codex` shell function that adds them (so it works
   for `codex …` typed in that shell, not for a program that runs the `codex` executable itself).
-- It sets `VISDOM_GATEWAY_SESSION=1`, which switches the hooks' capture off for agents started
-  from that shell: the gateway records them.
+- It sets `VISDOM_GATEWAY_SESSION` to the agent's name, which switches that agent's capture
+  hooks off when it is started from that shell: the gateway records it. Another agent started
+  there is not routed by this script, and is captured by its hooks as usual.
 - The repository in the attribution headers is the one `visdom env` was run in; run it per
   repository (an `.envrc` does that).
 - It is weaker than `visdom`: `env` in the agent's own settings files still wins over the

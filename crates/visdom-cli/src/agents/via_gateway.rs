@@ -224,7 +224,10 @@ pub fn claude_command(
     let mut routing: Vec<(&str, String)> = vec![
         // The hooks read this to record nothing: a settings file must not
         // switch them back on beside the gateway.
-        (GATEWAY_SESSION_ENV, "1".to_string()),
+        (
+            GATEWAY_SESSION_ENV,
+            Agent::ClaudeCode.tool_name().to_string(),
+        ),
         (MODE_ENV, TracingMode::Gateway.name().to_string()),
         ("ANTHROPIC_BASE_URL", gateway.llm_url.clone()),
         ("ANTHROPIC_CUSTOM_HEADERS", headers),
@@ -344,7 +347,7 @@ pub fn codex_command(
         ));
     }
     let mut cmd = Command::new(program);
-    cmd.env(GATEWAY_SESSION_ENV, "1");
+    cmd.env(GATEWAY_SESSION_ENV, Agent::Codex.tool_name());
     cmd.env(MODE_ENV, TracingMode::Gateway.name());
     cmd.env(CODEX_KEY_ENV, &gateway.key);
     let provider = format!("model_providers.{CODEX_PROVIDER}");
@@ -400,9 +403,12 @@ fn script(agent: Agent, project: &str, lines: Vec<String>) -> String {
         "# `visdom` itself is the way that cannot be overruled.".into(),
     ];
     out.extend(lines);
-    // The hooks record nothing for an agent started from this shell: the
-    // gateway records it.
-    out.push(format!("export {GATEWAY_SESSION_ENV}=1"));
+    // This agent's hooks record nothing when it is started from this shell:
+    // the gateway records it. Any other agent's still do.
+    out.push(format!(
+        "export {GATEWAY_SESSION_ENV}={}",
+        agent.tool_name()
+    ));
     out.join("\n") + "\n"
 }
 
@@ -530,7 +536,10 @@ mod tests {
     fn claude_gets_the_gateway_the_key_helper_and_a_session() {
         let cmd = claude(&strings(&["--verbose"]), &gateway(), &no_env);
         let env = envs_of(&cmd);
-        assert_eq!(env["VISDOM_GATEWAY_SESSION"].as_deref(), Some("1"));
+        assert_eq!(
+            env["VISDOM_GATEWAY_SESSION"].as_deref(),
+            Some("claude-code")
+        );
         assert_eq!(env["VISDOM_TRACING_MODE"].as_deref(), Some("gateway"));
         assert_eq!(
             env["ANTHROPIC_BASE_URL"].as_deref(),
@@ -562,7 +571,7 @@ mod tests {
         assert_eq!(
             settings["env"],
             serde_json::json!({
-                "VISDOM_GATEWAY_SESSION": "1",
+                "VISDOM_GATEWAY_SESSION": "claude-code",
                 "VISDOM_TRACING_MODE": "gateway",
                 "ANTHROPIC_API_KEY": "",
                 "ANTHROPIC_AUTH_TOKEN": "",
@@ -769,7 +778,7 @@ mod tests {
         launch.model = Some("gpt-general".to_string());
         let cmd = codex(&strings(&["exec", "hi"]), &launch);
         let env = envs_of(&cmd);
-        assert_eq!(env["VISDOM_GATEWAY_SESSION"].as_deref(), Some("1"));
+        assert_eq!(env["VISDOM_GATEWAY_SESSION"].as_deref(), Some("codex"));
         assert_eq!(env["VISDOM_TRACING_MODE"].as_deref(), Some("gateway"));
         assert_eq!(env["VISDOM_GATEWAY_API_KEY"].as_deref(), Some("sk-abc"));
         let args = args_of(&cmd);

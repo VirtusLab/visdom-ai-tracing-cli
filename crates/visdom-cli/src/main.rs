@@ -316,6 +316,34 @@ fn init_mode(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<Traci
             // run only: there is no agent to start here.
             if let Some(mode) = flag {
                 save_mode(&session, mode);
+                // Kept in the user config, which the environment and the
+                // repository's config come before: a mode they name is the
+                // one the next plain `visdom` runs in, not this one.
+                let user = config::load_user_config_in(&env.config_root).unwrap_or_default();
+                let repo = checks_repo_config(&env);
+                let next = configured_mode(
+                    None,
+                    env.mode.as_deref(),
+                    repo.tracing_mode,
+                    user.tracing_mode,
+                );
+                if !matches!(next, Ok(Some(next)) if next == mode) {
+                    let said_by = match env.mode {
+                        Some(_) => format!("{MODE_ENV} in the environment"),
+                        None => "tracing_mode in the repository's .visdom/config.toml".to_string(),
+                    };
+                    let other = match next {
+                        Ok(Some(next)) => format!("`{}`", next.name()),
+                        _ => "something else".to_string(),
+                    };
+                    eprintln!(
+                        "visdom: `{mode}` was saved to your config, but {said_by} says {other} \
+                         and comes first: a plain `visdom` here would not start in {mode} mode. \
+                         Change it there, or pass --mode {mode} each time.",
+                        mode = mode.name()
+                    );
+                    exit(1);
+                }
             }
             return;
         }
@@ -352,6 +380,13 @@ fn init_mode(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<Traci
         return;
     };
     save_mode(&session, mode);
+}
+
+/// The repository's own visdom config for the directory `visdom` runs in.
+fn checks_repo_config(env: &Environment) -> config::RepoConfig {
+    git_toplevel(&env.cwd)
+        .and_then(|dir| config::load_repo_config_in(&dir).ok())
+        .unwrap_or_default()
 }
 
 fn save_mode(session: &Session, mode: TracingMode) {

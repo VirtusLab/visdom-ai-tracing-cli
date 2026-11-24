@@ -109,7 +109,7 @@ fn a_chosen_gateway_session_gets_a_key_a_model_and_its_ids() {
     let recorded = lines(&log);
     let has = |line: &str| recorded.iter().any(|l| l == line);
     assert!(has("VISDOM_TRACING_MODE=gateway"), "{recorded:?}");
-    assert!(has("VISDOM_GATEWAY_SESSION=1"), "{recorded:?}");
+    assert!(has("VISDOM_GATEWAY_SESSION=claude-code"), "{recorded:?}");
     assert!(has("CLAUDE_CODE_USE_BEDROCK unset"), "{recorded:?}");
     assert!(
         has(&format!("ANTHROPIC_BASE_URL={}", server.url)),
@@ -317,7 +317,7 @@ fn a_direct_workspace_keeps_sessions_on_hooks() {
         // What is left in the environment (of a gateway session's shell,
         // say) must not switch the hooks' capture off either.
         .env("VISDOM_TRACING_MODE", "gateway")
-        .env("VISDOM_GATEWAY_SESSION", "1")
+        .env("VISDOM_GATEWAY_SESSION", "claude-code")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
@@ -757,7 +757,7 @@ fn env_sends_a_claude_started_without_visdom_through_the_gateway() {
     assert!(has("ANTHROPIC_AUTH_TOKEN=sk-personal"), "{recorded:?}");
     assert!(has("ANTHROPIC_API_KEY unset"), "{recorded:?}");
     assert!(has("ANTHROPIC_MODEL=claude-sonnet"), "{recorded:?}");
-    assert!(has("VISDOM_GATEWAY_SESSION=1"), "{recorded:?}");
+    assert!(has("VISDOM_GATEWAY_SESSION=claude-code"), "{recorded:?}");
     assert!(has("CLAUDE_CODE_USE_BEDROCK unset"), "{recorded:?}");
     assert!(
         has("ANTHROPIC_CUSTOM_HEADERS=x-tracevault-agent: claude-code"),
@@ -800,7 +800,7 @@ fn env_gives_codex_a_function_that_adds_the_gateway() {
         "{recorded:?}"
     );
     assert!(
-        recorded.contains(&"VISDOM_GATEWAY_SESSION=1".to_string()),
+        recorded.contains(&"VISDOM_GATEWAY_SESSION=codex".to_string()),
         "{recorded:?}"
     );
     let args = args(&log);
@@ -879,7 +879,7 @@ fn the_project_and_the_model_can_come_from_the_environment() {
         "{recorded:?}"
     );
     assert!(
-        recorded.contains(&"VISDOM_GATEWAY_SESSION=1".to_string()),
+        recorded.contains(&"VISDOM_GATEWAY_SESSION=claude-code".to_string()),
         "{recorded:?}"
     );
 }
@@ -941,7 +941,7 @@ fn init_leaves_the_gateway_ready_and_says_where_its_settings_are() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let recorded = lines(&log);
     assert!(
-        recorded.contains(&"VISDOM_GATEWAY_SESSION=1".to_string()),
+        recorded.contains(&"VISDOM_GATEWAY_SESSION=claude-code".to_string()),
         "{recorded:?}"
     );
     // The key issued by init is the one used.
@@ -1188,4 +1188,69 @@ fn the_environment_wins_over_the_config_files() {
         "{:?}",
         server.routes()
     );
+}
+
+/// A model alias the project no longer has does not stop a launch — the
+/// gateway refuses the request, and the developer was told why.
+#[test]
+fn a_launch_warns_about_a_model_alias_the_project_does_not_have() {
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let (sb, log) = sandbox(&server);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway"])
+        .env("VISDOM_GATEWAY_MODEL", "removed-alias")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let said = stderr(&output);
+    assert!(said.contains("`removed-alias` is not among"), "{said}");
+    assert!(said.contains("gpt-general, claude-sonnet"), "{said}");
+    let recorded = lines(&log);
+    assert!(
+        recorded.contains(&"ANTHROPIC_MODEL=removed-alias".to_string()),
+        "{recorded:?}"
+    );
+}
+
+/// `visdom --mode gateway init` keeps the mode in the user config. Where the
+/// repository's config (or the environment) says otherwise, that wins at the
+/// next `visdom`: init says so instead of calling the setup done.
+#[test]
+fn init_fails_when_the_mode_it_saves_would_be_overruled() {
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    std::fs::create_dir_all(sb.repo.path().join(".visdom")).unwrap();
+    std::fs::write(
+        sb.repo.path().join(".visdom/config.toml"),
+        "tracing_mode = \"hooks\"\n",
+    )
+    .unwrap();
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway", "init"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    let said = stderr(&output);
+    assert!(said.contains(".visdom/config.toml"), "{said}");
+    assert!(said.contains("hooks"), "{said}");
+    assert!(!stdout(&output).contains("AI Gateway ready"));
 }
