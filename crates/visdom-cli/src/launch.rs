@@ -97,6 +97,17 @@ pub fn prepare_gateway(
         session.gateway_model.as_deref(),
         &available,
     );
+    if let Some(configured) = model
+        .as_deref()
+        .filter(|m| !available.iter().any(|a| a == m))
+    {
+        notes.push(format!(
+            "the model alias `{configured}` is not among those your key may call in the project \
+             `{}` ({}): the gateway will refuse it",
+            plan.project.slug,
+            available.join(", ")
+        ));
+    }
     if model.is_none() {
         notes.push(format!(
             "no AI Gateway model alias was chosen for {}: it asks for its own default, which \
@@ -163,6 +174,32 @@ pub fn no_model(agent: Agent, project: &str, available: &[String]) -> String {
         "{choice}: set {key} under [gateway] in your visdom config, or VISDOM_GATEWAY_MODEL, to \
          the alias to use"
     )
+}
+
+/// Whether `model` is one the agent can ask the gateway for: an alias the
+/// key may call. `Err` says what is wrong and what to set — no alias at all
+/// ([`no_model`]), or one (set at `source`) that the project does not have.
+pub fn usable_model(
+    agent: Agent,
+    model: Option<&str>,
+    source: Option<&str>,
+    project: &str,
+    available: &[String],
+) -> Result<(), String> {
+    let Some(model) = model else {
+        return Err(no_model(agent, project, available));
+    };
+    if available.iter().any(|alias| alias == model) {
+        return Ok(());
+    }
+    let from = source.map(|s| format!(" ({s})")).unwrap_or_default();
+    let have = match available.is_empty() {
+        true => "it lets your key call none".to_string(),
+        false => format!("your key may call: {}", available.join(", ")),
+    };
+    Err(format!(
+        "the model alias `{model}`{from} is not one the project `{project}` has — {have}"
+    ))
 }
 
 /// Where the gateway's settings are made, for somebody whose gateway is not

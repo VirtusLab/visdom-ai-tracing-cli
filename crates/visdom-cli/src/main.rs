@@ -361,7 +361,12 @@ fn save_mode(session: &Session, mode: TracingMode) {
             mode.name(),
             session.user_config_path.display()
         ),
-        Err(e) => eprintln!("visdom: warning: tracing mode not saved: {e}"),
+        Err(e) => {
+            // The next `visdom` would not know the choice: not a setup done.
+            eprintln!("visdom: the tracing mode could not be saved: {e}");
+            eprintln!("  Set it yourself: export {MODE_ENV}={}", mode.name());
+            exit(1);
+        }
     }
 }
 
@@ -476,11 +481,14 @@ fn init_gateway(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<Tr
             prepared.launch.model = Some(model);
         }
     }
-    if prepared.launch.model.is_none() {
-        eprintln!(
-            "visdom: the AI Gateway is not ready: {}",
-            launch::no_model(agent, &plan.project.slug, &prepared.available)
-        );
+    if let Err(why) = launch::usable_model(
+        agent,
+        prepared.launch.model.as_deref(),
+        sources.model.as_deref(),
+        &plan.project.slug,
+        &prepared.available,
+    ) {
+        eprintln!("visdom: the AI Gateway is not ready: {why}");
         exit(1);
     }
     print!(
@@ -518,13 +526,13 @@ fn env_script(runtime: &tokio::runtime::Runtime, agent: Option<Agent>) -> ! {
         // Nothing checks the gateway again before an agent started by hand:
         // a setup that would ask for a model the project refuses is not one
         // to hand out.
-        if prepared.launch.model.is_none() {
-            return Err(launch::no_model(
-                session.ctx.agent,
-                &project,
-                &prepared.available,
-            ));
-        }
+        launch::usable_model(
+            session.ctx.agent,
+            prepared.launch.model.as_deref(),
+            session.gateway_sources.model.as_deref(),
+            &project,
+            &prepared.available,
+        )?;
         session.adapter.env_script(&prepared.launch, &project)
     });
     match script {
