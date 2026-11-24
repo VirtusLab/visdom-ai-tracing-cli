@@ -440,7 +440,7 @@ pub async fn plan_gateway(
 /// is there and cannot be read or parsed (the library treats both alike).
 fn missing_or_unreadable() -> CredentialState {
     use tracevault_cli::credentials::Credentials;
-    match Credentials::path() {
+    match Credentials::existing_path() {
         Ok(path) if path.exists() && Credentials::load().is_none() => {
             CredentialState::Unreadable(path.display().to_string())
         }

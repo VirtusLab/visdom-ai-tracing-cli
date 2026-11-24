@@ -239,7 +239,7 @@ impl Credentials {
 
     /// The file the login is in now: [`Self::path`], else the legacy file
     /// when only that one exists.
-    fn existing_path() -> Result<PathBuf, std::io::Error> {
+    pub fn existing_path() -> Result<PathBuf, std::io::Error> {
         let path = Self::path()?;
         if !path.exists() {
             if let Some(legacy) = Self::legacy_path().filter(|p| p.exists()) {
@@ -253,7 +253,7 @@ impl Credentials {
     /// do about a missing config directory (a message is being printed either
     /// way). Never used to read or write.
     pub fn path_for_display() -> String {
-        match Self::path() {
+        match Self::existing_path() {
             Ok(p) => p.display().to_string(),
             Err(_) => "<no user config directory: set XDG_CONFIG_HOME or HOME>".to_string(),
         }
