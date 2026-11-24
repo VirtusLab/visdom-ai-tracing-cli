@@ -153,9 +153,9 @@ impl Fixture {
                 .success();
             assert!(ok, "git {args:?} must succeed");
         }
-        std::fs::create_dir_all(repo.join(".tracevault")).unwrap();
+        std::fs::create_dir_all(repo.join(".visdom")).unwrap();
         std::fs::write(
-            repo.join(".tracevault").join("config.toml"),
+            repo.join(".visdom").join("tracing.toml"),
             format!("repo_id = \"{REPO_ID}\"\n"),
         )
         .unwrap();
@@ -174,10 +174,7 @@ impl Fixture {
     }
 
     fn session_dir(&self) -> PathBuf {
-        self.repo
-            .join(".tracevault")
-            .join("sessions")
-            .join(SESSION_ID)
+        self.repo.join(".visdom").join("sessions").join(SESSION_ID)
     }
 
     fn main_line(&self, n: usize) {

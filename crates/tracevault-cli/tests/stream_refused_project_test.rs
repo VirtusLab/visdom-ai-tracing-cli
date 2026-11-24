@@ -182,9 +182,9 @@ impl Fixture {
                 .success();
             assert!(ok, "git {args:?} must succeed");
         }
-        std::fs::create_dir_all(repo.join(".tracevault")).unwrap();
+        std::fs::create_dir_all(repo.join(".visdom")).unwrap();
         std::fs::write(
-            repo.join(".tracevault").join("config.toml"),
+            repo.join(".visdom").join("tracing.toml"),
             format!("repo_id = \"{REPO_ID}\"\n"),
         )
         .unwrap();
@@ -197,9 +197,9 @@ impl Fixture {
     }
 
     /// Bind the session's `active_project`, where `session_state::load`
-    /// reads it (`$XDG_STATE_HOME/tracevault/sessions/<id>.toml`).
+    /// reads it (`$XDG_STATE_HOME/visdom/sessions/<id>.toml`).
     fn bind_session_project(&self, pid: uuid::Uuid) {
-        let dir = self.state.join("tracevault").join("sessions");
+        let dir = self.state.join("visdom").join("sessions");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(format!("{SESSION_ID}.toml")),
@@ -212,7 +212,7 @@ impl Fixture {
 
     fn queue_path(&self) -> PathBuf {
         self.repo
-            .join(".tracevault")
+            .join(".visdom")
             .join("sessions")
             .join(SESSION_ID)
             .join(format!("pending-{REPO_ID}.jsonl"))

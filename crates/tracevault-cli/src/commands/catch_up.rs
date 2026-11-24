@@ -5,7 +5,7 @@
 //! hook failed or timed out, or was not installed yet (sessions that ended
 //! before the upgrade that adds it), the line stays on disk unsent.
 //! `session-start` runs [`sweep`] for its repository: a tracked session
-//! (`.tracevault/sessions/*`) whose main transcript has unsent lines, and
+//! (`.visdom/sessions/*`) whose main transcript has unsent lines, and
 //! whose unsent lines hold a `cost-state`, gets them sent the way its
 //! `SessionEnd` hook would have. Unsent lines without one are left to the
 //! session's own hooks: it may still be running.
@@ -96,7 +96,7 @@ pub fn candidates(
 }
 
 /// [`candidates`], also considering `external` session dirs: sessions that
-/// ran in this checkout but keep their dir in the `.tracevault/` they started
+/// ran in this checkout but keep their dir in the `.visdom/` they started
 /// in, e.g. an umbrella dir (VIS-1257).
 pub fn candidates_with(
     project_root: &Path,
@@ -105,9 +105,9 @@ pub fn candidates_with(
     now: SystemTime,
     deadline: Instant,
 ) -> Vec<Candidate> {
-    let sessions = project_root.join(".tracevault").join("sessions");
+    let sessions = project_root.join(".visdom").join("sessions");
     let local = std::fs::read_dir(&sessions).into_iter().flatten();
-    // `.tracevault/sessions` is never pruned: even listing it is bounded by
+    // `.visdom/sessions` is never pruned: even listing it is bounded by
     // the deadline.
     let mut unsent: Vec<(SystemTime, String, PathBuf, PathBuf, u64)> = local
         .take_while(|_| Instant::now() < deadline)
@@ -170,7 +170,7 @@ pub async fn sweep(
         return;
     }
     let external = crate::session_state::anchored_session_dirs(
-        &project_root.join(".tracevault").join("sessions"),
+        &project_root.join(".visdom").join("sessions"),
         &worktree,
     );
     let mut sent_sessions = 0;
@@ -292,7 +292,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("repo");
         let transcripts = tmp.path().join("claude-project");
-        fs::create_dir_all(root.join(".tracevault/sessions")).unwrap();
+        fs::create_dir_all(root.join(".visdom/sessions")).unwrap();
         fs::create_dir_all(&transcripts).unwrap();
         Repo {
             _tmp: tmp,
@@ -305,7 +305,7 @@ mod tests {
         /// A tracked session whose transcript holds `sent` (already sent, the
         /// offset points past them) and then `unsent`.
         fn session(&self, id: &str, sent: &[&str], unsent: &[&str]) -> PathBuf {
-            let dir = self.root.join(".tracevault/sessions").join(id);
+            let dir = self.root.join(".visdom/sessions").join(id);
             fs::create_dir_all(&dir).unwrap();
             let transcript = self.transcripts.join(format!("{id}.jsonl"));
             let sent: String = sent.iter().map(|l| format!("{l}\n")).collect();
@@ -400,17 +400,16 @@ mod tests {
     fn a_session_without_an_offset_or_transcript_is_skipped() {
         let r = repo();
         r.session("no-offset", &[], &[COST_STATE]);
-        fs::remove_file(r.root.join(".tracevault/sessions/no-offset/.stream_offset")).unwrap();
+        fs::remove_file(r.root.join(".visdom/sessions/no-offset/.stream_offset")).unwrap();
         let gone = r.session("gone", &[], &[COST_STATE]);
         fs::remove_file(gone).unwrap();
         r.session("bad-offset", &[], &[COST_STATE]);
         fs::write(
-            r.root
-                .join(".tracevault/sessions/bad-offset/.stream_offset"),
+            r.root.join(".visdom/sessions/bad-offset/.stream_offset"),
             "garbage",
         )
         .unwrap();
-        fs::create_dir_all(r.root.join(".tracevault/sessions/no-metadata")).unwrap();
+        fs::create_dir_all(r.root.join(".visdom/sessions/no-metadata")).unwrap();
         assert!(r.ids("other", SystemTime::now()).is_empty());
     }
 
@@ -459,7 +458,7 @@ mod tests {
         r.session("removed", &[], &[COST_STATE]);
         let worktree = r.transcripts.parent().unwrap().join("wt");
         fs::create_dir_all(&worktree).unwrap();
-        let sessions = r.root.join(".tracevault/sessions");
+        let sessions = r.root.join(".visdom/sessions");
         fs::write(
             sessions.join("here/origin"),
             worktree.to_string_lossy().as_bytes(),
@@ -484,7 +483,7 @@ mod tests {
         let r = repo();
         let umbrella = repo();
         umbrella.session("anchored", &[ASSISTANT], &[COST_STATE]);
-        let external = umbrella.root.join(".tracevault/sessions/anchored");
+        let external = umbrella.root.join(".visdom/sessions/anchored");
         let found = candidates_with(
             &r.root,
             vec![external.clone()],

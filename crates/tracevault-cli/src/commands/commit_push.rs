@@ -11,7 +11,7 @@ pub async fn run_commit_push(
     cwd: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Config / credentials come from the PRIMARY root (the only place
-    // .tracevault/ exists); git state comes from the invoking worktree (cwd).
+    // .visdom/ exists); git state comes from the invoking worktree (cwd).
     let config = TracevaultConfig::load(project_root).ok_or("config not found")?;
     let repo_id = config.repo_id.ok_or("repo_id not configured")?;
 

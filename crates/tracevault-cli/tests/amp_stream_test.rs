@@ -736,7 +736,7 @@ fn real_cli_keeps_amp_tool_calls_for_check() {
 
     let log = repo
         .path()
-        .join(".tracevault/sessions/T-00000000-0000-7000-8000-000000000002/tool_calls.jsonl");
+        .join(".visdom/sessions/T-00000000-0000-7000-8000-000000000002/tool_calls.jsonl");
     let counts = count_tool_calls(&log);
     let live = tool_result_ids(fixture).len() as i32;
     // Every live call plus the Task call that only agent.end carries.

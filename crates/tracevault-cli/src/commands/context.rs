@@ -4,19 +4,19 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// Walk up from `start` to find the nearest ancestor that contains a
-/// `.tracevault/` directory. Returns that ancestor. Errors if none found.
+/// `.visdom/` directory. Returns that ancestor. Errors if none found.
 ///
 /// Kept as a public utility for integration tests and callers that need the
-/// classic "must have .tracevault/" guarantee (e.g. legacy hooks, tests).
+/// classic "must have .visdom/" guarantee (e.g. legacy hooks, tests).
 /// Worktree-aware commands use `resolve_context_paths` directly instead.
 pub fn find_project_root(start: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     for ancestor in start.ancestors() {
-        if ancestor.join(".tracevault").is_dir() {
+        if crate::layout::has_repo_dir(ancestor) {
             return Ok(ancestor.to_path_buf());
         }
     }
     Err(format!(
-        "No .tracevault/ directory found in '{}' or any parent directory. \
+        "No .visdom/ directory found in '{}' or any parent directory. \
          Run `tracevault init` first.",
         start.display()
     )
@@ -64,7 +64,7 @@ fn user_context_path_in(
     let repo_uc = match find_project_root(cwd) {
         Ok(root) => TracevaultConfig::try_load(&root)
             .map_err(|e| {
-                format!("cannot resolve --user path: malformed .tracevault/config.toml: {e}")
+                format!("cannot resolve --user path: malformed .visdom/tracing.toml: {e}")
             })?
             .and_then(|c| c.user_context),
         Err(_) => None, // no checkout → fall through to the user-level config
@@ -133,9 +133,9 @@ pub fn run_set(
 
     let paths = resolve_context_paths(cwd);
 
-    // Require an initialised .tracevault/ before mutating.
-    if !paths.tracevault_dir.exists() {
-        return Err("no .tracevault/ found — run 'tracevault init' first".into());
+    // Require an initialised .visdom/ before mutating.
+    if !paths.state_dir.exists() {
+        return Err("no .visdom/ found — run 'tracevault init' first".into());
     }
 
     if global || matches!(paths.scope, WorktreeScope::Primary) {
@@ -187,9 +187,9 @@ pub fn run_update(
 
     let paths = resolve_context_paths(cwd);
 
-    // Require an initialised .tracevault/ before mutating.
-    if !paths.tracevault_dir.exists() {
-        return Err("no .tracevault/ found — run 'tracevault init' first".into());
+    // Require an initialised .visdom/ before mutating.
+    if !paths.state_dir.exists() {
+        return Err("no .visdom/ found — run 'tracevault init' first".into());
     }
 
     let use_global = global || matches!(paths.scope, WorktreeScope::Primary);
@@ -273,7 +273,7 @@ fn apply_update_mutations(
 ///   4. Effective — the merged result that the hook stamps on every event, with
 ///      each label/param annotated with the layer it came from.
 ///
-/// Prints a hint if no `.tracevault/` directory is found (i.e. `tracevault init` has
+/// Prints a hint if no `.visdom/` directory is found (i.e. `tracevault init` has
 /// not been run), using `find_project_root` for the diagnostic.
 pub fn run_show(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
     run_show_in(cwd, &crate::config::tv_config_root())
@@ -301,8 +301,8 @@ pub fn run_show_in(cwd: &Path, config_root: &Path) -> Result<(), Box<dyn std::er
     // If the tracevault directory doesn't exist yet, hint that init is needed.
     // find_project_root gives the classic walk-up path; if it also fails, the
     // user has not run `tracevault init` yet.
-    if !paths.tracevault_dir.exists() && find_project_root(cwd).is_err() {
-        eprintln!("hint: No .tracevault/ directory found. Run `tracevault init` first.");
+    if !paths.state_dir.exists() && find_project_root(cwd).is_err() {
+        eprintln!("hint: No .visdom/ directory found. Run `tracevault init` first.");
     }
 
     let is_linked = matches!(paths.scope, WorktreeScope::Linked { .. });
@@ -530,9 +530,9 @@ pub fn run_clear(cwd: &Path, global: bool, user: bool) -> Result<(), Box<dyn std
 
     let paths = resolve_context_paths(cwd);
 
-    // Require an initialised .tracevault/ before mutating.
-    if !paths.tracevault_dir.exists() {
-        return Err("no .tracevault/ found — run 'tracevault init' first".into());
+    // Require an initialised .visdom/ before mutating.
+    if !paths.state_dir.exists() {
+        return Err("no .visdom/ found — run 'tracevault init' first".into());
     }
 
     let use_global = global || matches!(paths.scope, WorktreeScope::Primary);
@@ -582,9 +582,9 @@ pub fn run_source(
     let mut config = match TracevaultConfig::try_load(&root) {
         Ok(Some(cfg)) => cfg,
         Ok(None) => {
-            return Err("no .tracevault/config.toml found — run 'tracevault init' first".into())
+            return Err("no .visdom/tracing.toml found — run 'tracevault init' first".into())
         }
-        Err(e) => return Err(format!("malformed .tracevault/config.toml: {e}").into()),
+        Err(e) => return Err(format!("malformed .visdom/tracing.toml: {e}").into()),
     };
 
     let new_user_context = if disable {
@@ -643,13 +643,13 @@ mod tests {
         );
     }
 
-    /// Create a temp project with a `.tracevault/config.toml` for `run_source` tests.
+    /// Create a temp project with a `.visdom/tracing.toml` for `run_source` tests.
     fn temp_project() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let tv_dir = dir.path().join(".tracevault");
+        let tv_dir = dir.path().join(".visdom");
         fs::create_dir_all(&tv_dir).unwrap();
         fs::write(
-            tv_dir.join("config.toml"),
+            tv_dir.join("tracing.toml"),
             TracevaultConfig::default().to_toml(),
         )
         .unwrap();
@@ -689,18 +689,18 @@ mod tests {
     #[test]
     fn source_keeps_the_rest_of_the_config() {
         let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
+        fs::create_dir_all(dir.path().join(".visdom")).unwrap();
         let original = "repo_id = \"r1\"\napi_key = \"tvk_x\"\nuser_context = true\n\
                         default_project = \"payments\"\nfuture_setting = 1\n";
-        fs::write(dir.path().join(".tracevault/config.toml"), original).unwrap();
+        fs::write(dir.path().join(".visdom/tracing.toml"), original).unwrap();
 
         run_source(dir.path(), false, true, None, false).unwrap();
 
-        let content = fs::read_to_string(dir.path().join(".tracevault/config.toml")).unwrap();
+        let content = fs::read_to_string(dir.path().join(".visdom/tracing.toml")).unwrap();
         assert_eq!(
             content,
             format!(
-                "# TraceVault configuration\n{}agent = \"claude-code\"\n",
+                "# Visdom tracing configuration (this checkout's own)\n{}agent = \"claude-code\"\n",
                 original.replace("user_context = true", "user_context = false")
             )
         );
@@ -747,13 +747,13 @@ mod tests {
     /// explicit path outside the project (`uc_path`).
     fn temp_project_with_user_context(uc_path: &Path) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let tv_dir = dir.path().join(".tracevault");
+        let tv_dir = dir.path().join(".visdom");
         fs::create_dir_all(&tv_dir).unwrap();
         let config = TracevaultConfig {
             user_context: Some(UserContext::Path(uc_path.display().to_string())),
             ..TracevaultConfig::default()
         };
-        fs::write(tv_dir.join("config.toml"), config.to_toml()).unwrap();
+        fs::write(tv_dir.join("tracing.toml"), config.to_toml()).unwrap();
         dir
     }
 
@@ -819,7 +819,7 @@ mod tests {
             "user_context = true\n",
         )
         .unwrap();
-        let cwd = tempfile::tempdir().unwrap(); // no .tracevault/ anywhere above
+        let cwd = tempfile::tempdir().unwrap(); // no .visdom/ anywhere above
         let p = user_context_path_in(cwd.path(), cfg_root.path()).unwrap();
         assert_eq!(
             p,
@@ -849,7 +849,7 @@ mod tests {
         // Seed the referenced default context file so the enabled layer has content.
         let ctx = crate::config::default_user_context_path_in(cfg_root.path());
         crate::context::Context::default().save_to(&ctx).unwrap();
-        let cwd = tempfile::tempdir().unwrap(); // no .tracevault/ anywhere above
+        let cwd = tempfile::tempdir().unwrap(); // no .visdom/ anywhere above
                                                 // Must resolve against the injected root (NOT ~/.config) and not error.
         assert!(run_show_in(cwd.path(), cfg_root.path()).is_ok());
     }
@@ -858,10 +858,10 @@ mod tests {
     fn user_context_path_explicit_off_repo_falls_through_to_user_level() {
         // A checkout whose repo config explicitly disables the user layer.
         let repo = tempfile::tempdir().unwrap();
-        let tv = repo.path().join(".tracevault");
+        let tv = repo.path().join(".visdom");
         std::fs::create_dir_all(&tv).unwrap();
         std::fs::write(
-            tv.join("config.toml"),
+            tv.join("tracing.toml"),
             "agent = \"claude-code\"\nuser_context = false\n",
         )
         .unwrap();

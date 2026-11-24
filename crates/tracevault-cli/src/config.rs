@@ -96,22 +96,32 @@ pub(crate) fn enable_default() -> bool {
     true
 }
 
-/// Root of the user-level TraceVault config dir: `~/.config/tracevault/`
-/// (beside `credentials.json` / `context.json`). Falls back to `./tracevault`.
+/// Root of the user-level config dir: `~/.config/visdom/` (beside
+/// `credentials.json` / `context.json`). Falls back to `./visdom`. Files an
+/// earlier release left in `~/.config/tracevault/` are still read from there
+/// (see [`crate::layout`]).
 pub fn tv_config_root() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("tracevault")
+    crate::layout::user_dir_in(&dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")))
 }
 
+/// Where the user-level tracing config is written: `tracing.toml` (the
+/// directory's `config.toml` is the `visdom` launcher's own).
 pub fn user_config_path_in(config_root: &Path) -> PathBuf {
-    config_root.join("config.toml")
+    config_root.join(crate::layout::TRACING_CONFIG)
+}
+
+/// The user-level tracing config to read: [`user_config_path_in`], else the
+/// legacy directory's `config.toml`.
+pub fn existing_user_config_path_in(config_root: &Path) -> PathBuf {
+    crate::layout::existing_user_tracing_config(config_root)
 }
 pub fn user_config_path() -> PathBuf {
     user_config_path_in(&tv_config_root())
 }
+/// The default user-context file: `context.json` under `config_root`, or the
+/// legacy directory's when it exists only there.
 pub fn default_user_context_path_in(config_root: &Path) -> PathBuf {
-    config_root.join("context.json")
+    crate::layout::user_path(config_root, "context.json")
 }
 
 /// `~/.config/tracevault/context.json`, alongside credentials.json.
@@ -126,9 +136,9 @@ pub fn default_user_context_path() -> PathBuf {
 /// Load the user-level `config.toml`, distinguishing a **missing** file
 /// (`Ok(None)`) from a malformed/unreadable one (`Err`). Mirrors
 /// `TracevaultConfig::try_load` but for a direct file path (the user-level
-/// config is NOT inside a `.tracevault/` dir).
+/// config is NOT inside a `.visdom/` dir).
 pub fn try_load_user_config_in(config_root: &Path) -> Result<Option<TracevaultConfig>, String> {
-    let path = user_config_path_in(config_root);
+    let path = existing_user_config_path_in(config_root);
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -145,7 +155,7 @@ pub fn load_user_config_in(config_root: &Path) -> TracevaultConfig {
         Ok(Some(cfg)) => cfg,
         Ok(None) => TracevaultConfig::default(),
         Err(e) => {
-            eprintln!("tracevault: warning: malformed user config.toml: {e}");
+            eprintln!("tracevault: warning: malformed user tracing config: {e}");
             TracevaultConfig::default()
         }
     }
@@ -231,21 +241,30 @@ impl UserContext {
 }
 
 impl TracevaultConfig {
+    /// `<project_root>/.visdom`: where this CLI writes.
     pub fn config_dir(project_root: &Path) -> PathBuf {
-        project_root.join(".tracevault")
+        crate::layout::repo_dir(project_root)
     }
 
+    /// Where the tracing config is **written**: `.visdom/tracing.toml`.
     pub fn config_path(project_root: &Path) -> PathBuf {
-        Self::config_dir(project_root).join("config.toml")
+        crate::layout::tracing_config(project_root)
     }
 
-    /// Runtime artifacts inside a `.tracevault/` directory that must never be
-    /// committed (`config.toml` and the `.gitignore` itself stay tracked).
-    const GITIGNORE_CONTENTS: &'static str = "sessions/\ncache/\n*.local.toml\n";
+    /// The tracing config to **read**: [`config_path`](Self::config_path),
+    /// else the `.tracevault/config.toml` an earlier release wrote.
+    pub fn existing_config_path(project_root: &Path) -> PathBuf {
+        crate::layout::existing_tracing_config(project_root)
+    }
 
-    /// Ensure a `.gitignore` exists inside `config_dir` (a `.tracevault/` dir)
+    /// A `.visdom/` directory holds one file meant to be committed — the
+    /// team's `config.toml` — beside this checkout's own tracing binding and
+    /// runtime state, which must never be.
+    const GITIGNORE_CONTENTS: &'static str = "*\n!.gitignore\n!config.toml\n";
+
+    /// Ensure a `.gitignore` exists inside `config_dir` (a `.visdom/` dir)
     /// so runtime artifacts are ignored no matter where the directory was
-    /// created — including the per-subproject `.tracevault/` dirs the stream
+    /// created — including the per-subproject `.visdom/` dirs the stream
     /// hook may create from a nested working directory. Idempotent: an existing
     /// `.gitignore` is never overwritten. Best-effort; callers may ignore the
     /// result (a failure must never break the hook).
@@ -259,8 +278,10 @@ impl TracevaultConfig {
 
     pub fn to_toml(&self) -> String {
         let body = toml::to_string(self).unwrap_or_default();
-        format!("# TraceVault configuration\n{body}")
+        format!("{}{body}", Self::HEADER)
     }
+
+    const HEADER: &'static str = "# Visdom tracing configuration (this checkout's own)\n";
 
     /// Every key this struct reads from `config.toml`. Kept in step with the
     /// fields by `fields_lists_every_serialized_key`.
@@ -287,10 +308,11 @@ impl TracevaultConfig {
     /// order is kept. An unreadable or malformed file is replaced.
     pub fn save(&self, project_root: &Path) -> std::io::Result<()> {
         let path = Self::config_path(project_root);
-        let mut table: toml::Table = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|content| content.parse().ok())
-            .unwrap_or_default();
+        let mut table: toml::Table =
+            std::fs::read_to_string(Self::existing_config_path(project_root))
+                .ok()
+                .and_then(|content| content.parse().ok())
+                .unwrap_or_default();
         let ours = toml::Table::try_from(self).map_err(std::io::Error::other)?;
         // The file's fields as this struct reads them, to tell which ones the
         // caller changed.
@@ -320,7 +342,10 @@ impl TracevaultConfig {
             }
         }
         let body = toml::to_string(&table).map_err(std::io::Error::other)?;
-        std::fs::write(path, format!("# TraceVault configuration\n{body}"))
+        let dir = Self::config_dir(project_root);
+        std::fs::create_dir_all(&dir)?;
+        Self::ensure_gitignore(&dir)?;
+        std::fs::write(path, format!("{}{body}", Self::HEADER))
     }
 
     /// Load `config.toml`, distinguishing a **missing** file (`Ok(None)`) from a
@@ -332,7 +357,7 @@ impl TracevaultConfig {
     /// permission denied) is surfaced as `Err` with the path, rather than being
     /// masked as an absent config.
     pub fn try_load(project_root: &Path) -> Result<Option<Self>, String> {
-        let path = Self::config_path(project_root);
+        let path = Self::existing_config_path(project_root);
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -351,7 +376,7 @@ impl TracevaultConfig {
         match Self::try_load(project_root) {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("tracevault: warning: malformed config.toml: {e}");
+                eprintln!("tracevault: warning: malformed tracing config: {e}");
                 None
             }
         }
@@ -398,10 +423,10 @@ mod tests {
     #[test]
     fn load_valid_config() {
         let dir = tempfile::tempdir().unwrap();
-        let tv_dir = dir.path().join(".tracevault");
+        let tv_dir = dir.path().join(".visdom");
         fs::create_dir_all(&tv_dir).unwrap();
         fs::write(
-            tv_dir.join("config.toml"),
+            tv_dir.join("tracing.toml"),
             "agent = \"claude-code\"\nserver_url = \"https://example.com\"\n",
         )
         .unwrap();
@@ -416,10 +441,10 @@ mod tests {
         // single-tenant org removal. serde must silently ignore the unknown
         // field rather than fail to parse (no `deny_unknown_fields`).
         let dir = tempfile::tempdir().unwrap();
-        let tv_dir = dir.path().join(".tracevault");
+        let tv_dir = dir.path().join(".visdom");
         fs::create_dir_all(&tv_dir).unwrap();
         fs::write(
-            tv_dir.join("config.toml"),
+            tv_dir.join("tracing.toml"),
             "agent = \"claude-code\"\nserver_url = \"https://example.com\"\norg_slug = \"x\"\n",
         )
         .unwrap();
@@ -445,9 +470,9 @@ mod tests {
 
         // Valid file → Ok(Some(cfg)).
         let valid = tempfile::tempdir().unwrap();
-        let tv_dir = valid.path().join(".tracevault");
+        let tv_dir = valid.path().join(".visdom");
         fs::create_dir_all(&tv_dir).unwrap();
-        fs::write(tv_dir.join("config.toml"), "agent = \"claude-code\"\n").unwrap();
+        fs::write(tv_dir.join("tracing.toml"), "agent = \"claude-code\"\n").unwrap();
         assert!(matches!(
             TracevaultConfig::try_load(valid.path()),
             Ok(Some(_))
@@ -455,22 +480,22 @@ mod tests {
 
         // Present but unparseable → Err (NOT silently treated as missing).
         let bad = tempfile::tempdir().unwrap();
-        let bad_dir = bad.path().join(".tracevault");
+        let bad_dir = bad.path().join(".visdom");
         fs::create_dir_all(&bad_dir).unwrap();
-        fs::write(bad_dir.join("config.toml"), "this = = not valid toml").unwrap();
+        fs::write(bad_dir.join("tracing.toml"), "this = = not valid toml").unwrap();
         assert!(TracevaultConfig::try_load(bad.path()).is_err());
 
         // Present but unreadable (a non-NotFound IO error — here config.toml is a
         // directory) → Err, NOT masked as missing.
         let io = tempfile::tempdir().unwrap();
-        fs::create_dir_all(io.path().join(".tracevault").join("config.toml")).unwrap();
+        fs::create_dir_all(io.path().join(".visdom").join("tracing.toml")).unwrap();
         assert!(TracevaultConfig::try_load(io.path()).is_err());
     }
 
     #[test]
     fn ensure_gitignore_creates_runtime_ignore_file() {
         let dir = tempfile::tempdir().unwrap();
-        let config_dir = dir.path().join(".tracevault");
+        let config_dir = dir.path().join(".visdom");
         fs::create_dir_all(&config_dir).unwrap();
 
         TracevaultConfig::ensure_gitignore(&config_dir).unwrap();
@@ -478,9 +503,8 @@ mod tests {
         let gitignore = config_dir.join(".gitignore");
         assert!(gitignore.exists(), ".gitignore must be created");
         let content = fs::read_to_string(&gitignore).unwrap();
-        assert!(content.contains("sessions/"), "must ignore sessions/");
-        assert!(content.contains("cache/"), "must ignore cache/");
-        assert!(content.contains("*.local.toml"), "must ignore *.local.toml");
+        // Everything but the team's `config.toml` (and this file) is local.
+        assert_eq!(content, "*\n!.gitignore\n!config.toml\n");
     }
 
     #[test]
@@ -568,14 +592,14 @@ mod tests {
 
     #[test]
     fn user_config_paths_are_under_config_root() {
-        let root = std::path::Path::new("/x/tracevault");
+        let root = std::path::Path::new("/x/visdom");
         assert_eq!(
             user_config_path_in(root),
-            std::path::Path::new("/x/tracevault/config.toml")
+            std::path::Path::new("/x/visdom/tracing.toml")
         );
         assert_eq!(
             default_user_context_path_in(root),
-            std::path::Path::new("/x/tracevault/context.json")
+            std::path::Path::new("/x/visdom/context.json")
         );
     }
 
@@ -677,7 +701,7 @@ mod tests {
     #[test]
     fn ensure_gitignore_preserves_existing_file() {
         let dir = tempfile::tempdir().unwrap();
-        let config_dir = dir.path().join(".tracevault");
+        let config_dir = dir.path().join(".visdom");
         fs::create_dir_all(&config_dir).unwrap();
         let gitignore = config_dir.join(".gitignore");
         fs::write(&gitignore, "custom-user-content\n").unwrap();
@@ -736,8 +760,8 @@ mod tests {
     }
 
     fn write_config(root: &Path, content: &str) {
-        fs::create_dir_all(root.join(".tracevault")).unwrap();
-        fs::write(root.join(".tracevault/config.toml"), content).unwrap();
+        fs::create_dir_all(root.join(".visdom")).unwrap();
+        fs::write(root.join(".visdom/tracing.toml"), content).unwrap();
     }
 
     #[test]
@@ -755,7 +779,7 @@ mod tests {
         let content = fs::read_to_string(TracevaultConfig::config_path(dir.path())).unwrap();
         assert_eq!(
             content,
-            "# TraceVault configuration\nrepo_id = \"r2\"\napi_key = \"tvk_abc==\"\nfuture_key = 7\nagent = \"claude-code\"\n"
+            "# Visdom tracing configuration (this checkout's own)\nrepo_id = \"r2\"\napi_key = \"tvk_abc==\"\nfuture_key = 7\nagent = \"claude-code\"\n"
         );
     }
 
@@ -809,7 +833,7 @@ mod tests {
         assert_eq!(
             content,
             format!(
-                "# TraceVault configuration\n{}",
+                "# Visdom tracing configuration (this checkout's own)\n{}",
                 original.replace("r1", "r2")
             )
         );
@@ -830,7 +854,7 @@ mod tests {
         let content = fs::read_to_string(TracevaultConfig::config_path(dir.path())).unwrap();
         assert_eq!(
             content,
-            "# TraceVault configuration\nuser_context = false\nagent = \"claude-code\"\n"
+            "# Visdom tracing configuration (this checkout's own)\nuser_context = false\nagent = \"claude-code\"\n"
         );
     }
 
@@ -851,9 +875,72 @@ mod tests {
     #[test]
     fn save_creates_a_missing_config() {
         let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
+        fs::create_dir_all(dir.path().join(".visdom")).unwrap();
         TracevaultConfig::default().save(dir.path()).unwrap();
         let content = fs::read_to_string(TracevaultConfig::config_path(dir.path())).unwrap();
         assert_eq!(content, TracevaultConfig::default().to_toml());
+    }
+
+    #[test]
+    fn a_legacy_config_is_read_and_saved_into_the_new_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".tracevault")).unwrap();
+        fs::write(
+            root.join(".tracevault/config.toml"),
+            "repo_id = \"r1\"\napi_key = \"tvk_x\"\nfuture_setting = 1\n",
+        )
+        .unwrap();
+        // The launcher's own file beside it is not the tracing config.
+        fs::create_dir_all(root.join(".visdom")).unwrap();
+        fs::write(root.join(".visdom/config.toml"), "agent = \"codex\"\n").unwrap();
+
+        let mut cfg = TracevaultConfig::try_load(root).unwrap().unwrap();
+        assert_eq!(cfg.repo_id.as_deref(), Some("r1"));
+        assert_eq!(cfg.agent, "claude-code");
+
+        cfg.repo_id = Some("r2".into());
+        cfg.save(root).unwrap();
+
+        // Written to the new file, with what only the old file carried.
+        assert_eq!(
+            fs::read_to_string(root.join(".visdom/tracing.toml")).unwrap(),
+            "# Visdom tracing configuration (this checkout's own)\nrepo_id = \"r2\"\n\
+             api_key = \"tvk_x\"\nfuture_setting = 1\nagent = \"claude-code\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(".visdom/config.toml")).unwrap(),
+            "agent = \"codex\"\n"
+        );
+        assert!(root.join(".visdom/.gitignore").exists());
+        // The old file is left as it was, and no longer read.
+        assert!(fs::read_to_string(root.join(".tracevault/config.toml"))
+            .unwrap()
+            .contains("r1"));
+        assert_eq!(
+            TracevaultConfig::load(root).unwrap().repo_id.as_deref(),
+            Some("r2")
+        );
+    }
+
+    #[test]
+    fn a_legacy_user_config_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("tracevault")).unwrap();
+        fs::write(
+            dir.path().join("tracevault/config.toml"),
+            "user_context = \"/ctx.json\"\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("tracevault/context.json"), "{}").unwrap();
+        let user = dir.path().join("visdom");
+
+        let cfg = try_load_user_config_in(&user).unwrap().unwrap();
+        assert!(matches!(cfg.user_context, Some(UserContext::Path(p)) if p == "/ctx.json"));
+        assert_eq!(
+            default_user_context_path_in(&user),
+            dir.path().join("tracevault/context.json")
+        );
+        assert_eq!(user_config_path_in(&user), user.join("tracing.toml"));
     }
 }

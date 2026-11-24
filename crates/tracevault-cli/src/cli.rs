@@ -204,7 +204,7 @@ pub struct InitArgs {
     /// Bind this directory to one project, for every session started
     /// under it (an umbrella folder of checkouts, for example): resolves
     /// --project once on the server and writes its id to
-    /// .tracevault/config.toml here (created if missing). Works outside
+    /// .visdom/tracing.toml here (created if missing). Works outside
     /// git; installs no hooks (use --global for those) and binds no repo.
     #[arg(
         long,
@@ -583,6 +583,18 @@ pub async fn run(cmd: Command) {
             workspace,
             project,
         }) => {
+            // Files an earlier release kept under `tracevault` names move to
+            // their `visdom` ones first, so everything below writes beside
+            // them. A machine-wide setup leaves the current directory alone.
+            let mut carried = commands::relocate::carry_over_user();
+            if !global {
+                if let Ok(cwd) = env::current_dir() {
+                    carried.extend(commands::relocate::carry_over_repo(&cwd));
+                }
+            }
+            for line in carried {
+                println!("{line}");
+            }
             if workspace {
                 let cwd = env::current_dir().expect("Cannot determine current directory");
                 // `requires = "project"` guarantees it.
@@ -801,11 +813,16 @@ pub async fn run(cmd: Command) {
                             agent.label()
                         );
                         println!("Git hooks installed (pre-push, post-commit)");
-                        println!("Added .tracevault/ to .gitignore");
+                        println!(
+                            "Tracing state is kept in .visdom/ (ignored by its own .gitignore)"
+                        );
                     } else {
                         println!("{} hooks installed ({entry})", agent.label());
                         println!("Git hooks installed (pre-push, post-commit)");
-                        println!("Added .tracevault/ and {entry} to .gitignore");
+                        println!("Added {entry} to .gitignore");
+                        println!(
+                            "Tracing state is kept in .visdom/ (ignored by its own .gitignore)"
+                        );
                     }
                     println!(
                         "Nothing needs to be committed — all TraceVault files are local only."

@@ -5,17 +5,17 @@ use tracevault_cli::commands::context::{
 };
 use tracevault_cli::context::Context;
 
-/// Create a tempdir with a pre-existing `.tracevault/` directory
+/// Create a tempdir with a pre-existing `.visdom/` directory
 /// (simulating a `tracevault init`-ed repo).
 fn tmp_project() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    std::fs::create_dir_all(tmp.path().join(".tracevault")).unwrap();
+    std::fs::create_dir_all(tmp.path().join(".visdom")).unwrap();
     tmp
 }
 
 /// Load the context from a test project dir (reads the global context.json).
 fn load_ctx(tmp: &TempDir) -> Context {
-    Context::load_from(&tmp.path().join(".tracevault").join("context.json"))
+    Context::load_from(&tmp.path().join(".visdom").join("context.json"))
 }
 
 // ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ fn find_project_root_walks_up_from_subdir() {
 
 #[test]
 fn find_project_root_errors_without_tracevault() {
-    let tmp = TempDir::new().unwrap(); // no .tracevault/
+    let tmp = TempDir::new().unwrap(); // no .visdom/
     let err = find_project_root(tmp.path()).unwrap_err();
     assert!(err.to_string().contains("tracevault init"));
 }
@@ -383,12 +383,12 @@ fn clear_empties_all_fields() {
 }
 
 // ---------------------------------------------------------------------------
-// set / update / clear — require initialised .tracevault/
+// set / update / clear — require initialised .visdom/
 // ---------------------------------------------------------------------------
 
 #[test]
 fn set_errors_without_tracevault_dir() {
-    let tmp = tempfile::TempDir::new().unwrap(); // no .tracevault/
+    let tmp = tempfile::TempDir::new().unwrap(); // no .visdom/
     let err = run_set(tmp.path(), None, vec![], vec![], false, false).unwrap_err();
     assert!(
         err.to_string().contains("tracevault init"),
@@ -398,7 +398,7 @@ fn set_errors_without_tracevault_dir() {
 
 #[test]
 fn update_errors_without_tracevault_dir() {
-    let tmp = tempfile::TempDir::new().unwrap(); // no .tracevault/
+    let tmp = tempfile::TempDir::new().unwrap(); // no .visdom/
     let err = run_update(
         tmp.path(),
         None,
@@ -418,7 +418,7 @@ fn update_errors_without_tracevault_dir() {
 
 #[test]
 fn clear_errors_without_tracevault_dir() {
-    let tmp = tempfile::TempDir::new().unwrap(); // no .tracevault/
+    let tmp = tempfile::TempDir::new().unwrap(); // no .visdom/
     let err = run_clear(tmp.path(), false, false).unwrap_err();
     assert!(
         err.to_string().contains("tracevault init"),

@@ -117,7 +117,7 @@ struct AuthContext {
 
 /// `config_server_url`/`config_api_key` are the lowest rung, mirroring
 /// `credentials::resolve_credentials`. Without them this inspector reported a
-/// repo authenticated purely through `.tracevault/config.toml` as "no
+/// repo authenticated purely through `.visdom/tracing.toml` as "no
 /// credentials found" and exited non-zero, while every command using that same
 /// config worked — the inspector called a working setup broken.
 fn resolve_auth(config_server_url: Option<&str>, config_api_key: Option<&str>) -> AuthContext {
@@ -172,7 +172,7 @@ fn resolve_auth(config_server_url: Option<&str>, config_api_key: Option<&str>) -
         server_url: env_url.or_else(|| config_server_url.map(str::to_string)),
         credential: config_api_key.map(|k| Credential::ApiKey(k.to_string())),
         source: if config_api_key.is_some() {
-            "project config (.tracevault/config.toml)"
+            "project config (.visdom/tracing.toml)"
         } else {
             "none"
         },
@@ -236,10 +236,10 @@ async fn auth_checks(auth: &AuthContext, config_server_url: Option<&str>) -> Vec
         out.push(Check::warn(
             "Server URL",
             format!(
-                ".tracevault/config.toml pins '{config_url}' but the saved login is for \
+                ".visdom/tracing.toml pins '{config_url}' but the saved login is for \
                  '{file_url}'. The config URL is ignored — commands use '{file_url}'. Run \
                  `tracevault login --server-url {config_url}` to use the repo's instance, or \
-                 remove `server_url` from .tracevault/config.toml."
+                 remove `server_url` from .visdom/tracing.toml."
             ),
         ));
     }
@@ -325,7 +325,7 @@ fn project_checks(
         ));
     }
 
-    let tv_present = project_root.join(".tracevault").exists();
+    let tv_present = crate::layout::is_set_up(project_root);
     out.push(tracevault_init_check(tv_present, has_global, has_binding));
 
     // Distinguish "no config.toml" (expected in workspace/detached mode —
@@ -342,7 +342,7 @@ fn project_checks(
             if tv_present {
                 out.push(Check::warn(
                     "Project config",
-                    "No .tracevault/config.toml — run `tracevault init`, or use workspace mode (`tracevault repo status`).",
+                    "No .visdom/tracing.toml — run `tracevault init`, or use workspace mode (`tracevault repo status`).",
                 ));
             }
             None
@@ -350,7 +350,7 @@ fn project_checks(
         Err(e) => {
             out.push(Check::err(
                 "Project config",
-                format!(".tracevault/config.toml malformed: {e}"),
+                format!(".visdom/tracing.toml malformed: {e}"),
             ));
             None
         }
@@ -376,7 +376,7 @@ fn project_checks(
     } else {
         out.push(Check::skip(
             "Git hooks",
-            "not installed (no .tracevault/ — run `tracevault init`)",
+            "not installed (no .visdom/ — run `tracevault init`)",
         ));
     }
 
@@ -603,17 +603,17 @@ fn claude_hook_check_in(repo_claude_dir: &Path, global_settings: Option<&Path>) 
     )
 }
 
-/// Severity of the "TraceVault initialized" check. A per-repo `.tracevault/`
+/// Severity of the "TraceVault initialized" check. A per-repo `.visdom/`
 /// present is always Ok. Absent is EXPECTED (Skip) when the user has a global
 /// install or an active workspace binding; only a truly-unconfigured setup
 /// (none of the three) is an Error.
 fn tracevault_init_check(tv_dir_present: bool, has_global: bool, has_binding: bool) -> Check {
     if tv_dir_present {
-        Check::ok("TraceVault initialized", ".tracevault/ present")
+        Check::ok("TraceVault initialized", ".visdom/ present")
     } else if has_global || has_binding {
         Check::skip(
             "TraceVault initialized",
-            "no per-repo .tracevault/ — global/workspace mode",
+            "no per-repo .visdom/ — global/workspace mode",
         )
     } else {
         Check::err(
@@ -886,7 +886,7 @@ fn project_binding_check(outcome: &ProjectOutcome) -> Check {
     }
 }
 
-/// Surfaces a `.tracevault/config.toml` that still carries the legacy
+/// Surfaces a `.visdom/tracing.toml` that still carries the legacy
 /// `default_project` NAME (VIS-1256). Ingest never resolves names, so the
 /// name contributes nothing to attribution until `init`/`sync` migrate it to
 /// `project_id`; this command therefore does not resolve it either (that
@@ -962,9 +962,9 @@ fn checkout_recording_check(
     use crate::commands::stream::Attribution;
     const LABEL: &str = "Recording";
     let repo_id_problem = config.and_then(|c| match c.repo_id.as_deref() {
-        None => Some(".tracevault/config.toml has no repo_id".to_string()),
+        None => Some(".visdom/tracing.toml has no repo_id".to_string()),
         Some(id) if !crate::commands::stream::binding_repo_id_is_valid(id) => Some(format!(
-            ".tracevault/config.toml repo_id '{id}' is not a valid id"
+            ".visdom/tracing.toml repo_id '{id}' is not a valid id"
         )),
         Some(_) => None,
     });
@@ -1179,7 +1179,7 @@ enum RepoLookup {
     /// The explicitly named session's repo binding for this worktree (a
     /// subagent override or the `repo switch` binding).
     Workspace(String),
-    /// The `repo_id` in `.tracevault/config.toml` (bound mode).
+    /// The `repo_id` in `.visdom/tracing.toml` (bound mode).
     Bound(String),
     /// A `config.toml` exists but has no `repo_id`, and no session binding
     /// supplies one — the state in which the stream hook drops every event
@@ -1253,12 +1253,12 @@ async fn server_repo_checks(
         Some(RepoLookup::MissingRepoId) => {
             out.push(Check::err(
                 "Repo registered on server",
-                ".tracevault/config.toml has no repo_id, so sessions here are not attributed to this repo — run `tracevault sync` while logged in to register the repo and write it",
+                ".visdom/tracing.toml has no repo_id, so sessions here are not attributed to this repo — run `tracevault sync` while logged in to register the repo and write it",
             ));
             return out;
         }
         Some(RepoLookup::Workspace(id)) => (id, "session binding", false),
-        Some(RepoLookup::Bound(id)) => (id, ".tracevault/config.toml", true),
+        Some(RepoLookup::Bound(id)) => (id, ".visdom/tracing.toml", true),
     };
 
     let (Some(credential), Some(server_url)) = (auth.credential.clone(), auth.server_url.as_ref())
@@ -1395,11 +1395,11 @@ fn count_pending_events(session_dir: &Path, include_legacy: bool) -> usize {
 }
 
 fn session_checks(project_root: &Path) -> Vec<Check> {
-    let sessions_dir = project_root.join(".tracevault/sessions");
+    let sessions_dir = project_root.join(".visdom/sessions");
     if !sessions_dir.exists() {
         return vec![Check::skip(
             "Pending events",
-            "no .tracevault/sessions/ here (project-local check; a detached worker's queue may live under its own working dir)",
+            "no .visdom/sessions/ here (project-local check; a detached worker's queue may live under its own working dir)",
         )];
     }
 
@@ -1783,7 +1783,7 @@ mod tests {
         assert_eq!(
             exit_code_for(&refs),
             0,
-            "global mode must not force exit 1 on missing .tracevault/"
+            "global mode must not force exit 1 on missing .visdom/"
         );
         assert!(checks
             .iter()
@@ -1792,13 +1792,13 @@ mod tests {
 
     #[test]
     fn project_checks_warns_when_config_toml_missing() {
-        // Pure workspace/detached-mode user: .tracevault/ exists (or not,
+        // Pure workspace/detached-mode user: .visdom/ exists (or not,
         // doesn't matter for this check) but there's no config.toml because
         // `tracevault init` was never run. This must be a Warn, not an
         // Error, and therefore must not force the process exit code to 1.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-        std::fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".visdom/sessions")).unwrap();
         let missing_global = dir.path().join("no-global.json");
         let (checks, cfg) =
             project_checks(dir.path(), Some(missing_global.as_path()), false, false);
@@ -1824,9 +1824,9 @@ mod tests {
         // and keep forcing a non-zero exit code.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-        std::fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".visdom")).unwrap();
         std::fs::write(
-            dir.path().join(".tracevault/config.toml"),
+            dir.path().join(".visdom/tracing.toml"),
             "not valid toml {{{",
         )
         .unwrap();
@@ -2895,7 +2895,7 @@ mod tests {
         )));
         let check = project_binding_check(&outcome);
         assert_eq!(check.level, Level::Ok, "detail: {}", check.detail);
-        assert_eq!(check.detail, "visdom — workspace .tracevault/config.toml");
+        assert_eq!(check.detail, "visdom — workspace .visdom/tracing.toml");
     }
 
     /// A legacy `default_project` is reported as unmigrated, never resolved
@@ -3013,7 +3013,7 @@ mod tests {
     // crate lock serializes mutators against each other, but only holding
     // the lock AND declaring the var's value makes a reader safe.
 
-    // ---- resolve_auth: `.tracevault/config.toml` is the lowest credential
+    // ---- resolve_auth: `.visdom/tracing.toml` is the lowest credential
     // ---- rung in `resolve_credentials`, so the inspector must know it too.
 
     /// Isolate the env and the credentials file so nothing on the developer's
@@ -3047,7 +3047,7 @@ mod tests {
             matches!(auth.credential, Some(Credential::ApiKey(ref k)) if k == "tvk_from_config"),
             "the config's key is the credential every command resolves"
         );
-        assert_eq!(auth.source, "project config (.tracevault/config.toml)");
+        assert_eq!(auth.source, "project config (.visdom/tracing.toml)");
     }
 
     /// `resolve_credentials` resolves the URL and the credential independently,
@@ -3070,7 +3070,7 @@ mod tests {
     #[test]
     fn the_credentials_file_still_outranks_the_config() {
         let (dir, _lock, _guard) = auth_fixture();
-        let creds_dir = dir.path().join("tracevault");
+        let creds_dir = dir.path().join("visdom");
         std::fs::create_dir_all(&creds_dir).unwrap();
         std::fs::write(
             creds_dir.join("credentials.json"),

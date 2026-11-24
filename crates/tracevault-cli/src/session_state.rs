@@ -112,7 +112,7 @@ pub struct SessionState {
     /// again from its checkout's remote on the next hook event.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_bind_off: bool,
-    /// The directory holding the `.tracevault/` this session keeps its
+    /// The directory holding the `.visdom/` this session keeps its
     /// session dir (`.stream_offset`, pending queues, `origin`) in, recorded
     /// once by the `SessionStart` hook from where the session started
     /// (VIS-1257). Claude Code's hook `cwd` follows the shell's `cd`, so
@@ -146,7 +146,7 @@ pub struct InferredRepo {
 }
 
 /// The session's recorded [`SessionState::storage_root`], if that directory
-/// still exists. Its `.tracevault/` may not exist yet: a git root is recorded
+/// still exists. Its `.visdom/` may not exist yet: a git root is recorded
 /// whether or not it has one, and the stream hook creates it on first use,
 /// exactly as it would for an event whose `cwd` resolved there.
 pub fn storage_root(state: &SessionState) -> Option<PathBuf> {
@@ -204,22 +204,43 @@ pub fn anchored_session_dirs_in(
     local_sessions_dir: &std::path::Path,
     worktree_top: &str,
 ) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(state_dir) else {
-        return vec![];
-    };
-    let mut dirs: Vec<PathBuf> = entries
+    // Sessions an earlier release recorded are still in the legacy state dir.
+    let state_dirs = std::iter::once(state_dir.to_path_buf())
+        .chain(crate::layout::legacy_user_sessions_dir(state_dir));
+    let ids: std::collections::BTreeSet<String> = state_dirs
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
         .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name();
-            let id = name.to_str()?.strip_suffix(".toml")?.to_string();
+        .filter_map(|e| Some(e.file_name().to_str()?.strip_suffix(".toml")?.to_string()))
+        .collect();
+    let mut dirs: Vec<PathBuf> = ids
+        .into_iter()
+        .filter_map(|id| {
             let root = storage_root(&load_in(state_dir, &id))?;
-            let dir = root.join(".tracevault").join("sessions").join(&id);
-            (dir.parent() != Some(local_sessions_dir) && dir.is_dir() && ran_in(&dir, worktree_top))
-                .then_some(dir)
+            let dir = crate::layout::session_dir(&root, &id);
+            let local = dir
+                .parent()
+                .is_some_and(|parent| is_local_sessions_dir(parent, local_sessions_dir));
+            (!local && dir.is_dir() && ran_in(&dir, worktree_top)).then_some(dir)
         })
         .collect();
     dirs.sort();
     dirs
+}
+
+/// Whether `dir` is the checkout's own sessions directory `local` — under
+/// either of the names its `.visdom/` directory has had.
+pub(crate) fn is_local_sessions_dir(dir: &std::path::Path, local: &std::path::Path) -> bool {
+    if dir == local {
+        return true;
+    }
+    match (
+        crate::layout::session_dir_root(&dir.join("x")),
+        crate::layout::session_dir_root(&local.join("x")),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// [`anchored_session_dirs_in`] the user's state dir.
@@ -232,14 +253,15 @@ pub fn anchored_session_dirs(
         .unwrap_or_default()
 }
 
-/// `<root>/.tracevault/sessions/<session_id>` for `session_id`, where `root`
+/// `<root>/.visdom/sessions/<session_id>` for `session_id` (or the
+/// `.tracevault/` one an earlier release started it in), where `root`
 /// is the session's recorded [`storage_root`], else `fallback_root` (the root
 /// resolved from the caller's working directory). Every reader and writer of
 /// a session dir goes through this, so a session is found where its hook
 /// keeps it.
 pub fn session_dir(fallback_root: &std::path::Path, session_id: &str) -> PathBuf {
     let root = storage_root(&load(session_id)).unwrap_or_else(|| fallback_root.to_path_buf());
-    root.join(".tracevault").join("sessions").join(session_id)
+    crate::layout::session_dir(&root, session_id)
 }
 
 /// Record `root` as the session's [`SessionState::storage_root`] unless one
@@ -260,12 +282,14 @@ pub fn record_storage_root(
     Ok(true)
 }
 
-/// `$XDG_STATE_HOME/tracevault/sessions` or `~/.local/state/tracevault/sessions`.
+/// `$XDG_STATE_HOME/visdom/sessions` or `~/.local/state/visdom/sessions`. A
+/// session recorded under the legacy `tracevault/sessions` beside it is still
+/// read from there (see [`load_from`]).
 pub fn sessions_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))?;
-    Some(base.join("tracevault").join("sessions"))
+    Some(crate::layout::user_dir_in(&base).join("sessions"))
 }
 
 /// The session of the agent that runs this command, from its environment:
@@ -311,7 +335,14 @@ fn load_in(sessions_dir: &std::path::Path, session_id: &str) -> SessionState {
     if !is_safe_session_id(session_id) {
         return SessionState::default();
     }
-    match std::fs::read_to_string(state_path_in(sessions_dir, session_id)) {
+    let mut path = state_path_in(sessions_dir, session_id);
+    if !path.exists() {
+        // Recorded by an earlier release, under the legacy state dir.
+        if let Some(legacy) = crate::layout::legacy_user_sessions_dir(sessions_dir) {
+            path = state_path_in(&legacy, session_id);
+        }
+    }
+    match std::fs::read_to_string(path) {
         Ok(s) => toml::from_str(&s).unwrap_or_default(),
         Err(_) => SessionState::default(),
     }
@@ -591,14 +622,14 @@ mod tests {
         let state = tmp.path().join("state");
         let umbrella = tmp.path().join("umbrella");
         let repo = tmp.path().join("umbrella/repo");
-        let local = repo.join(".tracevault/sessions");
+        let local = repo.join(".visdom/sessions");
         let anchor = |id: &str, root: &std::path::Path, ran: Option<&str>| {
             let st = SessionState {
                 storage_root: Some(root.to_string_lossy().into_owned()),
                 ..Default::default()
             };
             save_in(&state, id, &st).unwrap();
-            let dir = root.join(".tracevault/sessions").join(id);
+            let dir = root.join(".visdom/sessions").join(id);
             std::fs::create_dir_all(&dir).unwrap();
             if let Some(wt) = ran {
                 record_worktree(&dir, wt).unwrap();
@@ -645,5 +676,54 @@ mod tests {
         let loaded = load_from(tmp.path(), "sess-1");
         assert_eq!(loaded.active_project, Some(pb.clone()));
         assert_eq!(loaded.subagent_projects.get("/wt"), Some(&pb));
+    }
+
+    #[test]
+    fn a_session_recorded_by_an_earlier_release_is_still_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("tracevault/sessions");
+        let new = dir.path().join("visdom/sessions");
+        let umbrella = dir.path().join("umbrella");
+        let state = SessionState {
+            storage_root: Some(umbrella.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        save_in(&legacy, "old", &state).unwrap();
+
+        // Read through the new state dir, from the legacy one beside it.
+        assert_eq!(load_from(&new, "old").storage_root, state.storage_root);
+
+        // Its directory under the umbrella's `.tracevault/` is still the one.
+        let session = umbrella.join(".tracevault/sessions/old");
+        std::fs::create_dir_all(&session).unwrap();
+        record_worktree(&session, "/work/tree").unwrap();
+        let local = dir.path().join("checkout/.visdom/sessions");
+        assert_eq!(
+            anchored_session_dirs_in(&new, &local, "/work/tree"),
+            vec![session]
+        );
+
+        // Once saved, the state lives in the new dir and shadows the old file.
+        update_in(&new, "old", |s| s.storage_root = Some("/elsewhere".into())).unwrap();
+        assert!(new.join("old.toml").exists());
+        assert_eq!(
+            load_from(&new, "old").storage_root.as_deref(),
+            Some("/elsewhere")
+        );
+    }
+
+    #[test]
+    fn a_checkouts_own_sessions_are_local_under_either_name() {
+        let root = std::path::Path::new("/repo");
+        let local = root.join(".visdom/sessions");
+        assert!(is_local_sessions_dir(&local, &local));
+        assert!(is_local_sessions_dir(
+            &root.join(".tracevault/sessions"),
+            &local
+        ));
+        assert!(!is_local_sessions_dir(
+            std::path::Path::new("/other/.tracevault/sessions"),
+            &local
+        ));
     }
 }

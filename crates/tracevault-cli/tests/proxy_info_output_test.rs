@@ -14,7 +14,7 @@ use std::process::Command;
 fn run_proxy_info(creds: Option<&str>) -> (i32, String, String) {
     let dir = tempfile::tempdir().unwrap();
     if let Some(creds) = creds {
-        let creds_dir = dir.path().join("tracevault");
+        let creds_dir = dir.path().join("visdom");
         fs::create_dir_all(&creds_dir).unwrap();
         fs::write(creds_dir.join("credentials.json"), creds).unwrap();
     }

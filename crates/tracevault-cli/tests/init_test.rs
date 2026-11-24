@@ -6,7 +6,7 @@ use tracevault_cli::config::UserContext;
 
 /// A fake git repo that `init` accepts: per-repo `init` refuses to run
 /// without a credential (VIS-1045), so the repo carries one in its own
-/// `.tracevault/config.toml` — the lowest-precedence source, and the only one
+/// `.visdom/tracing.toml` — the lowest-precedence source, and the only one
 /// that is per-test rather than process-wide (env) or per-user (credentials
 /// file). There is no `origin` remote, so `init` never contacts a server.
 fn tmp_git_repo() -> TempDir {
@@ -17,12 +17,12 @@ fn tmp_git_repo() -> TempDir {
 }
 
 fn write_repo_config(root: &std::path::Path, content: &str) {
-    fs::create_dir_all(root.join(".tracevault")).unwrap();
-    fs::write(root.join(".tracevault/config.toml"), content).unwrap();
+    fs::create_dir_all(root.join(".visdom")).unwrap();
+    fs::write(root.join(".visdom/tracing.toml"), content).unwrap();
 }
 
 fn read_repo_config(root: &std::path::Path) -> String {
-    fs::read_to_string(root.join(".tracevault/config.toml")).unwrap()
+    fs::read_to_string(root.join(".visdom/tracing.toml")).unwrap()
 }
 
 /// A real git repo (`git init`) with an `origin` remote and nothing else —
@@ -88,7 +88,7 @@ fn init_without_credentials_fails_and_installs_nothing() {
     );
 
     // Nothing that would look installed while recording nothing.
-    assert!(!repo.path().join(".tracevault").exists());
+    assert!(!repo.path().join(".visdom").exists());
     assert!(!repo.path().join(".claude").exists());
     assert!(!repo.path().join(".gitignore").exists());
     assert!(!repo.path().join(".git/hooks/pre-push").exists());
@@ -118,7 +118,7 @@ fn init_without_credentials_names_the_known_server_url() {
         stderr.contains("tracevault login --server-url https://tv.example.com"),
         "stderr={stderr}"
     );
-    assert!(!repo.path().join(".tracevault").exists());
+    assert!(!repo.path().join(".visdom").exists());
 }
 
 /// A server URL from `TRACEVAULT_SERVER_URL` fills in the login hint too.
@@ -154,7 +154,7 @@ fn init_without_credentials_leaves_existing_files_unchanged() {
     let home = TempDir::new().unwrap();
     let files = [
         (
-            ".tracevault/config.toml",
+            ".visdom/tracing.toml",
             "agent = \"claude-code\"\nrepo_id = \"r\"\n",
         ),
         (".claude/settings.json", "{\"hooks\":{\"Stop\":[]}}\n"),
@@ -225,7 +225,7 @@ async fn init_fails_without_git() {
 #[tokio::test]
 async fn init_creates_tracevault_config() {
     let tmp = tmp_git_repo();
-    let config_path = tmp.path().join(".tracevault").join("config.toml");
+    let config_path = tmp.path().join(".visdom").join("tracing.toml");
 
     tracevault_cli::commands::init::init_in_directory(
         tmp.path(),
@@ -258,12 +258,18 @@ async fn init_creates_directory_structure() {
     .await
     .unwrap();
 
-    assert!(tmp.path().join(".tracevault").exists());
-    assert!(tmp.path().join(".tracevault/sessions").exists());
-    assert!(tmp.path().join(".tracevault/cache").exists());
+    assert!(tmp.path().join(".visdom").exists());
+    assert!(tmp.path().join(".visdom/sessions").exists());
+    assert!(tmp.path().join(".visdom/cache").exists());
 
     let gitignore = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
-    assert!(gitignore.contains(".tracevault/"));
+    // `.visdom/` ignores its own contents (all but the team's `config.toml`),
+    // so the repository's `.gitignore` does not have to name it.
+    assert!(!gitignore.contains(".visdom"), "{gitignore}");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join(".visdom/.gitignore")).unwrap(),
+        "*\n!.gitignore\n!config.toml\n"
+    );
     assert!(gitignore.contains(".claude/settings.json"));
     // Only the settings file init actually wrote is gitignored. init never
     // touched settings.local.json (Shared target), so it must not be added.
@@ -673,7 +679,7 @@ async fn init_writes_server_url_to_config() {
     .await
     .unwrap();
 
-    let config_path = tmp.path().join(".tracevault/config.toml");
+    let config_path = tmp.path().join(".visdom/tracing.toml");
     let content = fs::read_to_string(&config_path).unwrap();
     assert!(content.contains("server_url = \"https://tv.example.com\""));
 }
@@ -699,13 +705,13 @@ async fn init_no_gitignore_skips_gitignore_update() {
     if gitignore_path.exists() {
         let content = fs::read_to_string(&gitignore_path).unwrap();
         assert!(
-            !content.contains(".tracevault/"),
+            !content.contains(".visdom/"),
             ".gitignore should not have been modified with --no-gitignore"
         );
         assert!(!content.contains(".claude/settings.json"));
     }
     // But the rest of init should still work
-    assert!(tmp.path().join(".tracevault").exists());
+    assert!(tmp.path().join(".visdom").exists());
     assert!(tmp.path().join(".claude/settings.json").exists());
 }
 
@@ -724,7 +730,7 @@ async fn init_default_writes_user_context_true() {
     .await
     .unwrap();
 
-    let config_path = tmp.path().join(".tracevault/config.toml");
+    let config_path = tmp.path().join(".visdom/tracing.toml");
     let content = fs::read_to_string(&config_path).unwrap();
     assert!(
         content.contains("user_context = true"),
@@ -885,14 +891,14 @@ fn init_gsd_repo_local_installs_extension_and_gitignores_gsd_dir() {
         "extension-manifest.json is required for GSD to load the extension"
     );
 
-    // .gitignore has .tracevault/ AND .gsd/ — the latter because, when `gsd`
+    // .gitignore has .visdom/ AND .gsd/ — the latter because, when `gsd`
     // is on PATH, `gsd install <dir> -l` itself writes a project-local
     // `.gsd/settings.json` registration file into the repo (confirmed live:
     // it lists the installed package path). That's GSD's own local-install
     // state, not something a user should commit, so `init` gitignores it
     // preemptively regardless of whether `gsd` happened to run here.
     let gitignore = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
-    assert!(gitignore.contains(".tracevault/"));
+    assert!(repo.path().join(".visdom/.gitignore").exists());
     assert!(
         gitignore.contains(".gsd/"),
         "gsd's project-local install state must be gitignored: {gitignore}"
@@ -934,7 +940,7 @@ async fn init_opencode_repo_local_installs_plugin_and_gitignores_opencode_dir() 
     );
 
     let gitignore = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
-    assert!(gitignore.contains(".tracevault/"));
+    assert!(tmp.path().join(".visdom/.gitignore").exists());
     assert!(
         gitignore.contains(".opencode/"),
         "opencode plugin dir must be gitignored: {gitignore}"
@@ -956,7 +962,7 @@ async fn init_explicit_user_context_path_written() {
     .await
     .unwrap();
 
-    let config_path = tmp.path().join(".tracevault/config.toml");
+    let config_path = tmp.path().join(".visdom/tracing.toml");
     let content = fs::read_to_string(&config_path).unwrap();
     assert!(
         content.contains("user_context = \"/tmp/my-context.json\""),
@@ -1008,7 +1014,7 @@ fn init_rerun_without_flags_keeps_the_existing_config() {
     );
     assert_eq!(
         read_repo_config(repo.path()),
-        format!("# TraceVault configuration\n{TUNED_CONFIG}")
+        format!("# Visdom tracing configuration (this checkout's own)\n{TUNED_CONFIG}")
     );
 }
 
@@ -1044,7 +1050,7 @@ fn init_rerun_flags_override_only_their_own_fields() {
         );
     assert_eq!(
         read_repo_config(repo.path()),
-        format!("# TraceVault configuration\n{expected}")
+        format!("# Visdom tracing configuration (this checkout's own)\n{expected}")
     );
 }
 
@@ -1135,7 +1141,7 @@ async fn init_refuses_to_overwrite_a_malformed_config() {
     .await
     .expect_err("a malformed config must stop init");
 
-    assert!(err.to_string().contains(".tracevault/config.toml"), "{err}");
+    assert!(err.to_string().contains(".visdom/tracing.toml"), "{err}");
     assert_eq!(
         read_repo_config(tmp.path()),
         "api_key = \"tvk_test\"\nrepo_id = [unclosed\n"
@@ -1168,7 +1174,7 @@ async fn init_amp_repo_local_installs_plugin_and_gitignores_its_dir() {
     );
 
     let gitignore = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
-    assert!(gitignore.contains(".tracevault/"));
+    assert!(tmp.path().join(".visdom/.gitignore").exists());
     assert!(
         gitignore.lines().any(|l| l == ".amp/plugins/tracevault/"),
         "amp plugin dir must be gitignored: {gitignore}"
@@ -1303,4 +1309,49 @@ fn init_workspace_cli_binds_errors_and_requires_both_flags() {
         &["--workspace", "--project", "payments", "--global"],
     );
     assert_eq!(output.status.code(), Some(2), "--global conflicts");
+}
+
+/// A checkout and a login set up by a release that still used the
+/// `tracevault` names: `init` carries them over to `.visdom/` and `visdom/`,
+/// says so, and keeps every setting.
+#[test]
+fn init_carries_a_legacy_setup_over_to_the_visdom_names() {
+    let repo = real_git_repo_without_remote();
+    let home = TempDir::new().unwrap();
+    let legacy = repo.path().join(".tracevault");
+    fs::create_dir_all(legacy.join("sessions/done")).unwrap();
+    fs::write(legacy.join("config.toml"), TUNED_CONFIG).unwrap();
+    fs::write(
+        legacy.join(".gitignore"),
+        "sessions/\ncache/\n*.local.toml\n",
+    )
+    .unwrap();
+    fs::write(legacy.join("sessions/done/.pushed"), "").unwrap();
+    fs::create_dir_all(legacy.join("sessions/live")).unwrap();
+    let legacy_user = home.path().join(".config/tracevault");
+    fs::create_dir_all(&legacy_user).unwrap();
+    fs::write(legacy_user.join("default_repo.toml"), "").unwrap();
+
+    let output = run_init_isolated(repo.path(), home.path(), &["--claude-settings", "shared"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read_repo_config(repo.path()),
+        format!("# Visdom tracing configuration (this checkout's own)\n{TUNED_CONFIG}")
+    );
+    assert!(repo.path().join(".visdom/sessions/done/.pushed").exists());
+    // A session that may still be running keeps its directory.
+    assert!(legacy.join("sessions/live").exists());
+    assert!(!legacy.join("config.toml").exists());
+    assert!(home
+        .path()
+        .join(".config/visdom/default_repo.toml")
+        .exists());
+    assert!(stdout.contains("Moved"), "{stdout}");
+    assert!(stdout.contains("not pushed yet"), "{stdout}");
 }

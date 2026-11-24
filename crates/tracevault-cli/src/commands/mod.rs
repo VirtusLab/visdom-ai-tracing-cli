@@ -11,6 +11,7 @@ pub mod logout;
 pub mod migrate;
 pub mod project;
 pub mod proxy;
+pub mod relocate;
 pub mod repo;
 // Shared building blocks for the SessionStart/UserPromptSubmit hook commands
 // (sub-plan C).

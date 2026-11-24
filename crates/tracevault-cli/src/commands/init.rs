@@ -116,7 +116,7 @@ pub fn validate_init_flags(
     Ok(())
 }
 
-/// Set up TraceVault in `project_root`. An existing `.tracevault/config.toml`
+/// Set up TraceVault in `project_root`. An existing `.visdom/tracing.toml`
 /// is kept and only overridden where this run says so: `server_url` and
 /// `user_context` (`None` = no flag given) replace the stored values; every
 /// other field, and any field not overridden, survives (VIS-1046).
@@ -136,17 +136,17 @@ pub async fn init_in_directory(
         ));
     }
 
-    // Refuse to initialize from a linked worktree: TraceVault's `.tracevault/`,
+    // Refuse to initialize from a linked worktree: TraceVault's `.visdom/`,
     // git hooks, and Claude settings all belong in the primary checkout (which
     // every worktree shares). Initializing here would create a stray
-    // `.tracevault/` in this worktree instead. (In a linked worktree `.git` is a
+    // `.visdom/` in this worktree instead. (In a linked worktree `.git` is a
     // file, so the check above passes — this guard is what catches it.)
     if let Some(primary) = linked_worktree_primary(project_root) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
                 "Run `tracevault init` from the primary checkout ({}), not a linked worktree. \
-                 cd there and run it again — all worktrees share the primary's .tracevault/.",
+                 cd there and run it again — all worktrees share the primary's .visdom/.",
                 primary.display()
             ),
         ));
@@ -159,7 +159,7 @@ pub async fn init_in_directory(
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "cannot read the existing .tracevault/config.toml ({e}). Fix or remove it, \
+                "cannot read the existing .visdom/tracing.toml ({e}). Fix or remove it, \
                  then run `tracevault init` again."
             ),
         )
@@ -231,12 +231,12 @@ pub async fn init_in_directory(
         crate::agent::Agent::Amp => (None, AMP_PLUGIN_GITIGNORE_ENTRY.to_string()),
     };
 
-    // Create .tracevault/ directory
+    // Create .visdom/ directory
     let config_dir = TracevaultConfig::config_dir(project_root);
     fs::create_dir_all(&config_dir)?;
     fs::create_dir_all(config_dir.join("sessions"))?;
     fs::create_dir_all(config_dir.join("cache"))?;
-    // Self-contained ignore for runtime artifacts, so this `.tracevault/` is
+    // Self-contained ignore for runtime artifacts, so this `.visdom/` is
     // safe even if the root .gitignore doesn't cover it.
     TracevaultConfig::ensure_gitignore(&config_dir)?;
 
@@ -287,7 +287,7 @@ pub async fn init_in_directory(
         crate::agent::Agent::Gsd => {
             // GSD (pi) loads extensions from the user-global ~/.gsd/, not from
             // anything in the repo, so even the repo-local `init` path installs
-            // there — the repo itself only needs the .tracevault/ binding + git
+            // there — the repo itself only needs the .visdom/ binding + git
             // hooks set up above, which the extension shells out to `tracevault`
             // to use. `Some(project_root)` makes `install_gsd_extension` run
             // `gsd install -l` from this repo, registering the extension as a
@@ -356,7 +356,7 @@ pub async fn init_in_directory(
                 eprintln!(
                     "Warning: codebase {} already has {} repo records ({}) and none is named \
                      '{repo_name}'; not registering another. Set `repo_id = \"<id>\"` in \
-                     .tracevault/config.toml to the one this checkout belongs to.",
+                     .visdom/tracing.toml to the one this checkout belongs to.",
                     codebase.display_name(),
                     codebase.repos.len(),
                     codebase.repo_list()
@@ -470,7 +470,7 @@ fn credential_url_mismatch(resolved: Option<&str>, explicit: Option<&str>) -> Op
 pub struct WorkspaceInit {
     pub project_id: uuid::Uuid,
     pub project_name: String,
-    /// The `.tracevault/config.toml` written.
+    /// The `.visdom/tracing.toml` written.
     pub config_path: PathBuf,
 }
 
@@ -478,7 +478,7 @@ pub struct WorkspaceInit {
 /// session started under `dir` to one project, with no per-session step.
 ///
 /// Meant for an umbrella directory that is not itself a repo (e.g. a folder
-/// of checkouts), so it does not require git. It creates `dir/.tracevault/`
+/// of checkouts), so it does not require git. It creates `dir/.visdom/`
 /// if missing — the stream hook's `resolve_project_root` ancestor walk then
 /// finds it from any non-git directory below — resolves `project_name` to its
 /// id ONCE against the server, and writes `project_id` + `project_name`. The
@@ -505,7 +505,7 @@ pub async fn init_workspace(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "{} is inside the git repo {}; sessions here read that repo's \
-                     .tracevault/config.toml, so a workspace binding here would never be used. \
+                     .visdom/tracing.toml, so a workspace binding here would never be used. \
                      Run `tracevault init --workspace` from the repo root or from a directory \
                      that is not inside a repo.",
                     dir.display(),
@@ -519,7 +519,7 @@ pub async fn init_workspace(
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "cannot read the existing .tracevault/config.toml ({e}). Fix or remove it, \
+                "cannot read the existing .visdom/tracing.toml ({e}). Fix or remove it, \
                  then run `tracevault init --workspace` again."
             ),
         )
@@ -586,7 +586,7 @@ pub fn not_logged_in_message(url: Option<&str>) -> String {
 }
 
 /// Record the repo this checkout binds — and its codebase, display-only — in
-/// an existing `.tracevault/config.toml`, returning whether it was written.
+/// an existing `.visdom/tracing.toml`, returning whether it was written.
 ///
 /// Never creates the config: a checkout without one is in workspace mode (a
 /// global install binds sessions with `repo switch`), and writing one would
@@ -690,12 +690,14 @@ fn update_root_gitignore(project_root: &Path, settings_entry: &str) -> Result<()
         String::new()
     };
 
-    // Only ignore what `init` actually creates or modifies: the `.tracevault/`
-    // directory and the single settings file we wrote hooks into. The
-    // other settings file is left untouched, so we don't add it here. An
-    // empty `settings_entry` means the agent writes nothing into the repo at
-    // all — skip it rather than appending a blank line.
-    let needed: Vec<&str> = [".tracevault/", settings_entry]
+    // Only ignore what `init` actually creates or modifies: the single
+    // settings file we wrote hooks into. (`.visdom/` ignores its own contents
+    // through the `.gitignore` inside it, leaving the team's `config.toml`
+    // there free to be committed.) The other settings file is left untouched,
+    // so we don't add it here. An empty `settings_entry` means the agent
+    // writes nothing into the repo at all — skip it rather than appending a
+    // blank line.
+    let needed: Vec<&str> = [settings_entry]
         .iter()
         .copied()
         .filter(|entry| !entry.is_empty() && !existing.lines().any(|line| line.trim() == *entry))
@@ -709,7 +711,7 @@ fn update_root_gitignore(project_root: &Path, settings_entry: &str) -> Result<()
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
-    content.push_str("\n# TraceVault — local only, do not commit\n");
+    content.push_str("\n# Visdom tracing — local only, do not commit\n");
     for entry in needed {
         content.push_str(entry);
         content.push('\n');
@@ -2787,9 +2789,9 @@ mod tests {
         crate::test_helpers::init_git_repo(root);
         // `init` refuses to run without a credential; a per-repo one keeps
         // this test independent of the process env and the user's login.
-        fs::create_dir_all(root.join(".tracevault")).unwrap();
+        fs::create_dir_all(root.join(".visdom")).unwrap();
         fs::write(
-            root.join(".tracevault/config.toml"),
+            root.join(".visdom/tracing.toml"),
             "api_key = \"tvk_test\"\n",
         )
         .unwrap();
@@ -2813,16 +2815,16 @@ mod tests {
         // .gitignore covers the codex hooks file.
         let gi = fs::read_to_string(root.join(".gitignore")).unwrap();
         assert!(gi.contains(".codex/hooks.json"));
-        assert!(gi.contains(".tracevault/"));
+        assert!(root.join(".visdom/.gitignore").exists());
     }
 
     /// A successful `POST /api/v1/repos` during `init` must persist the
-    /// returned `repo_id` into `.tracevault/config.toml` — this is the
+    /// returned `repo_id` into `.visdom/tracing.toml` — this is the
     /// "everything worked" happy path of the registration step at the end of
     /// `init_in_directory`, previously untested.
     ///
     /// `XDG_CONFIG_HOME` is redirected so this doesn't read/write the
-    /// developer's real `~/.config/tracevault/credentials.json`;
+    /// developer's real `~/.config/visdom/credentials.json`;
     /// `TRACEVAULT_API_KEY` is pinned directly since `resolve_credentials`
     /// checks it before the credentials file. `_env_lock` serializes this
     /// against other tests in the crate that mutate the same env vars
@@ -3114,9 +3116,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         crate::test_helpers::init_git_repo(tmp.path());
         add_origin_remote(tmp.path(), "git@github.com:org/repo.git");
-        fs::create_dir_all(tmp.path().join(".tracevault")).unwrap();
+        fs::create_dir_all(tmp.path().join(".visdom")).unwrap();
         fs::write(
-            tmp.path().join(".tracevault/config.toml"),
+            tmp.path().join(".visdom/tracing.toml"),
             format!("repo_id = \"{STRAY}\"\n"),
         )
         .unwrap();
@@ -3142,9 +3144,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         crate::test_helpers::init_git_repo(tmp.path());
         add_origin_remote(tmp.path(), "git@github.com:org/repo.git");
-        fs::create_dir_all(tmp.path().join(".tracevault")).unwrap();
+        fs::create_dir_all(tmp.path().join(".visdom")).unwrap();
         fs::write(
-            tmp.path().join(".tracevault/config.toml"),
+            tmp.path().join(".visdom/tracing.toml"),
             "api_key = \"tvk_kept\"\ndefault_project = \"payments\"\nuser_context = false\n",
         )
         .unwrap();
@@ -3184,9 +3186,9 @@ mod tests {
         let _env_lock = crate::test_helpers::lock_env_mutation().await;
         let tmp = tempfile::tempdir().unwrap();
         crate::test_helpers::init_git_repo(tmp.path());
-        fs::create_dir_all(tmp.path().join(".tracevault")).unwrap();
+        fs::create_dir_all(tmp.path().join(".visdom")).unwrap();
         let content = "default_project = \"typo\"\n";
-        fs::write(tmp.path().join(".tracevault/config.toml"), content).unwrap();
+        fs::write(tmp.path().join(".visdom/tracing.toml"), content).unwrap();
         let (base, _rx) = crate::test_helpers::spawn_seq(vec![http_response(
             "200 OK",
             &format!(r#"[{{"id":"{PROJECT}","name":"payments"}}]"#),
@@ -3209,14 +3211,14 @@ mod tests {
 
         assert!(err.to_string().contains("'typo'"), "{err}");
         assert_eq!(
-            fs::read_to_string(tmp.path().join(".tracevault/config.toml")).unwrap(),
+            fs::read_to_string(tmp.path().join(".visdom/tracing.toml")).unwrap(),
             content
         );
         assert!(!tmp.path().join(".codex/hooks.json").exists());
     }
 
     /// `init --workspace --project <name>` in a non-git directory creates
-    /// `.tracevault/`, resolves the name once, and writes `project_id` +
+    /// `.visdom/`, resolves the name once, and writes `project_id` +
     /// `project_name` with no `repo_id` (VIS-1256).
     #[tokio::test]
     async fn init_workspace_binds_a_non_git_dir_to_a_project() {
@@ -3242,7 +3244,7 @@ mod tests {
         assert_eq!(cfg.project_name.as_deref(), Some("visdom"));
         assert_eq!(cfg.repo_id, None);
         assert_eq!(cfg.server_url.as_deref(), Some(base.as_str()));
-        assert!(dir.join(".tracevault/.gitignore").exists());
+        assert!(dir.join(".visdom/.gitignore").exists());
         let requests: Vec<String> = rx.try_iter().collect();
         assert_eq!(requests.len(), 1, "{requests:?}");
         // A sub-directory resolves to this config, as the stream hook does.
@@ -3264,9 +3266,9 @@ mod tests {
         let _env_lock = crate::test_helpers::lock_env_mutation().await;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        fs::create_dir_all(dir.join(".tracevault")).unwrap();
+        fs::create_dir_all(dir.join(".visdom")).unwrap();
         fs::write(
-            dir.join(".tracevault/config.toml"),
+            dir.join(".visdom/tracing.toml"),
             "default_project = \"old\"\nproject_id = \"00000000-0000-4000-8000-000000000001\"\nuser_context = false\n",
         )
         .unwrap();
@@ -3329,9 +3331,9 @@ mod tests {
         let _env_lock = crate::test_helpers::lock_env_mutation().await;
         let tmp = tempfile::tempdir().unwrap();
         let (base, rx) = crate::test_helpers::spawn_seq(vec![http_response("200 OK", "[]")]);
-        fs::create_dir_all(tmp.path().join(".tracevault")).unwrap();
+        fs::create_dir_all(tmp.path().join(".visdom")).unwrap();
         fs::write(
-            tmp.path().join(".tracevault/config.toml"),
+            tmp.path().join(".visdom/tracing.toml"),
             "server_url = \"http://other.example.invalid\"\napi_key = \"tvk_x\"\n",
         )
         .unwrap();
@@ -3368,13 +3370,13 @@ mod tests {
         let _env_lock = crate::test_helpers::lock_env_mutation().await;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("umbrella");
-        fs::create_dir_all(dir.join(".tracevault")).unwrap();
+        fs::create_dir_all(dir.join(".visdom")).unwrap();
         let (base, _rx) = crate::test_helpers::spawn_seq(vec![http_response(
             "200 OK",
             &format!(r#"[{{"id":"{PROJECT}","name":"visdom"}}]"#),
         )]);
         fs::write(
-            dir.join(".tracevault/config.toml"),
+            dir.join(".visdom/tracing.toml"),
             format!("server_url = \"{base}\"\napi_key = \"tvk_x\"\ndefault_project = \"visdom\"\n"),
         )
         .unwrap();
@@ -3409,7 +3411,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains(&format!("'{name}'")), "{err}");
-            assert!(!tmp.path().join(".tracevault").exists(), "{name}");
+            assert!(!tmp.path().join(".visdom").exists(), "{name}");
         }
     }
 
@@ -3431,7 +3433,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("inside the git repo"), "{err}");
-        assert!(!sub.join(".tracevault").exists());
+        assert!(!sub.join(".visdom").exists());
     }
 
     /// A re-run that cannot reach the server keeps the bound `repo_id`: it is
@@ -3442,9 +3444,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         crate::test_helpers::init_git_repo(tmp.path());
         add_origin_remote(tmp.path(), "git@github.com:org/repo.git");
-        fs::create_dir_all(tmp.path().join(".tracevault")).unwrap();
+        fs::create_dir_all(tmp.path().join(".visdom")).unwrap();
         fs::write(
-            tmp.path().join(".tracevault/config.toml"),
+            tmp.path().join(".visdom/tracing.toml"),
             format!("repo_id = \"{STRAY}\"\n"),
         )
         .unwrap();

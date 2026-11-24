@@ -38,7 +38,7 @@ enum Lookup {
 /// Look up `git_url` (the origin of the checkout at `path`) on the server.
 ///
 /// Several repos of the codebase → the one the checkout's own
-/// `.tracevault/config.toml` names, else the one named like the checkout's
+/// `.visdom/tracing.toml` names, else the one named like the checkout's
 /// directory (as `init` would pick it), else no guess: a session bound to the
 /// wrong record of a codebase is split from its other sessions (VIS-1018).
 async fn look_up(

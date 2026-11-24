@@ -1371,7 +1371,7 @@ fn a_workspace_init_binds_the_folder_and_sets_up_the_gateway() {
         "{}",
         stdout(&output)
     );
-    let bound = std::fs::read_to_string(folder.path().join(".tracevault/config.toml")).unwrap();
+    let bound = std::fs::read_to_string(folder.path().join(".visdom/tracing.toml")).unwrap();
     assert!(
         bound.contains("11111111-2222-3333-4444-555555555555"),
         "{bound}"

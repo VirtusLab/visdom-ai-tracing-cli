@@ -31,7 +31,7 @@ pub fn check(ctx: &CheckContext) -> Vec<Finding> {
     let global_installed = matches!(has_tracevault_hooks(&global), Ok(true));
     let init = || Fix {
         description: format!(
-            "run `visdom trace init --agent {}` in {} (writes .tracevault/, the {} hooks and \
+            "run `visdom trace init --agent {}` in {} (writes .visdom/, the {} hooks and \
              the git hooks)",
             ctx.agent.tool_name(),
             root.display(),
@@ -54,7 +54,7 @@ pub fn check(ctx: &CheckContext) -> Vec<Finding> {
             Severity::Unknown,
             format!(
                 "cannot use {} — {e}; fix or remove it",
-                TracevaultConfig::config_path(root).display()
+                TracevaultConfig::existing_config_path(root).display()
             ),
         )
     } else if own_setup {
@@ -69,7 +69,7 @@ pub fn check(ctx: &CheckContext) -> Vec<Finding> {
             COMPONENT,
             "tracing.repo",
             Severity::Ok,
-            "no .tracevault/ here: sessions are captured by the global install and bound to \
+            "no .visdom/ here: sessions are captured by the global install and bound to \
              the repository by its origin remote",
         )
     } else {
@@ -306,7 +306,7 @@ mod tests {
         }
 
         fn wire_config(&self) {
-            self.write(".tracevault/config.toml", "server_url = \"https://tv\"\n");
+            self.write(".visdom/tracing.toml", "server_url = \"https://tv\"\n");
         }
 
         fn wire_git_hooks(&self) {
@@ -407,7 +407,7 @@ mod tests {
             by_id(&findings, "tracing.agent_hooks").severity,
             Severity::Ok
         );
-        // With a global install a repo needs no .tracevault/ of its own.
+        // With a global install a repo needs no .visdom/ of its own.
         let repo = by_id(&findings, "tracing.repo");
         assert_eq!(repo.severity, Severity::Ok);
         assert!(repo.message.contains("global install"), "{repo:?}");
@@ -499,12 +499,12 @@ mod tests {
         let fx = Fixture::new();
         fx.wire_git_hooks();
         fx.write(".claude/settings.json", CLAUDE_HOOKS);
-        fx.write(".tracevault/config.toml", "server_url = [truncated");
+        fx.write(".visdom/tracing.toml", "server_url = [truncated");
         let findings = check(&fx.ctx(Agent::ClaudeCode));
         let repo = by_id(&findings, "tracing.repo");
         assert_eq!(repo.severity, Severity::Unknown, "{repo:?}");
         assert!(repo.fix.is_none());
-        assert!(repo.message.contains("config.toml"), "{repo:?}");
+        assert!(repo.message.contains("tracing.toml"), "{repo:?}");
     }
 
     #[test]
@@ -590,7 +590,7 @@ mod tests {
     fn unreadable_credential_file_is_unknown_without_login_fix() {
         let fx = Fixture::new();
         let mut ctx = fx.ctx(Agent::ClaudeCode);
-        ctx.credential = CredentialState::Unreadable("/cfg/tracevault/credentials.json".into());
+        ctx.credential = CredentialState::Unreadable("/cfg/visdom/credentials.json".into());
         let findings = check(&ctx);
         let auth = by_id(&findings, "tracing.auth");
         assert_eq!(auth.severity, Severity::Unknown);

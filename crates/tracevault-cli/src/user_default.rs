@@ -8,9 +8,16 @@ use std::path::{Path, PathBuf};
 
 use crate::session_state::RepoBinding;
 
-/// `dirs::config_dir()/tracevault/default_repo.toml` — beside `credentials.json`.
+const FILE: &str = "default_repo.toml";
+
+/// `dirs::config_dir()/visdom/default_repo.toml` — beside `credentials.json`.
 pub fn default_repo_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("tracevault").join("default_repo.toml"))
+    dirs::config_dir().map(|d| crate::layout::user_dir_in(&d).join(FILE))
+}
+
+/// The file an earlier release kept the binding in.
+fn legacy_repo_path() -> Option<PathBuf> {
+    crate::layout::legacy_sibling(default_repo_path()?.parent()?).map(|dir| dir.join(FILE))
 }
 
 fn load_from(path: &Path) -> Option<RepoBinding> {
@@ -40,7 +47,13 @@ fn clear_at(path: &Path) -> std::io::Result<()> {
 
 /// Load the user-level default binding; `None` if unset or malformed.
 pub fn load() -> Option<RepoBinding> {
-    load_from(&default_repo_path()?)
+    let path = default_repo_path()?;
+    if !path.exists() {
+        if let Some(legacy) = legacy_repo_path() {
+            return load_from(&legacy);
+        }
+    }
+    load_from(&path)
 }
 
 /// Persist the user-level default binding, creating the config dir if needed.
@@ -53,6 +66,10 @@ pub fn save(binding: &RepoBinding) -> Result<(), Box<dyn std::error::Error>> {
 pub fn clear() -> Result<(), Box<dyn std::error::Error>> {
     let path = default_repo_path().ok_or("cannot determine user config dir")?;
     clear_at(&path)?;
+    // Otherwise the binding an earlier release left would come back.
+    if let Some(legacy) = legacy_repo_path() {
+        clear_at(&legacy)?;
+    }
     Ok(())
 }
 

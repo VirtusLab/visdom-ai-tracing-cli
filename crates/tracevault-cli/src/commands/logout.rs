@@ -60,7 +60,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", dir.path());
 
-        let creds_dir = dir.path().join("tracevault");
+        let creds_dir = dir.path().join("visdom");
         fs::create_dir_all(&creds_dir).unwrap();
         fs::write(
             creds_dir.join("credentials.json"),
@@ -87,7 +87,7 @@ mod tests {
         let mut _guard = crate::test_helpers::EnvVarGuard::new();
         _guard.set("XDG_CONFIG_HOME", dir.path());
 
-        let creds_dir = dir.path().join("tracevault");
+        let creds_dir = dir.path().join("visdom");
         fs::create_dir_all(&creds_dir).unwrap();
         fs::write(
             creds_dir.join("credentials.json"),

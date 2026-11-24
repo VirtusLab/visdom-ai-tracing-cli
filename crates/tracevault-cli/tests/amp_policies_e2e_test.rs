@@ -249,7 +249,7 @@ impl Fixture {
     fn session_state(&self) -> String {
         std::fs::read_to_string(
             self.state
-                .join("tracevault/sessions")
+                .join("visdom/sessions")
                 .join(format!("{THREAD}.toml")),
         )
         .unwrap_or_default()

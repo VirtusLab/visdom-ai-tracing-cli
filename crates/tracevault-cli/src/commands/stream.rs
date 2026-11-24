@@ -311,7 +311,7 @@ impl Attribution {
 /// before the repo is cloned, which is the case this whole path serves.
 /// `resolve_stream_binding` has the same machine-global tier for repos, so the
 /// two sides stay symmetric. Consequence worth knowing: a session started in an
-/// unrelated directory, with no repo and no `.tracevault/`, will attribute to
+/// unrelated directory, with no repo and no `.visdom/`, will attribute to
 /// that default project.
 pub(crate) fn attribution_for(
     binding: Option<&crate::session_state::RepoBinding>,
@@ -426,23 +426,19 @@ fn adopted_project_queue(
 /// This is the pure, testable core of `run_stream`'s path resolution. It uses
 /// [`crate::paths::resolve_project_root`] which queries `git rev-parse
 /// --git-common-dir` first, so it correctly resolves to the **primary**
-/// `.tracevault/` directory from any worktree — including sibling linked
-/// worktrees where the primary `.tracevault/` is not an ancestor of `hook_cwd`.
+/// `.visdom/` directory from any worktree — including sibling linked
+/// worktrees where the primary `.visdom/` is not an ancestor of `hook_cwd`.
 ///
 /// Returns `(resolved, session_dir)` — the resolved
 /// [`crate::paths::ProjectRoot`] (so callers can inspect `.source`, e.g. to warn
-/// on a Fallback that would create a stray `.tracevault/`) and `session_dir`
-/// under `<resolved.root>/.tracevault/sessions/<session_id>/`.
+/// on a Fallback that would create a stray `.visdom/`) and `session_dir`
+/// under `<resolved.root>/.visdom/sessions/<session_id>/`.
 pub fn resolve_session_paths(
     hook_cwd: &Path,
     session_id: &str,
 ) -> (crate::paths::ProjectRoot, std::path::PathBuf) {
     let resolved = crate::paths::resolve_project_root(hook_cwd);
-    let session_dir = resolved
-        .root
-        .join(".tracevault")
-        .join("sessions")
-        .join(session_id);
+    let session_dir = crate::layout::session_dir(&resolved.root, session_id);
     (resolved, session_dir)
 }
 
@@ -623,7 +619,7 @@ pub(crate) fn attribution_force(
 /// The capture-time project BINDING for a stream event: a thin wrapper over
 /// the shared chain [`crate::resolution::capture_project_binding`] (subagent
 /// worktree override -> `TRACEVAULT_PROJECT` -> session `active_project` ->
-/// workspace `.tracevault/config.toml` `project_id` -> user-level default; no
+/// workspace `.visdom/tracing.toml` `project_id` -> user-level default; no
 /// `--project` flag on the hook path), with a binding whose stored id is not a
 /// UUID dropped exactly as [`crate::resolution::capture_project_id`] drops it.
 /// Local only — no network (the hook fires per event in a short-lived
@@ -1468,12 +1464,12 @@ pub async fn run_stream(
     // `resolve_session_paths` uses `git rev-parse --git-common-dir` to locate
     // the primary worktree root, so it works correctly from a primary checkout,
     // a nested worktree, AND a sibling linked worktree (where the primary
-    // `.tracevault/` is NOT an ancestor of hook_cwd — the old ancestor-walk
+    // `.visdom/` is NOT an ancestor of hook_cwd — the old ancestor-walk
     // would fall back to hook_cwd itself, fail to load config, and silently
     // drop the event).
     //
     // The hook must never hard-fail (a failing hook blocks the Claude Code tool
-    // call).  Genuine resolution failure (no git, no `.tracevault/`) results in
+    // call).  Genuine resolution failure (no git, no `.visdom/`) results in
     // a Fallback root (start dir).  Note: `fs::create_dir_all(&session_dir)?`
     // just below runs BEFORE the config/credentials check and can itself
     // `?`-exit early — that remains graceful because `main.rs` catches all
@@ -1482,27 +1478,24 @@ pub async fn run_stream(
     // The session DIR is anchored to where the session started when
     // `session-start` recorded that (VIS-1257): the hook's `cwd` follows the
     // shell's `cd`, and a dir resolved per event would split the session's
-    // `.stream_offset` and queues across two `.tracevault/`s. Config and
+    // `.stream_offset` and queues across two `.visdom/`s. Config and
     // credentials still come from the event's `cwd` (`project_root`).
     let hook_cwd = Path::new(&hook_event.cwd);
     let (resolved, cwd_session_dir) = resolve_session_paths(hook_cwd, &hook_event.session_id);
     let storage_root =
         crate::session_state::storage_root(&crate::session_state::load(&hook_event.session_id));
     let session_dir = match &storage_root {
-        Some(root) => root
-            .join(".tracevault")
-            .join("sessions")
-            .join(&hook_event.session_id),
+        Some(root) => crate::layout::session_dir(root, &hook_event.session_id),
         None => cwd_session_dir,
     };
     if storage_root.is_none() && resolved.source == crate::paths::ProjectRootSource::Fallback {
-        // Neither git nor an ancestor `.tracevault/` resolved a project root, so
-        // we are about to create a fresh `.tracevault/` at the hook's working
-        // directory — which is how stray per-subdirectory `.tracevault/` dirs
+        // Neither git nor an ancestor `.visdom/` resolved a project root, so
+        // we are about to create a fresh `.visdom/` at the hook's working
+        // directory — which is how stray per-subdirectory `.visdom/` dirs
         // appear. Surface it (best-effort; stderr never blocks the hook).
         eprintln!(
             "tracevault: warning: could not resolve a git project root from {}; \
-             creating .tracevault/ there. Ensure `git` is on PATH for the hook and \
+             creating .visdom/ there. Ensure `git` is on PATH for the hook and \
              that it runs inside the repository to keep sessions under the repo root.",
             hook_cwd.display()
         );
@@ -1513,12 +1506,15 @@ pub async fn run_stream(
     fs::create_dir_all(&session_dir)?;
 
     // Ensure runtime artifacts (sessions/, cache/, *.local.toml) are git-ignored
-    // inside whatever `.tracevault/` we just created — including a per-subproject
+    // inside whatever `.visdom/` we just created — including a per-subproject
     // one. `tracevault init` writes this for the root dir, but runtime-created
     // dirs would otherwise have no .gitignore and leak sessions into commits.
     // Best-effort: never fail the hook on this.
-    let storage = storage_root.as_ref().unwrap_or(&project_root);
-    let _ = crate::config::TracevaultConfig::ensure_gitignore(&storage.join(".tracevault"));
+    // (The directory is the session dir's own grandparent: a session an
+    // earlier release started keeps its `.tracevault/`.)
+    if let Some(dir) = session_dir.parent().and_then(Path::parent) {
+        let _ = crate::config::TracevaultConfig::ensure_gitignore(dir);
+    }
 
     // Write origin marker so verify-start can disambiguate sessions by worktree.
     // Best-effort: never fail the hook on marker errors. Uses the shared
@@ -1585,7 +1581,7 @@ pub fn stream_event_type(event_type: &str) -> StreamEventType {
 /// directory.
 pub(crate) struct SessionTarget {
     pub project_root: std::path::PathBuf,
-    /// `<project_root>/.tracevault/sessions/<session_id>`; must exist.
+    /// `<project_root>/.visdom/sessions/<session_id>`; must exist.
     pub session_dir: std::path::PathBuf,
     /// The checkout the session runs in (see [`crate::paths::worktree_toplevel`]).
     pub worktree_top: String,
@@ -1787,7 +1783,7 @@ pub(crate) async fn stream_event(
     // repo_id feeds the lowest-precedence tier (via `binding_from_config`
     // below).
     if let Err(e) = &config {
-        return Err(format!("malformed .tracevault/config.toml: {e}").into());
+        return Err(format!("malformed .visdom/tracing.toml: {e}").into());
     }
 
     // Resolve the effective repo binding (workspace/detached mode). Bound
@@ -2169,7 +2165,7 @@ mod tests {
                 m
             },
         };
-        let ctx_path = dir.path().join(".tracevault").join("context.json");
+        let ctx_path = dir.path().join(".visdom").join("context.json");
         written.save_to(&ctx_path).unwrap();
         let loaded = Context::load_from(&ctx_path);
         let (flow_id2, labels2, params2) = apply_context(Context::merge_layers(&[&loaded]));
@@ -2183,7 +2179,7 @@ mod tests {
     #[test]
     fn apply_context_missing_file_all_none() {
         let dir = tempfile::tempdir().unwrap();
-        let missing_path = dir.path().join(".tracevault").join("context.json");
+        let missing_path = dir.path().join(".visdom").join("context.json");
         let ctx = Context::load_from(&missing_path); // no context.json → default
         let (flow_id, labels, params) = apply_context(Context::merge_layers(&[&ctx]));
         assert!(flow_id.is_none(), "flow_id should be None");
@@ -2231,20 +2227,20 @@ mod tests {
     //
     // These tests verify that `resolve_session_paths` routes through the
     // git-aware resolver so that sibling linked worktrees capture events under
-    // the PRIMARY `.tracevault/sessions/`, not the worktree directory.
+    // the PRIMARY `.visdom/sessions/`, not the worktree directory.
 
     use crate::test_helpers::{add_worktree, init_git_repo};
 
     /// Primary checkout: project_root resolves to the repo root; session_dir is
-    /// under `<repo>/.tracevault/sessions/<id>/`.
+    /// under `<repo>/.visdom/sessions/<id>/`.
     #[test]
     fn resolve_session_paths_primary_checkout() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         init_git_repo(&repo);
-        // Create a .tracevault/ in the primary root to match a real init.
-        std::fs::create_dir_all(repo.join(".tracevault")).unwrap();
+        // Create a .visdom/ in the primary root to match a real init.
+        std::fs::create_dir_all(repo.join(".visdom")).unwrap();
 
         let (resolved, session_dir) = resolve_session_paths(&repo, "sess-primary-123");
         let project_root = resolved.root;
@@ -2256,10 +2252,10 @@ mod tests {
         );
         assert_eq!(
             session_dir.canonicalize().unwrap_or(session_dir.clone()),
-            repo.join(".tracevault")
+            repo.join(".visdom")
                 .join("sessions")
                 .join("sess-primary-123"),
-            "primary checkout: session_dir must be <repo>/.tracevault/sessions/<id>/"
+            "primary checkout: session_dir must be <repo>/.visdom/sessions/<id>/"
         );
         // session_dir must be INSIDE the primary repo, not elsewhere.
         assert!(
@@ -2280,8 +2276,8 @@ mod tests {
 
         std::fs::create_dir_all(&repo).unwrap();
         init_git_repo(&repo);
-        // Place .tracevault/ ONLY in the primary repo — not in the worktree.
-        std::fs::create_dir_all(repo.join(".tracevault")).unwrap();
+        // Place .visdom/ ONLY in the primary repo — not in the worktree.
+        std::fs::create_dir_all(repo.join(".visdom")).unwrap();
         add_worktree(&repo, &wt);
 
         let (resolved, session_dir) = resolve_session_paths(&wt, "sess-sibling-456");
@@ -2293,7 +2289,7 @@ mod tests {
             repo.canonicalize().unwrap(),
             "sibling worktree: project_root must be primary repo root (not worktree dir)"
         );
-        // session_dir must be inside the PRIMARY .tracevault/, not the worktree.
+        // session_dir must be inside the PRIMARY .visdom/, not the worktree.
         assert!(
             session_dir.starts_with(&repo),
             "sibling worktree: session_dir must be under the PRIMARY repo root"
@@ -2304,20 +2300,20 @@ mod tests {
         );
         assert!(
             session_dir.ends_with(
-                std::path::Path::new(".tracevault")
+                std::path::Path::new(".visdom")
                     .join("sessions")
                     .join("sess-sibling-456")
             ),
-            "session_dir must end with .tracevault/sessions/<session_id>"
+            "session_dir must end with .visdom/sessions/<session_id>"
         );
     }
 
-    /// Non-git directory with no `.tracevault/` ancestor: project_root falls
+    /// Non-git directory with no `.visdom/` ancestor: project_root falls
     /// back to `hook_cwd` itself (Fallback source); the function must not panic.
     #[test]
     fn resolve_session_paths_non_git_fallback() {
         let tmp = tempfile::tempdir().unwrap();
-        // No git repo, no .tracevault/ anywhere.
+        // No git repo, no .visdom/ anywhere.
         let (resolved, session_dir) = resolve_session_paths(tmp.path(), "sess-fallback-789");
         let project_root = resolved.root;
 
@@ -2329,7 +2325,7 @@ mod tests {
         assert_eq!(
             session_dir,
             tmp.path()
-                .join(".tracevault")
+                .join(".visdom")
                 .join("sessions")
                 .join("sess-fallback-789"),
             "non-git: session_dir must be relative to the fallback root"
@@ -2347,10 +2343,7 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         init_git_repo(&repo);
 
-        let session_dir = repo
-            .join(".tracevault")
-            .join("sessions")
-            .join("test-sess-001");
+        let session_dir = repo.join(".visdom").join("sessions").join("test-sess-001");
         std::fs::create_dir_all(&session_dir).unwrap();
 
         let hook_cwd = &repo;

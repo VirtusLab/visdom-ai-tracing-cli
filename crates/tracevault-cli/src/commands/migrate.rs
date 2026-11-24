@@ -1,5 +1,5 @@
 //! Directory-scoped project binding (VIS-1256): resolving a project NAME to
-//! the `project_id` a `.tracevault/config.toml` carries, and migrating the
+//! the `project_id` a `.visdom/tracing.toml` carries, and migrating the
 //! legacy `default_project` name to it.
 //!
 //! The workspace tier of the capture chain reads `project_id` (a UUID)
@@ -40,7 +40,7 @@ pub fn resolve_unique_project<'a>(
             let ids: Vec<String> = many.iter().map(|p| p.id.to_string()).collect();
             Err(format!(
                 "project name '{name}' is ambiguous: {} projects carry it ({}); set \
-                 `project_id = \"<id>\"` in .tracevault/config.toml by hand",
+                 `project_id = \"<id>\"` in .visdom/tracing.toml by hand",
                 many.len(),
                 ids.join(", ")
             ))
@@ -151,10 +151,10 @@ pub fn migration_report(migration: &Migration) -> Option<String> {
     match migration {
         Migration::NotNeeded => None,
         Migration::Migrated { name, project_id } => Some(format!(
-            "Migrated .tracevault/config.toml: default_project '{name}' -> project_id {project_id}"
+            "Migrated .visdom/tracing.toml: default_project '{name}' -> project_id {project_id}"
         )),
         Migration::DroppedLegacy { name } => Some(format!(
-            "Removed the legacy default_project '{name}' from .tracevault/config.toml \
+            "Removed the legacy default_project '{name}' from .visdom/tracing.toml \
              (its project_id is what attribution uses)"
         )),
     }
@@ -168,7 +168,7 @@ pub fn legacy_default_project_notice(config: &TracevaultConfig) -> Option<String
     let name = config.default_project.as_deref()?;
     Some(if has_valid_project_id(config) {
         format!(
-            "default_project \"{name}\" in .tracevault/config.toml is ignored (its project_id \
+            "default_project \"{name}\" in .visdom/tracing.toml is ignored (its project_id \
              wins); run `tracevault sync` to remove it"
         )
     } else {

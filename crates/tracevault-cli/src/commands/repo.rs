@@ -28,7 +28,7 @@ pub enum RepoCmd {
         /// Which of the codebase's repo records to bind, when <path>'s
         /// codebase has several. Without it, switch keeps the repo already in
         /// use (the session's current binding, else a checkout's
-        /// `.tracevault/config.toml`) and errors if none of them is.
+        /// `.visdom/tracing.toml`) and errors if none of them is.
         #[arg(long, requires = "path")]
         repo_id: Option<uuid::Uuid>,
         /// Write a session-independent user-level default instead of a session
@@ -160,7 +160,7 @@ fn pick_switch_repo(
         RepoChoice::Preferred(id, i) => Ok((id, Some(in_use[i].source.clone()))),
         RepoChoice::Ambiguous => Err(format!(
             "codebase {} has {} repo records: {}. None of them is this binding's current \
-             repo or a checkout's .tracevault/config.toml repo, so switch will not guess; \
+             repo or a checkout's .visdom/tracing.toml repo, so switch will not guess; \
              choose one with `tracevault repo switch <path> --repo-id <id>`",
             codebase.display_name(),
             codebase.repos.len(),
@@ -297,7 +297,7 @@ fn in_use_repos(dest: &SwitchDest, target: &Path, project_root: &Path) -> Vec<In
         if let Some(repo_id) = checkout_config_repo_id(checkout) {
             in_use.push(InUse {
                 repo_id,
-                source: format!("{}'s .tracevault/config.toml", checkout.display()),
+                source: format!("{}'s .visdom/tracing.toml", checkout.display()),
             });
         }
     }
@@ -754,7 +754,7 @@ mod tests {
         let b = binding("r4");
         assert_eq!(
             format_status(Some((&b, BindingSource::Bound))),
-            "bound to repo r4 via bound .tracevault/config.toml"
+            "bound to repo r4 via bound .visdom/tracing.toml"
         );
     }
 
@@ -1021,7 +1021,7 @@ mod tests {
             None,
             &[
                 in_use(LOW, "the current binding"),
-                in_use(HIGH, "config.toml"),
+                in_use(HIGH, "tracing.toml"),
             ],
         )
         .unwrap();
@@ -1039,12 +1039,12 @@ mod tests {
             None,
             &[
                 in_use(other, "the current binding"),
-                in_use(HIGH, "config.toml"),
+                in_use(HIGH, "tracing.toml"),
             ],
         )
         .unwrap();
         assert_eq!(id.to_string(), HIGH);
-        assert_eq!(kept.as_deref(), Some("config.toml"));
+        assert_eq!(kept.as_deref(), Some("tracing.toml"));
     }
 
     /// Several repos and none in use: an error naming them, never a guess.
@@ -1101,9 +1101,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         crate::test_helpers::init_git_repo(tmp.path());
         add_origin_remote(tmp.path(), "git@github.com:org/repo.git");
-        std::fs::create_dir_all(tmp.path().join(".tracevault")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".visdom")).unwrap();
         std::fs::write(
-            tmp.path().join(".tracevault/config.toml"),
+            tmp.path().join(".visdom/tracing.toml"),
             format!("repo_id = \"{HIGH}\"\n"),
         )
         .unwrap();
@@ -1131,13 +1131,13 @@ mod tests {
     const ACTIVE: &str = "a0000000-0000-4000-8000-00000000000a";
     const USER: &str = "d0000000-0000-4000-8000-00000000000d";
 
-    /// A git checkout whose `.tracevault/config.toml` binds `repo_id`.
+    /// A git checkout whose `.visdom/tracing.toml` binds `repo_id`.
     fn checkout_bound_to(repo_id: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         crate::test_helpers::init_git_repo(dir.path());
-        std::fs::create_dir_all(dir.path().join(".tracevault")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".visdom")).unwrap();
         std::fs::write(
-            dir.path().join(".tracevault/config.toml"),
+            dir.path().join(".visdom/tracing.toml"),
             format!("repo_id = \"{repo_id}\"\n"),
         )
         .unwrap();

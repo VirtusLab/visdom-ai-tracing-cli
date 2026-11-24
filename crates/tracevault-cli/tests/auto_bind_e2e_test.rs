@@ -1,5 +1,5 @@
 //! VIS-1048 end to end: with only `init --global` + `login` (no
-//! `.tracevault/config.toml`, no `repo switch`, no user default), a session
+//! `.visdom/tracing.toml`, no `repo switch`, no user default), a session
 //! started in a registered repo's checkout is bound to that repo by its hooks
 //! and its events are sent under it; an unregistered remote stays unbound and
 //! is reported once.
@@ -140,7 +140,7 @@ fn not_registered() -> String {
     http("404 Not Found", r#"{"error":"No remote for that URL"}"#)
 }
 
-/// A checkout with an origin remote and no `.tracevault/` (global install),
+/// A checkout with an origin remote and no `.visdom/` (global install),
 /// plus isolated home/state dirs.
 struct Fixture {
     _tmp: tempfile::TempDir,
@@ -208,7 +208,7 @@ impl Fixture {
             cmd.env("TRACEVAULT_SERVER_URL", base)
                 .env("TRACEVAULT_API_KEY", "tvk_test");
         } else {
-            let dir = self.home.join(".config").join("tracevault");
+            let dir = self.home.join(".config").join("visdom");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
                 dir.join("credentials.json"),
@@ -259,7 +259,7 @@ impl Fixture {
     fn session_state(&self) -> String {
         std::fs::read_to_string(
             self.state
-                .join("tracevault")
+                .join("visdom")
                 .join("sessions")
                 .join(format!("{SESSION_ID}.toml")),
         )
@@ -402,7 +402,7 @@ fn an_unregistered_remote_stays_unbound_and_says_so_once() {
 fn an_explicit_repo_switch_binding_is_never_overridden() {
     let fx = Fixture::new("git@github.com:org/repo.git");
     let switched = "22222222-2222-4222-8222-222222222222";
-    let dir = fx.state.join("tracevault").join("sessions");
+    let dir = fx.state.join("visdom").join("sessions");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join(format!("{SESSION_ID}.toml")),
@@ -428,7 +428,7 @@ fn an_explicit_repo_switch_binding_is_never_overridden() {
 fn a_project_session_infers_the_repo_instead_of_binding_it() {
     let fx = Fixture::new("git@github.com:org/repo.git");
     let pid = uuid::Uuid::from_u128(0x1258);
-    let sessions = fx.state.join("tracevault").join("sessions");
+    let sessions = fx.state.join("visdom").join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
     std::fs::write(
         sessions.join(format!("{SESSION_ID}.toml")),

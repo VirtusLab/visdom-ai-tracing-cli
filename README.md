@@ -236,8 +236,27 @@ Settings:
   for the `TRACEVAULT_*` variables of the same name and win over them.
 
 `tracevault` keeps working during the transition and both binaries share one login
-(`tracevault/credentials.json`). Installed hooks keep calling `tracevault …`, so it must stay on
+(`visdom/credentials.json`). Installed hooks keep calling `tracevault …`, so it must stay on
 `PATH`; run interactively it prints a one-line deprecation note on stderr.
+
+### Files from before the `visdom` names
+
+Both binaries keep their files under `.visdom/` (in a repository or workspace folder) and
+`visdom/` (in your config and state directories). Releases up to `tracevault` 0.29.6 /
+`visdom` 1.0.0 used `.tracevault/` and `tracevault/`, and the tracing config was called
+`config.toml` there. Those files are still read: each one is looked for under the new name
+first, then under the old one, so an existing setup keeps working as it is. New files are
+always written under the new names, with two exceptions that keep a file where it is — a
+refreshed login token goes back into the file the login came from, and a session an earlier
+release started keeps its directory until it ends.
+
+`visdom init` (or `tracevault init`) moves what is left over and says what it moved: the
+login, the user-level files, the checkout's tracing config and context, and every session that
+has been pushed. A session not pushed yet stays in `.tracevault/sessions/` and is still read
+there. `login` writes the new file and removes the old login; `logout` removes both.
+
+Upgrade both binaries together: a `tracevault` from before this change does not read the new
+directories, so after a new `login` or `init` its hooks would find no login and no `repo_id`.
 
 ## Crates
 
@@ -279,7 +298,7 @@ Then start a new Claude Code session in the repo. Its sessions are captured and 
 the server as they happen.
 
 **Log in before `init`.** `init` registers the repo with the server and writes the repo's
-server id (`repo_id`) into `.tracevault/config.toml`; the hooks send events under that id, and
+server id (`repo_id`) into `.visdom/tracing.toml`; the hooks send events under that id, and
 without it — and without any of the workspace-mode bindings described
 [below](#every-session-on-the-machine----global) — they send nothing. So per-repo `init` refuses
 to run without credentials (a login, or an API key in `TRACEVAULT_API_KEY`): it exits 1 before
@@ -311,7 +330,7 @@ switch` would. The repo must already be registered, by someone's `tracevault ini
 `tracevault sync` in a checkout of it. If it is not, the session stays unrecorded and Claude
 Code shows a message saying so, once; run `tracevault sync` in the checkout to register it,
 then `tracevault repo switch <path>` to bind the running session. A remote whose codebase has
-several repo records on the server binds the one the checkout's `.tracevault/config.toml` names
+several repo records on the server binds the one the checkout's `.visdom/tracing.toml` names
 or the one named like the checkout's directory; with neither, it stays unbound and the message
 lists the records to pick from with `repo switch --repo-id`.
 
@@ -326,7 +345,7 @@ a session is bound to a repo by:
    without a session id, it sets the user-level default (point 3) instead. The automatic
    binding is stored the same way, so a later `repo switch` replaces it, and `repo reset`
    clears it for good (the session is not bound automatically again).
-2. **The repo has its own `tracevault init`** (a `.tracevault/config.toml` with a `repo_id`):
+2. **The repo has its own `tracevault init`** (a `.visdom/tracing.toml` with a `repo_id`):
    sessions started in it are recorded as with the per-repo setup.
 3. **A user-level default: `tracevault repo switch --user <path>`.** Every session not bound
    by points 1–2 is then attributed to that one repo, whatever directory it runs in — the
@@ -353,9 +372,9 @@ tracevault init --workspace --project my-platform
 
 Every session started in that directory, or in a non-git directory below it, is then recorded
 to project `my-platform` with no per-session step — without `--user`, so sessions elsewhere on
-the machine are not affected. `init --workspace` works outside git, creates `.tracevault/`
+the machine are not affected. `init --workspace` works outside git, creates `.visdom/`
 there if needed, looks the project name up on the server **once** (an unknown or ambiguous name
-is an error and writes nothing), and writes its id to `.tracevault/config.toml` as `project_id`
+is an error and writes nothing), and writes its id to `.visdom/tracing.toml` as `project_id`
 (with `project_name` for display). It binds no repo and installs no hooks: pair it with
 `init --global`. A session's own `project switch` still overrides it. A session started inside
 a git checkout below it is not covered: it follows that checkout (its own `tracevault init`, or
@@ -370,7 +389,7 @@ something (any tool call), and look for the session in the dashboard under **Tra
 Sessions**. The checks below are quicker but only show that the setup is right, not that
 events arrived:
 
-- In a per-repo setup, `.tracevault/config.toml` contains a `repo_id = "…"` line. Without it,
+- In a per-repo setup, `.visdom/tracing.toml` contains a `repo_id = "…"` line. Without it,
   sessions in the repo are captured only if bound some other way (workspace mode, a user-level
   default, a project) — and then not necessarily to this repo.
 - `tracevault status` shows `✓ Logged in`, `✓ Recording` and `✓ Repo registered on server`.
@@ -403,8 +422,8 @@ It prints a verification URL and a one-time code, tries to open your browser, an
 you approve. It skips the browser with `--no-browser`, or when `TRACEVAULT_NO_BROWSER` or `CI`
 / `GITHUB_ACTIONS` is set, inside a container (`/.dockerenv`), or — on Linux and other
 non-macOS Unix — when neither `DISPLAY` nor `WAYLAND_DISPLAY` is set. On success it writes
-`credentials.json` (mode `0600`) into the TraceVault config directory — `~/.config/tracevault/`
-on Linux (`$XDG_CONFIG_HOME/tracevault/` if set), `~/Library/Application Support/tracevault/`
+`credentials.json` (mode `0600`) into the Visdom config directory — `~/.config/visdom/`
+on Linux (`$XDG_CONFIG_HOME/visdom/` if set), `~/Library/Application Support/visdom/`
 on macOS — holding a short-lived access token plus a long-lived `offline_access` **refresh
 token**, and prints the account and role the server resolved for you.
 
@@ -431,7 +450,7 @@ export TRACEVAULT_API_KEY=tvk_...
 
 Each setting is taken from the first source that has it: the environment
 (`TRACEVAULT_SERVER_URL`, `TRACEVAULT_API_KEY`), then the credentials file, then `server_url`
-/ `api_key` in the repo's `.tracevault/config.toml`. So a key set in the environment always
+/ `api_key` in the repo's `.visdom/tracing.toml`. So a key set in the environment always
 wins on a machine that also has an interactive login. A server deployed without Keycloak
 supports only this API-key path, and `tracevault login` says exactly that instead of starting
 a flow that cannot complete.
@@ -452,7 +471,7 @@ export TRACEVAULT_PROJECT_ATTRIBUTION=explicit
 
 **`TRACEVAULT_PROJECT`** is one tier of the project chain the capture hook uses, which is, from
 highest precedence: a subagent's per-worktree override → `TRACEVAULT_PROJECT` → the session's
-`project switch` binding → the workspace `.tracevault/config.toml` `project_id` (written by
+`project switch` binding → the workspace `.visdom/tracing.toml` `project_id` (written by
 [`init --workspace`](#a-folder-of-checkouts--init---workspace)) → the user-level default
 (`project switch --user`). When none applies, the hook sends no project and the server derives
 it from the repo. A config file baked into a pod image therefore cannot outrank the launcher.
@@ -510,8 +529,8 @@ the force.
 
 `tracevault init` wires TraceVault into a repository: it installs the AI-agent hooks that
 capture sessions, adds git hooks (a pre-push policy check and a post-commit metadata push),
-creates `.tracevault/`, and — when the repo has an `origin` remote — registers the repo with
-the server and stores its `repo_id` in `.tracevault/config.toml`. It needs a login (or
+creates `.visdom/`, and — when the repo has an `origin` remote — registers the repo with
+the server and stores its `repo_id` in `.visdom/tracing.toml`. It needs a login (or
 `TRACEVAULT_API_KEY`) and fails with exit code 1, installing nothing, without one (see
 [Quick start](#one-repository)). Every `init` error exits 1. Run it once per repo, from the
 root of the primary checkout (not a linked worktree).
@@ -519,10 +538,10 @@ root of the primary checkout (not a linked worktree).
 If the server already has a repo record for the checkout's remote, `init` binds to it instead of
 registering a second one (a second record would split sessions between the two). When the
 remote has several records and none is named like the checkout, `init` registers nothing and
-lists them; set `repo_id` in `.tracevault/config.toml` to the right one. `tracevault sync`
+lists them; set `repo_id` in `.visdom/tracing.toml` to the right one. `tracevault sync`
 follows the same rule.
 
-Re-running `init` is safe: it keeps the existing `.tracevault/config.toml` (`repo_id`,
+Re-running `init` is safe: it keeps the existing `.visdom/tracing.toml` (`repo_id`,
 `user_context`, a pinned `server_url` / `api_key` / `project_id`, and keys it does not
 know) and changes only what a flag on that run sets (`--server-url`, `--user-context`,
 `--no-user-context`). A legacy `default_project` name is migrated to `project_id` (see
@@ -539,7 +558,7 @@ install hooks for (default `claude-code`):
 |---|---|---|
 | `tracevault init` | `.claude/settings.json` (or `.claude/settings.local.json`) hooks | Claude Code (default) |
 | `tracevault init --agent codex` | `.codex/hooks.json` hooks | OpenAI Codex CLI |
-| `tracevault init --agent gsd` (alias `gsd2`) | the TraceVault extension, written to `gsd-extension/` in the TraceVault config directory and registered for this repo with `gsd install -l` | GSD (pi) |
+| `tracevault init --agent gsd` (alias `gsd2`) | the TraceVault extension, written to `gsd-extension/` in the Visdom config directory and registered for this repo with `gsd install -l` | GSD (pi) |
 | `tracevault init --agent opencode` | `.opencode/plugins/tracevault.ts` plugin | OpenCode |
 | `tracevault init --agent amp` | `.amp/plugins/tracevault/index.ts` plugin | Amp ([ampcode.com](https://ampcode.com)); see **Amp** below |
 
@@ -554,12 +573,13 @@ in its hook payload) and from the session rollout on older versions.
 uses `shared`. It applies only to `--agent claude-code` and is rejected with any other agent.
 Hooks you already have in that file are kept; see [What `init` installs](#what-init-installs).
 
-Unless you pass `--no-gitignore`, `init` adds `.tracevault/` and the agent's hook file (for
+Unless you pass `--no-gitignore`, `init` adds the agent's hook file (for
 Claude Code, whichever settings file you chose — `settings.json` included) to the root
-`.gitignore`, so nothing needs to be committed and every contributor runs `tracevault init`
+`.gitignore`. `.visdom/` ignores its own contents through the `.gitignore` inside it — all but
+the `config.toml` a team may commit for the `visdom` launcher — so nothing needs to be committed and every contributor runs `tracevault init`
 for themselves. Pass `--no-gitignore` if you want to commit the hook file.
 
-`--server-url <URL>` stores a server URL in `.tracevault/config.toml`; it is only needed when
+`--server-url <URL>` stores a server URL in `.visdom/tracing.toml`; it is only needed when
 the URL does not come from `tracevault login` or `TRACEVAULT_SERVER_URL`.
 
 **Amp**
@@ -631,7 +651,7 @@ tracevault init --global --agent amp        # $XDG_CONFIG_HOME/amp/plugins/trace
 
 `<config dir>` is the platform config directory: `~/.config` on Linux (`$XDG_CONFIG_HOME` if
 set), `~/Library/Application Support` on macOS. Amp reads `$XDG_CONFIG_HOME/amp/`, or
-`~/.config/amp/` when that is unset, on every platform, and the Amp plugin goes there. It does not need a git repository. It also writes the user-level `config.toml` in the
+`~/.config/amp/` when that is unset, on every platform, and the Amp plugin goes there. It does not need a git repository. It also writes the user-level `tracing.toml` in the
 TraceVault config directory, which enables the user context layer (see below) for repos that
 do not configure it themselves; `--no-user-context` and `--user-context <path>` apply to it.
 `--global` cannot be combined with `--server-url`, `--claude-settings` or `--no-gitignore`.
@@ -655,7 +675,7 @@ tracevault telemetry on | status
 removes only what TraceVault wrote: `otelHeadersHelper` when it is TraceVault's, and the `env`
 entries below while they still hold TraceVault's values (`CLAUDE_CODE_ENABLE_TELEMETRY` and
 `OTEL_LOGS_EXPORTER` stay when another exporter still uses them). The choice is recorded in
-`~/.config/tracevault/install-state.json`, so neither a later `init` nor a CLI upgrade turns it
+`~/.config/visdom/install-state.json`, so neither a later `init` nor a CLI upgrade turns it
 back on; only `--claude-telemetry` or `tracevault telemetry on` does.
 
 **After a CLI upgrade**, the first Claude Code session that starts (its `SessionStart` hook,
@@ -777,10 +797,10 @@ user  →  repo (global)  →  worktree
 ```
 
 - **User** — optional, cross-repo, opt-in. Lives outside the repo (by default `context.json`
-  in the TraceVault config directory, e.g. `~/.config/tracevault/context.json` on Linux), so
+  in the Visdom config directory, e.g. `~/.config/visdom/context.json` on Linux), so
   it follows *you* across every project instead of being scoped to one repo.
-- **Repo (global)** — `.tracevault/context.json`, shared by all worktrees of the repo.
-- **Worktree** — `.tracevault/worktrees/<key>/context.json`, present only in a linked git
+- **Repo (global)** — `.visdom/context.json`, shared by all worktrees of the repo.
+- **Worktree** — `.visdom/worktrees/<key>/context.json`, present only in a linked git
   worktree.
 
 More specific wins: for `flow_id` and each `params` key, the highest layer that sets a value
@@ -796,7 +816,7 @@ from the output).
 **Enabling the user layer — `user_context` in `config.toml`**
 
 Whether the user layer is consulted is decided by `user_context` in the repo's
-`.tracevault/config.toml`. If the repo config does not set it, the user-level `config.toml`
+`.visdom/tracing.toml`. If the repo config does not set it, the user-level `tracing.toml`
 (written by `tracevault init --global`) decides; if neither sets it, the layer is off.
 `tracevault init` writes `user_context = true` into the repo config when it has none yet
 (`--no-user-context` to write `false`, `--user-context <path>` to point it at an explicit file
@@ -805,13 +825,13 @@ up front); a re-run without either flag keeps the value already there. The field
 | `config.toml` | Meaning |
 |---|---|
 | `user_context = false` | disabled — no user layer is consulted, whatever the user-level config says |
-| `user_context = true` | enabled, reading `context.json` in the TraceVault config directory |
+| `user_context = true` | enabled, reading `context.json` in the Visdom config directory |
 | `user_context = "/custom/path.json"` | enabled, reading from that file |
 | `[user_context]` with `enable` / `path = "..."` | `enable` defaults to `true`; `enable = false` disables the layer but keeps the path in the file |
 
 Change the repo's setting after the fact with `tracevault context source` (one of `--enable`,
 `--disable`, `--path <file>`, or `--default` is required). It edits only the current repo's
-`.tracevault/config.toml` and fails if the repo has none. `--enable` and `--default` both write
+`.visdom/tracing.toml` and fails if the repo has none. `--enable` and `--default` both write
 `user_context = true`, so they use the default path and discard a remembered one:
 
 ```sh
@@ -898,8 +918,8 @@ every session on the machine instead.
 |---|---|
 | `--agent <claude-code\|codex\|gsd\|opencode\|amp>` | Which agent to install hooks for (default `claude-code`; `gsd2` is an alias of `gsd`) |
 | `--claude-settings <shared\|local>` | Claude Code only: `.claude/settings.json` or `.claude/settings.local.json`. Omitted: asks in a terminal, otherwise `shared` |
-| `--no-gitignore` | Do not add `.tracevault/` and the hook file to the root `.gitignore` |
-| `--server-url <URL>` | Register the repo with this server during this `init` (instead of the URL from the environment or your login), and store it in `.tracevault/config.toml`, where later commands treat it as the lowest-precedence source (see [credentials](#tracevault-login--sign-in-humans)) |
+| `--no-gitignore` | Do not add the hook file to the root `.gitignore` |
+| `--server-url <URL>` | Register the repo with this server during this `init` (instead of the URL from the environment or your login), and store it in `.visdom/tracing.toml`, where later commands treat it as the lowest-precedence source (see [credentials](#tracevault-login--sign-in-humans)) |
 | `--user-context <path>` | Enable the user context layer, reading this file |
 | `--no-user-context` | Disable the user context layer (conflicts with `--user-context`) |
 | `--global` | Install machine-wide instead of in this repo; does not need git. Conflicts with `--server-url`, `--claude-settings`, `--no-gitignore` |
@@ -913,7 +933,7 @@ every session on the machine instead.
 [telemetry](#tracevault-init--set-up-tracing-in-a-repo)).
 
 **`tracevault sync`** — register the repo with the server, or bind to its existing record, and
-write `repo_id` into `.tracevault/config.toml` if the repo has one. Needs a login (or API key)
+write `repo_id` into `.visdom/tracing.toml` if the repo has one. Needs a login (or API key)
 and an `origin` remote. It first migrates a legacy `default_project` name in that config to
 `project_id` — also in a directory without a remote — and exits 1 naming the value if it is
 unknown or ambiguous. The pre-push hook runs it before every push.
@@ -1037,14 +1057,14 @@ it), `session-start` sends it later: for each session of the repo whose unsent l
 not run when `TRACEVAULT_PROJECT` or `TRACEVAULT_PROJECT_ATTRIBUTION` is set: they attribute what
 the current process sends, and an earlier session may have run with other values. For the same
 reason it sends a session only under the repo and project its own hooks sent under (recorded in
-`.tracevault/sessions/<session>/metadata.json`).
+`.visdom/sessions/<session>/metadata.json`).
 
 **Subagents.** Claude Code writes each subagent's conversation to its own file,
 `<session>/subagents/agent-<id>.jsonl` next to the session transcript, and leaves the subagent's
 messages and token usage out of the main transcript. Every `stream` hook therefore also sends what
 each of those files gained since the last hook: under the parent session, one file per request
 (never mixed with another file's lines or the main transcript's), each file with its own read
-offset in `.tracevault/sessions/<session>/.subagent_offsets/`. Subagents running in the background
+offset in `.visdom/sessions/<session>/.subagent_offsets/`. Subagents running in the background
 are sent while they run, and `Stop` reads every file to its end. `SubagentStop` sends only those
 files, which covers a background subagent that finishes after the session's last `Stop`. A batch
 that cannot be delivered is queued like any other event and sent by a later hook or
@@ -1062,7 +1082,7 @@ a plugin, rewritten in full by every `init`. See **Amp** under [`tracevault init
 **Claude Code telemetry** (unless `--no-claude-telemetry`, a no at the prompt, or an earlier
 opt-out; always `~/.claude/settings.json`): the `env` entries and `otelHeadersHelper` shown
 under [telemetry](#tracevault-init--set-up-tracing-in-a-repo). The choice and the version that
-last configured the machine go into `~/.config/tracevault/install-state.json`.
+last configured the machine go into `~/.config/visdom/install-state.json`.
 
 **Git hooks** (per-repo `init` only; an existing hook keeps its content and gets a TraceVault
 block appended):
@@ -1070,21 +1090,21 @@ block appended):
 - `pre-push` — `tracevault sync`, then `tracevault check`; a failed check aborts the push.
 - `post-commit` — `tracevault commit-push`, in the background.
 
-**Files**: `.tracevault/` (with `config.toml`, `sessions/`, `cache/` and its own `.gitignore`),
-and — unless `--no-gitignore` — entries for `.tracevault/` and the hook file in the root
+**Files**: `.visdom/` (with `tracing.toml`, `sessions/`, `cache/` and its own `.gitignore`),
+and — unless `--no-gitignore` — an entry for the hook file in the root
 `.gitignore`.
 
 ## Environment variables
 
 | Variable | Effect |
 |---|---|
-| `TRACEVAULT_SERVER_URL` | Server URL; wins over the credentials file and `.tracevault/config.toml` |
+| `TRACEVAULT_SERVER_URL` | Server URL; wins over the credentials file and `.visdom/tracing.toml` |
 | `TRACEVAULT_API_KEY` | API key (`tvk_…`) for CI and automation; wins over an interactive login |
 | `TRACEVAULT_PROJECT` | Project UUID to attribute events to; see [Project attribution](#project-attribution--tracevault_project-and-tracevault_project_attribution) |
 | `TRACEVAULT_PROJECT_ATTRIBUTION` | `explicit` to force attribution to that project; anything else means `derived` |
 | `TRACEVAULT_SESSION_ID` | Default session for `status`, `verify-start`, `repo …` and `project …`; the `SessionStart` hook exports it into the agent's shell |
 | `TRACEVAULT_NO_BROWSER` | Any value: `login` does not open a browser |
-| `XDG_STATE_HOME` | Base for per-session state (`$XDG_STATE_HOME/tracevault/sessions`, default `~/.local/state/tracevault/sessions`) |
+| `XDG_STATE_HOME` | Base for per-session state (`$XDG_STATE_HOME/visdom/sessions`, default `~/.local/state/visdom/sessions`) |
 
 The capture hook also reads the agent's own environment and auth files — for Claude Code
 `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_OAUTH_TOKEN`,
@@ -1094,20 +1114,21 @@ their values.
 
 ## Files
 
-All user-level files live in the TraceVault config directory: `~/.config/tracevault/` on Linux
-(`$XDG_CONFIG_HOME/tracevault/` if set), `~/Library/Application Support/tracevault/` on macOS.
+All user-level files live in the Visdom config directory: `~/.config/visdom/` on Linux
+(`$XDG_CONFIG_HOME/visdom/` if set), `~/Library/Application Support/visdom/` on macOS.
 
 | File | Written by | Holds |
 |---|---|---|
 | `credentials.json` | `login` (mode `0600`) | Server URL, access and refresh token |
-| `config.toml` | `init --global` | User-level settings (the user context layer) |
+| `tracing.toml` | `init --global` | User-level tracing settings (the user context layer) |
+| `config.toml` | `visdom init`, by hand | The `visdom` launcher's settings (agent, tracing mode, gateway) |
 | `context.json` | `context … --user` | The user context layer (default location) |
 | `default_repo.toml` | `repo switch --user` | Machine-wide default repo binding |
 | `user_project.toml` | `project switch --user` | Machine-wide default project binding |
-| `<repo>/.tracevault/config.toml` | `init`, `sync`, `context source` | `repo_id`, `user_context`, the agent, and optionally `server_url` / `api_key` / `project_id` + `project_name` |
-| `<dir>/.tracevault/config.toml` | `init --workspace` | `project_id` + `project_name` for every session started under `<dir>` (no `repo_id`) |
-| `<repo>/.tracevault/context.json` | `context …` | The repo context layer |
-| `<repo>/.tracevault/worktrees/<key>/context.json` | `context …` in a linked worktree | The worktree context layer |
+| `<repo>/.visdom/tracing.toml` | `init`, `sync`, `context source` | `repo_id`, `user_context`, the agent, and optionally `server_url` / `api_key` / `project_id` + `project_name` |
+| `<dir>/.visdom/tracing.toml` | `init --workspace` | `project_id` + `project_name` for every session started under `<dir>` (no `repo_id`) |
+| `<repo>/.visdom/context.json` | `context …` | The repo context layer |
+| `<repo>/.visdom/worktrees/<key>/context.json` | `context …` in a linked worktree | The worktree context layer |
 
 ## GitHub Action
 

@@ -10,6 +10,7 @@ pub mod credentials;
 pub mod hooks;
 pub(crate) mod inferred_repo;
 pub mod install_state;
+pub mod layout;
 pub mod oidc;
 pub mod paths;
 pub mod resolution;

@@ -26,7 +26,7 @@ pub enum CredentialState {
 /// Everything the checks look at, gathered once.
 #[derive(Clone, Debug)]
 pub struct CheckContext {
-    /// Where `visdom` runs. `.tracevault/` and the git hooks belong to the
+    /// Where `visdom` runs. `.visdom/` and the git hooks belong to the
     /// primary checkout.
     pub workdir: Workdir,
     pub home: PathBuf,

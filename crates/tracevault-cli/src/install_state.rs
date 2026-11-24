@@ -5,7 +5,7 @@
 //!
 //! Kept in `~/.config/tracevault/install-state.json`, beside `config.toml`:
 //! `config.toml` is rewritten from its struct by `init --global`, and a repo's
-//! `.tracevault/` does not exist in workspace mode.
+//! `.visdom/` does not exist in workspace mode.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -51,7 +51,8 @@ pub fn state_path_in(config_root: &Path) -> PathBuf {
 /// The state under `config_root`; a missing or unreadable file is an empty
 /// state (every step then runs once, which is safe: each one is idempotent).
 pub fn load_in(config_root: &Path) -> InstallState {
-    std::fs::read_to_string(state_path_in(config_root))
+    // Still in the legacy directory until something saves it.
+    std::fs::read_to_string(crate::layout::user_path(config_root, "install-state.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
