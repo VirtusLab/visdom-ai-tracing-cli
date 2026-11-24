@@ -148,7 +148,7 @@ fn stream_event(
 }
 
 /// An agent `visdom` started through the AI Gateway carries
-/// `VISDOM_GATEWAY_SESSION=1`; its capture hook then answers and records
+/// `VISDOM_GATEWAY_SESSION=<that agent>`; its capture hook then answers and records
 /// nothing — not even the session's local state. The developer's preference
 /// (`VISDOM_TRACING_MODE`) says nothing about the agent at hand: one started
 /// without `visdom` is not routed anywhere, and is captured.
@@ -156,24 +156,29 @@ fn stream_event(
 fn the_capture_hook_records_nothing_for_a_gateway_session() {
     let home = tempfile::tempdir().unwrap();
 
-    let gateway = tempfile::tempdir().unwrap();
-    let out = stream_event(
-        gateway.path(),
-        home.path(),
-        &[("VISDOM_GATEWAY_SESSION", "1")],
-    );
-    let answer: serde_json::Value = serde_json::from_str(out.trim()).expect("a hook response");
-    assert!(answer.is_object(), "{out}");
-    assert!(
-        !gateway.path().join(".tracevault").exists(),
-        "nothing may be written for a gateway session"
-    );
+    // The agent's own name, and `1`, which `visdom` 1.0.0 set.
+    for marker in ["claude-code", "1"] {
+        let gateway = tempfile::tempdir().unwrap();
+        let out = stream_event(
+            gateway.path(),
+            home.path(),
+            &[("VISDOM_GATEWAY_SESSION", marker)],
+        );
+        let answer: serde_json::Value = serde_json::from_str(out.trim()).expect("a hook response");
+        assert!(answer.is_object(), "{out}");
+        assert!(
+            !gateway.path().join(".tracevault").exists(),
+            "{marker}: nothing may be written for a gateway session"
+        );
+    }
 
     // The same event in a hooks session leaves the session's local state.
-    let captured: [&[(&str, &str)]; 3] = [
+    let captured: [&[(&str, &str)]; 4] = [
         &[],
         &[("VISDOM_TRACING_MODE", "hooks")],
         &[("VISDOM_TRACING_MODE", "gateway")],
+        // Another agent was routed, and this one started from its shell.
+        &[("VISDOM_GATEWAY_SESSION", "codex")],
     ];
     for environment in captured {
         let hooks = tempfile::tempdir().unwrap();

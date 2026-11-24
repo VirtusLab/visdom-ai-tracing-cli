@@ -109,7 +109,7 @@ fn a_chosen_gateway_session_gets_a_key_a_model_and_its_ids() {
     let recorded = lines(&log);
     let has = |line: &str| recorded.iter().any(|l| l == line);
     assert!(has("VISDOM_TRACING_MODE=gateway"), "{recorded:?}");
-    assert!(has("VISDOM_GATEWAY_SESSION=1"), "{recorded:?}");
+    assert!(has("VISDOM_GATEWAY_SESSION=claude-code"), "{recorded:?}");
     assert!(has("CLAUDE_CODE_USE_BEDROCK unset"), "{recorded:?}");
     assert!(
         has(&format!("ANTHROPIC_BASE_URL={}", server.url)),
@@ -317,7 +317,7 @@ fn a_direct_workspace_keeps_sessions_on_hooks() {
         // What is left in the environment (of a gateway session's shell,
         // say) must not switch the hooks' capture off either.
         .env("VISDOM_TRACING_MODE", "gateway")
-        .env("VISDOM_GATEWAY_SESSION", "1")
+        .env("VISDOM_GATEWAY_SESSION", "claude-code")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
@@ -683,4 +683,574 @@ fn an_enforcing_workspace_does_not_start_codex_told_to_use_another_provider() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(modes(&log), ["VISDOM_TRACING_MODE=gateway"]);
     assert!(args(&log).contains(&r#"model_provider="visdom-gateway""#.to_string()));
+}
+
+const TWO_PROJECTS: (&str, u16, &str) = (
+    "GET /api/me/keys",
+    200,
+    r#"{"hours":24,"projects":[{"id":"p-1","slug":"alpha","name":"Alpha","budget":null},{"id":"p-2","slug":"beta","name":"Beta","budget":null}],"keys":[]}"#,
+);
+
+/// Run `script` (the output of `visdom env`) in a shell of the sandbox, then
+/// `command` in the same shell.
+fn sourced(sb: &Sandbox, script: &str, command: &str) -> std::process::Output {
+    // The sandbox's own environment, as `visdom` is given it.
+    let shell = sb.visdom(sb.repo.path());
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg(format!("{script}\n{command}"))
+        .current_dir(sb.repo.path());
+    for (name, value) in shell.get_envs() {
+        match value {
+            Some(value) => cmd.env(name, value),
+            None => cmd.env_remove(name),
+        };
+    }
+    // `visdom` in the script is named by its full path.
+    cmd.output().unwrap()
+}
+
+/// `visdom env`: what makes a Claude Code started by hand go through the
+/// gateway. The key is not in it — only the command that gets it.
+#[test]
+fn env_sends_a_claude_started_without_visdom_through_the_gateway() {
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let (agent, log) = sb.recording_agent(&[
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "VISDOM_GATEWAY_SESSION",
+        "CLAUDE_CODE_USE_BEDROCK",
+    ]);
+    // Hooks at rest: asking for the variables is asking for the gateway.
+    let output = sb.visdom(sb.repo.path()).arg("env").output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let script = stdout(&output);
+    assert!(!script.contains("sk-personal"), "{script}");
+    assert!(script.contains("gateway-key --console"), "{script}");
+    assert!(script.contains("project `alpha`"), "{script}");
+
+    let run = sourced(
+        &sb,
+        &format!("export ANTHROPIC_API_KEY=sk-mine CLAUDE_CODE_USE_BEDROCK=1\n{script}"),
+        &format!("'{}' --verbose", agent.display()),
+    );
+    assert!(run.status.success(), "{}", stderr(&run));
+    let recorded = lines(&log);
+    let has = |line: &str| recorded.iter().any(|l| l == line);
+    assert!(
+        has(&format!("ANTHROPIC_BASE_URL={}", server.url)),
+        "{recorded:?}"
+    );
+    assert!(has("ANTHROPIC_AUTH_TOKEN=sk-personal"), "{recorded:?}");
+    assert!(has("ANTHROPIC_API_KEY unset"), "{recorded:?}");
+    assert!(has("ANTHROPIC_MODEL=claude-sonnet"), "{recorded:?}");
+    assert!(has("VISDOM_GATEWAY_SESSION=claude-code"), "{recorded:?}");
+    assert!(has("CLAUDE_CODE_USE_BEDROCK unset"), "{recorded:?}");
+    assert!(
+        has("ANTHROPIC_CUSTOM_HEADERS=x-tracevault-agent: claude-code"),
+        "{recorded:?}"
+    );
+    assert_eq!(args(&log), ["--verbose"]);
+}
+
+/// Codex takes its provider as options, so the script defines a `codex`
+/// function that adds them to whatever it is called with.
+#[test]
+fn env_gives_codex_a_function_that_adds_the_gateway() {
+    let settings = policy("enforced");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let (agent, log) = sb.recording_agent(&["VISDOM_GATEWAY_API_KEY", "VISDOM_GATEWAY_SESSION"]);
+    sb.write_user_config(&format!("[agents]\ncodex = \"{}\"\n", agent.display()));
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["env", "--agent", "codex"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let script = stdout(&output);
+    assert!(!script.contains("sk-personal"), "{script}");
+
+    let run = sourced(&sb, &script, "codex exec 'say hi'");
+    assert!(run.status.success(), "{}", stderr(&run));
+    let recorded = lines(&log);
+    assert!(
+        recorded.contains(&"VISDOM_GATEWAY_API_KEY=sk-personal".to_string()),
+        "{recorded:?}"
+    );
+    assert!(
+        recorded.contains(&"VISDOM_GATEWAY_SESSION=codex".to_string()),
+        "{recorded:?}"
+    );
+    let args = args(&log);
+    assert!(
+        args.contains(&"model_provider=\"visdom-gateway\"".to_string()),
+        "{args:?}"
+    );
+    assert!(
+        args.iter().any(|a| a
+            == &format!(
+                "model_providers.visdom-gateway.base_url=\"{}/v1\"",
+                server.url
+            )),
+        "{args:?}"
+    );
+    assert_eq!(&args[args.len() - 2..], ["exec", "say hi"], "{args:?}");
+}
+
+/// Where the workspace keeps sessions off the gateway there is nothing to
+/// set, and nothing is printed for a shell to run.
+#[test]
+fn env_prints_nothing_where_the_workspace_keeps_sessions_on_hooks() {
+    let settings = policy("direct");
+    let server = MockServer::start(&[SUITE, ("GET /api/v1/workspace/settings", 200, &settings)]);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let output = sb.visdom(sb.repo.path()).arg("env").output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert!(
+        stderr(&output).contains("AI traffic policy"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// A setting left out of the config is taken from the environment: the
+/// project among several, and the model alias.
+#[test]
+fn the_project_and_the_model_can_come_from_the_environment() {
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        TWO_PROJECTS,
+        ISSUE,
+        MODELS,
+    ]);
+    let (sb, log) = sandbox(&server);
+    // Several projects and nobody said which: no gateway session.
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway"])
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&output).contains("VISDOM_GATEWAY_PROJECT"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(lines(&log).contains(&"VISDOM_GATEWAY_SESSION unset".to_string()));
+    std::fs::remove_file(&log).unwrap();
+
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway"])
+        .env("VISDOM_GATEWAY_PROJECT", "beta")
+        .env("VISDOM_GATEWAY_MODEL", "gpt-general")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let recorded = lines(&log);
+    assert!(
+        recorded.contains(&"ANTHROPIC_MODEL=gpt-general".to_string()),
+        "{recorded:?}"
+    );
+    assert!(
+        recorded.contains(&"VISDOM_GATEWAY_SESSION=claude-code".to_string()),
+        "{recorded:?}"
+    );
+}
+
+/// `visdom init` leaves the gateway ready: the mode asked for is kept, the
+/// model alias is written down, a key is issued and tried, and what was set
+/// up is shown with where each setting comes from.
+#[test]
+fn init_leaves_the_gateway_ready_and_says_where_its_settings_are() {
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway", "init"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let said = stdout(&output);
+    assert!(said.contains("AI Gateway ready for Claude Code"), "{said}");
+    for line in [
+        "published by the tracing server",
+        "project under [gateway]",
+        "claude_code_model under [gateway]",
+        "VISDOM_GATEWAY_PROJECT",
+        "source <(visdom env)",
+    ] {
+        assert!(said.contains(line), "{line}: {said}");
+    }
+    assert!(!said.contains("sk-personal"), "{said}");
+    // What was settled is in the config: the next `visdom` needs no option.
+    let config = std::fs::read_to_string(sb.user_config()).unwrap();
+    assert!(config.contains("tracing_mode = \"gateway\""), "{config}");
+    // The only project open today too: one more opened later changes nothing.
+    assert!(config.contains("project = \"alpha\""), "{config}");
+    assert!(
+        config.contains("claude_code_model = \"claude-sonnet\""),
+        "{config}"
+    );
+    assert_eq!(count(&server, "POST /api/me/keys"), 1);
+    assert_eq!(count(&server, "GET /v1/models"), 1);
+
+    let (agent, log) = sb.recording_agent(&VARIABLES);
+    let mut config = std::fs::read_to_string(sb.user_config()).unwrap();
+    config.push_str(&format!(
+        "\n[agents]\nclaude_code = \"{}\"\n",
+        agent.display()
+    ));
+    sb.write_user_config(&config);
+    let output = sb.visdom(sb.repo.path()).output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let recorded = lines(&log);
+    assert!(
+        recorded.contains(&"VISDOM_GATEWAY_SESSION=claude-code".to_string()),
+        "{recorded:?}"
+    );
+    // The key issued by init is the one used.
+    assert_eq!(count(&server, "POST /api/me/keys"), 1);
+}
+
+/// A gateway that cannot be made ready fails init, with what to set and
+/// where: init does not end "done" on a setup whose first start would fail.
+#[test]
+fn init_fails_when_the_gateway_cannot_be_made_ready() {
+    let settings = policy("enforced");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        TWO_PROJECTS,
+    ]);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    // Nobody to ask which of the two projects.
+    let output = sb.visdom(sb.repo.path()).arg("init").output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    let said = stderr(&output);
+    assert!(said.contains("the AI Gateway is not ready"), "{said}");
+    assert!(said.contains("alpha, beta"), "{said}");
+    assert!(said.contains("`project`"), "{said}");
+    assert!(said.contains("VISDOM_GATEWAY_PROJECT"), "{said}");
+    assert!(!stdout(&output).contains("AI Gateway ready"));
+
+    // Said in the environment, it is set up.
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        TWO_PROJECTS,
+        ISSUE,
+        MODELS,
+    ]);
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let output = sb
+        .visdom(sb.repo.path())
+        .arg("init")
+        .env("VISDOM_GATEWAY_PROJECT", "beta")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let said = stdout(&output);
+    assert!(
+        said.contains("VISDOM_GATEWAY_PROJECT in the environment"),
+        "{said}"
+    );
+    assert!(said.contains("required by the workspace"), "{said}");
+}
+
+const CUSTOM_MODELS: (&str, u16, &str) = (
+    "GET /v1/models",
+    200,
+    r#"{"object":"list","data":[{"id":"team-assistant"},{"id":"team-fast"}]}"#,
+);
+
+/// A gateway whose aliases say nothing about the agent, and nobody to ask
+/// which to use: the agent would ask for its own default, which the project
+/// does not have. That is not a gateway left ready, nor one to hand out
+/// variables for.
+#[test]
+fn init_and_env_fail_without_a_model_alias_to_ask_for() {
+    let settings = policy("per_agent");
+    let routes = [
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, settings.as_str()),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        CUSTOM_MODELS,
+    ];
+    let server = MockServer::start(&routes);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway", "init"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    let said = stderr(&output);
+    assert!(said.contains("the AI Gateway is not ready"), "{said}");
+    assert!(said.contains("team-assistant, team-fast"), "{said}");
+    assert!(said.contains("claude_code_model"), "{said}");
+    assert!(said.contains("VISDOM_GATEWAY_MODEL"), "{said}");
+    assert!(!stdout(&output).contains("AI Gateway ready"));
+
+    let output = sb.visdom(sb.repo.path()).arg("env").output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert!(
+        stderr(&output).contains("team-assistant"),
+        "{}",
+        stderr(&output)
+    );
+
+    // An alias the project does not have is no better than none.
+    for command in ["init", "env"] {
+        let output = sb
+            .visdom(sb.repo.path())
+            .args(["--mode", "gateway", command])
+            .env("VISDOM_GATEWAY_MODEL", "claude-sonnet")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{command}: {}",
+            stdout(&output)
+        );
+        let said = stderr(&output);
+        assert!(said.contains("`claude-sonnet`"), "{command}: {said}");
+        assert!(
+            said.contains("VISDOM_GATEWAY_MODEL in the environment"),
+            "{said}"
+        );
+        assert!(said.contains("team-assistant, team-fast"), "{said}");
+        assert!(!stdout(&output).contains("ready"), "{command}");
+    }
+
+    // Named, it is ready.
+    let output = sb
+        .visdom(sb.repo.path())
+        .arg("init")
+        .env("VISDOM_GATEWAY_MODEL", "team-assistant")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("VISDOM_GATEWAY_MODEL in the environment"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+/// What init settles has to be found by the next `visdom`: a config that
+/// cannot be written is a failed init, not a summary of a setup that is gone
+/// when the command ends.
+#[cfg(unix)]
+#[test]
+fn init_fails_when_what_it_settled_cannot_be_saved() {
+    use std::os::unix::fs::PermissionsExt;
+    let settings = policy("enforced");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    sb.write_user_config("agent = \"claude-code\"\n");
+    let config = sb.user_config();
+    let read_only = std::fs::Permissions::from_mode(0o444);
+    std::fs::set_permissions(&config, read_only).unwrap();
+    let output = sb.visdom(sb.repo.path()).arg("init").output().unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+    if std::fs::read_to_string(&config)
+        .unwrap()
+        .contains("[gateway]")
+    {
+        // Running as root: nothing is read-only.
+        return;
+    }
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    let said = stderr(&output);
+    assert!(said.contains("could not be saved"), "{said}");
+    assert!(said.contains("VISDOM_GATEWAY_PROJECT"), "{said}");
+    assert!(!stdout(&output).contains("AI Gateway ready"));
+
+    // The mode asked for is such a setting too.
+    sb.write_user_config("[gateway]\nproject = \"alpha\"\nclaude_code_model = \"claude-sonnet\"\n");
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    sb.log_in(&server.url, PERSON_TOKEN);
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway", "init"])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    let said = stderr(&output);
+    assert!(said.contains("tracing mode could not be saved"), "{said}");
+    assert!(said.contains("VISDOM_TRACING_MODE=gateway"), "{said}");
+    assert!(!stdout(&output).contains("AI Gateway ready"));
+}
+
+/// A variable that is set wins over the files: the project over the
+/// repository's and the user's, the model over the user's.
+#[test]
+fn the_environment_wins_over_the_config_files() {
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        TWO_PROJECTS,
+        ISSUE,
+        MODELS,
+    ]);
+    let (sb, log) = sandbox(&server);
+    let mut config = std::fs::read_to_string(sb.user_config()).unwrap();
+    config.push_str("\n[gateway]\nproject = \"alpha\"\nclaude_code_model = \"claude-sonnet\"\n");
+    sb.write_user_config(&config);
+    std::fs::create_dir_all(sb.repo.path().join(".visdom")).unwrap();
+    std::fs::write(
+        sb.repo.path().join(".visdom/config.toml"),
+        "[gateway]\nproject = \"alpha\"\n",
+    )
+    .unwrap();
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway"])
+        .env("VISDOM_GATEWAY_PROJECT", "beta")
+        .env("VISDOM_GATEWAY_MODEL", "gpt-general")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let recorded = lines(&log);
+    assert!(
+        recorded.contains(&"ANTHROPIC_MODEL=gpt-general".to_string()),
+        "{recorded:?}"
+    );
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|r| r.route == "POST /api/me/keys" && r.body.contains("p-2")),
+        "{:?}",
+        server.routes()
+    );
+}
+
+/// A model alias the project no longer has does not stop a launch — the
+/// gateway refuses the request, and the developer was told why.
+#[test]
+fn a_launch_warns_about_a_model_alias_the_project_does_not_have() {
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let (sb, log) = sandbox(&server);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway"])
+        .env("VISDOM_GATEWAY_MODEL", "removed-alias")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let said = stderr(&output);
+    assert!(said.contains("`removed-alias` is not among"), "{said}");
+    assert!(said.contains("gpt-general, claude-sonnet"), "{said}");
+    let recorded = lines(&log);
+    assert!(
+        recorded.contains(&"ANTHROPIC_MODEL=removed-alias".to_string()),
+        "{recorded:?}"
+    );
+}
+
+/// `visdom --mode gateway init` keeps the mode in the user config. Where the
+/// repository's config (or the environment) says otherwise, that wins at the
+/// next `visdom`: init says so instead of calling the setup done.
+#[test]
+fn init_fails_when_the_mode_it_saves_would_be_overruled() {
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    std::fs::create_dir_all(sb.repo.path().join(".visdom")).unwrap();
+    std::fs::write(
+        sb.repo.path().join(".visdom/config.toml"),
+        "tracing_mode = \"hooks\"\n",
+    )
+    .unwrap();
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway", "init"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    let said = stderr(&output);
+    assert!(said.contains(".visdom/config.toml"), "{said}");
+    assert!(said.contains("hooks"), "{said}");
+    assert!(!stdout(&output).contains("AI Gateway ready"));
 }

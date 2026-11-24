@@ -224,7 +224,10 @@ pub fn claude_command(
     let mut routing: Vec<(&str, String)> = vec![
         // The hooks read this to record nothing: a settings file must not
         // switch them back on beside the gateway.
-        (GATEWAY_SESSION_ENV, "1".to_string()),
+        (
+            GATEWAY_SESSION_ENV,
+            Agent::ClaudeCode.tool_name().to_string(),
+        ),
         (MODE_ENV, TracingMode::Gateway.name().to_string()),
         ("ANTHROPIC_BASE_URL", gateway.llm_url.clone()),
         ("ANTHROPIC_CUSTOM_HEADERS", headers),
@@ -344,7 +347,7 @@ pub fn codex_command(
         ));
     }
     let mut cmd = Command::new(program);
-    cmd.env(GATEWAY_SESSION_ENV, "1");
+    cmd.env(GATEWAY_SESSION_ENV, Agent::Codex.tool_name());
     cmd.env(MODE_ENV, TracingMode::Gateway.name());
     cmd.env(CODEX_KEY_ENV, &gateway.key);
     let provider = format!("model_providers.{CODEX_PROVIDER}");
@@ -379,6 +382,90 @@ pub fn codex_command(
     }
     cmd.args(args);
     Ok(cmd)
+}
+
+/// `text` as one word of a POSIX shell command.
+pub fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The lines every such script starts and ends with: the key is not in the
+/// script, which only says how to get it, so the script can be kept (a shell
+/// profile, an `.envrc`) and shown around.
+fn script(agent: Agent, project: &str, lines: Vec<String>) -> String {
+    let mut out = vec![
+        format!(
+            "# {} through the Visdom AI Gateway (project `{project}`), started without `visdom`.",
+            agent.label()
+        ),
+        "# Use:  source <(visdom env)    — again when the key expires (24 hours at most).".into(),
+        "# Settings your agent's own configuration files make still win over these;".into(),
+        "# `visdom` itself is the way that cannot be overruled.".into(),
+    ];
+    out.extend(lines);
+    // This agent's hooks record nothing when it is started from this shell:
+    // the gateway records it. Any other agent's still do.
+    out.push(format!(
+        "export {GATEWAY_SESSION_ENV}={}",
+        agent.tool_name()
+    ));
+    out.join("\n") + "\n"
+}
+
+/// Shell commands that send a Claude Code started from that shell, without
+/// `visdom`, through the gateway.
+pub fn claude_env_script(gateway: &GatewayLaunch, project: &str) -> String {
+    let mut headers = vec![format!(
+        "x-tracevault-agent: {}",
+        Agent::ClaudeCode.tool_name()
+    )];
+    if let Some(repo) = &gateway.repo_id {
+        headers.push(format!("x-tracevault-repo: {}", header_value(repo)));
+    }
+    let mut lines = vec![
+        format!(
+            "export ANTHROPIC_BASE_URL={}",
+            shell_quote(&gateway.llm_url)
+        ),
+        format!("export ANTHROPIC_AUTH_TOKEN=\"$({})\"", gateway.key_helper),
+        format!(
+            "export ANTHROPIC_CUSTOM_HEADERS={}",
+            shell_quote(&headers.join("\n"))
+        ),
+    ];
+    if let Some(model) = &gateway.model {
+        for name in ["ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"] {
+            lines.push(format!("export {name}={}", shell_quote(model)));
+        }
+    }
+    lines.push(format!(
+        "unset ANTHROPIC_API_KEY {}",
+        CLAUDE_OTHER_PROVIDERS.join(" ")
+    ));
+    script(Agent::ClaudeCode, project, lines)
+}
+
+/// The same for Codex, whose provider is given as options, not variables:
+/// the script defines a `codex` function that adds them.
+pub fn codex_env_script(
+    program: &str,
+    gateway: &GatewayLaunch,
+    project: &str,
+) -> Result<String, String> {
+    let cmd = codex_command(program, &[], gateway)?;
+    let options: Vec<String> = cmd
+        .get_args()
+        .map(|arg| shell_quote(&arg.to_string_lossy()))
+        .collect();
+    let lines = vec![
+        format!("export {CODEX_KEY_ENV}=\"$({})\"", gateway.key_helper),
+        format!(
+            "codex() {{ command {} {} \"$@\"; }}",
+            shell_quote(program),
+            options.join(" ")
+        ),
+    ];
+    Ok(script(Agent::Codex, project, lines))
 }
 
 #[cfg(test)]
@@ -449,7 +536,10 @@ mod tests {
     fn claude_gets_the_gateway_the_key_helper_and_a_session() {
         let cmd = claude(&strings(&["--verbose"]), &gateway(), &no_env);
         let env = envs_of(&cmd);
-        assert_eq!(env["VISDOM_GATEWAY_SESSION"].as_deref(), Some("1"));
+        assert_eq!(
+            env["VISDOM_GATEWAY_SESSION"].as_deref(),
+            Some("claude-code")
+        );
         assert_eq!(env["VISDOM_TRACING_MODE"].as_deref(), Some("gateway"));
         assert_eq!(
             env["ANTHROPIC_BASE_URL"].as_deref(),
@@ -481,7 +571,7 @@ mod tests {
         assert_eq!(
             settings["env"],
             serde_json::json!({
-                "VISDOM_GATEWAY_SESSION": "1",
+                "VISDOM_GATEWAY_SESSION": "claude-code",
                 "VISDOM_TRACING_MODE": "gateway",
                 "ANTHROPIC_API_KEY": "",
                 "ANTHROPIC_AUTH_TOKEN": "",
@@ -688,7 +778,7 @@ mod tests {
         launch.model = Some("gpt-general".to_string());
         let cmd = codex(&strings(&["exec", "hi"]), &launch);
         let env = envs_of(&cmd);
-        assert_eq!(env["VISDOM_GATEWAY_SESSION"].as_deref(), Some("1"));
+        assert_eq!(env["VISDOM_GATEWAY_SESSION"].as_deref(), Some("codex"));
         assert_eq!(env["VISDOM_TRACING_MODE"].as_deref(), Some("gateway"));
         assert_eq!(env["VISDOM_GATEWAY_API_KEY"].as_deref(), Some("sk-abc"));
         let args = args_of(&cmd);

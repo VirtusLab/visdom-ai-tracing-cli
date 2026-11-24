@@ -1423,17 +1423,29 @@ async fn deliver_parts(
 /// its provider directly.
 pub const TRACING_MODE_ENV: &str = "VISDOM_TRACING_MODE";
 
-/// The variable `visdom` sets, to `1`, on an agent it has routed through the
-/// AI Gateway, which then records the session itself. Nobody else sets it.
+/// The variable `visdom` sets on an agent it has routed through the AI
+/// Gateway, which then records the session itself: the agent's name
+/// (`claude-code`, `codex`). Nobody else sets it.
 pub const GATEWAY_SESSION_ENV: &str = "VISDOM_GATEWAY_SESSION";
 
-/// Whether the session this hook runs in is recorded by the AI Gateway, given
-/// the value of [`GATEWAY_SESSION_ENV`]. Hooks inherit the agent's
-/// environment, so this is true exactly for the events of an agent `visdom`
-/// started through the gateway. The capture hook then records nothing: the
+/// Whether the session this hook of `agent` runs in is recorded by the AI
+/// Gateway, given the value of [`GATEWAY_SESSION_ENV`]. Hooks inherit the
+/// agent's environment, so this is true for the events of an agent `visdom`
+/// routed through the gateway. The capture hook then records nothing: the
 /// same session captured twice would be a second, conflicting source.
-pub fn captured_by_gateway(marker: Option<&str>) -> bool {
-    marker.is_some_and(|m| m.trim() == "1")
+///
+/// The variable names the agent that was routed, and only that agent's hooks
+/// go quiet: whatever else is started from its shell — another agent, by
+/// hand or by the first one — inherits the variable without being routed
+/// anywhere, and is captured.
+///
+/// `1` is what `visdom` 1.0.0 sets, for whichever agent it started: still
+/// taken, for every agent, so that its gateway sessions are not captured a
+/// second time by a newer `tracevault`.
+pub fn captured_by_gateway(marker: Option<&str>, agent: crate::agent::Agent) -> bool {
+    marker
+        .map(str::trim)
+        .is_some_and(|m| m == "1" || m.eq_ignore_ascii_case(agent.tool_name()))
 }
 
 pub async fn run_stream(
@@ -1445,7 +1457,7 @@ pub async fn run_stream(
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
     // The event is read (the agent is writing it) and then left alone.
-    if captured_by_gateway(std::env::var(GATEWAY_SESSION_ENV).ok().as_deref()) {
+    if captured_by_gateway(std::env::var(GATEWAY_SESSION_ENV).ok().as_deref(), agent) {
         println!("{}", serde_json::to_string(&HookResponse::allow())?);
         return Ok(());
     }

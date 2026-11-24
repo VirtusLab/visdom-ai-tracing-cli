@@ -62,6 +62,7 @@ fn main() {
             if per_repo && matches!(agent, Agent::ClaudeCode | Agent::Codex) {
                 init_bazaar(&runtime, agent);
                 init_mode(&runtime, agent, cli.mode);
+                init_gateway(&runtime, agent, cli.mode);
             }
         }
         Some(VisdomCommand::Doctor {
@@ -81,6 +82,7 @@ fn main() {
         Some(VisdomCommand::GatewayKey { console, project }) => {
             gateway_key(&runtime, &console, &project)
         }
+        Some(VisdomCommand::Env { agent }) => env_script(&runtime, agent.or(cli.agent)),
         None => check_and_launch(runtime, cli.agent, cli.mode, cli.yes, &cli.agent_args),
     }
 }
@@ -308,7 +310,43 @@ fn init_mode(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<Traci
             );
             return;
         }
-        ModeReason::Policy(_) | ModeReason::Chosen => return,
+        ModeReason::Policy(_) => return,
+        ModeReason::Chosen => {
+            // `visdom --mode … init` is a choice to keep, not one for this
+            // run only: there is no agent to start here.
+            if let Some(mode) = flag {
+                save_mode(&session, mode);
+                // Kept in the user config, which the environment and the
+                // repository's config come before: a mode they name is the
+                // one the next plain `visdom` runs in, not this one.
+                let user = config::load_user_config_in(&env.config_root).unwrap_or_default();
+                let repo = checks_repo_config(&env);
+                let next = configured_mode(
+                    None,
+                    env.mode.as_deref(),
+                    repo.tracing_mode,
+                    user.tracing_mode,
+                );
+                if !matches!(next, Ok(Some(next)) if next == mode) {
+                    let said_by = match env.mode {
+                        Some(_) => format!("{MODE_ENV} in the environment"),
+                        None => "tracing_mode in the repository's .visdom/config.toml".to_string(),
+                    };
+                    let other = match next {
+                        Ok(Some(next)) => format!("`{}`", next.name()),
+                        _ => "something else".to_string(),
+                    };
+                    eprintln!(
+                        "visdom: `{mode}` was saved to your config, but {said_by} says {other} \
+                         and comes first: a plain `visdom` here would not start in {mode} mode. \
+                         Change it there, or pass --mode {mode} each time.",
+                        mode = mode.name()
+                    );
+                    exit(1);
+                }
+            }
+            return;
+        }
         ModeReason::Default => {}
     }
     let user = config::load_user_config_in(&env.config_root).unwrap_or_default();
@@ -341,9 +379,210 @@ fn init_mode(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<Traci
     let Some(mode) = interactive::ask_mode() else {
         return;
     };
+    save_mode(&session, mode);
+}
+
+/// The repository's own visdom config for the directory `visdom` runs in.
+fn checks_repo_config(env: &Environment) -> config::RepoConfig {
+    git_toplevel(&env.cwd)
+        .and_then(|dir| config::load_repo_config_in(&dir).ok())
+        .unwrap_or_default()
+}
+
+fn save_mode(session: &Session, mode: TracingMode) {
     match interactive::save_tracing_mode(&session.user_config_path, mode) {
-        Ok(()) => eprintln!("Saved to {}", session.user_config_path.display()),
-        Err(e) => eprintln!("visdom: warning: tracing mode not saved: {e}"),
+        Ok(()) => eprintln!(
+            "Saved tracing_mode = \"{}\" to {}",
+            mode.name(),
+            session.user_config_path.display()
+        ),
+        Err(e) => {
+            // The next `visdom` would not know the choice: not a setup done.
+            eprintln!("visdom: the tracing mode could not be saved: {e}");
+            eprintln!("  Set it yourself: export {MODE_ENV}={}", mode.name());
+            exit(1);
+        }
+    }
+}
+
+/// Write a gateway setting init has settled to the user config. One that
+/// cannot be written ends init: the next `visdom` would not find it, and the
+/// setup would only look done.
+fn save_gateway(session: &Session, key: &str, value: &str) {
+    match interactive::save_gateway_setting(&session.user_config_path, key, value) {
+        Ok(()) => eprintln!(
+            "Saved {key} = \"{value}\" under [gateway] to {}",
+            session.user_config_path.display()
+        ),
+        Err(e) => {
+            eprintln!("visdom: the AI Gateway is not set up: {key} could not be saved: {e}");
+            eprintln!(
+                "  Set it yourself: {}",
+                launch::gateway_setting_env(key).unwrap_or(key)
+            );
+            exit(1);
+        }
+    }
+}
+
+/// The end of `visdom init` when sessions go through the AI Gateway (chosen
+/// just now, earlier, or required by the workspace): leave it ready to use.
+/// The project and the model alias are settled — asked for when there is a
+/// choice and somebody to ask — and written to the user config, a personal
+/// key is issued and tried on the LLM gateway, and what was set up is shown
+/// with where each setting comes from. A gateway that cannot be made ready
+/// makes init fail, with what to set.
+fn init_gateway(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<TracingMode>) {
+    let env = Environment::current();
+    let mut session = gather(&env, Some(agent), flag, runtime);
+    if session.mode.mode != TracingMode::Gateway {
+        return;
+    }
+    let asking = interactive::is_interactive();
+    // Several projects: the choice is the developer's.
+    if asking && session.gateway_sources.project.is_none() {
+        let open = match (&session.console_url, &session.token) {
+            (Some(console), Some(token)) => runtime
+                .block_on(visdom_cli::gateway::open_projects(
+                    &checks::http_client(),
+                    console,
+                    token,
+                ))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if open.len() > 1 {
+            let names: Vec<String> = open
+                .iter()
+                .map(|p| format!("{} ({})", p.slug, p.name))
+                .collect();
+            if let Some(i) =
+                interactive::ask_choice("Which AI Gateway project is this for?", &names)
+            {
+                save_gateway(&session, "project", &open[i].slug);
+                session = gather(&env, Some(agent), flag, runtime);
+            }
+        }
+    }
+    let visdom = std::env::current_exe().unwrap_or_else(|_| "visdom".into());
+    let mut prepared = match launch::prepare_gateway(&session, runtime, &visdom, now()) {
+        Ok(prepared) => prepared,
+        Err(why) => {
+            eprintln!("visdom: the AI Gateway is not ready: {why}");
+            eprintln!(
+                "{}",
+                launch::gateway_settings_hint(&session.user_config_path)
+            );
+            exit(1);
+        }
+    };
+    let Some(Ok(plan)) = &session.gateway else {
+        return;
+    };
+    let mut sources = session.gateway_sources.clone();
+    let in_user_config = |key: &str| {
+        Some(format!(
+            "{key} under [gateway] in {}",
+            session.user_config_path.display()
+        ))
+    };
+    if sources.project.is_none() {
+        // The only project open today: written down, so that being given
+        // access to another one later does not leave the choice open.
+        save_gateway(&session, "project", &plan.project.slug);
+        sources.project = in_user_config("project");
+    }
+    let model_key = format!("{}_model", config::agent_config_key(agent));
+    if sources.model.is_none() {
+        // Nobody named a model: the one picked for the agent, else theirs to
+        // pick. Written down either way, so it does not change by itself.
+        let picked = prepared.launch.model.clone().or_else(|| {
+            asking
+                .then(|| {
+                    interactive::ask_choice(
+                        &format!(
+                            "Which model alias should {} ask the AI Gateway for?",
+                            agent.label()
+                        ),
+                        &prepared.available,
+                    )
+                })
+                .flatten()
+                .map(|i| prepared.available[i].clone())
+        });
+        if let Some(model) = picked {
+            save_gateway(&session, &model_key, &model);
+            sources.model = in_user_config(&model_key);
+            prepared.launch.model = Some(model);
+        }
+    }
+    if let Err(why) = launch::usable_model(
+        agent,
+        prepared.launch.model.as_deref(),
+        sources.model.as_deref(),
+        &plan.project.slug,
+        &prepared.available,
+    ) {
+        eprintln!("visdom: the AI Gateway is not ready: {why}");
+        exit(1);
+    }
+    print!(
+        "{}",
+        launch::gateway_summary(
+            agent,
+            &session.mode,
+            plan,
+            &sources,
+            prepared.launch.model.as_deref(),
+            &session.user_config_path,
+        )
+    );
+}
+
+/// `visdom env`: the shell commands for an agent started without `visdom`.
+/// Only they go to stdout.
+fn env_script(runtime: &tokio::runtime::Runtime, agent: Option<Agent>) -> ! {
+    let env = Environment::current();
+    // Asking for these is asking for the gateway, whatever the mode at rest.
+    let session = gather(&env, agent, Some(TracingMode::Gateway), runtime);
+    if session.mode.mode != TracingMode::Gateway {
+        eprintln!(
+            "visdom: the workspace's AI traffic policy keeps sessions off the AI Gateway: \
+             there is nothing to set"
+        );
+        exit(1);
+    }
+    let visdom = std::env::current_exe().unwrap_or_else(|_| "visdom".into());
+    let script = launch::prepare_gateway(&session, runtime, &visdom, now()).and_then(|prepared| {
+        let project = match &session.gateway {
+            Some(Ok(plan)) => plan.project.slug.clone(),
+            _ => String::new(),
+        };
+        // Nothing checks the gateway again before an agent started by hand:
+        // a setup that would ask for a model the project refuses is not one
+        // to hand out.
+        launch::usable_model(
+            session.ctx.agent,
+            prepared.launch.model.as_deref(),
+            session.gateway_sources.model.as_deref(),
+            &project,
+            &prepared.available,
+        )?;
+        session.adapter.env_script(&prepared.launch, &project)
+    });
+    match script {
+        Ok(script) => {
+            print!("{script}");
+            exit(0)
+        }
+        Err(why) => {
+            eprintln!("visdom: the AI Gateway is not ready: {why}");
+            eprintln!(
+                "{}",
+                launch::gateway_settings_hint(&session.user_config_path)
+            );
+            exit(1)
+        }
     }
 }
 
@@ -369,13 +608,14 @@ fn agent_command(
         return hooks(session);
     }
     let visdom = std::env::current_exe().unwrap_or_else(|_| "visdom".into());
-    let prepared =
-        launch::prepare_gateway(session, runtime, &visdom, now()).and_then(|(gateway, notes)| {
-            session
-                .adapter
-                .launch_via_gateway(agent_args, &gateway, &|name| std::env::var(name).ok())
-                .map(|cmd| (cmd, notes))
-        });
+    let prepared = launch::prepare_gateway(session, runtime, &visdom, now()).and_then(|prepared| {
+        session
+            .adapter
+            .launch_via_gateway(agent_args, &prepared.launch, &|name| {
+                std::env::var(name).ok()
+            })
+            .map(|cmd| (cmd, prepared.notes))
+    });
     match prepared {
         Ok((cmd, notes)) => {
             for note in notes {

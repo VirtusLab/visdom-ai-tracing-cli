@@ -22,7 +22,8 @@ visdom doctor --fix         # …and offer the fixes (--yes applies all, --json 
 | `visdom [--agent <a>] [--mode <m>] [--yes] [-- <agent args>]` | Check, offer each fix, start the agent in the current directory. Findings never stop the agent from starting (one exception: a gateway the workspace requires and that cannot be used, see below). |
 | `visdom doctor [--fix] [--yes] [--json] [--agent <a>] [--mode <m>]` | The same checks without starting anything. |
 | `visdom login` / `visdom logout` | Same as `tracevault login` / `logout`. |
-| `visdom init [...]` | Sets the repository up: tracing (`tracevault init`, same flags), then registers the bazaar MCP server for the agent, then asks how your sessions are traced when that is yours to choose. |
+| `visdom init [...]` | Sets the repository up: tracing (`tracevault init`, same flags), then registers the bazaar MCP server for the agent, then asks how your sessions are traced when that is yours to choose — and, through the AI Gateway, leaves the gateway ready to use. |
+| `visdom env [--agent <a>]` | Prints shell commands that send an agent you start *without* `visdom` through the AI Gateway: `source <(visdom env)`. |
 | `visdom trace <command>` | Every `tracevault` command: `visdom trace status`, `visdom trace verify-start`, … |
 
 What is checked:
@@ -48,6 +49,37 @@ in the user config), and how your sessions are traced when the installation has 
 the choice is yours (saved as `tracing_mode`). Without a terminal it asks nothing and reports what
 is missing.
 
+When your sessions go through the AI Gateway — you chose it just now or earlier, passed
+`visdom --mode gateway init` (which is then saved), or the workspace requires it — `visdom init`
+ends by making the gateway ready, so that the first `visdom` does not fail on something init
+could have settled:
+
+- it writes down the gateway project (`[gateway] project`): the only one open to you, or, with
+  several, the one you pick — so that a project opened to you later does not unsettle it;
+- it issues your personal key and tries it on the LLM gateway;
+- it writes down the model alias the agent will ask for (`[gateway] claude_code_model` /
+  `codex_model`): the one picked for the agent, or, when none of the aliases is named for it, the
+  one you pick;
+- it prints what it set up and **where each setting comes from**:
+
+  ```text
+  AI Gateway ready for Claude Code: `visdom` starts it through the gateway.
+    mode         gateway                  (your choice)
+    console      https://gw.example.com   (published by the tracing server)
+    LLM gateway  https://llm.example.com  (named by the console)
+    project      payments                 (project under [gateway] in ~/.config/visdom/config.toml)
+    model        claude-sonnet            (claude_code_model under [gateway] in ~/.config/visdom/config.toml)
+    personal key issued, and accepted by the LLM gateway  (kept for you only, renewed by `visdom`)
+  ```
+
+A gateway that cannot be made ready (nobody to ask which project, no login it accepts, an LLM
+gateway that refuses the key, no model alias to ask for, a config that cannot be written) makes
+`visdom init` fail, with what to set and where.
+
+Every one of these settings can be kept in the config file; **what is left out there is taken
+from the environment** (`VISDOM_TRACING_MODE`, `VISDOM_GATEWAY_URL`, `VISDOM_GATEWAY_PROJECT`,
+`VISDOM_GATEWAY_MODEL`), and a variable that is set wins over the file — see Settings below.
+
 ### Hooks or the AI Gateway
 
 A session reaches AI Tracing one of two ways, and **you choose**:
@@ -63,7 +95,7 @@ A session reaches AI Tracing one of two ways, and **you choose**:
 Your choice is `--mode`, then `VISDOM_TRACING_MODE`, then `tracing_mode` in the repository's
 `.visdom/config.toml`, then in the user config. That variable is only your preference for
 `visdom`: an agent you start without `visdom` is captured by its hooks whatever it says (what
-switches the capture off is `VISDOM_GATEWAY_SESSION=1`, which `visdom` sets on the agent it has
+switches the capture off is `VISDOM_GATEWAY_SESSION=<agent>`, which `visdom` sets on the agent it has
 routed through the gateway, and nobody else should).
 
 **A workspace admin may decide instead**, with the AI traffic policy in Control Plane:
@@ -124,6 +156,35 @@ options of yours that choose another provider):
 An API key (`VISDOM_API_KEY`) is only ever sent to the tracing server; the gateway and Control
 Plane need a Visdom account login (`visdom login`).
 
+#### The agent started without `visdom` — `visdom env`
+
+`visdom` is the way to start an agent through the gateway. For the times it is started some
+other way — by an editor, a script, out of habit — `visdom env` prints the shell commands that
+send it through the gateway too:
+
+```sh
+source <(visdom env)                 # Claude Code; `--agent codex` for Codex
+claude                               # now goes through the gateway
+```
+
+- The key is **not** in the output: the script only names the command that gets it
+  (`visdom gateway-key …`), so it can be kept in a shell profile or an `.envrc` and shown around.
+  The key is read when the script is sourced and lasts 24 hours at most: source it again then.
+- For Claude Code it sets `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, the attribution headers
+  and the model alias, and unsets `ANTHROPIC_API_KEY` and the provider switches. For Codex, whose
+  provider is given as options, it defines a `codex` shell function that adds them (so it works
+  for `codex …` typed in that shell, not for a program that runs the `codex` executable itself).
+- It sets `VISDOM_GATEWAY_SESSION` to the agent's name, which switches that agent's capture
+  hooks off when it is started from that shell: the gateway records it. Another agent started
+  there is not routed by this script, and is captured by its hooks as usual. (`visdom` 1.0.0 set
+  the variable to `1` for whichever agent it started; `tracevault` still takes that.)
+- The repository in the attribution headers is the one `visdom env` was run in; run it per
+  repository (an `.envrc` does that).
+- It is weaker than `visdom`: `env` in the agent's own settings files still wins over the
+  environment, and nothing checks the gateway again before each start. Where the workspace keeps
+  sessions off the gateway (`direct`), or the gateway is not ready (no model alias to ask for
+  included), it prints nothing and fails.
+
 Settings:
 
 - The agent: `--agent`, then `VISDOM_AGENT`, then `agent = "…"` in the repository's
@@ -148,6 +209,10 @@ Settings:
   ```
 - A repository may name its own in `.visdom/config.toml`: `agent`, `tracing_mode`, and
   `[gateway] project`.
+- The gateway project: `VISDOM_GATEWAY_PROJECT`, then `[gateway] project` in the repository's
+  config, then in the user config, then the only project open to you.
+- The model alias: `VISDOM_GATEWAY_MODEL`, then `[gateway] claude_code_model` / `codex_model` in
+  the user config, then the first alias the key may call that is named for the agent.
 - The bazaar URL: `VISDOM_BAZAAR_URL`, then `bazaar_url` above, then the tracing server's
   `public-config` (`bazaar_mcp_url`, when it publishes one).
 - Control Plane and the gateway console: `VISDOM_CONTROL_PLANE_URL` / `VISDOM_GATEWAY_URL`, then

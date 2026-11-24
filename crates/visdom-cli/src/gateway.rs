@@ -254,7 +254,8 @@ pub fn pick_project(configured: Option<&str>, open: &[OpenProject]) -> Result<Op
         None if open.len() == 1 => Ok(open[0].clone()),
         None => Err(format!(
             "several AI Gateway projects are open to you ({}): set `project` under \
-             `[gateway]` in .visdom/config.toml or in your visdom config",
+             `[gateway]` in .visdom/config.toml or in your visdom config, or \
+             VISDOM_GATEWAY_PROJECT (`visdom init` asks and saves it)",
             names()
         )),
     }

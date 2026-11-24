@@ -123,6 +123,19 @@ pub trait AgentAdapter {
             _ => via_gateway::claude_command(self.program(), args, gateway, env),
         }
     }
+
+    /// Shell commands that send this agent, started from that shell without
+    /// `visdom`, through the AI Gateway (`visdom env`).
+    fn env_script(
+        &self,
+        gateway: &via_gateway::GatewayLaunch,
+        project: &str,
+    ) -> Result<String, String> {
+        match self.agent() {
+            Agent::Codex => via_gateway::codex_env_script(self.program(), gateway, project),
+            _ => Ok(via_gateway::claude_env_script(gateway, project)),
+        }
+    }
 }
 
 /// The adapter for `agent`. `program_override` replaces the executable name.
