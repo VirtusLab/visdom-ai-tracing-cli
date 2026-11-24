@@ -42,11 +42,17 @@ function enqueue(sessionId: string, task: () => Promise<void>): Promise<void> {
  */
 const pendingToolArgs = new Map<string, unknown>();
 
+/**
+ * The command this plugin runs. The installer rewrites this line when the
+ * `visdom` binary installs the plugin (`visdom trace …`).
+ */
+const CLI = ["tracevault"];
+
 /** Spawn `tracevault <args...>`, feeding `stdinJson` on stdin. Never throws. */
 function runTracevault(args: string[], stdinJson: unknown, cwd: string): Promise<void> {
   return new Promise((resolve) => {
     try {
-      const child = spawn("tracevault", args, { cwd, stdio: ["pipe", "ignore", "ignore"] });
+      const child = spawn(CLI[0], [...CLI.slice(1), ...args], { cwd, stdio: ["pipe", "ignore", "ignore"] });
       child.on("error", (e) => {
         console.error(`[tracevault] spawn failed: ${e instanceof Error ? e.message : String(e)}`);
         resolve();

@@ -1355,3 +1355,36 @@ fn init_carries_a_legacy_setup_over_to_the_visdom_names() {
     assert!(stdout.contains("Moved"), "{stdout}");
     assert!(stdout.contains("not pushed yet"), "{stdout}");
 }
+
+/// A checkout `visdom` set up: its hooks call `visdom trace …`. Running the
+/// `tracevault` binary's `init` there must not take them back to
+/// `tracevault …` — on a machine with `visdom` alone they would stop working.
+#[test]
+fn init_by_tracevault_keeps_hooks_that_call_visdom() {
+    let repo = real_git_repo_without_remote();
+    let home = TempDir::new().unwrap();
+    write_repo_config(repo.path(), TUNED_CONFIG);
+    fs::create_dir_all(repo.path().join(".claude")).unwrap();
+    fs::write(
+        repo.path().join(".claude/settings.json"),
+        r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"visdom trace stream --event stop"}]}]}}"#,
+    )
+    .unwrap();
+
+    let output = run_init_isolated(repo.path(), home.path(), &["--claude-settings", "shared"]);
+
+    assert!(
+        output.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let settings = fs::read_to_string(repo.path().join(".claude/settings.json")).unwrap();
+    assert!(
+        settings.contains("visdom trace session-start"),
+        "{settings}"
+    );
+    assert!(!settings.contains("\"tracevault "), "{settings}");
+    // A fresh git hook is the `tracevault` binary's own.
+    let pre_push = fs::read_to_string(repo.path().join(".git/hooks/pre-push")).unwrap();
+    assert!(pre_push.contains("tracevault sync"), "{pre_push}");
+}

@@ -26,6 +26,8 @@ use visdom_cli::{doctor as checks, env_alias, launch};
 fn main() {
     // Before the runtime starts its threads: this changes the environment.
     env_alias::apply();
+    // What this binary installs for an agent or git to run calls `visdom`.
+    tracevault_cli::program::run_as_visdom();
     let matches = VisdomCli::command().get_matches();
     let cli = VisdomCli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     // `init --agent` has a default, so only the matches know whether it was typed.
