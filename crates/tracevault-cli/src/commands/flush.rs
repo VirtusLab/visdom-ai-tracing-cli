@@ -68,12 +68,18 @@ fn pending_queues_in(
     session_dir: &Path,
     bound_repo_id: Option<&str>,
 ) -> std::io::Result<Vec<(std::path::PathBuf, QueueTarget)>> {
+    // A queue another reader claimed and never finished (a flush that was
+    // interrupted, a hook that was killed) is listed under the queue it was
+    // claimed from, which may itself be gone: draining that queue takes the
+    // claim over (see `crate::pending_queue::claim`).
+    let mut seen = std::collections::HashSet::new();
     let mut pending_queues: Vec<(std::path::PathBuf, QueueTarget)> = fs::read_dir(session_dir)?
         .filter_map(|e| e.ok())
         .filter_map(|e| {
-            let path = e.path();
+            let path = crate::pending_queue::queue_of(&e.path())?;
             let name = path.file_name()?.to_str()?.to_string();
-            Some((path, queue_target_from_filename(&name)?))
+            let target = queue_target_from_filename(&name)?;
+            seen.insert(path.clone()).then_some((path, target))
         })
         .collect();
 

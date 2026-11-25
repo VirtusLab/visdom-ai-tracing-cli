@@ -198,20 +198,8 @@ impl Fixture {
 
     /// Run the session's hook for `event`.
     fn hook_event(&self, base: &str, event: &str, hook_event_name: &str) {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tracevault"))
-            .current_dir(&self.repo)
-            .env("HOME", &self.home)
-            .env("XDG_CONFIG_HOME", self.home.join(".config"))
-            .env("XDG_STATE_HOME", &self.state)
-            .env("TRACEVAULT_SERVER_URL", base)
-            .env("TRACEVAULT_API_KEY", "tvk_test")
-            .env_remove("CLAUDE_ENV_FILE")
-            .env_remove("TRACEVAULT_SESSION_ID")
-            .env_remove("VISDOM_SESSION_ID")
-            .env_remove("VISDOM_GATEWAY_SESSION")
-            .env_remove("AMP_CURRENT_THREAD_ID")
-            .env_remove("TRACEVAULT_PROJECT")
-            .env_remove("TRACEVAULT_PROJECT_ATTRIBUTION")
+        let mut child = self
+            .command(base)
             .args(["stream", "--event", event])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -235,6 +223,25 @@ impl Fixture {
             .unwrap();
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{out:?}");
+    }
+
+    /// The binary, isolated to this fixture and pointed at `base`.
+    fn command(&self, base: &str) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tracevault"));
+        cmd.current_dir(&self.repo)
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", self.home.join(".config"))
+            .env("XDG_STATE_HOME", &self.state)
+            .env("TRACEVAULT_SERVER_URL", base)
+            .env("TRACEVAULT_API_KEY", "tvk_test")
+            .env_remove("CLAUDE_ENV_FILE")
+            .env_remove("TRACEVAULT_SESSION_ID")
+            .env_remove("VISDOM_SESSION_ID")
+            .env_remove("VISDOM_GATEWAY_SESSION")
+            .env_remove("AMP_CURRENT_THREAD_ID")
+            .env_remove("TRACEVAULT_PROJECT")
+            .env_remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+        cmd
     }
 }
 
@@ -417,6 +424,60 @@ fn a_backlog_larger_than_one_hook_reads_is_sent_over_several() {
     assert_each_line_once(&reqs, 90);
     assert_eq!(fx.offset(), fx.transcript_len());
     assert!(!fx.queue().exists());
+}
+
+/// While another hook of the session is reading and sending the transcript,
+/// a hook sends its own event without lines and leaves the offset alone: the
+/// lines are the other hook's to send, under one chunk_index each.
+#[test]
+fn a_hook_leaves_the_transcript_to_the_hook_that_is_at_it() {
+    let fx = Fixture::new();
+    fx.lines(3, 100);
+    std::fs::create_dir_all(fx.session_dir()).unwrap();
+    let busy = std::fs::File::create(fx.session_dir().join(".stream_offset.lock")).unwrap();
+    busy.lock().unwrap();
+
+    let (up, rx) = spawn_server(ALWAYS);
+    fx.hook(&up);
+    let reqs: Vec<StreamEventRequest> = rx.try_iter().collect();
+    assert_eq!(tool_events(&reqs), 1, "the event is sent");
+    assert!(stored(&reqs).is_empty(), "without the lines");
+    assert_eq!(fx.offset(), 0);
+
+    drop(busy);
+    let (up, rx) = spawn_server(ALWAYS);
+    fx.hook(&up);
+    assert_each_line_once(&rx.try_iter().collect::<Vec<_>>(), 3);
+    assert_eq!(fx.offset(), fx.transcript_len());
+}
+
+/// A queue whose reader died holding it (the file is under its claimed name,
+/// and the queue's own name is gone) is still found and sent by `flush`.
+#[test]
+fn flush_sends_a_queue_an_interrupted_reader_left_claimed() {
+    let fx = Fixture::new();
+    fx.lines(2, 100);
+    let (down, _) = spawn_server(NEVER);
+    fx.hook(&down);
+    let claimed = fx
+        .session_dir()
+        .join(format!("pending-{REPO_ID}.jsonl.draining-dead"));
+    std::fs::rename(fx.queue(), &claimed).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&claimed)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+        .unwrap();
+
+    let (up, rx) = spawn_server(ALWAYS);
+    let out = fx.command(&up).arg("flush").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let reqs: Vec<StreamEventRequest> = rx.try_iter().collect();
+    assert_eq!(tool_events(&reqs), 1);
+    assert_each_line_once(&reqs, 2);
+    assert!(!claimed.exists() && !fx.queue().exists());
 }
 
 /// `Stop` may be the session's last hook, so it does not leave the rest of a

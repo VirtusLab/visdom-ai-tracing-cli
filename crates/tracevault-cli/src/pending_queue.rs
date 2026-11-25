@@ -56,11 +56,38 @@ pub fn lines_are_reread(tool: Option<&str>) -> bool {
 /// must not lose it to the bound, which a hook queueing meanwhile may have
 /// used up. It can exceed the bound by no more than what was claimed.
 pub fn requeue(pending_path: &Path, json: &str) -> io::Result<()> {
+    let _lock = queue_lock(pending_path)?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(pending_path)?;
     writeln!(file, "{json}")
+}
+
+/// The lock that orders writes to the queue at `pending_path` with its being
+/// claimed. Without it a writer could open the file, have it claimed, read
+/// and removed, and then write into the removed file: a record nobody will
+/// ever read, whose lines the transcript's offset has moved past.
+fn queue_lock(pending_path: &Path) -> io::Result<fs::File> {
+    // A hidden name: whatever lists a session directory's `pending*` files
+    // must not take the lock for a queue.
+    let name = pending_path
+        .file_name()
+        .map(|n| format!(".{}.lock", n.to_string_lossy()))
+        .unwrap_or_else(|| ".pending.lock".to_string());
+    lock(&pending_path.with_file_name(name))
+}
+
+/// The queue file a directory entry belongs to: the entry itself when it is
+/// a queue, and for a claimed queue (see [`claim`]) the file it was claimed
+/// from, which may not exist while its records wait in the claim.
+pub fn queue_of(entry: &Path) -> Option<PathBuf> {
+    let name = entry.file_name()?.to_str()?;
+    let base = match name.split_once(".draining-") {
+        Some((base, _)) => base,
+        None => name,
+    };
+    base.ends_with(".jsonl").then(|| entry.with_file_name(base))
 }
 
 /// Take the exclusive lock `lock_path` names, waiting for its holder. For
@@ -91,6 +118,7 @@ pub fn without_lines(mut part: StreamEventRequest) -> Option<StreamEventRequest>
 
 /// Append one record to the queue if it fits; `false` when the queue is full.
 pub fn try_append(pending_path: &Path, json: &str) -> io::Result<bool> {
+    let _lock = queue_lock(pending_path)?;
     let size = fs::metadata(pending_path).map(|m| m.len()).unwrap_or(0);
     if size + json.len() as u64 + 1 > MAX_QUEUE_BYTES {
         return Ok(false);
@@ -171,6 +199,8 @@ fn claim_at(pending_path: &Path, now: SystemTime) -> io::Result<Claimed> {
     }
 
     let mine = dir.join(format!("{prefix}{}", uuid::Uuid::now_v7()));
+    // Not while a writer is between opening the queue and writing to it.
+    let _lock = queue_lock(pending_path)?;
     match fs::rename(pending_path, &mine) {
         Ok(()) => {
             touch(&mine);
@@ -336,6 +366,20 @@ mod tests {
         }
     }
 
+    /// How many files `dir` holds, the lock files aside.
+    fn files(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter(|e| {
+                !e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".lock")
+            })
+            .count()
+    }
+
     fn json(r: &StreamEventRequest) -> String {
         serde_json::to_string(r).unwrap()
     }
@@ -427,6 +471,52 @@ mod tests {
         assert_eq!(fs::read_to_string(&repo).unwrap(), format!("{lines}\n"));
     }
 
+    /// A claim waits for a writer that has the queue open, so nothing is
+    /// written into a file that was already read and removed.
+    #[test]
+    fn a_claim_waits_for_a_write_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending-x.jsonl");
+        let first = json(&record(Some("opencode"), StreamEventType::ToolUse, 1));
+        let late = json(&record(Some("opencode"), StreamEventType::ToolUse, 1));
+        fs::write(&path, format!("{first}\n")).unwrap();
+
+        // A writer: holds the lock, has the file open, has not written yet.
+        let writing = queue_lock(&path).unwrap();
+        let mut open = OpenOptions::new().append(true).open(&path).unwrap();
+        let claimer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let claimed = claim(&path).unwrap();
+                let got: Vec<String> = claimed.records().map(Result::unwrap).collect();
+                claimed.release();
+                got
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!claimer.is_finished(), "the claim waits");
+        writeln!(open, "{late}").unwrap();
+        drop(open);
+        drop(writing);
+
+        assert_eq!(claimer.join().unwrap(), vec![first, late]);
+    }
+
+    #[test]
+    fn a_claim_belongs_to_the_queue_it_was_taken_from() {
+        let dir = Path::new("/s");
+        assert_eq!(
+            queue_of(&dir.join("pending-x.jsonl")),
+            Some(dir.join("pending-x.jsonl"))
+        );
+        assert_eq!(
+            queue_of(&dir.join("pending-x.jsonl.draining-0199")),
+            Some(dir.join("pending-x.jsonl"))
+        );
+        assert_eq!(queue_of(&dir.join(".pending-x.jsonl.lock")), None);
+        assert_eq!(queue_of(&dir.join("metadata.json")), None);
+    }
+
     #[test]
     fn a_claimed_record_goes_back_whatever_the_bound() {
         let dir = tempfile::tempdir().unwrap();
@@ -499,14 +589,14 @@ mod tests {
         assert_eq!(parsed(records[0]).event_uuid, event.event_uuid);
         assert!(after.len() < content.len() / 50);
         // Nothing of the claim is left behind.
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(files(dir.path()), 1);
     }
 
     #[test]
     fn compact_of_a_missing_queue_creates_nothing() {
         let dir = tempfile::tempdir().unwrap();
         compact(&dir.path().join("pending-x.jsonl")).unwrap();
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(files(dir.path()), 0);
     }
 
     #[test]
@@ -522,7 +612,7 @@ mod tests {
         let got: Vec<String> = claimed.records().map(Result::unwrap).collect();
         assert_eq!(got, vec![a, b]);
         claimed.release();
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(files(dir.path()), 0);
     }
 
     #[test]
@@ -555,7 +645,7 @@ mod tests {
         assert!(!abandoned.exists());
         claimed.release();
         assert!(foreign.exists());
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(files(dir.path()), 1);
     }
 
     #[test]

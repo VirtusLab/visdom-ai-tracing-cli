@@ -1827,6 +1827,33 @@ pub(crate) async fn stream_event(
     // (see `deliver_subagent_transcripts` below): it is not an event of the
     // main conversation, so it neither reads nor advances `.stream_offset`.
     let sends_main = event_type != "subagent-stop";
+    // One hook of a session at a time reads the transcript file, sends or
+    // queues what it read and moves the offset: two that read the same lines
+    // and advance by different amounts leave the later lines to be sent under
+    // two chunk_indexes, and stored twice. A hook that finds another at it
+    // sends its event without lines, which the other, or a later hook, sends.
+    // A final hook waits instead, as for a subagent's file (see
+    // `deliver_subagent_transcripts`): no hook may come after it.
+    let reads_file = sends_main && hook_event.transcript_records.is_none();
+    let main_lock = if reads_file {
+        let wait_until =
+            matches!(event_type, "stop" | "session-end").then(|| deadline + FINAL_LOCK_WAIT);
+        loop {
+            match crate::subagents::try_lock(&offset_path) {
+                Ok(None) if wait_until.is_some_and(|t| std::time::Instant::now() < t) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Ok(lock) => break lock,
+                Err(e) => {
+                    eprintln!("{TOP}: warning: cannot lock the transcript offset: {e}");
+                    break None;
+                }
+            }
+        }
+    } else {
+        None
+    };
+    let sends_lines = !reads_file || main_lock.is_some();
     let mut batch = if sends_main {
         read_transcript_batch(transcript_path, &offset_path, MAX_BATCH_BYTES)?
     } else {
@@ -1950,7 +1977,9 @@ pub(crate) async fn stream_event(
     stamp_agent(&mut req, agent);
     // Taken before the lines go in, so they are not copied.
     let subagent_template = transcript_template(&req);
-    if !transcript_lines.is_empty() {
+    // Lines read while another hook holds the transcript only told this
+    // event's `tool_is_error`.
+    if sends_lines && !transcript_lines.is_empty() {
         req.transcript_lines = Some(transcript_lines);
     }
 
@@ -2206,7 +2235,7 @@ pub(crate) async fn stream_event(
     // (see `Unsent`), so none is read a second time, and a batch too large
     // for one hook's budget is sent over several hooks.
     let mut all_accepted = all_accepted;
-    if sends_main {
+    if sends_main && sends_lines {
         let next = if is_inline {
             Some(new_offset)
         } else {
@@ -2255,6 +2284,7 @@ pub(crate) async fn stream_event(
             read_on = next == Some(more.end);
         }
     }
+    drop(main_lock);
 
     // 11. Subagent transcripts (Claude Code keeps each subagent's conversation
     // out of the main file). Swept on every hook, not only on `SubagentStop`,
