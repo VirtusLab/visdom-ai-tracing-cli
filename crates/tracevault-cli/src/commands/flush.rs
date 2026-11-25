@@ -1,7 +1,6 @@
 use crate::api_client::ApiClient;
 use crate::credentials::resolve_credentials;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use tracevault_protocol::streaming::StreamEventRequest;
 
@@ -284,18 +283,20 @@ async fn drain_queue(
     if let Some(session_dir) = pending_path.parent() {
         crate::pending_queue::upgrade(session_dir)?;
     }
-    if !pending_path.exists() {
-        return Ok((0, 0));
-    }
-    let events = drain_pending(pending_path)?;
-    if events.is_empty() {
+    // Claimed and read one record at a time, like a hook does: a queue's
+    // lines are nowhere else (the transcript's read offset is past them), so
+    // nothing may be held only in memory. What is not sent goes back to the
+    // queue as it is reached, and a flush that is interrupted leaves its
+    // claim for the next reader to take over.
+    let claimed = crate::pending_queue::claim(pending_path)?;
+    if claimed.is_empty() {
         return Ok((0, 0));
     }
 
-    let event_total = events.len();
     let mut sent = 0u64;
     let mut failed = 0u64;
-    let mut failed_events: Vec<StreamEventRequest> = Vec::new();
+    // After a refusal nothing more is tried: the rest goes back unsent.
+    let mut refused = false;
 
     // Label the progress and warning lines with the session directory the
     // queue lives in. It is the same id the hook stamped on every event here
@@ -308,13 +309,24 @@ async fn drain_queue(
         .and_then(|n| n.to_str())
         .unwrap_or("?");
 
-    let mut events = events.into_iter().enumerate();
-    while let Some((i, mut event)) = events.next() {
+    for (i, record) in claimed.records().enumerate() {
+        let record = record?;
+        if refused {
+            crate::pending_queue::requeue(pending_path, &record)?;
+            failed += 1;
+            continue;
+        }
+        let mut event = match serde_json::from_str::<StreamEventRequest>(&record) {
+            Ok(event) => event,
+            Err(e) => {
+                eprintln!("Warning: skipping malformed pending event: {e}");
+                continue;
+            }
+        };
         eprint!(
-            "\r  Session {} — event {}/{} ...",
+            "\r  Session {} — event {} ...",
             display_prefix(queue_dir_name),
             i + 1,
-            event_total
         );
         event.truncate_large_fields();
         match send_queued_event(client, target, capture_pid, force, &event).await {
@@ -330,7 +342,7 @@ async fn drain_queue(
             QueuedSend::Failed(e) => {
                 eprintln!();
                 eprintln!("  Warning: failed to send event (session {queue_dir_name}): {e}");
-                failed_events.push(event);
+                crate::pending_queue::requeue(pending_path, &serde_json::to_string(&event)?)?;
                 failed += 1;
             }
             QueuedSend::Refused { pid, kind } => {
@@ -339,21 +351,16 @@ async fn drain_queue(
                     "{}",
                     crate::commands::stream::refused_error(pid, &kind, force)
                 );
-                failed_events.push(event);
-                failed_events.extend(events.by_ref().map(|(_, e)| e));
-                // Everything not sent is failed: earlier failures, the refused
-                // event, and the untried rest.
-                failed = event_total as u64 - sent;
-                break;
+                // The refused event and the untried rest are failed, like
+                // the earlier failures.
+                crate::pending_queue::requeue(pending_path, &serde_json::to_string(&event)?)?;
+                failed += 1;
+                refused = true;
             }
         }
     }
     eprintln!();
-
-    // Re-enqueue retryable events (not 413s) to the SAME per-target file.
-    if !failed_events.is_empty() {
-        append_pending(pending_path, &failed_events)?;
-    }
+    claimed.release();
     Ok((sent, failed))
 }
 
@@ -413,37 +420,13 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-/// Read and remove all events from a pending.jsonl file.
-fn drain_pending(path: &Path) -> Result<Vec<StreamEventRequest>, Box<dyn std::error::Error>> {
-    let file = fs::File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut events = Vec::new();
-
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<StreamEventRequest>(trimmed) {
-            Ok(event) => events.push(event),
-            Err(e) => {
-                eprintln!("Warning: skipping malformed pending event: {e}");
-            }
-        }
-    }
-
-    // Truncate the file after reading
-    fs::write(path, "")?;
-
-    Ok(events)
-}
-
-/// Append events back to a pending.jsonl file (for re-enqueuing failures).
+/// Write events to a queue file.
+#[cfg(test)]
 fn append_pending(
     path: &Path,
     events: &[StreamEventRequest],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)

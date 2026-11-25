@@ -193,6 +193,11 @@ impl Fixture {
 
     /// Run a `PostToolUse` hook of the session.
     fn hook(&self, base: &str) {
+        self.hook_event(base, "post-tool-use", "PostToolUse");
+    }
+
+    /// Run the session's hook for `event`.
+    fn hook_event(&self, base: &str, event: &str, hook_event_name: &str) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_tracevault"))
             .current_dir(&self.repo)
             .env("HOME", &self.home)
@@ -207,7 +212,7 @@ impl Fixture {
             .env_remove("AMP_CURRENT_THREAD_ID")
             .env_remove("TRACEVAULT_PROJECT")
             .env_remove("TRACEVAULT_PROJECT_ATTRIBUTION")
-            .args(["stream", "--event", "post-tool-use"])
+            .args(["stream", "--event", event])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -217,7 +222,7 @@ impl Fixture {
             "session_id": SESSION_ID,
             "transcript_path": self.transcript.to_string_lossy(),
             "cwd": self.repo.to_string_lossy(),
-            "hook_event_name": "PostToolUse",
+            "hook_event_name": hook_event_name,
             "tool_name": "Bash",
             "tool_use_id": "toolu_1",
             "tool_input": {"command": "ls"},
@@ -412,6 +417,30 @@ fn a_backlog_larger_than_one_hook_reads_is_sent_over_several() {
     assert_each_line_once(&reqs, 90);
     assert_eq!(fx.offset(), fx.transcript_len());
     assert!(!fx.queue().exists());
+}
+
+/// `Stop` may be the session's last hook, so it does not leave the rest of a
+/// backlog for a next one: it reads to the end, a batch at a time, and what
+/// it cannot send in time it queues.
+#[test]
+fn stop_reads_a_backlog_to_its_end() {
+    let fx = Fixture::new();
+    fx.lines(90, 100_000);
+
+    let (up, rx) = spawn_server(ALWAYS);
+    fx.hook_event(&up, "stop", "Stop");
+    let mut all: Vec<StreamEventRequest> = rx.try_iter().collect();
+    assert_eq!(fx.offset(), fx.transcript_len(), "nothing is left unread");
+    all.extend(queued(&fx.queue()));
+    assert_each_line_once(&all, 90);
+
+    // And with the server away: all of it in the queue, once.
+    let fx = Fixture::new();
+    fx.lines(90, 100_000);
+    let (down, _) = spawn_server(NEVER);
+    fx.hook_event(&down, "stop", "Stop");
+    assert_eq!(fx.offset(), fx.transcript_len());
+    assert_each_line_once(&queued(&fx.queue()), 90);
 }
 
 /// A queue an earlier release left, repeating a transcript whose offset

@@ -51,6 +51,34 @@ pub fn lines_are_reread(tool: Option<&str>) -> bool {
         .any(|a| Some(a.tool_name()) == tool)
 }
 
+/// Put a record that was already in the queue back into it, whatever the
+/// queue's size: a reader that claimed a queue and could not send a record
+/// must not lose it to the bound, which a hook queueing meanwhile may have
+/// used up. It can exceed the bound by no more than what was claimed.
+pub fn requeue(pending_path: &Path, json: &str) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(pending_path)?;
+    writeln!(file, "{json}")
+}
+
+/// Take the exclusive lock `lock_path` names, waiting for its holder. For
+/// the few file operations a hook must not interleave with another's; the
+/// OS drops the lock when its holder exits, even if killed.
+pub fn lock(lock_path: &Path) -> io::Result<fs::File> {
+    if let Some(dir) = lock_path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)?;
+    file.lock()?;
+    Ok(file)
+}
+
 /// `part` without the transcript lines a file still holds: `None` when it is
 /// nothing but lines.
 pub fn without_lines(mut part: StreamEventRequest) -> Option<StreamEventRequest> {
@@ -229,7 +257,7 @@ fn compact(pending_path: &Path) -> io::Result<()> {
     }
     for record in claimed.records() {
         if let Some(kept) = compacted(&record?) {
-            append(pending_path, &kept)?;
+            requeue(pending_path, &kept)?;
         }
     }
     claimed.release();
@@ -244,8 +272,16 @@ const UPGRADED: &str = ".queue-v2";
 /// a directory without the mark may hold queues an earlier release wrote,
 /// which are [`compact`]ed. Called before a queue of the directory is read
 /// or written. A new directory has no queue and only gets the mark.
+///
+/// One at a time per directory: a second caller that compacted after the
+/// first had finished would take the lines the first then queued, which are
+/// nowhere else, for an earlier release's.
 pub fn upgrade(session_dir: &Path) -> io::Result<()> {
     let mark = session_dir.join(UPGRADED);
+    if mark.exists() || !session_dir.is_dir() {
+        return Ok(());
+    }
+    let _lock = lock(&session_dir.join(".queue.lock"))?;
     if mark.exists() {
         return Ok(());
     }
@@ -392,10 +428,50 @@ mod tests {
     }
 
     #[test]
+    fn a_claimed_record_goes_back_whatever_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending-x.jsonl");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_QUEUE_BYTES)
+            .unwrap();
+        assert!(!try_append(&path, "new").unwrap());
+        requeue(&path, "claimed").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), MAX_QUEUE_BYTES + 8);
+    }
+
+    /// A second upgrade waits for the first and then finds the mark, so it
+    /// does not compact what was queued in between.
+    #[test]
+    fn upgrade_waits_for_one_in_progress_and_then_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending-x.jsonl");
+        let lines = json(&record(Some("claude-code"), StreamEventType::Transcript, 4));
+        let held = lock(&dir.path().join(".queue.lock")).unwrap();
+
+        let session_dir = dir.path().to_path_buf();
+        let waiting = std::thread::spawn(move || upgrade(&session_dir));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!waiting.is_finished(), "it waits for the lock");
+        // The holder finishes: marks the directory and queues lines.
+        fs::write(dir.path().join(UPGRADED), "").unwrap();
+        fs::write(&path, format!("{lines}\n")).unwrap();
+        drop(held);
+
+        waiting.join().unwrap().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{lines}\n"));
+    }
+
+    #[test]
     fn upgrade_of_a_new_or_missing_directory_only_marks_it() {
         let dir = tempfile::tempdir().unwrap();
         upgrade(dir.path()).unwrap();
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != ".queue.lock")
+            .collect();
+        assert_eq!(names, [UPGRADED]);
         upgrade(&dir.path().join("absent")).unwrap();
         assert!(!dir.path().join("absent").exists());
     }

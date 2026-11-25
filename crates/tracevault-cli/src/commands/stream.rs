@@ -154,6 +154,9 @@ pub fn read_transcript_batch(
 /// that got less through must not undo the other's progress, or the lines
 /// between are sent again under new chunk_indexes and stored twice.
 fn advance_offset(offset_path: &Path, to: i64) -> io::Result<()> {
+    // Read, compare and replace as one step: without the lock the hook with
+    // the smaller offset can still write last.
+    let _lock = crate::pending_queue::lock(&offset_path.with_extension("advance.lock"))?;
     let current = fs::read_to_string(offset_path)
         .ok()
         .and_then(|c| c.trim().parse::<i64>().ok());
@@ -1349,46 +1352,57 @@ async fn deliver_subagent_transcripts(
                 continue;
             }
         };
-        let batch = match crate::subagents::read_batch(&file, &offset_path, MAX_BATCH_BYTES) {
-            Ok(read) => read,
-            Err(e) => {
-                eprintln!(
-                    "{TOP}: warning: skipping subagent transcript {}: {e}",
-                    file.display()
-                );
-                continue;
+        // One batch per hook; a final hook reads on to the file's end, batch
+        // by batch, since no hook may come after it. Past the deadline the
+        // batches are queued, not sent, and once the queue is full the rest
+        // stays in the file (the offset stops there).
+        loop {
+            let mut batch = match crate::subagents::read_batch(&file, &offset_path, MAX_BATCH_BYTES)
+            {
+                Ok(read) => read,
+                Err(e) => {
+                    eprintln!(
+                        "{TOP}: warning: skipping subagent transcript {}: {e}",
+                        file.display()
+                    );
+                    break;
+                }
+            };
+            if batch.end == batch.start {
+                break;
             }
-        };
-        if batch.end == batch.start {
-            continue;
-        }
-        // Only blank or malformed lines: nothing to send, but move past them.
-        let mut delivered = Delivered {
-            all: true,
-            lines: 0,
-        };
-        if !batch.lines.is_empty() {
-            let mut req = template.clone();
-            req.transcript_lines = Some(batch.lines.clone());
-            req.transcript_offset = Some(batch.start);
-            delivered = deliver_parts(
-                client,
-                attribution,
-                force,
-                split_into_parts(req),
-                pending_path,
-                send_failed,
-                deadline,
-                Unsent::Queued,
-                warned,
-            )
-            .await?;
-            send_failed |= !delivered.all;
-        }
-        // Past what was accepted or queued. Under the file's lock, so the
-        // offset only ever moves forward here.
-        if let Some(next) = batch.next_offset(&delivered) {
-            crate::subagents::write_offset(&offset_path, next)?;
+            // Only blank or malformed lines: nothing to send, but move past them.
+            let mut delivered = Delivered {
+                all: true,
+                lines: 0,
+            };
+            if !batch.lines.is_empty() {
+                let mut req = template.clone();
+                req.transcript_lines = Some(std::mem::take(&mut batch.lines));
+                req.transcript_offset = Some(batch.start);
+                delivered = deliver_parts(
+                    client,
+                    attribution,
+                    force,
+                    split_into_parts(req),
+                    pending_path,
+                    send_failed,
+                    deadline,
+                    Unsent::Queued,
+                    warned,
+                )
+                .await?;
+                send_failed |= !delivered.all;
+            }
+            // Past what was accepted or queued. Under the file's lock, so the
+            // offset only ever moves forward here.
+            let next = batch.next_offset(&delivered);
+            if let Some(next) = next {
+                crate::subagents::write_offset(&offset_path, next)?;
+            }
+            if wait_for_lock.is_none() || next != Some(batch.end) {
+                break;
+            }
         }
     }
     Ok(())
@@ -2143,7 +2157,7 @@ pub(crate) async fn stream_event(
                 send_failed = true;
             }
         }
-        crate::pending_queue::append(&pending_path, &record)?;
+        crate::pending_queue::requeue(&pending_path, &record)?;
     }
     claimed.release();
 
@@ -2191,6 +2205,7 @@ pub(crate) async fn stream_event(
     // A file's offset advances past the lines that were accepted or queued
     // (see `Unsent`), so none is read a second time, and a batch too large
     // for one hook's budget is sent over several hooks.
+    let mut all_accepted = all_accepted;
     if sends_main {
         let next = if is_inline {
             Some(new_offset)
@@ -2199,6 +2214,45 @@ pub(crate) async fn stream_event(
         };
         if let Some(next) = next {
             advance_offset(&offset_path, next)?;
+        }
+        // `Stop` ends the session for the agents that have no later hook, so
+        // it reads on to the transcript's end, batch by batch, where another
+        // event leaves the rest to the next hook. Past the deadline the
+        // batches are queued, not sent, and once the queue is full the rest
+        // stays in the file.
+        let mut read_on = event_type == "stop" && !is_inline && next == Some(new_offset);
+        while read_on {
+            let mut more = read_transcript_batch(transcript_path, &offset_path, MAX_BATCH_BYTES)?;
+            if more.end == more.start {
+                break;
+            }
+            let mut delivered = Delivered {
+                all: true,
+                lines: 0,
+            };
+            if !more.lines.is_empty() {
+                let mut req = subagent_template.clone();
+                req.transcript_lines = Some(std::mem::take(&mut more.lines));
+                req.transcript_offset = Some(more.start);
+                delivered = deliver_parts(
+                    &client,
+                    &attribution,
+                    force,
+                    split_into_parts(req),
+                    &pending_path,
+                    send_failed || !all_accepted,
+                    deadline,
+                    Unsent::Queued,
+                    &mut warned,
+                )
+                .await?;
+                all_accepted &= delivered.all;
+            }
+            let next = more.next_offset(&delivered);
+            if let Some(next) = next {
+                advance_offset(&offset_path, next)?;
+            }
+            read_on = next == Some(more.end);
         }
     }
 
@@ -5209,6 +5263,52 @@ mod tests {
                 .is_empty());
         }
         assert_eq!(queued(&pending).len(), 2, "nothing was queued twice");
+    }
+
+    /// A hook reads one batch of a subagent's file and leaves the rest to
+    /// the next; a final hook, which has no next, reads the file to its end
+    /// and queues what it cannot send.
+    #[tokio::test]
+    async fn a_final_hook_reads_a_subagent_backlog_to_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, subagents, session_dir) = claude_session(dir.path());
+        let pending = session_dir.join("pending.jsonl");
+        let file = subagents.join("agent-a1.jsonl");
+        for n in 0..90 {
+            let line = serde_json::json!({"agentId": "a1", "n": n, "pad": "x".repeat(100_000)});
+            append_raw(&file, &format!("{line}\n"));
+        }
+        let len = fs::metadata(&file).unwrap().len() as i64;
+        let offset = || -> i64 {
+            fs::read_to_string(crate::subagents::offset_path(&session_dir, &file))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let queued_ns = || -> Vec<u64> {
+            fs::read_to_string(&pending)
+                .unwrap()
+                .lines()
+                .map(|j| serde_json::from_str::<StreamEventRequest>(j).unwrap())
+                .flat_map(|r| part_lines(&r))
+                .map(|l| l["n"].as_u64().unwrap())
+                .collect()
+        };
+
+        assert!(sweep(vec![], &main, &session_dir, &pending)
+            .await
+            .is_empty());
+        let after_one = offset();
+        assert!(
+            after_one >= MAX_BATCH_BYTES && after_one < len,
+            "{after_one}"
+        );
+
+        let sent = sweep_waiting(vec![], &main, &session_dir, &pending, Some(Instant::now())).await;
+        assert!(sent.is_empty());
+        assert_eq!(offset(), len);
+        assert_eq!(queued_ns(), (0..90).collect::<Vec<_>>(), "each line once");
     }
 
     /// Lines read from a file that could not be sent are queued whole, once,
