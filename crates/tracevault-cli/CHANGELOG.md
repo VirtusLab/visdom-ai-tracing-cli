@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.8](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.29.7...v0.29.8) - 2026-11-25
+
+### Fixed
+
+- *(stream)* the unsent rest of a claim is cut in place, an adopted claim belongs to its new queue, flush leaves lines where the sweep looks
+- *(stream)* flush sends what transcripts still hold, a 413 keeps its record, claims count against the bound
+- *(stream)* adoption takes the queues' locks, an interrupted compaction is finished, a claim being read is not abandoned
+- *(stream)* queue writes are ordered with claims, one hook at a time reads the transcript, flush finds a claimed queue
+- *(stream)* what is queued is never held only in memory, and hooks do not undo each other
+- *(stream)* a transcript line is queued once, and the queue is bounded and read a record at a time
+
 ## [0.29.7](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/v0.29.6...v0.29.7) - 2026-11-24
 
 ### Added

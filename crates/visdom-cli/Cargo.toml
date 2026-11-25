@@ -3,7 +3,7 @@ name = "visdom-cli"
 # Its own version, apart from the workspace's: `visdom` is the developer's
 # entry point and is stable from 1.0, while `tracevault` it is shipped with
 # keeps its 0.x line.
-version = "1.1.0"
+version = "1.1.1"
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
@@ -24,7 +24,7 @@ path = "src/main.rs"
 
 [dependencies]
 # 0.29.6 is the first with the gateway session marker the capture hook reads.
-tracevault-cli = { path = "../tracevault-cli", version = "0.29.7" }
+tracevault-cli = { path = "../tracevault-cli", version = "0.29.8" }
 clap = { version = "4", features = ["derive"] }
 tokio.workspace = true
 serde.workspace = true
