@@ -1,0 +1,717 @@
+//! A hook's memory and its queue must not depend on how long the server has
+//! been away. Before, every hook that failed to send queued the whole unsent
+//! end of the transcript again and read the whole queue into memory: a
+//! transcript of a few megabytes grew a queue of gigabytes. Now a line is
+//! queued once and the transcript's read offset moves past it.
+//!
+//! Runs the hook binary (via `CARGO_BIN_EXE_*`) against a raw-TCP mock server,
+//! isolated to a tempdir like `session_end_e2e_test.rs`.
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+use tracevault_protocol::streaming::{StreamEventRequest, StreamEventType};
+
+const REPO_ID: &str = "11111111-1111-1111-1111-111111111111";
+const SESSION_ID: &str = "queue-session";
+
+const ACCEPT_DEADLINE: Duration = Duration::from_secs(5);
+
+fn accept_with_deadline(listener: &TcpListener) -> Option<std::net::TcpStream> {
+    let deadline = Instant::now() + ACCEPT_DEADLINE;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
+                return Some(stream);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// A server that accepts the first `accepting` stream POSTs and answers every
+/// later one with a 503. Only accepted requests are captured: they are what
+/// the server stored.
+fn spawn_server(accepting: usize) -> (String, mpsc::Receiver<StreamEventRequest>) {
+    spawn_server_by(move |n, _| (n >= accepting).then_some("503 Service Unavailable"))
+}
+
+/// A server that refuses a stream POST with the status `refuse` returns for
+/// it (given the request's number among the stream POSTs and its body's
+/// size) and accepts the others, which are the ones captured.
+fn spawn_server_by(
+    refuse: impl Fn(usize, usize) -> Option<&'static str> + Send + 'static,
+) -> (String, mpsc::Receiver<StreamEventRequest>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let body = serde_json::to_string(&tracevault_protocol::streaming::StreamEventResponse {
+        session_db_id: uuid::Uuid::nil(),
+        event_db_id: Some(uuid::Uuid::nil()),
+        status: "accepted".to_string(),
+    })
+    .unwrap();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    thread::spawn(move || {
+        let mut posts = 0usize;
+        while let Some(stream) = accept_with_deadline(&listener) {
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            let mut content_length = 0usize;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                    break;
+                }
+                let header = header.trim_end();
+                if header.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = header.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body);
+            let mut stream = reader.into_inner();
+            if !(request_line.starts_with("POST /api/v1/") && request_line.contains("/stream")) {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
+            let refused = refuse(posts, body.len());
+            posts += 1;
+            if let Some(status) = refused {
+                let _ = stream.write_all(
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                );
+                continue;
+            }
+            if let Ok(req) = serde_json::from_slice(&body) {
+                let _ = tx.send(req);
+            }
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
+const ALWAYS: usize = usize::MAX;
+const NEVER: usize = 0;
+
+/// A temp git repo bound to `REPO_ID`, with isolated home/config/state dirs.
+struct Fixture {
+    _tmp: tempfile::TempDir,
+    home: PathBuf,
+    state: PathBuf,
+    repo: PathBuf,
+    transcript: PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["commit", "-q", "--allow-empty", "-m", "init"],
+        ] {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(&args)
+                .status()
+                .expect("git failed to run")
+                .success();
+            assert!(ok, "git {args:?} must succeed");
+        }
+        std::fs::create_dir_all(repo.join(".visdom")).unwrap();
+        std::fs::write(
+            repo.join(".visdom").join("tracing.toml"),
+            format!("repo_id = \"{REPO_ID}\"\n"),
+        )
+        .unwrap();
+        let transcript = tmp.path().join(format!("{SESSION_ID}.jsonl"));
+        Fixture {
+            _tmp: tmp,
+            home,
+            state,
+            repo,
+            transcript,
+        }
+    }
+
+    fn session_dir(&self) -> PathBuf {
+        self.repo.join(".visdom").join("sessions").join(SESSION_ID)
+    }
+
+    fn queue(&self) -> PathBuf {
+        self.session_dir().join(format!("pending-{REPO_ID}.jsonl"))
+    }
+
+    /// Append `count` transcript lines of about `bytes` each, numbered on
+    /// from the lines already there.
+    fn lines(&self, count: usize, bytes: usize) {
+        let from = std::fs::read_to_string(&self.transcript)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.transcript)
+            .unwrap();
+        for n in from..from + count {
+            let line = serde_json::json!({"type": "assistant", "n": n, "pad": "x".repeat(bytes)});
+            writeln!(f, "{line}").unwrap();
+        }
+    }
+
+    fn transcript_len(&self) -> u64 {
+        std::fs::metadata(&self.transcript).unwrap().len()
+    }
+
+    fn offset(&self) -> u64 {
+        std::fs::read_to_string(self.session_dir().join(".stream_offset"))
+            .map(|s| s.trim().parse().unwrap())
+            .unwrap_or(0)
+    }
+
+    /// Run a `PostToolUse` hook of the session.
+    fn hook(&self, base: &str) {
+        self.hook_event(base, "post-tool-use", "PostToolUse");
+    }
+
+    /// Run the session's hook for `event`.
+    fn hook_event(&self, base: &str, event: &str, hook_event_name: &str) {
+        let mut child = self
+            .command(base)
+            .args(["stream", "--event", event])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to run the tracevault binary");
+        let payload = serde_json::json!({
+            "session_id": SESSION_ID,
+            "transcript_path": self.transcript.to_string_lossy(),
+            "cwd": self.repo.to_string_lossy(),
+            "hook_event_name": hook_event_name,
+            "tool_name": "Bash",
+            "tool_use_id": "toolu_1",
+            "tool_input": {"command": "ls"},
+        });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+
+    /// The binary, isolated to this fixture and pointed at `base`.
+    fn command(&self, base: &str) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tracevault"));
+        cmd.current_dir(&self.repo)
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", self.home.join(".config"))
+            .env("XDG_STATE_HOME", &self.state)
+            .env("TRACEVAULT_SERVER_URL", base)
+            .env("TRACEVAULT_API_KEY", "tvk_test")
+            .env_remove("CLAUDE_ENV_FILE")
+            .env_remove("TRACEVAULT_SESSION_ID")
+            .env_remove("VISDOM_SESSION_ID")
+            .env_remove("VISDOM_GATEWAY_SESSION")
+            .env_remove("AMP_CURRENT_THREAD_ID")
+            .env_remove("TRACEVAULT_PROJECT")
+            .env_remove("TRACEVAULT_PROJECT_ATTRIBUTION");
+        cmd
+    }
+}
+
+fn queued(path: &Path) -> Vec<StreamEventRequest> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// The `n` of every transcript line the server stored, with the chunk_index
+/// the server derives for it (`transcript_offset` + position in the request).
+fn stored(reqs: &[StreamEventRequest]) -> Vec<(i64, u64)> {
+    reqs.iter()
+        .flat_map(|r| {
+            let offset = r.transcript_offset.unwrap_or(0);
+            r.transcript_lines
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .map(move |(i, l)| (offset + i as i64, l["n"].as_u64().unwrap()))
+        })
+        .collect()
+}
+
+/// Every line `0..count` exactly once, in order, under rising chunk_indexes.
+fn assert_each_line_once(reqs: &[StreamEventRequest], count: u64) {
+    let stored = stored(reqs);
+    let ns: Vec<u64> = stored.iter().map(|(_, n)| *n).collect();
+    assert_eq!(ns, (0..count).collect::<Vec<_>>());
+    assert!(stored.windows(2).all(|w| w[0].0 < w[1].0), "{stored:?}");
+}
+
+fn tool_events(reqs: &[StreamEventRequest]) -> usize {
+    reqs.iter()
+        .filter(|r| r.event_type == StreamEventType::ToolUse)
+        .count()
+}
+
+/// While the server is away every transcript line is queued once: later
+/// hooks add their own small event and nothing else, and nothing is lost or
+/// sent twice once the server is back.
+#[test]
+fn a_server_that_is_away_does_not_grow_the_queue_with_the_transcript() {
+    let fx = Fixture::new();
+    // 1.6 MB: several requests' worth.
+    fx.lines(40, 40_000);
+    let (down, _) = spawn_server(NEVER);
+
+    fx.hook(&down);
+    let after_one = std::fs::metadata(fx.queue()).unwrap().len();
+    assert!(after_one < 2 * fx.transcript_len());
+    assert_eq!(
+        fx.offset(),
+        fx.transcript_len(),
+        "the lines are in the queue, not to be read again"
+    );
+    let first = queued(&fx.queue());
+    assert_eq!(stored(&first).len(), 40);
+
+    for hooks in 2..=5 {
+        fx.hook(&down);
+        let queue = queued(&fx.queue());
+        assert_eq!(queue.len(), first.len() + hooks - 1, "one event per hook");
+        assert_eq!(stored(&queue).len(), 40, "no line a second time");
+    }
+    assert!(
+        std::fs::metadata(fx.queue()).unwrap().len() < after_one + 10_000,
+        "four more hooks added four small events"
+    );
+    assert_eq!(
+        std::fs::read_dir(fx.session_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("draining"))
+            .count(),
+        0,
+        "no claimed queue is left behind"
+    );
+
+    let (up, rx) = spawn_server(ALWAYS);
+    fx.hook(&up);
+    let reqs: Vec<StreamEventRequest> = rx.try_iter().collect();
+    assert_eq!(tool_events(&reqs), 6, "the five queued events and this one");
+    assert_each_line_once(&reqs, 40);
+    assert_eq!(fx.offset(), fx.transcript_len());
+    assert!(!fx.queue().exists());
+}
+
+/// A batch the server takes only part of: the rest is queued once and sent
+/// by the next hook. No line twice, none missing.
+#[test]
+fn a_partly_accepted_batch_is_finished_from_the_queue() {
+    let fx = Fixture::new();
+    fx.lines(40, 40_000);
+    let (flaky, rx) = spawn_server(2);
+
+    fx.hook(&flaky);
+    let first: Vec<StreamEventRequest> = rx.try_iter().collect();
+    assert_eq!(first.len(), 2);
+    let stored_first = stored(&first).len();
+    assert!(stored_first > 0 && stored_first < 40);
+    assert_eq!(
+        stored(&queued(&fx.queue())).len(),
+        40 - stored_first,
+        "exactly the lines the server did not take"
+    );
+    assert_eq!(fx.offset(), fx.transcript_len());
+
+    fx.lines(1, 100);
+    let (up, rx) = spawn_server(ALWAYS);
+    fx.hook(&up);
+    let mut reqs = first;
+    reqs.extend(rx.try_iter());
+    assert_each_line_once(&reqs, 41);
+    assert_eq!(tool_events(&reqs), 2);
+    assert_eq!(fx.offset(), fx.transcript_len());
+    assert!(!fx.queue().exists());
+}
+
+/// A queue cannot grow past its bound however long the server is away: the
+/// lines that do not fit stay in the transcript, and the offset waits before
+/// them until the queue has drained.
+#[test]
+fn a_full_queue_leaves_the_rest_in_the_transcript() {
+    let fx = Fixture::new();
+    // 40 MB of transcript against a 32 MiB queue, read 4 MiB at a time.
+    fx.lines(400, 100_000);
+    let (down, _) = spawn_server(NEVER);
+    let cap = 32 * 1024 * 1024;
+
+    for _ in 0..12 {
+        fx.hook(&down);
+        assert!(std::fs::metadata(fx.queue()).unwrap().len() <= cap);
+    }
+    let offset = fx.offset();
+    assert!(offset > 0 && offset < fx.transcript_len(), "{offset}");
+    let in_queue = stored(&queued(&fx.queue()));
+    assert_eq!(
+        in_queue.iter().map(|(_, n)| *n).collect::<Vec<_>>(),
+        (0..in_queue.len() as u64).collect::<Vec<_>>(),
+        "the first lines, each once"
+    );
+
+    let (up, rx) = spawn_server(ALWAYS);
+    for _ in 0..40 {
+        if fx.offset() == fx.transcript_len() && !fx.queue().exists() {
+            break;
+        }
+        fx.hook(&up);
+    }
+    let reqs: Vec<StreamEventRequest> = rx.try_iter().collect();
+    assert_each_line_once(&reqs, 400);
+    assert_eq!(fx.offset(), fx.transcript_len());
+    assert!(!fx.queue().exists());
+}
+
+/// A transcript larger than one hook reads (a resumed session, a long
+/// outage) is caught up on over the next hooks.
+#[test]
+fn a_backlog_larger_than_one_hook_reads_is_sent_over_several() {
+    let fx = Fixture::new();
+    // 9 MB, against a 4 MiB read per hook.
+    fx.lines(90, 100_000);
+    let (up, rx) = spawn_server(ALWAYS);
+
+    fx.hook(&up);
+    let after_one = fx.offset();
+    assert!(
+        (4 * 1024 * 1024..5 * 1024 * 1024).contains(&after_one),
+        "one hook reads about 4 MiB, not the file: {after_one}"
+    );
+    fx.hook(&up);
+    fx.hook(&up);
+
+    let reqs: Vec<StreamEventRequest> = rx.try_iter().collect();
+    assert_each_line_once(&reqs, 90);
+    assert_eq!(fx.offset(), fx.transcript_len());
+    assert!(!fx.queue().exists());
+}
+
+/// While another hook of the session is reading and sending the transcript,
+/// a hook sends its own event without lines and leaves the offset alone: the
+/// lines are the other hook's to send, under one chunk_index each.
+#[test]
+fn a_hook_leaves_the_transcript_to_the_hook_that_is_at_it() {
+    let fx = Fixture::new();
+    fx.lines(3, 100);
+    std::fs::create_dir_all(fx.session_dir()).unwrap();
+    let busy = std::fs::File::create(fx.session_dir().join(".stream_offset.lock")).unwrap();
+    busy.lock().unwrap();
+
+    let (up, rx) = spawn_server(ALWAYS);
+    fx.hook(&up);
+    let reqs: Vec<StreamEventRequest> = rx.try_iter().collect();
+    assert_eq!(tool_events(&reqs), 1, "the event is sent");
+    assert!(stored(&reqs).is_empty(), "without the lines");
+    assert_eq!(fx.offset(), 0);
+
+    drop(busy);
+    let (up, rx) = spawn_server(ALWAYS);
+    fx.hook(&up);
+    assert_each_line_once(&rx.try_iter().collect::<Vec<_>>(), 3);
+    assert_eq!(fx.offset(), fx.transcript_len());
+}
+
+/// A queue whose reader died holding it (the file is under its claimed name,
+/// and the queue's own name is gone) is still found and sent by `flush`.
+#[test]
+fn flush_sends_a_queue_an_interrupted_reader_left_claimed() {
+    let fx = Fixture::new();
+    fx.lines(2, 100);
+    let (down, _) = spawn_server(NEVER);
+    fx.hook(&down);
+    let claimed = fx
+        .session_dir()
+        .join(format!("pending-{REPO_ID}.jsonl.draining-dead"));
+    std::fs::rename(fx.queue(), &claimed).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&claimed)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+        .unwrap();
+
+    let (up, rx) = spawn_server(ALWAYS);
+    let out = fx.command(&up).arg("flush").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let reqs: Vec<StreamEventRequest> = rx.try_iter().collect();
+    assert_eq!(tool_events(&reqs), 1);
+    assert_each_line_once(&reqs, 2);
+    assert!(!claimed.exists() && !fx.queue().exists());
+}
+
+/// A record the server finds too large stays in the queue (its lines are
+/// nowhere else) without holding up what is behind it, in a hook and in
+/// `flush` alike.
+#[test]
+fn a_record_the_server_finds_too_large_is_kept_and_does_not_block_the_rest() {
+    let too_large = |_: usize, body: usize| (body > 100_000).then_some("413 Payload Too Large");
+    let fx = Fixture::new();
+    // Queued while the server is away: one large part, then a small event.
+    fx.lines(1, 200_000);
+    let (down, _) = spawn_server(NEVER);
+    fx.hook(&down);
+    fx.hook(&down);
+    assert_eq!(queued(&fx.queue()).len(), 2);
+
+    // A hook: the large record is refused and kept, the small one behind it
+    // and the hook's own event go through.
+    let (picky, rx) = spawn_server_by(too_large);
+    fx.hook(&picky);
+    assert_eq!(tool_events(&rx.try_iter().collect::<Vec<_>>()), 2);
+    let kept = queued(&fx.queue());
+    assert_eq!(kept.len(), 1);
+    assert_eq!(stored(&kept).len(), 1, "with its line");
+
+    // `flush`: kept as well, and said so.
+    let (picky, _rx) = spawn_server_by(too_large);
+    let out = fx.command(&picky).arg("flush").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("kept in the queue"), "{stderr}");
+    assert_eq!(stored(&queued(&fx.queue())).len(), 1);
+
+    // A server that takes it: delivered, once.
+    let (up, rx) = spawn_server(ALWAYS);
+    let out = fx.command(&up).arg("flush").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(stored(&rx.try_iter().collect::<Vec<_>>()).len(), 1);
+    assert!(!fx.queue().exists());
+}
+
+/// An ended session whose queue an earlier release wrote: the queue's copies
+/// of the transcript lines are dropped, so `flush` sends the lines from the
+/// transcript itself, where the offset still points at them. Nothing is left
+/// for a hook that will never come.
+#[test]
+fn flush_sends_what_an_ended_session_left_unread_in_its_transcript() {
+    let fx = Fixture::new();
+    fx.lines(2, 100);
+    let (up, rx) = spawn_server(ALWAYS);
+    fx.hook(&up);
+    assert_eq!(stored(&rx.try_iter().collect::<Vec<_>>()).len(), 2);
+    let sent_to = fx.offset();
+
+    // What the old release left: two more lines, unread (the offset did not
+    // move), and a queue repeating them.
+    fx.lines(2, 100);
+    let record = serde_json::json!({
+        "protocol_version": 1,
+        "tool": "claude-code",
+        "event_type": "transcript",
+        "session_id": SESSION_ID,
+        "timestamp": "2026-11-23T00:00:00Z",
+        "hook_event_name": "Stop",
+        "transcript_offset": sent_to,
+        "transcript_lines": [{"n": 2, "pad": "old"}, {"n": 3, "pad": "old"}],
+    })
+    .to_string();
+    std::fs::write(fx.queue(), format!("{record}\n{record}\n{record}\n")).unwrap();
+    std::fs::remove_file(fx.session_dir().join(".queue-v2")).unwrap();
+
+    let (up, rx) = spawn_server(ALWAYS);
+    let out = fx.command(&up).arg("flush").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let reqs: Vec<StreamEventRequest> = rx.try_iter().collect();
+    let ns: Vec<u64> = stored(&reqs).iter().map(|(_, n)| *n).collect();
+    assert_eq!(ns, [2, 3], "each unread line once, from the transcript");
+    assert_eq!(fx.offset(), fx.transcript_len());
+    assert!(!fx.queue().exists());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("unread rest of 1 session(s) sent"),
+        "{stdout}"
+    );
+
+    // Nothing left: a second flush sends nothing.
+    let (up, rx) = spawn_server(ALWAYS);
+    assert!(fx
+        .command(&up)
+        .arg("flush")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert_eq!(rx.try_iter().count(), 0);
+}
+
+/// What `flush` reads from a transcript and cannot send stays there, in every
+/// batch and not only the first: the lines after the offset are where the
+/// catch-up sweep of a later session start looks for the `cost-state`
+/// report, and a queued copy would move the offset past it.
+#[test]
+fn flush_leaves_what_it_cannot_send_in_the_transcript() {
+    let fx = Fixture::new();
+    fx.lines(1, 100);
+    let (up, _rx) = spawn_server(ALWAYS);
+    fx.hook(&up);
+
+    // 9 MB more, unread: three batches for `flush`.
+    fx.lines(90, 100_000);
+    let before = fx.offset();
+    let (flaky, rx) = spawn_server(12);
+    let out = fx.command(&flaky).arg("flush").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let stored_now = stored(&rx.try_iter().collect::<Vec<_>>()).len();
+    assert!(stored_now > 0 && stored_now < 90, "{stored_now}");
+    let offset = fx.offset();
+    assert!(
+        offset > before + 4 * 1024 * 1024,
+        "past the first batch: {offset}"
+    );
+    assert!(offset < fx.transcript_len());
+    assert!(
+        stored(&queued(&fx.queue())).is_empty(),
+        "no line of the transcript is queued"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("of 1 not"), "{stdout}");
+
+    // The rest goes with the next flush: every line once.
+    let (up, rx) = spawn_server(ALWAYS);
+    assert!(fx
+        .command(&up)
+        .arg("flush")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert_eq!(
+        stored(&rx.try_iter().collect::<Vec<_>>()).len(),
+        90 - stored_now
+    );
+    assert_eq!(fx.offset(), fx.transcript_len());
+}
+
+/// `Stop` may be the session's last hook, so it does not leave the rest of a
+/// backlog for a next one: it reads to the end, a batch at a time, and what
+/// it cannot send in time it queues.
+#[test]
+fn stop_reads_a_backlog_to_its_end() {
+    let fx = Fixture::new();
+    fx.lines(90, 100_000);
+
+    let (up, rx) = spawn_server(ALWAYS);
+    fx.hook_event(&up, "stop", "Stop");
+    let mut all: Vec<StreamEventRequest> = rx.try_iter().collect();
+    assert_eq!(fx.offset(), fx.transcript_len(), "nothing is left unread");
+    all.extend(queued(&fx.queue()));
+    assert_each_line_once(&all, 90);
+
+    // And with the server away: all of it in the queue, once.
+    let fx = Fixture::new();
+    fx.lines(90, 100_000);
+    let (down, _) = spawn_server(NEVER);
+    fx.hook_event(&down, "stop", "Stop");
+    assert_eq!(fx.offset(), fx.transcript_len());
+    assert_each_line_once(&queued(&fx.queue()), 90);
+}
+
+/// A queue an earlier release left, repeating a transcript whose offset
+/// never moved, shrinks to its events the first time a hook touches it,
+/// server or no server; the lines are read from the transcript.
+#[test]
+fn a_queue_that_repeats_the_transcript_is_compacted_by_the_next_hook() {
+    let fx = Fixture::new();
+    fx.lines(4, 1_000);
+    std::fs::create_dir_all(fx.session_dir()).unwrap();
+    let record = |event_type: &str, lines: usize| {
+        serde_json::json!({
+            "protocol_version": 1,
+            "tool": "claude-code",
+            "event_type": event_type,
+            "session_id": SESSION_ID,
+            "timestamp": "2026-11-23T00:00:00Z",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": "toolu_old",
+            "tool_input": {"command": "ls"},
+            "event_uuid": uuid::Uuid::now_v7(),
+            "transcript_offset": 0,
+            "transcript_lines": (0..lines)
+                .map(|n| serde_json::json!({"n": n, "pad": "x".repeat(10_000)}))
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+    };
+    let mut old = String::new();
+    for _ in 0..100 {
+        old.push_str(&record("transcript", 40));
+        old.push('\n');
+    }
+    for _ in 0..2 {
+        old.push_str(&record("tool_use", 40));
+        old.push('\n');
+    }
+    std::fs::write(fx.queue(), &old).unwrap();
+    assert!(old.len() > 40_000_000);
+
+    let (down, _) = spawn_server(NEVER);
+    fx.hook(&down);
+
+    let queue = queued(&fx.queue());
+    assert_eq!(queue.len(), 3, "the two old events and this hook's");
+    assert!(queue[..2].iter().all(|r| r.transcript_lines.is_none()));
+    assert_eq!(stored(&queue[2..]).len(), 4, "the transcript's lines, once");
+    assert!(std::fs::metadata(fx.queue()).unwrap().len() < 20_000);
+
+    let (up, rx) = spawn_server(ALWAYS);
+    fx.hook(&up);
+    let reqs: Vec<StreamEventRequest> = rx.try_iter().collect();
+    assert_eq!(tool_events(&reqs), 4);
+    assert_each_line_once(&reqs, 4);
+    assert!(!fx.queue().exists());
+}

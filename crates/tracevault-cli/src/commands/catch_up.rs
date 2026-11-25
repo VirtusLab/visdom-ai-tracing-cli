@@ -188,19 +188,7 @@ pub async fn sweep(
         if sent_sessions >= MAX_SESSIONS || Instant::now() >= deadline {
             break;
         }
-        let event = tracevault_protocol::hooks::HookEvent {
-            session_id: c.session_id.clone(),
-            transcript_path: c.transcript.to_string_lossy().into_owned(),
-            cwd: c.worktree_top.clone(),
-            permission_mode: None,
-            hook_event_name: "SessionEnd".to_string(),
-            tool_name: None,
-            tool_input: None,
-            tool_response: None,
-            tool_use_id: None,
-            source: None,
-            transcript_records: None,
-        };
+        let event = session_end_event(&c.session_id, &c.transcript, &c.worktree_top);
         let target = SessionTarget {
             project_root: project_root.clone(),
             session_dir: c.session_dir,
@@ -223,6 +211,122 @@ pub async fn sweep(
                 eprintln!("{TOP}: cannot send the end of an earlier session: {e}");
                 break;
             }
+        }
+    }
+}
+
+/// The `SessionEnd` event a session's own hook would have sent.
+fn session_end_event(
+    session_id: &str,
+    transcript: &Path,
+    cwd: &str,
+) -> tracevault_protocol::hooks::HookEvent {
+    tracevault_protocol::hooks::HookEvent {
+        session_id: session_id.to_string(),
+        transcript_path: transcript.to_string_lossy().into_owned(),
+        cwd: cwd.to_string(),
+        permission_mode: None,
+        hook_event_name: "SessionEnd".to_string(),
+        tool_name: None,
+        tool_input: None,
+        tool_response: None,
+        tool_use_id: None,
+        source: None,
+        transcript_records: None,
+    }
+}
+
+/// The agent whose hooks recorded the session in `session_dir`: the one they
+/// noted in its `metadata.json`, or, for a session an earlier release
+/// recorded, the one whose directory its transcript is in. `None` for an
+/// agent that hands its records over inline (it has no transcript to read)
+/// and when neither tells.
+fn session_agent(session_dir: &Path, transcript: &Path) -> Option<crate::agent::Agent> {
+    use crate::agent::Agent;
+    use clap::ValueEnum;
+    let meta = stream::session_metadata(session_dir);
+    let agent = match meta.get("agent").and_then(|a| a.as_str()) {
+        Some(tool) => *Agent::value_variants()
+            .iter()
+            .find(|a| a.tool_name() == tool)?,
+        None => {
+            let under = |dir: &str| transcript.components().any(|c| c.as_os_str() == dir);
+            if under(".claude") {
+                Agent::ClaudeCode
+            } else if under(".codex") {
+                Agent::Codex
+            } else {
+                return None;
+            }
+        }
+    };
+    crate::pending_queue::lines_are_reread(Some(agent.tool_name())).then_some(agent)
+}
+
+/// Whether the session's transcripts hold anything its hooks did not read.
+fn has_unread(session_dir: &Path, transcript: &Path) -> bool {
+    let len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let offset = |p: &Path| -> u64 {
+        std::fs::read_to_string(p)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    len(transcript) > offset(&session_dir.join(".stream_offset"))
+        || crate::subagents::transcripts(transcript)
+            .iter()
+            .any(|f| len(f) > offset(&crate::subagents::offset_path(session_dir, f)))
+}
+
+/// For `flush`: send what the transcripts of the session in `session_dir`
+/// still hold unread, to their ends, subagent files included. A session's
+/// hooks leave lines unread when the queue is full, and an earlier release's
+/// queue is reduced to its events on the understanding that the lines are
+/// read from the transcript; for a session that has ended, no hook will.
+///
+/// `None` when there is nothing to do or the session cannot be sent from
+/// here: no transcript on record or on disk, nothing unread, an agent that
+/// cannot be told, or an environment that attributes what this process
+/// sends (as for [`sweep`]). Sent only under the attribution the session's
+/// hooks recorded.
+pub(crate) async fn send_rest(
+    project_root: &Path,
+    session_dir: &Path,
+    deadline: Instant,
+) -> Option<stream::Sent> {
+    if env_sets_attribution(|name| std::env::var_os(name)) {
+        return None;
+    }
+    let session_id = session_dir.file_name()?.to_str()?;
+    if !crate::session_state::is_safe_session_id(session_id) {
+        return None;
+    }
+    let transcript = transcript_path(session_dir)?;
+    if !transcript.is_file() || !has_unread(session_dir, &transcript) {
+        return None;
+    }
+    let agent = session_agent(session_dir, &transcript)?;
+    let worktree_top = worktree_top(session_dir, project_root);
+    let event = session_end_event(session_id, &transcript, &worktree_top);
+    let target = SessionTarget {
+        project_root: project_root.to_path_buf(),
+        session_dir: session_dir.to_path_buf(),
+        worktree_top,
+    };
+    match stream::stream_event(
+        event,
+        "session-end",
+        agent,
+        &target,
+        deadline,
+        stream::Sender::Flush,
+    )
+    .await
+    {
+        Ok(sent) => Some(sent),
+        Err(e) => {
+            eprintln!("{TOP}: cannot send the rest of a session: {e}");
+            Some(stream::Sent::Queued)
         }
     }
 }

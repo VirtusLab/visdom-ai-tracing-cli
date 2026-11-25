@@ -1,7 +1,6 @@
 use crate::api_client::ApiClient;
 use crate::credentials::resolve_credentials;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use tracevault_protocol::streaming::StreamEventRequest;
 
@@ -69,12 +68,18 @@ fn pending_queues_in(
     session_dir: &Path,
     bound_repo_id: Option<&str>,
 ) -> std::io::Result<Vec<(std::path::PathBuf, QueueTarget)>> {
+    // A queue another reader claimed and never finished (a flush that was
+    // interrupted, a hook that was killed) is listed under the queue it was
+    // claimed from, which may itself be gone: draining that queue takes the
+    // claim over (see `crate::pending_queue::claim`).
+    let mut seen = std::collections::HashSet::new();
     let mut pending_queues: Vec<(std::path::PathBuf, QueueTarget)> = fs::read_dir(session_dir)?
         .filter_map(|e| e.ok())
         .filter_map(|e| {
-            let path = e.path();
+            let path = crate::pending_queue::queue_of(&e.path())?;
             let name = path.file_name()?.to_str()?.to_string();
-            Some((path, queue_target_from_filename(&name)?))
+            let target = queue_target_from_filename(&name)?;
+            seen.insert(path.clone()).then_some((path, target))
         })
         .collect();
 
@@ -83,8 +88,12 @@ fn pending_queues_in(
     // `config.repo_id`. `status` counts these, so `flush` must be able to
     // drain them or they're stuck forever. If there's no bound repo_id,
     // skip it — there's nothing to attribute it to (best-effort).
+    // Also when it exists only as a claim an interrupted reader left.
     let legacy_path = session_dir.join("pending.jsonl");
-    if legacy_path.exists() {
+    let legacy_exists = fs::read_dir(session_dir)?
+        .filter_map(|e| e.ok())
+        .any(|e| crate::pending_queue::queue_of(&e.path()).as_ref() == Some(&legacy_path));
+    if legacy_exists {
         if let Some(repo_id) = bound_repo_id {
             pending_queues.push((legacy_path, QueueTarget::Repo(repo_id.to_string())));
         }
@@ -132,11 +141,16 @@ fn queue_attribution_force(
     crate::commands::stream::attribution_force(speaks_for_this_queue)
 }
 
+/// How long `flush` keeps sending the unread rest of one session's
+/// transcripts. It is run by hand, with no hook timeout over it.
+const REPLAY_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// What happened to one queued event on its way back to the server.
 #[derive(Debug)]
 pub(crate) enum QueuedSend {
     Sent,
-    /// 413 even after truncation — dropped, never retried.
+    /// 413 even after truncation. Kept in the queue: its lines are nowhere
+    /// else, and the limit may be a proxy's that later changes.
     TooLarge,
     /// Transient (5xx, network, 401, ...) — re-enqueue and retry later.
     Failed(String),
@@ -278,15 +292,27 @@ async fn drain_queue(
     capture_pid: Option<uuid::Uuid>,
     force: crate::commands::stream::AttributionForce,
 ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
-    let events = drain_pending(pending_path)?;
-    if events.is_empty() {
+    // A queue an earlier release wrote can repeat the session's transcript
+    // many times over; drop that first, one record at a time, before the
+    // queue is loaded whole (see `crate::pending_queue`).
+    if let Some(session_dir) = pending_path.parent() {
+        crate::pending_queue::upgrade(session_dir)?;
+    }
+    // Claimed and read one record at a time, like a hook does: a queue's
+    // lines are nowhere else (the transcript's read offset is past them), so
+    // nothing may be held only in memory. What is not sent goes back to the
+    // queue as it is reached, and a flush that is interrupted leaves its
+    // claim for the next reader to take over.
+    let claimed = crate::pending_queue::claim(pending_path)?;
+    if claimed.is_empty() {
         return Ok((0, 0));
     }
 
-    let event_total = events.len();
     let mut sent = 0u64;
     let mut failed = 0u64;
-    let mut failed_events: Vec<StreamEventRequest> = Vec::new();
+    // Where the drain stopped, when it did: from there on the claim's
+    // records stay queued as they are (see `Claimed::finish`).
+    let mut rest = None;
 
     // Label the progress and warning lines with the session directory the
     // queue lives in. It is the same id the hook stamped on every event here
@@ -299,29 +325,39 @@ async fn drain_queue(
         .and_then(|n| n.to_str())
         .unwrap_or("?");
 
-    let mut events = events.into_iter().enumerate();
-    while let Some((i, mut event)) = events.next() {
+    let mut reader = claimed.reader();
+    let mut n = 0u64;
+    while let Some(record) = reader.next_record()? {
+        let mut event = match serde_json::from_str::<StreamEventRequest>(&record) {
+            Ok(event) => event,
+            Err(e) => {
+                eprintln!("Warning: skipping malformed pending event: {e}");
+                continue;
+            }
+        };
+        n += 1;
         eprint!(
-            "\r  Session {} — event {}/{} ...",
+            "\r  Session {} — event {n} ...",
             display_prefix(queue_dir_name),
-            i + 1,
-            event_total
         );
         event.truncate_large_fields();
         match send_queued_event(client, target, capture_pid, force, &event).await {
             QueuedSend::Sent => sent += 1,
             QueuedSend::TooLarge => {
-                // Payload too large even after truncation — drop it.
+                // Too large even after truncation. Kept as it was queued: a
+                // hook moved the transcript's offset past its lines, so no
+                // later read brings them back.
                 eprintln!();
                 eprintln!(
-                    "  Warning: dropped event (session {queue_dir_name}) — still too large after truncation"
+                    "  Warning: event kept in the queue (session {queue_dir_name}) — the server finds it too large"
                 );
+                crate::pending_queue::requeue(pending_path, &record)?;
                 failed += 1;
             }
             QueuedSend::Failed(e) => {
                 eprintln!();
                 eprintln!("  Warning: failed to send event (session {queue_dir_name}): {e}");
-                failed_events.push(event);
+                crate::pending_queue::requeue(pending_path, &serde_json::to_string(&event)?)?;
                 failed += 1;
             }
             QueuedSend::Refused { pid, kind } => {
@@ -330,21 +366,20 @@ async fn drain_queue(
                     "{}",
                     crate::commands::stream::refused_error(pid, &kind, force)
                 );
-                failed_events.push(event);
-                failed_events.extend(events.by_ref().map(|(_, e)| e));
-                // Everything not sent is failed: earlier failures, the refused
-                // event, and the untried rest.
-                failed = event_total as u64 - sent;
+                // The refused event and the untried rest stay queued and
+                // are failed, like the earlier failures.
+                rest = Some(reader.before_last());
+                failed += 1;
+                while reader.next_record()?.is_some() {
+                    failed += 1;
+                }
                 break;
             }
         }
     }
     eprintln!();
-
-    // Re-enqueue retryable events (not 413s) to the SAME per-target file.
-    if !failed_events.is_empty() {
-        append_pending(pending_path, &failed_events)?;
-    }
+    drop(reader);
+    claimed.finish(rest, pending_path)?;
     Ok((sent, failed))
 }
 
@@ -367,6 +402,8 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
 
     let mut total_sent = 0u64;
     let mut total_failed = 0u64;
+    let mut caught_up = 0u64;
+    let mut not_caught_up = 0u64;
 
     let session_entries: Vec<_> = sessions_dirs
         .iter()
@@ -398,43 +435,33 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
             total_sent += sent;
             total_failed += failed;
         }
+
+        // Then what the session's transcripts hold that no hook read: the
+        // queue is not the only place unsent lines wait (see `send_rest`).
+        let deadline = std::time::Instant::now() + REPLAY_BUDGET;
+        match crate::commands::catch_up::send_rest(project_root, &session_dir, deadline).await {
+            Some(crate::commands::stream::Sent::Accepted) => caught_up += 1,
+            Some(crate::commands::stream::Sent::Queued) => not_caught_up += 1,
+            Some(crate::commands::stream::Sent::Skipped) | None => {}
+        }
     }
 
     println!("Flush complete: {total_sent} sent, {total_failed} failed");
+    if caught_up + not_caught_up > 0 {
+        println!(
+            "Transcripts: the unread rest of {caught_up} session(s) sent, of {not_caught_up} not"
+        );
+    }
     Ok(())
 }
 
-/// Read and remove all events from a pending.jsonl file.
-fn drain_pending(path: &Path) -> Result<Vec<StreamEventRequest>, Box<dyn std::error::Error>> {
-    let file = fs::File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut events = Vec::new();
-
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<StreamEventRequest>(trimmed) {
-            Ok(event) => events.push(event),
-            Err(e) => {
-                eprintln!("Warning: skipping malformed pending event: {e}");
-            }
-        }
-    }
-
-    // Truncate the file after reading
-    fs::write(path, "")?;
-
-    Ok(events)
-}
-
-/// Append events back to a pending.jsonl file (for re-enqueuing failures).
+/// Write events to a queue file.
+#[cfg(test)]
 fn append_pending(
     path: &Path,
     events: &[StreamEventRequest],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)

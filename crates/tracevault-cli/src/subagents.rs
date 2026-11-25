@@ -113,6 +113,18 @@ pub fn read_new_lines(
     transcript: &Path,
     offset_path: &Path,
 ) -> io::Result<(Vec<serde_json::Value>, i64, i64)> {
+    let batch = read_batch(transcript, offset_path, i64::MAX)?;
+    Ok((batch.lines, batch.start, batch.end))
+}
+
+/// [`read_new_lines`], reading no further than the line that reaches
+/// `max_bytes`, and telling where each line ends (see
+/// [`crate::commands::stream::TranscriptBatch`]).
+pub fn read_batch(
+    transcript: &Path,
+    offset_path: &Path,
+    max_bytes: i64,
+) -> io::Result<crate::commands::stream::TranscriptBatch> {
     let start: i64 = match fs::read_to_string(offset_path) {
         Ok(content) => content
             .trim()
@@ -126,6 +138,7 @@ pub fn read_new_lines(
     let mut reader = io::BufReader::new(file);
 
     let mut lines = Vec::new();
+    let mut ends = Vec::new();
     let mut end = start;
     let mut buf = Vec::new();
     loop {
@@ -137,9 +150,18 @@ pub fn read_new_lines(
         end += n as i64;
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&buf) {
             lines.push(value);
+            ends.push(end);
+        }
+        if end - start >= max_bytes {
+            break;
         }
     }
-    Ok((lines, start, end))
+    Ok(crate::commands::stream::TranscriptBatch {
+        lines,
+        ends,
+        start,
+        end,
+    })
 }
 
 #[cfg(test)]
