@@ -120,7 +120,10 @@ pub fn without_lines(mut part: StreamEventRequest) -> Option<StreamEventRequest>
 /// Append one record to the queue if it fits; `false` when the queue is full.
 pub fn try_append(pending_path: &Path, json: &str) -> io::Result<bool> {
     let _lock = queue_lock(pending_path)?;
-    let size = fs::metadata(pending_path).map(|m| m.len()).unwrap_or(0);
+    // What readers hold claimed counts too: it may all come back, so a claim
+    // must not make room for as much again.
+    let size =
+        fs::metadata(pending_path).map(|m| m.len()).unwrap_or(0) + claimed_bytes(pending_path);
     if size + json.len() as u64 + 1 > MAX_QUEUE_BYTES {
         return Ok(false);
     }
@@ -130,6 +133,28 @@ pub fn try_append(pending_path: &Path, json: &str) -> io::Result<bool> {
         .open(pending_path)?;
     writeln!(file, "{json}")?;
     Ok(true)
+}
+
+/// The size of the files claimed from the queue at `pending_path` and not
+/// yet released.
+fn claimed_bytes(pending_path: &Path) -> u64 {
+    let (Some(dir), Some(prefix)) = (pending_path.parent(), claim_prefix(pending_path)) else {
+        return 0;
+    };
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with(&prefix))
+                })
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 /// Append one record to the queue. A full queue drops it and says so once
@@ -152,6 +177,7 @@ pub fn append(pending_path: &Path, json: &str) -> io::Result<()> {
 /// it appends there. The claimed files are removed by [`Claimed::release`]; a
 /// reader that dies first leaves them to be taken over (after
 /// [`ABANDONED_AFTER`]) instead of losing what it held in memory.
+#[derive(Default)]
 pub struct Claimed {
     files: Vec<PathBuf>,
 }
@@ -224,6 +250,12 @@ fn touch(path: &Path) {
 impl Claimed {
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
+    }
+
+    /// This claim followed by `later`'s, read as one.
+    pub fn then(mut self, later: Claimed) -> Claimed {
+        self.files.extend(later.files);
+        self
     }
 
     /// The claimed records in order, one at a time.
@@ -527,6 +559,38 @@ mod tests {
         );
         assert_eq!(queue_of(&dir.join(".pending-x.jsonl.lock")), None);
         assert_eq!(queue_of(&dir.join("metadata.json")), None);
+    }
+
+    /// A claim does not make room: what a reader holds may all come back.
+    #[test]
+    fn a_claimed_queue_still_counts_against_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending-x.jsonl");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_QUEUE_BYTES - 4)
+            .unwrap();
+        let claimed = claim(&path).unwrap();
+        assert!(!path.exists());
+        assert!(!try_append(&path, "0123456789").unwrap(), "still full");
+        claimed.release();
+        assert!(try_append(&path, "0123456789").unwrap());
+    }
+
+    #[test]
+    fn claims_read_as_one_keep_their_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("pending-project-p.jsonl");
+        let newer = dir.path().join("pending-r.jsonl");
+        let a = json(&record(Some("opencode"), StreamEventType::ToolUse, 1));
+        let b = json(&record(Some("opencode"), StreamEventType::ToolUse, 1));
+        fs::write(&older, format!("{a}\n")).unwrap();
+        fs::write(&newer, format!("{b}\n")).unwrap();
+        let claimed = claim(&older).unwrap().then(claim(&newer).unwrap());
+        let got: Vec<String> = claimed.records().map(Result::unwrap).collect();
+        assert_eq!(got, vec![a, b]);
+        claimed.release();
+        assert_eq!(files(dir.path()), 0);
     }
 
     #[test]

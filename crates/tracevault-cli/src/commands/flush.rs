@@ -141,11 +141,16 @@ fn queue_attribution_force(
     crate::commands::stream::attribution_force(speaks_for_this_queue)
 }
 
+/// How long `flush` keeps sending the unread rest of one session's
+/// transcripts. It is run by hand, with no hook timeout over it.
+const REPLAY_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// What happened to one queued event on its way back to the server.
 #[derive(Debug)]
 pub(crate) enum QueuedSend {
     Sent,
-    /// 413 even after truncation — dropped, never retried.
+    /// 413 even after truncation. Kept in the queue: its lines are nowhere
+    /// else, and the limit may be a proxy's that later changes.
     TooLarge,
     /// Transient (5xx, network, 401, ...) — re-enqueue and retry later.
     Failed(String),
@@ -342,11 +347,14 @@ async fn drain_queue(
         match send_queued_event(client, target, capture_pid, force, &event).await {
             QueuedSend::Sent => sent += 1,
             QueuedSend::TooLarge => {
-                // Payload too large even after truncation — drop it.
+                // Too large even after truncation. Kept as it was queued: a
+                // hook moved the transcript's offset past its lines, so no
+                // later read brings them back.
                 eprintln!();
                 eprintln!(
-                    "  Warning: dropped event (session {queue_dir_name}) — still too large after truncation"
+                    "  Warning: event kept in the queue (session {queue_dir_name}) — the server finds it too large"
                 );
+                crate::pending_queue::requeue(pending_path, &record)?;
                 failed += 1;
             }
             QueuedSend::Failed(e) => {
@@ -393,6 +401,8 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
 
     let mut total_sent = 0u64;
     let mut total_failed = 0u64;
+    let mut caught_up = 0u64;
+    let mut not_caught_up = 0u64;
 
     let session_entries: Vec<_> = sessions_dirs
         .iter()
@@ -424,9 +434,23 @@ pub async fn run_flush(project_root: &Path) -> Result<(), Box<dyn std::error::Er
             total_sent += sent;
             total_failed += failed;
         }
+
+        // Then what the session's transcripts hold that no hook read: the
+        // queue is not the only place unsent lines wait (see `send_rest`).
+        let deadline = std::time::Instant::now() + REPLAY_BUDGET;
+        match crate::commands::catch_up::send_rest(project_root, &session_dir, deadline).await {
+            Some(crate::commands::stream::Sent::Accepted) => caught_up += 1,
+            Some(crate::commands::stream::Sent::Queued) => not_caught_up += 1,
+            Some(crate::commands::stream::Sent::Skipped) | None => {}
+        }
     }
 
     println!("Flush complete: {total_sent} sent, {total_failed} failed");
+    if caught_up + not_caught_up > 0 {
+        println!(
+            "Transcripts: the unread rest of {caught_up} session(s) sent, of {not_caught_up} not"
+        );
+    }
     Ok(())
 }
 

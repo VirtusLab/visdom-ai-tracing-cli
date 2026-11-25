@@ -43,6 +43,15 @@ fn accept_with_deadline(listener: &TcpListener) -> Option<std::net::TcpStream> {
 /// later one with a 503. Only accepted requests are captured: they are what
 /// the server stored.
 fn spawn_server(accepting: usize) -> (String, mpsc::Receiver<StreamEventRequest>) {
+    spawn_server_by(move |n, _| (n >= accepting).then_some("503 Service Unavailable"))
+}
+
+/// A server that refuses a stream POST with the status `refuse` returns for
+/// it (given the request's number among the stream POSTs and its body's
+/// size) and accepts the others, which are the ones captured.
+fn spawn_server_by(
+    refuse: impl Fn(usize, usize) -> Option<&'static str> + Send + 'static,
+) -> (String, mpsc::Receiver<StreamEventRequest>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
@@ -58,7 +67,7 @@ fn spawn_server(accepting: usize) -> (String, mpsc::Receiver<StreamEventRequest>
         body.len()
     );
     thread::spawn(move || {
-        let mut accepted = 0usize;
+        let mut posts = 0usize;
         while let Some(stream) = accept_with_deadline(&listener) {
             let mut reader = BufReader::new(stream);
             let mut request_line = String::new();
@@ -88,13 +97,15 @@ fn spawn_server(accepting: usize) -> (String, mpsc::Receiver<StreamEventRequest>
                 );
                 continue;
             }
-            if accepted >= accepting {
+            let refused = refuse(posts, body.len());
+            posts += 1;
+            if let Some(status) = refused {
                 let _ = stream.write_all(
-                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
                 );
                 continue;
             }
-            accepted += 1;
             if let Ok(req) = serde_json::from_slice(&body) {
                 let _ = tx.send(req);
             }
@@ -478,6 +489,102 @@ fn flush_sends_a_queue_an_interrupted_reader_left_claimed() {
     assert_eq!(tool_events(&reqs), 1);
     assert_each_line_once(&reqs, 2);
     assert!(!claimed.exists() && !fx.queue().exists());
+}
+
+/// A record the server finds too large stays in the queue (its lines are
+/// nowhere else) without holding up what is behind it, in a hook and in
+/// `flush` alike.
+#[test]
+fn a_record_the_server_finds_too_large_is_kept_and_does_not_block_the_rest() {
+    let too_large = |_: usize, body: usize| (body > 100_000).then_some("413 Payload Too Large");
+    let fx = Fixture::new();
+    // Queued while the server is away: one large part, then a small event.
+    fx.lines(1, 200_000);
+    let (down, _) = spawn_server(NEVER);
+    fx.hook(&down);
+    fx.hook(&down);
+    assert_eq!(queued(&fx.queue()).len(), 2);
+
+    // A hook: the large record is refused and kept, the small one behind it
+    // and the hook's own event go through.
+    let (picky, rx) = spawn_server_by(too_large);
+    fx.hook(&picky);
+    assert_eq!(tool_events(&rx.try_iter().collect::<Vec<_>>()), 2);
+    let kept = queued(&fx.queue());
+    assert_eq!(kept.len(), 1);
+    assert_eq!(stored(&kept).len(), 1, "with its line");
+
+    // `flush`: kept as well, and said so.
+    let (picky, _rx) = spawn_server_by(too_large);
+    let out = fx.command(&picky).arg("flush").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("kept in the queue"), "{stderr}");
+    assert_eq!(stored(&queued(&fx.queue())).len(), 1);
+
+    // A server that takes it: delivered, once.
+    let (up, rx) = spawn_server(ALWAYS);
+    let out = fx.command(&up).arg("flush").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(stored(&rx.try_iter().collect::<Vec<_>>()).len(), 1);
+    assert!(!fx.queue().exists());
+}
+
+/// An ended session whose queue an earlier release wrote: the queue's copies
+/// of the transcript lines are dropped, so `flush` sends the lines from the
+/// transcript itself, where the offset still points at them. Nothing is left
+/// for a hook that will never come.
+#[test]
+fn flush_sends_what_an_ended_session_left_unread_in_its_transcript() {
+    let fx = Fixture::new();
+    fx.lines(2, 100);
+    let (up, rx) = spawn_server(ALWAYS);
+    fx.hook(&up);
+    assert_eq!(stored(&rx.try_iter().collect::<Vec<_>>()).len(), 2);
+    let sent_to = fx.offset();
+
+    // What the old release left: two more lines, unread (the offset did not
+    // move), and a queue repeating them.
+    fx.lines(2, 100);
+    let record = serde_json::json!({
+        "protocol_version": 1,
+        "tool": "claude-code",
+        "event_type": "transcript",
+        "session_id": SESSION_ID,
+        "timestamp": "2026-11-23T00:00:00Z",
+        "hook_event_name": "Stop",
+        "transcript_offset": sent_to,
+        "transcript_lines": [{"n": 2, "pad": "old"}, {"n": 3, "pad": "old"}],
+    })
+    .to_string();
+    std::fs::write(fx.queue(), format!("{record}\n{record}\n{record}\n")).unwrap();
+    std::fs::remove_file(fx.session_dir().join(".queue-v2")).unwrap();
+
+    let (up, rx) = spawn_server(ALWAYS);
+    let out = fx.command(&up).arg("flush").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let reqs: Vec<StreamEventRequest> = rx.try_iter().collect();
+    let ns: Vec<u64> = stored(&reqs).iter().map(|(_, n)| *n).collect();
+    assert_eq!(ns, [2, 3], "each unread line once, from the transcript");
+    assert_eq!(fx.offset(), fx.transcript_len());
+    assert!(!fx.queue().exists());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("unread rest of 1 session(s) sent"),
+        "{stdout}"
+    );
+
+    // Nothing left: a second flush sends nothing.
+    let (up, rx) = spawn_server(ALWAYS);
+    assert!(fx
+        .command(&up)
+        .arg("flush")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert_eq!(rx.try_iter().count(), 0);
 }
 
 /// `Stop` may be the session's last hook, so it does not leave the rest of a

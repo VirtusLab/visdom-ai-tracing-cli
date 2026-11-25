@@ -281,60 +281,6 @@ pub fn append_pending(pending_path: &Path, json: &str) -> Result<(), io::Error> 
     Ok(())
 }
 
-/// Move the queue at `from` into the queue at `into`, ahead of what `into`
-/// already holds (`from`'s events are older), without a window in which a
-/// failure loses either: the merged file is written beside `into` and
-/// renamed over it, and only then is `from` removed. Any error before the
-/// rename leaves both files as they were — this matters because queued
-/// inline records and tool payloads cannot be re-read from a transcript.
-/// A failure to remove `from` after the rename leaves its events in both
-/// files; they are then sent twice to the SAME target, where the server
-/// dedupes them (`chunk_index`, `event_uuid`).
-fn adopt_queue(from: &Path, into: &Path) -> Result<(), io::Error> {
-    // Under both queues' locks, taken in one order: a record another hook or
-    // `flush` puts back into either while this runs would be lost to the
-    // rename below, or to the removal after it.
-    let (first, second) = if from <= into {
-        (from, into)
-    } else {
-        (into, from)
-    };
-    let _first = crate::pending_queue::queue_lock(first)?;
-    let _second = crate::pending_queue::queue_lock(second)?;
-    // Copied through, never held whole: a queue can be large.
-    let mut adopted = match fs::File::open(from) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    let tmp = into.with_extension("jsonl.adopting");
-    let mut merge = || -> Result<(), io::Error> {
-        let mut out = io::BufWriter::new(fs::File::create(&tmp)?);
-        let copied = io::copy(&mut adopted, &mut out)?;
-        if copied > 0 {
-            let mut last = [0u8; 1];
-            adopted.seek(SeekFrom::End(-1))?;
-            adopted.read_exact(&mut last)?;
-            if last != *b"\n" {
-                out.write_all(b"\n")?;
-            }
-        }
-        match fs::File::open(into) {
-            Ok(mut existing) => {
-                io::copy(&mut existing, &mut out)?;
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        out.flush()?;
-        fs::rename(&tmp, into)
-    };
-    merge().inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })?;
-    fs::remove_file(from)
-}
-
 pub fn drain_pending(pending_path: &Path) -> Result<Vec<String>, io::Error> {
     if !pending_path.exists() {
         return Ok(vec![]);
@@ -1594,6 +1540,38 @@ fn lines_of(part: &StreamEventRequest) -> usize {
     part.transcript_lines.as_ref().map_or(0, Vec::len)
 }
 
+/// Whether `failure` (an error of `ApiClient::stream_event*`, as text) is the
+/// server's HTTP 413.
+fn too_large(failure: &str) -> bool {
+    failure.contains("(413 ")
+}
+
+/// Whether the transcript past `from` tells that the tool call `tool_use_id`
+/// failed, for a hook whose batch stopped short of the transcript's end: the
+/// call's result is among the last lines written, wherever the backlog
+/// starts. Reads at most the last [`MAX_BATCH_BYTES`] and parses only the
+/// lines that name the call.
+fn tool_is_error_past(transcript: &Path, from: i64, tool_use_id: &str) -> Option<bool> {
+    let mut file = fs::File::open(transcript).ok()?;
+    let len = file.metadata().ok()?.len() as i64;
+    if len <= from || tool_use_id.is_empty() {
+        return None;
+    }
+    file.seek(SeekFrom::Start(from.max(len - MAX_BATCH_BYTES) as u64))
+        .ok()?;
+    let mut tail = Vec::new();
+    file.take(MAX_BATCH_BYTES as u64)
+        .read_to_end(&mut tail)
+        .ok()?;
+    let needle = tool_use_id.as_bytes();
+    let lines: Vec<serde_json::Value> = tail
+        .split(|b| *b == b'\n')
+        .filter(|line| line.windows(needle.len()).any(|w| w == needle))
+        .filter_map(|line| serde_json::from_slice(line).ok())
+        .collect();
+    extract_is_error_from_transcript(tool_use_id, &lines)
+}
+
 /// Say once per hook why a send failed. A refusal the server explained has
 /// been printed already (it sets `warned`); anything else used to fail
 /// without a word, hook after hook.
@@ -1789,6 +1767,11 @@ pub(crate) enum Sender {
     /// process's credentials say nothing about that session's (the server
     /// keeps the one it has).
     CatchUp,
+    /// `flush`, on behalf of a session that may have ended: like the
+    /// catch-up, but everything the session's transcripts still hold unread
+    /// (to their ends, subagent files included), since no hook may come to
+    /// send it.
+    Flush,
 }
 
 /// What a [`stream_event`] did.
@@ -1927,7 +1910,15 @@ pub(crate) async fn stream_event(
     let tool_is_error = hook_event
         .tool_use_id
         .as_deref()
-        .and_then(|uid| extract_is_error_from_transcript(uid, &transcript_lines))
+        .and_then(|uid| {
+            extract_is_error_from_transcript(uid, &transcript_lines)
+                // The batch may have stopped short of the lines of this call.
+                .or_else(|| {
+                    reads_file
+                        .then(|| tool_is_error_past(transcript_path, new_offset, uid))
+                        .flatten()
+                })
+        })
         .or_else(|| inline_tool_is_error(&transcript_lines));
 
     // Load config once, up front, so it can back both the user-level context
@@ -2122,10 +2113,19 @@ pub(crate) async fn stream_event(
     match sender {
         Sender::Hook => {
             let _ = record_metadata(session_dir, "attribution", attribution_record(&attribution));
+            // For `flush`, which sends what a session left unread and must
+            // stamp it as this agent's.
+            let _ = record_metadata(session_dir, "agent", agent.tool_name().into());
         }
-        Sender::CatchUp => {
+        Sender::CatchUp | Sender::Flush => {
             let meta = session_metadata(session_dir);
-            if !catch_up_may_send(meta.get("attribution"), &attribution) {
+            let recorded = meta.get("attribution");
+            // `flush` reads whole transcripts, so it wants more than the
+            // catch-up's benefit of the doubt for a session without a record:
+            // only what the session's own hooks sent under is sent on.
+            if (sender == Sender::Flush && recorded.is_none())
+                || !catch_up_may_send(recorded, &attribution)
+            {
                 return Ok(Sent::Skipped);
             }
         }
@@ -2151,11 +2151,15 @@ pub(crate) async fn stream_event(
     } else {
         adopted_project_queue(session_dir, &attribution)
     };
-    if let Some(adopted) = adopted {
-        adopt_queue(&adopted, &pending_path)?;
-    }
     crate::pending_queue::upgrade(session_dir)?;
-    let claimed = crate::pending_queue::claim(&pending_path)?;
+    // The adopted queue is read first (its events are older), and with it
+    // whatever a reader that died left claimed from it: after the switch no
+    // hook reads that queue under its own name again.
+    let claimed = match adopted {
+        Some(adopted) => crate::pending_queue::claim(&adopted)?,
+        None => crate::pending_queue::Claimed::default(),
+    }
+    .then(crate::pending_queue::claim(&pending_path)?);
 
     let mut send_failed = false;
     // Spans the whole invocation (pending-flush loop + live send below) so a
@@ -2193,7 +2197,10 @@ pub(crate) async fn stream_event(
                     Err(_) => "no answer in time".to_string(),
                 };
                 warn_unsent(&mut warned, &failure);
-                send_failed = true;
+                // A record the server (or a proxy before it) finds too large
+                // will be found so again: it is kept, since its lines are
+                // nowhere else, but it must not hold up what is behind it.
+                send_failed = !too_large(&failure);
             }
         }
         crate::pending_queue::requeue(&pending_path, &record)?;
@@ -2259,7 +2266,9 @@ pub(crate) async fn stream_event(
         // event leaves the rest to the next hook. Past the deadline the
         // batches are queued, not sent, and once the queue is full the rest
         // stays in the file.
-        let mut read_on = event_type == "stop" && !is_inline && next == Some(new_offset);
+        let mut read_on = (event_type == "stop" || sender == Sender::Flush)
+            && !is_inline
+            && next == Some(new_offset);
         while read_on {
             let mut more = read_transcript_batch(transcript_path, &offset_path, MAX_BATCH_BYTES)?;
             if more.end == more.start {
@@ -2300,7 +2309,7 @@ pub(crate) async fn stream_event(
     // out of the main file). Swept on every hook, not only on `SubagentStop`,
     // so a long-running or background subagent is sent while it runs, and
     // the final hooks read every file to its end.
-    if sender == Sender::Hook && agent == crate::agent::Agent::ClaudeCode {
+    if sender != Sender::CatchUp && agent == crate::agent::Agent::ClaudeCode {
         deliver_subagent_transcripts(
             &client,
             &attribution,
@@ -4273,44 +4282,6 @@ mod tests {
     }
 
     #[test]
-    fn adopt_queue_puts_the_older_queue_first_and_removes_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let from = dir.path().join("pending-project-x.jsonl");
-        let into = dir.path().join("pending-r.jsonl");
-        std::fs::write(&from, "a1\na2").unwrap(); // no trailing newline
-        std::fs::write(&into, "r1\n").unwrap();
-        adopt_queue(&from, &into).unwrap();
-        assert!(!from.exists());
-        assert_eq!(drain_pending(&into).unwrap(), vec!["a1", "a2", "r1"]);
-        assert!(
-            !dir.path().join("pending-r.jsonl.adopting").exists(),
-            "no temp file left behind"
-        );
-    }
-
-    #[test]
-    fn adopt_queue_without_a_source_is_a_no_op() {
-        let dir = tempfile::tempdir().unwrap();
-        let into = dir.path().join("pending-r.jsonl");
-        std::fs::write(&into, "r1\n").unwrap();
-        adopt_queue(&dir.path().join("absent.jsonl"), &into).unwrap();
-        assert_eq!(drain_pending(&into).unwrap(), vec!["r1"]);
-    }
-
-    /// Codex R1.2: an unreadable target queue must not cost the adopted one —
-    /// inline records and tool payloads exist nowhere else.
-    #[test]
-    fn adopt_queue_failure_leaves_the_source_intact() {
-        let dir = tempfile::tempdir().unwrap();
-        let from = dir.path().join("pending-project-x.jsonl");
-        let into = dir.path().join("pending-r.jsonl");
-        std::fs::write(&from, "a1\n").unwrap();
-        std::fs::create_dir(&into).unwrap(); // reading it fails
-        assert!(adopt_queue(&from, &into).is_err());
-        assert_eq!(std::fs::read_to_string(&from).unwrap(), "a1\n");
-    }
-
-    #[test]
     fn adopted_project_queue_only_for_the_same_project() {
         let dir = Path::new("/tmp/sess");
         let pid = uuid::Uuid::from_u128(0x77);
@@ -5541,6 +5512,57 @@ mod tests {
         assert_eq!(rest.end, body.len() as i64);
     }
 
+    /// A tool's result is among the last lines written; a batch that stops
+    /// short of them (a backlog) must not lose the event's error flag.
+    #[test]
+    fn a_tool_error_past_the_batch_is_still_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        let result = |id: &str, is_error: bool| {
+            serde_json::json!({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": id, "is_error": is_error}
+            ]}})
+            .to_string()
+        };
+        let backlog = serde_json::json!({"type": "assistant", "pad": "x".repeat(1000)}).to_string();
+        let body = format!(
+            "{backlog}\n{backlog}\n{}\n{}\n",
+            result("toolu_ok", false),
+            result("toolu_bad", true)
+        );
+        fs::write(&transcript, &body).unwrap();
+        let after_backlog = 2 * (backlog.len() as i64 + 1);
+
+        assert_eq!(
+            tool_is_error_past(&transcript, after_backlog, "toolu_bad"),
+            Some(true)
+        );
+        assert_eq!(
+            tool_is_error_past(&transcript, after_backlog, "toolu_ok"),
+            Some(false)
+        );
+        assert_eq!(
+            tool_is_error_past(&transcript, after_backlog, "toolu_none"),
+            None
+        );
+        // Nothing past the batch: nothing to look at.
+        assert_eq!(
+            tool_is_error_past(&transcript, body.len() as i64, "toolu_bad"),
+            None
+        );
+        assert_eq!(
+            tool_is_error_past(&dir.path().join("absent"), 0, "toolu_bad"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_413_is_told_from_other_failures() {
+        assert!(too_large("Stream failed (413 Payload Too Large): "));
+        assert!(!too_large("Stream failed (503 Service Unavailable): {}"));
+        assert!(!too_large("Stream failed (404 Not Found): no repo 4130"));
+    }
+
     #[test]
     fn the_read_offset_only_moves_forward() {
         let dir = tempfile::tempdir().unwrap();
@@ -5561,20 +5583,6 @@ mod tests {
         fs::write(&offset_path, "garbage").unwrap();
         advance_offset(&offset_path, 7).unwrap();
         assert_eq!(read(), "7");
-    }
-
-    /// A queue is merged into another without either being held whole.
-    #[test]
-    fn adopt_queue_adds_the_missing_newline_between_the_queues() {
-        let dir = tempfile::tempdir().unwrap();
-        let from = dir.path().join("pending-project-x.jsonl");
-        let into = dir.path().join("pending-y.jsonl");
-        fs::write(&from, "a1\na2").unwrap();
-        fs::write(&into, "r1\n").unwrap();
-        adopt_queue(&from, &into).unwrap();
-        assert_eq!(fs::read_to_string(&into).unwrap(), "a1\na2\nr1\n");
-        assert!(!from.exists());
-        assert!(!into.with_extension("jsonl.adopting").exists());
     }
 
     /// A file another hook of the session is sending is left to it: not read,
