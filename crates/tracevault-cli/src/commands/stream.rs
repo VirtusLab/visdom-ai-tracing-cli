@@ -52,13 +52,59 @@ pub fn read_new_transcript_lines(
     transcript_path: &Path,
     offset_path: &Path,
 ) -> Result<(Vec<serde_json::Value>, i64, i64), io::Error> {
+    let batch = read_transcript_batch(transcript_path, offset_path, i64::MAX)?;
+    Ok((batch.lines, batch.start, batch.end))
+}
+
+/// How much of a transcript one hook reads. A hook has a few seconds to send
+/// in, and what it holds it holds parsed; a backlog larger than this (a
+/// resumed session's transcript, a server that was away) is caught up on over
+/// the next hooks instead, each advancing the read offset by what it sent.
+pub const MAX_BATCH_BYTES: i64 = 4 * 1024 * 1024;
+
+/// What a hook read of a transcript: the lines, where each ends in the file
+/// (`ends[i]` is the byte offset after `lines[i]`), and the byte range read.
+#[derive(Debug, Default)]
+pub struct TranscriptBatch {
+    pub lines: Vec<serde_json::Value>,
+    pub ends: Vec<i64>,
+    pub start: i64,
+    pub end: i64,
+}
+
+impl TranscriptBatch {
+    /// Where the next read starts after `delivered`: the end of the batch
+    /// when every line was accepted or queued, else the end of the last line
+    /// that was, and `None` when none was. Lines read from there on get new
+    /// chunk_indexes, all past those of the lines before them: an index is
+    /// the batch's byte offset plus the line's position, and a line is longer
+    /// than one byte.
+    pub fn next_offset(&self, delivered: &Delivered) -> Option<i64> {
+        if delivered.lines >= self.ends.len() {
+            return Some(self.end);
+        }
+        delivered
+            .lines
+            .checked_sub(1)
+            .and_then(|last| self.ends.get(last))
+            .copied()
+    }
+}
+
+/// [`read_new_transcript_lines`], reading no further than the line that
+/// reaches `max_bytes`.
+pub fn read_transcript_batch(
+    transcript_path: &Path,
+    offset_path: &Path,
+    max_bytes: i64,
+) -> Result<TranscriptBatch, io::Error> {
     // An empty path means "no transcript yet" — Codex documents `transcript_path`
     // as nullable (e.g. on SessionStart before a rollout exists), and the hook
     // payload deserializes null/absent to "". Guard explicitly so we never hand
     // `Path::new("")` to `exists()`/`File::open` (whose behavior on an empty path
     // is platform-dependent); treat it as a clean no-op.
     if transcript_path.as_os_str().is_empty() || !transcript_path.exists() {
-        return Ok((vec![], 0, 0));
+        return Ok(TranscriptBatch::default());
     }
 
     let offset: i64 = if offset_path.exists() {
@@ -76,6 +122,7 @@ pub fn read_new_transcript_lines(
 
     let reader = io::BufReader::new(file);
     let mut lines = Vec::new();
+    let mut ends = Vec::new();
     let mut bytes_read = offset;
 
     for line_result in reader.lines() {
@@ -87,10 +134,33 @@ pub fn read_new_transcript_lines(
         }
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
             lines.push(value);
+            ends.push(bytes_read);
+        }
+        if bytes_read - offset >= max_bytes {
+            break;
         }
     }
 
-    Ok((lines, offset, bytes_read))
+    Ok(TranscriptBatch {
+        lines,
+        ends,
+        start: offset,
+        end: bytes_read,
+    })
+}
+
+/// Move the read offset `offset_path` holds forward to `to`, never back: two
+/// hooks of a session can read from one offset at the same time, and the one
+/// that got less through must not undo the other's progress, or the lines
+/// between are sent again under new chunk_indexes and stored twice.
+fn advance_offset(offset_path: &Path, to: i64) -> io::Result<()> {
+    let current = fs::read_to_string(offset_path)
+        .ok()
+        .and_then(|c| c.trim().parse::<i64>().ok());
+    if current.is_some_and(|c| c >= to) {
+        return Ok(());
+    }
+    crate::subagents::write_offset(offset_path, to)
 }
 
 /// Store `transcript_path` in the session's `metadata.json`, which is where
@@ -218,24 +288,37 @@ pub fn append_pending(pending_path: &Path, json: &str) -> Result<(), io::Error> 
 /// files; they are then sent twice to the SAME target, where the server
 /// dedupes them (`chunk_index`, `event_uuid`).
 fn adopt_queue(from: &Path, into: &Path) -> Result<(), io::Error> {
-    let adopted = match fs::read_to_string(from) {
-        Ok(s) => s,
+    // Copied through, never held whole: a queue can be large.
+    let mut adopted = match fs::File::open(from) {
+        Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    let existing = match fs::read_to_string(into) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
-    };
-    let mut merged = adopted;
-    if !merged.is_empty() && !merged.ends_with('\n') {
-        merged.push('\n');
-    }
-    merged.push_str(&existing);
     let tmp = into.with_extension("jsonl.adopting");
-    fs::write(&tmp, merged)?;
-    fs::rename(&tmp, into)?;
+    let mut merge = || -> Result<(), io::Error> {
+        let mut out = io::BufWriter::new(fs::File::create(&tmp)?);
+        let copied = io::copy(&mut adopted, &mut out)?;
+        if copied > 0 {
+            let mut last = [0u8; 1];
+            adopted.seek(SeekFrom::End(-1))?;
+            adopted.read_exact(&mut last)?;
+            if last != *b"\n" {
+                out.write_all(b"\n")?;
+            }
+        }
+        match fs::File::open(into) {
+            Ok(mut existing) => {
+                io::copy(&mut existing, &mut out)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        out.flush()?;
+        fs::rename(&tmp, into)
+    };
+    merge().inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })?;
     fs::remove_file(from)
 }
 
@@ -1266,7 +1349,7 @@ async fn deliver_subagent_transcripts(
                 continue;
             }
         };
-        let (lines, start, end) = match crate::subagents::read_new_lines(&file, &offset_path) {
+        let batch = match crate::subagents::read_batch(&file, &offset_path, MAX_BATCH_BYTES) {
             Ok(read) => read,
             Err(e) => {
                 eprintln!(
@@ -1276,16 +1359,19 @@ async fn deliver_subagent_transcripts(
                 continue;
             }
         };
-        if end == start {
+        if batch.end == batch.start {
             continue;
         }
         // Only blank or malformed lines: nothing to send, but move past them.
-        let mut accepted = true;
-        if !lines.is_empty() {
+        let mut delivered = Delivered {
+            all: true,
+            lines: 0,
+        };
+        if !batch.lines.is_empty() {
             let mut req = template.clone();
-            req.transcript_lines = Some(lines);
-            req.transcript_offset = Some(start);
-            accepted = deliver_parts(
+            req.transcript_lines = Some(batch.lines.clone());
+            req.transcript_offset = Some(batch.start);
+            delivered = deliver_parts(
                 client,
                 attribution,
                 force,
@@ -1293,13 +1379,16 @@ async fn deliver_subagent_transcripts(
                 pending_path,
                 send_failed,
                 deadline,
+                Unsent::Queued,
                 warned,
             )
             .await?;
-            send_failed |= !accepted;
+            send_failed |= !delivered.all;
         }
-        if accepted {
-            crate::subagents::write_offset(&offset_path, end)?;
+        // Past what was accepted or queued. Under the file's lock, so the
+        // offset only ever moves forward here.
+        if let Some(next) = batch.next_offset(&delivered) {
+            crate::subagents::write_offset(&offset_path, next)?;
         }
     }
     Ok(())
@@ -1384,13 +1473,46 @@ pub(crate) const IN_FLIGHT_GRACE: std::time::Duration = std::time::Duration::fro
 /// seconds left before the 10 s hook timeout.
 const FINAL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Where the transcript lines of a part go when the part cannot be sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unsent {
+    /// Lines read from a transcript file: queued with their part while the
+    /// queue has room, and then counted in [`Delivered::lines`], so the read
+    /// offset moves past them and each is in one place only. Once the queue
+    /// is full the lines stay in the file for a later hook (the offset stops
+    /// before the first of them) and only the event itself is queued.
+    Queued,
+    /// Lines read from a transcript file that are left there: nothing of
+    /// them is queued and the offset does not move past them. For the
+    /// `SessionEnd` lines, which the catch-up sweep of a later session start
+    /// finds by that offset (`commands::catch_up`) and sends again.
+    StayInFile,
+    /// Records an agent handed over inline. They exist nowhere else: a part
+    /// is queued whole or, the queue being full, dropped.
+    Inline,
+}
+
+/// What [`deliver_parts`] did with a batch: whether the server accepted
+/// every part, and how many of the batch's transcript lines, from its start,
+/// are now accepted or in the queue. Those need not be read again; the read
+/// offset moves past them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Delivered {
+    pub all: bool,
+    pub lines: usize,
+}
+
 /// Send a hook event's parts in order. From the first failure on (or from the
 /// start when `send_failed`, i.e. older queued events are still waiting), or
-/// once `deadline` has passed, a part is appended to the pending queue
-/// instead, behind whatever is already there. A request still in flight
+/// once `deadline` has passed, a part goes to the pending queue instead,
+/// behind whatever is already there. A request still in flight
 /// [`IN_FLIGHT_GRACE`] past `deadline` counts as failed: the server may have
 /// stored it, and the queued copy then dedupes on its chunk_indexes and
-/// `event_uuid`. Returns whether every part was accepted.
+/// `event_uuid`.
+///
+/// What happens to the transcript lines of a part that is not sent is
+/// `unsent`'s to say (see [`Unsent`]); the caller moves a file's read offset
+/// past [`Delivered::lines`].
 #[allow(clippy::too_many_arguments)]
 async fn deliver_parts(
     client: &crate::api_client::ApiClient,
@@ -1400,22 +1522,62 @@ async fn deliver_parts(
     pending_path: &Path,
     mut send_failed: bool,
     deadline: std::time::Instant,
+    unsent: Unsent,
     warned: &mut bool,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut all_accepted = true;
+) -> Result<Delivered, Box<dyn std::error::Error>> {
+    let mut delivered = Delivered {
+        all: true,
+        lines: 0,
+    };
+    let mut queue_full = unsent == Unsent::StayInFile;
     for part in parts {
         send_failed = send_failed || std::time::Instant::now() >= deadline;
         if !send_failed {
             let send = send_stream_event(client, attribution, force, &part, warned);
-            match tokio::time::timeout_at((deadline + IN_FLIGHT_GRACE).into(), send).await {
-                Ok(Ok(_)) => continue,
-                Ok(Err(_)) | Err(_) => send_failed = true,
-            }
+            let failure =
+                match tokio::time::timeout_at((deadline + IN_FLIGHT_GRACE).into(), send).await {
+                    Ok(Ok(_)) => {
+                        delivered.lines += lines_of(&part);
+                        continue;
+                    }
+                    Ok(Err(e)) => e.to_string(),
+                    Err(_) => "no answer in time".to_string(),
+                };
+            warn_unsent(warned, &failure);
+            send_failed = true;
         }
-        all_accepted = false;
-        append_pending(pending_path, &serde_json::to_string(&part)?)?;
+        delivered.all = false;
+        let json = serde_json::to_string(&part)?;
+        if unsent == Unsent::Inline {
+            crate::pending_queue::append(pending_path, &json)?;
+            continue;
+        }
+        if !queue_full && crate::pending_queue::try_append(pending_path, &json)? {
+            delivered.lines += lines_of(&part);
+            continue;
+        }
+        // From here on the lines stay in the file: the offset stops before
+        // the first one left there, whatever a later, smaller part would fit.
+        queue_full = true;
+        if let Some(event) = crate::pending_queue::without_lines(part) {
+            crate::pending_queue::append(pending_path, &serde_json::to_string(&event)?)?;
+        }
     }
-    Ok(all_accepted)
+    Ok(delivered)
+}
+
+fn lines_of(part: &StreamEventRequest) -> usize {
+    part.transcript_lines.as_ref().map_or(0, Vec::len)
+}
+
+/// Say once per hook why a send failed. A refusal the server explained has
+/// been printed already (it sets `warned`); anything else used to fail
+/// without a word, hook after hook.
+fn warn_unsent(warned: &mut bool, failure: &str) {
+    if !*warned {
+        eprintln!("{TOP}: warning: could not send to the server ({failure}); it will be retried");
+        *warned = true;
+    }
 }
 
 /// The developer's choice of tracing mode for `visdom` (`hooks` or
@@ -1651,11 +1813,13 @@ pub(crate) async fn stream_event(
     // (see `deliver_subagent_transcripts` below): it is not an event of the
     // main conversation, so it neither reads nor advances `.stream_offset`.
     let sends_main = event_type != "subagent-stop";
-    let (transcript_lines, start_offset, new_offset) = if sends_main {
-        read_new_transcript_lines(transcript_path, &offset_path)?
+    let mut batch = if sends_main {
+        read_transcript_batch(transcript_path, &offset_path, MAX_BATCH_BYTES)?
     } else {
-        (vec![], 0, 0)
+        TranscriptBatch::default()
     };
+    let (transcript_lines, start_offset, new_offset) =
+        (std::mem::take(&mut batch.lines), batch.start, batch.end);
 
     // Fileless inline path (OpenCode): a plugin-based agent with no single
     // tailable transcript supplies records directly on the hook event. When
@@ -1937,7 +2101,8 @@ pub(crate) async fn stream_event(
     if let Some(adopted) = adopted {
         adopt_queue(&adopted, &pending_path)?;
     }
-    let pending_events = drain_pending(&pending_path)?;
+    crate::pending_queue::upgrade(session_dir)?;
+    let claimed = crate::pending_queue::claim(&pending_path)?;
 
     let mut send_failed = false;
     // Spans the whole invocation (pending-flush loop + live send below) so a
@@ -1945,38 +2110,42 @@ pub(crate) async fn stream_event(
     // not once per buffered event.
     let mut warned = false;
 
-    // Send pending events first. Past the delivery budget, put the rest back
-    // unsent (the queue file is already gone), so a hook killed at its timeout
-    // loses none of them.
-    for (i, pending_json) in pending_events.iter().enumerate() {
-        if let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(pending_json) {
-            // Capped like `deliver_parts`: the queue file is already gone, so
-            // a hook killed at its timeout mid-request would lose every event
-            // not yet re-queued, and never reach the subagent sweep.
-            if std::time::Instant::now() >= deadline
-                || !matches!(
-                    tokio::time::timeout_at(
-                        (deadline + IN_FLIGHT_GRACE).into(),
-                        send_stream_event(&client, &attribution, force, &pending_req, &mut warned),
-                    )
-                    .await,
-                    Ok(Ok(_))
-                )
-            {
-                // Re-queue only the failed event and the ones after it that
-                // were never attempted, in order. Events before `i` already
-                // got a server response and must NOT be re-queued here — a
-                // prior iteration already appended them if IT failed, and if
-                // it succeeded, re-adding them would deliver them twice on
-                // the next drain.
-                for evt in &pending_events[i..] {
-                    append_pending(&pending_path, evt)?;
-                }
+    // Send pending events first, one record at a time (the queue is never
+    // held whole in memory). From the first one that fails, or past the
+    // delivery budget, the rest goes back to the queue unsent, in order: the
+    // failed event and the ones never attempted, not those the server already
+    // answered. The claimed file is removed only once every record was sent
+    // or queued again, so a hook killed at its timeout loses none of them (a
+    // later hook takes the claim over), and a hook that queues meanwhile
+    // writes to a new file.
+    for record in claimed.records() {
+        let record = record?;
+        if !send_failed {
+            let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(&record) else {
+                continue;
+            };
+            if std::time::Instant::now() >= deadline {
                 send_failed = true;
-                break;
+            } else {
+                // Capped like `deliver_parts`, so the subagent sweep below is
+                // still reached.
+                let failure = match tokio::time::timeout_at(
+                    (deadline + IN_FLIGHT_GRACE).into(),
+                    send_stream_event(&client, &attribution, force, &pending_req, &mut warned),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(e)) => e.to_string(),
+                    Err(_) => "no answer in time".to_string(),
+                };
+                warn_unsent(&mut warned, &failure);
+                send_failed = true;
             }
         }
+        crate::pending_queue::append(&pending_path, &record)?;
     }
+    claimed.release();
 
     // Send the current event — several requests when its transcript batch
     // exceeds the request cap (see `split_into_parts`), never dropping lines.
@@ -1984,7 +2153,7 @@ pub(crate) async fn stream_event(
     // ended the session on the server.
     let sends_event = sends_main
         && !(req.event_type == StreamEventType::Transcript && req.transcript_lines.is_none());
-    let all_accepted = if sends_event {
+    let delivered = if sends_event {
         deliver_parts(
             &client,
             &attribution,
@@ -1993,12 +2162,23 @@ pub(crate) async fn stream_event(
             &pending_path,
             send_failed,
             deadline,
+            if is_inline {
+                Unsent::Inline
+            } else if event_type == "session-end" {
+                Unsent::StayInFile
+            } else {
+                Unsent::Queued
+            },
             &mut warned,
         )
         .await?
     } else {
-        true
+        Delivered {
+            all: true,
+            lines: 0,
+        }
     };
+    let all_accepted = delivered.all;
     // 10. Advance .stream_offset once every part is accepted. The inline
     // (OpenCode) path CONSUMES its records from the hook event — they are not
     // re-readable like a transcript file — so its record counter must advance
@@ -2006,13 +2186,20 @@ pub(crate) async fn stream_event(
     // queued after a failure. Otherwise the next inline event reuses these
     // chunk_indexes and the server drops the overlap via ON CONFLICT. The queued
     // parts already carry their `transcript_offset`, so the records keep their
-    // indices on drain. (File-based agents must NOT advance on failure: their
-    // next read re-covers these lines from the same start offset, so every line
-    // gets the same chunk_index again and the server dedupes it — whatever the
-    // queue meanwhile delivered or lost.)
+    // indices on drain.
     // Replaced atomically: the catch-up sweep can read it while this runs.
-    if sends_main && (all_accepted || is_inline) {
-        crate::subagents::write_offset(&offset_path, new_offset)?;
+    // A file's offset advances past the lines that were accepted or queued
+    // (see `Unsent`), so none is read a second time, and a batch too large
+    // for one hook's budget is sent over several hooks.
+    if sends_main {
+        let next = if is_inline {
+            Some(new_offset)
+        } else {
+            batch.next_offset(&delivered)
+        };
+        if let Some(next) = next {
+            advance_offset(&offset_path, next)?;
+        }
     }
 
     // 11. Subagent transcripts (Claude Code keeps each subagent's conversation
@@ -3928,6 +4115,11 @@ mod tests {
     /// inferred; another checkout reads as project-only.
     #[test]
     fn recording_attribution_labels_an_inferred_repo() {
+        // Reads `TRACEVAULT_PROJECT`, which other tests set for a while.
+        let _env_lock = crate::test_helpers::lock_env_mutation_sync();
+        let mut env = crate::test_helpers::EnvVarGuard::new();
+        env.remove("TRACEVAULT_PROJECT");
+        env.remove("VISDOM_PROJECT");
         let pid = uuid::Uuid::from_u128(0x1258);
         let repo = "22222222-2222-2222-2222-222222222222";
         let state = inferring_session(pid, "/umbrella/child", repo);
@@ -4632,10 +4824,12 @@ mod tests {
             &pending_path,
             false,
             far_deadline(),
+            Unsent::Inline,
             &mut false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .all;
 
         assert!(all_accepted);
         for part in &parts {
@@ -4667,10 +4861,12 @@ mod tests {
             &pending_path,
             false,
             far_deadline(),
+            Unsent::Inline,
             &mut false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .all;
 
         assert!(!all_accepted);
         assert!(rx.recv_timeout(crate::test_helpers::RECV_TIMEOUT).is_ok());
@@ -4708,10 +4904,12 @@ mod tests {
             &pending_path,
             true,
             far_deadline(),
+            Unsent::Inline,
             &mut false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .all;
 
         assert!(!all_accepted);
         assert_eq!(drain_pending(&pending_path).unwrap().len(), 1);
@@ -4735,10 +4933,12 @@ mod tests {
             &pending_path,
             false,
             std::time::Instant::now(),
+            Unsent::Inline,
             &mut false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .all;
 
         assert!(!all_accepted);
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
@@ -4767,10 +4967,12 @@ mod tests {
             &pending_path,
             false,
             started + Duration::from_millis(100),
+            Unsent::Inline,
             &mut false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .all;
 
         assert!(!all_accepted);
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -4970,12 +5172,12 @@ mod tests {
         assert_eq!(fs::read_dir(&session_dir).unwrap().count(), 0);
     }
 
-    /// A failed send queues the file's batch and leaves its offset alone, so
-    /// the next hook sends the same lines under the same chunk_indexes (the
-    /// server dedupes the queued copy). Files after the failure are queued
-    /// too, behind it, rather than sent out of order.
+    /// A failed send queues the file's batch and moves its offset past it, so
+    /// the lines are in one place only: the next hook does not read them
+    /// again. Files after the failure are queued too, behind it, rather than
+    /// sent out of order, each under the offset within its own file.
     #[tokio::test]
-    async fn a_failed_subagent_send_is_queued_and_resent_with_the_same_offsets() {
+    async fn a_failed_subagent_send_is_queued_once_and_not_read_again() {
         let dir = tempfile::tempdir().unwrap();
         let (main, subagents, session_dir) = claude_session(dir.path());
         let pending = session_dir.join("pending.jsonl");
@@ -4986,29 +5188,253 @@ mod tests {
             "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let failed = sweep(vec![error.to_string()], &main, &session_dir, &pending).await;
         assert_eq!(failed.len(), 1);
-        let queued: Vec<StreamEventRequest> = drain_pending(&pending)
+        let queued = |path: &Path| -> Vec<StreamEventRequest> {
+            fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|j| serde_json::from_str(j).unwrap())
+                .collect()
+        };
+        let first = queued(&pending);
+        assert_eq!(first.len(), 2, "the failed batch and the one behind it");
+        assert_one_file_per_request(&subagents, &first);
+        assert_eq!(first[0].transcript_offset, failed[0].transcript_offset);
+        assert_eq!(part_lines(&first[0]), part_lines(&failed[0]));
+        assert!(first.iter().all(|r| r.transcript_offset == Some(0)));
+
+        // The files are not read again: nothing is sent, nothing queued twice.
+        for _ in 0..2 {
+            assert!(sweep(vec![], &main, &session_dir, &pending)
+                .await
+                .is_empty());
+        }
+        assert_eq!(queued(&pending).len(), 2, "nothing was queued twice");
+    }
+
+    /// Lines read from a file that could not be sent are queued whole, once,
+    /// and count as dealt with: the read offset moves past them.
+    #[tokio::test]
+    async fn deliver_parts_queues_file_lines_and_counts_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending_path = dir.path().join("pending.jsonl");
+        let event = event_with_lines(big_lines(300, 5_000), 0);
+        let parts = split_into_parts(event.clone());
+        assert!(parts.len() >= 3);
+        let unavailable = crate::test_helpers::http_json("503 Service Unavailable", "{}");
+        let (base, _rx) = crate::test_helpers::spawn_seq(vec![ok_stream_response(), unavailable]);
+        let client = crate::api_client::ApiClient::new(&base, Some("tok"));
+
+        let delivered = deliver_parts(
+            &client,
+            &repo_attr(&uuid::Uuid::new_v4().to_string()),
+            AttributionForce::default(),
+            parts.clone(),
+            &pending_path,
+            false,
+            far_deadline(),
+            Unsent::Queued,
+            &mut false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            delivered,
+            Delivered {
+                all: false,
+                lines: 300
+            }
+        );
+        let queued: Vec<StreamEventRequest> = drain_pending(&pending_path)
             .unwrap()
             .iter()
             .map(|j| serde_json::from_str(j).unwrap())
             .collect();
-        assert_eq!(queued.len(), 2, "the failed batch and the one behind it");
+        assert_eq!(queued.len(), parts.len() - 1);
+        for (q, part) in queued.iter().zip(&parts[1..]) {
+            assert_eq!(q.transcript_offset, part.transcript_offset);
+            assert_eq!(q.transcript_lines, part.transcript_lines);
+        }
+    }
 
-        let resent = sweep(
-            vec![ok_stream_response(), ok_stream_response()],
-            &main,
-            &session_dir,
-            &pending,
+    /// A full queue takes no more lines: they stay in the file, the count
+    /// stops before them, and of the event only what cannot be read again is
+    /// kept.
+    #[tokio::test]
+    async fn deliver_parts_leaves_lines_in_the_file_once_the_queue_is_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending_path = dir.path().join("pending.jsonl");
+        let event = event_with_lines(big_lines(300, 5_000), 0);
+        let parts = split_into_parts(event.clone());
+        assert!(parts.len() >= 3);
+        // Room for the first part and the bare event, not for a second part.
+        let first = serde_json::to_string(&parts[0]).unwrap().len() as u64;
+        fs::write(&pending_path, "\n").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&pending_path)
+            .unwrap()
+            .set_len(crate::pending_queue::MAX_QUEUE_BYTES - first - 10_000)
+            .unwrap();
+        let before = fs::metadata(&pending_path).unwrap().len();
+        let client = crate::api_client::ApiClient::new("http://127.0.0.1:9", Some("tok"));
+
+        let delivered = deliver_parts(
+            &client,
+            &repo_attr(&uuid::Uuid::new_v4().to_string()),
+            AttributionForce::default(),
+            parts.clone(),
+            &pending_path,
+            true,
+            far_deadline(),
+            Unsent::Queued,
+            &mut false,
         )
-        .await;
-        assert_one_file_per_request(&subagents, &resent);
-        let key = |r: &StreamEventRequest| (r.transcript_offset, part_lines(r));
+        .await
+        .unwrap();
+
         assert_eq!(
-            resent.iter().map(key).collect::<Vec<_>>(),
-            queued.iter().map(key).collect::<Vec<_>>()
+            delivered,
+            Delivered {
+                all: false,
+                lines: part_lines(&parts[0]).len()
+            }
         );
-        assert!(sweep(vec![], &main, &session_dir, &pending)
-            .await
-            .is_empty());
+        let mut added = Vec::new();
+        let mut file = fs::File::open(&pending_path).unwrap();
+        file.seek(SeekFrom::Start(before)).unwrap();
+        file.read_to_end(&mut added).unwrap();
+        let queued: Vec<StreamEventRequest> = String::from_utf8(added)
+            .unwrap()
+            .lines()
+            .map(|j| serde_json::from_str(j).unwrap())
+            .collect();
+        assert_eq!(
+            queued.len(),
+            2,
+            "the first part, and the event without lines"
+        );
+        assert_eq!(queued[0].transcript_lines, parts[0].transcript_lines);
+        assert_eq!(queued[1].event_uuid, event.event_uuid);
+        assert_eq!(queued[1].tool_input, event.tool_input);
+        assert_eq!(queued[1].transcript_lines, None);
+    }
+
+    /// `SessionEnd` lines stay in the file: nothing of them is queued and
+    /// none counts, so the offset the catch-up sweep goes by does not move.
+    #[tokio::test]
+    async fn deliver_parts_can_leave_unsent_lines_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending_path = dir.path().join("pending.jsonl");
+        let lines_only = StreamEventRequest {
+            event_type: StreamEventType::Transcript,
+            ..event_with_lines(big_lines(3, 100), 0)
+        };
+        let client = crate::api_client::ApiClient::new("http://127.0.0.1:9", Some("tok"));
+
+        let delivered = deliver_parts(
+            &client,
+            &repo_attr(&uuid::Uuid::new_v4().to_string()),
+            AttributionForce::default(),
+            split_into_parts(lines_only),
+            &pending_path,
+            false,
+            far_deadline(),
+            Unsent::StayInFile,
+            &mut false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            delivered,
+            Delivered {
+                all: false,
+                lines: 0
+            }
+        );
+        assert!(!pending_path.exists());
+    }
+
+    /// A read stops at the line that reaches the cap and tells where every
+    /// line ends, so the offset can move to the end of any accepted prefix.
+    #[test]
+    fn a_batch_is_capped_and_knows_where_its_lines_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        let offset_path = dir.path().join(".stream_offset");
+        let line = |n: usize| format!("{}\n", serde_json::json!({"n": n, "pad": "x".repeat(90)}));
+        let len = line(0).len() as i64;
+        let body: String = (0..10).map(line).collect::<Vec<_>>().join("\n");
+        // A blank line between records, as a reader must tolerate.
+        fs::write(&transcript, &body).unwrap();
+
+        let batch = read_transcript_batch(&transcript, &offset_path, 2 * len).unwrap();
+        assert_eq!(batch.start, 0);
+        assert_eq!(batch.lines.len(), 2, "two lines and the blank after each");
+        assert_eq!(batch.ends, vec![len, 2 * len + 1]);
+        assert_eq!(batch.end, 2 * len + 1);
+
+        // No line dealt with: the offset stays. A prefix: its end. All: the
+        // batch's, whether the server took them or the queue did.
+        let none = Delivered {
+            all: false,
+            lines: 0,
+        };
+        let one = Delivered {
+            all: false,
+            lines: 1,
+        };
+        let all = Delivered {
+            all: false,
+            lines: 2,
+        };
+        assert_eq!(batch.next_offset(&none), None);
+        assert_eq!(batch.next_offset(&one), Some(len));
+        assert_eq!(batch.next_offset(&all), Some(batch.end));
+
+        // Read on from a line's end: the next lines, nothing twice.
+        fs::write(&offset_path, len.to_string()).unwrap();
+        let rest = read_transcript_batch(&transcript, &offset_path, i64::MAX).unwrap();
+        assert_eq!(rest.lines.len(), 9);
+        assert_eq!(rest.lines[0]["n"], 1);
+        assert_eq!(rest.end, body.len() as i64);
+    }
+
+    #[test]
+    fn the_read_offset_only_moves_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let offset_path = dir.path().join(".stream_offset");
+        let read = || fs::read_to_string(&offset_path).unwrap();
+
+        advance_offset(&offset_path, 100).unwrap();
+        assert_eq!(read(), "100");
+        advance_offset(&offset_path, 40).unwrap();
+        assert_eq!(
+            read(),
+            "100",
+            "a hook that got less through does not undo it"
+        );
+        advance_offset(&offset_path, 250).unwrap();
+        assert_eq!(read(), "250");
+        // An unreadable offset is replaced rather than kept for good.
+        fs::write(&offset_path, "garbage").unwrap();
+        advance_offset(&offset_path, 7).unwrap();
+        assert_eq!(read(), "7");
+    }
+
+    /// A queue is merged into another without either being held whole.
+    #[test]
+    fn adopt_queue_adds_the_missing_newline_between_the_queues() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("pending-project-x.jsonl");
+        let into = dir.path().join("pending-y.jsonl");
+        fs::write(&from, "a1\na2").unwrap();
+        fs::write(&into, "r1\n").unwrap();
+        adopt_queue(&from, &into).unwrap();
+        assert_eq!(fs::read_to_string(&into).unwrap(), "a1\na2\nr1\n");
+        assert!(!from.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     /// A file another hook of the session is sending is left to it: not read,

@@ -485,13 +485,17 @@ fn a_queue_left_in_the_umbrella_is_drained_from_the_child_repo() {
     fx.assistant(2);
     fx.tool_use(&base, &fx.child);
 
-    // A refused send does not advance `.stream_offset`, so the next event
-    // re-reads line 1 as well as draining the queued copy: the same chunk
-    // twice, which the server dedupes. Nothing is lost or re-chunked.
-    let mut chunks = sent_chunks(&rx);
-    chunks.sort();
-    chunks.dedup();
-    assert_eq!(chunks, vec![(0, 1), (0, 2)]);
+    // The refused send queued line 1 and moved `.stream_offset` past it, so
+    // the next event drains the queued copy and reads on from line 2: each
+    // line once, under its own chunk_index (the byte offset it was read at).
+    let chunks = sent_chunks(&rx);
+    let line_1 = serde_json::json!({"type": "assistant", "n": 1})
+        .to_string()
+        .len() as i64
+        + 1;
+    let ns: Vec<_> = chunks.iter().map(|c| c.1).collect();
+    assert_eq!(ns.len(), 2, "no line twice: {chunks:?}");
+    assert!(chunks.contains(&(0, 1)) && chunks.iter().any(|c| c.1 == 2 && c.0 == line_1));
     assert!(
         !pending(&fx.session_dir(&fx.umbrella)),
         "the queue is drained"

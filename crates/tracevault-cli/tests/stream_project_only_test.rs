@@ -306,7 +306,8 @@ fn queued(path: &std::path::Path) -> Vec<StreamEventRequest> {
 
 /// No repo binding, project bound, umbrella dir: the event goes to the bare
 /// project endpoint (no `repo_id`). With the server down it is queued in
-/// `pending-project-<pid>.jsonl`, the offset does not move, and the next
+/// `pending-project-<pid>.jsonl` with its lines, the offset moves past them
+/// (they are in the queue, and nowhere else to be read again), and the next
 /// event drains the queue before sending its own.
 #[test]
 fn umbrella_session_records_project_only_and_drains_its_queue() {
@@ -325,7 +326,7 @@ fn umbrella_session_records_project_only_and_drains_its_queue() {
     assert_eq!(line_ns(&reqs[0].body), vec![1, 2]);
     let after_run1 = fx.offset().expect("offset advanced");
 
-    // Run 2: server down — queued per project, offset unchanged.
+    // Run 2: server down — queued per project, and not to be read again.
     fx.append_transcript(3..=3);
     let (base, rx) = spawn_server(vec![unavailable(), accepted()]);
     fx.run_hook(&base);
@@ -333,12 +334,12 @@ fn umbrella_session_records_project_only_and_drains_its_queue() {
     let q = queued(&fx.project_queue(pid));
     assert_eq!(q.len(), 1, "queued in the project file");
     assert_eq!(line_ns(&q[0]), vec![3]);
-    assert_eq!(fx.offset(), Some(after_run1), "offset must not advance");
+    let after_run2 = fx.offset().expect("offset");
+    assert!(after_run2 > after_run1, "line 3 is in the queue only");
     assert!(!fx.repo_queue().exists());
 
-    // Run 3: server back — the queued event drains first, then the live one
-    // re-reads line 3 from the unchanged offset (same chunk_index, same
-    // server row: deduped) together with line 4.
+    // Run 3: server back — the queued event drains first, with line 3, then
+    // the live one with line 4. No line is sent twice.
     fx.append_transcript(4..=4);
     let (base, rx) = spawn_server(vec![accepted(), accepted(), accepted()]);
     fx.run_hook(&base);
@@ -348,18 +349,18 @@ fn umbrella_session_records_project_only_and_drains_its_queue() {
         assert!(r.line.starts_with(&bare), "{reqs:?}");
     }
     assert_eq!(line_ns(&reqs[0].body), vec![3]);
-    assert_eq!(line_ns(&reqs[1].body), vec![3, 4]);
-    assert_eq!(
-        reqs[0].body.transcript_offset, reqs[1].body.transcript_offset,
-        "line 3 carries the same offset both times, so the server dedupes it"
+    assert_eq!(line_ns(&reqs[1].body), vec![4]);
+    assert!(
+        reqs[0].body.transcript_offset < reqs[1].body.transcript_offset,
+        "each line under its own chunk_index"
     );
     assert!(queued(&fx.project_queue(pid)).is_empty(), "queue drained");
-    assert!(fx.offset().unwrap() > after_run1);
+    assert!(fx.offset().unwrap() > after_run2);
 }
 
 /// VIS-316 for the repo-less route: a deterministic 404 is an error that is
-/// printed and buffered, never dropped — the offset stays put, so the lines
-/// are re-read once the binding is fixed.
+/// printed and buffered, never dropped — the event is queued with its lines,
+/// to be sent once the binding is fixed.
 #[test]
 fn refused_project_only_send_is_queued_not_dropped() {
     let fx = Fixture::new();
@@ -383,7 +384,10 @@ fn refused_project_only_send_is_queued_not_dropped() {
     let q = queued(&fx.project_queue(pid));
     assert_eq!(q.len(), 1, "the refused event is queued");
     assert_eq!(line_ns(&q[0]), vec![1, 2]);
-    assert_eq!(fx.offset(), None, "nothing was accepted, offset untouched");
+    assert!(
+        fx.offset().is_some(),
+        "the lines are in the queue, not to be read again"
+    );
 }
 
 /// `repo switch` mid-session: once a repo binds, events go to the
@@ -429,10 +433,10 @@ fn repo_switch_mid_session_moves_to_the_repo_path_without_loss_or_duplication() 
         );
     }
     assert_eq!(line_ns(&reqs[0].body), vec![3], "the queued event, adopted");
-    assert_eq!(line_ns(&reqs[1].body), vec![3, 4], "re-read from offset");
-    assert_eq!(
-        reqs[0].body.transcript_offset, reqs[1].body.transcript_offset,
-        "line 3 has one chunk_index on ONE row (the repo row), so it dedupes"
+    assert_eq!(line_ns(&reqs[1].body), vec![4], "line 3 is not read again");
+    assert!(
+        reqs[0].body.transcript_offset < reqs[1].body.transcript_offset,
+        "each line under its own chunk_index, on ONE row (the repo row)"
     );
     assert!(
         !fx.project_queue(pid).exists() || queued(&fx.project_queue(pid)).is_empty(),
@@ -482,7 +486,7 @@ fn adopted_queue_migrates_to_the_repo_queue_on_failure() {
     let q = queued(&fx.repo_queue());
     assert_eq!(q.len(), 2, "adopted event + live event: {q:?}");
     assert_eq!(line_ns(&q[0]), vec![1], "older (adopted) event first");
-    assert_eq!(line_ns(&q[1]), vec![1, 2]);
+    assert_eq!(line_ns(&q[1]), vec![2], "each line queued once");
 }
 
 /// Codex R1.3: inline (OpenCode) records queued project-only exist ONLY in

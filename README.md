@@ -1024,6 +1024,15 @@ pre-push input) and aborts the push on failure.
 **`visdom trace flush`** — retry events that failed to stream in real time (network blip, server
 down) from the local queue.
 
+What a hook cannot send it keeps in the session's queue (`pending-*.jsonl` in the session
+directory), and the next hook of the session sends the queue first. A transcript line is queued
+once: the hook moves on past it in the transcript, so it is never read and queued again. The
+queue holds at most 32 MB and a hook reads at most 4 MB of a transcript at a time; what does not
+fit stays in the agent's transcript and is sent by later hooks, so neither the queue nor a hook's
+memory grows with how long the server was unreachable. A queue written by 0.29.7 or earlier,
+which repeated the unsent transcript on every hook, is reduced to its events the first time a
+hook or `flush` of this release touches the session.
+
 **`visdom trace stats`** — print local session statistics (sessions, events) for this repo.
 
 **`visdom trace verify (--range <a..b> | --commits <sha,sha,...>)`** — check that commits are

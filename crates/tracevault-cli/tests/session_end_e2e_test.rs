@@ -482,19 +482,23 @@ fn session_start_stops_at_the_first_session_the_server_refuses() {
     assert_eq!(tried.len(), 1, "the older session is not tried: {tried:?}");
     assert_eq!(tried[0].session_id, "newer", "most recent first");
     assert_eq!((fx.offset("older"), fx.offset("newer")), offsets);
-    let queued = fx
-        .session_dir("newer")
-        .join(format!("pending-{REPO_ID}.jsonl"));
-    assert!(
-        std::fs::read_to_string(queued)
-            .unwrap()
-            .contains("cost-state"),
-        "the refused part is queued"
-    );
-    assert!(!fx
-        .session_dir("older")
-        .join(format!("pending-{REPO_ID}.jsonl"))
-        .exists());
+    // The refused lines are not queued as well: they are in the transcript,
+    // and the offset still points at them.
+    for session in ["older", "newer"] {
+        assert!(!fx
+            .session_dir(session)
+            .join(format!("pending-{REPO_ID}.jsonl"))
+            .exists());
+    }
+
+    // So the next session start, with the server back, sends them.
+    let (base, rx) = spawn_server();
+    fx.session_start(&base, "later-session");
+    let sent = captured(&rx);
+    let mut sessions: Vec<&str> = sent.iter().map(|r| r.session_id.as_str()).collect();
+    sessions.sort_unstable();
+    assert_eq!(sessions, ["newer", "older"]);
+    assert!(sent.iter().all(|r| types(r) == ["cost-state"]));
 }
 
 #[test]

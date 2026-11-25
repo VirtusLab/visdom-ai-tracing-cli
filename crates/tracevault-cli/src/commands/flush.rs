@@ -278,6 +278,15 @@ async fn drain_queue(
     capture_pid: Option<uuid::Uuid>,
     force: crate::commands::stream::AttributionForce,
 ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+    // A queue an earlier release wrote can repeat the session's transcript
+    // many times over; drop that first, one record at a time, before the
+    // queue is loaded whole (see `crate::pending_queue`).
+    if let Some(session_dir) = pending_path.parent() {
+        crate::pending_queue::upgrade(session_dir)?;
+    }
+    if !pending_path.exists() {
+        return Ok((0, 0));
+    }
     let events = drain_pending(pending_path)?;
     if events.is_empty() {
         return Ok((0, 0));
