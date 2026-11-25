@@ -64,7 +64,8 @@ jobs:
           archive="tracevault-${tag}-${{ matrix.target }}"
           mkdir -p "$archive"
           # Both binaries in the one archive (its name stays, so the Homebrew
-          # URLs do): `visdom`, and `tracevault`, which installed hooks call.
+          # URLs do): `visdom`, and `tracevault` for what still calls it. The
+          # tap has a formula for each.
           cp "target/${{ matrix.target }}/release/tracevault" "$archive/"
           cp "target/${{ matrix.target }}/release/visdom" "$archive/"
           cp LICENSE README.md "$archive/" 2>/dev/null || true
@@ -84,10 +85,16 @@ jobs:
             tracevault-*.tar.gz.sha256
 
   update-homebrew:
-    name: Update Homebrew formula
+    name: Update Homebrew formulae
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # The released commit, for `visdom`'s version: the tag and the archives
+      # carry `tracevault`'s, and `visdom-cli` has its own.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
       - name: Wait for assets to be available
         run: sleep 10
 
@@ -98,8 +105,11 @@ jobs:
           # version = tag without any package prefix and leading v (e.g.
           # tracevault-cli-v0.20.0 -> 0.20.0, v0.20.0 -> 0.20.0).
           version="${tag##*v}"
+          visdom_version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -er '.packages[] | select(.name == "visdom-cli") | .version')"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "visdom_version=$visdom_version" >> "$GITHUB_OUTPUT"
 
       - name: Download checksums
         run: |
@@ -122,11 +132,12 @@ jobs:
         uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3.0.0
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          repository: VirtusLab/homebrew-visdom-ai-tracing
+          repository: VirtusLab/homebrew-visdom
           event-type: update-formula
           client-payload: |
             {
               "version": "${{ steps.release.outputs.version }}",
+              "visdom_version": "${{ steps.release.outputs.visdom_version }}",
               "tag": "${{ steps.release.outputs.tag }}",
               "sha256_aarch64_apple_darwin": "${{ steps.sha.outputs.aarch64_apple_darwin }}",
               "sha256_x86_64_apple_darwin": "${{ steps.sha.outputs.x86_64_apple_darwin }}",
