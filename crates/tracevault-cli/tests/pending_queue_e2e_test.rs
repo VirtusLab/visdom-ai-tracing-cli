@@ -467,7 +467,7 @@ fn flush_sends_a_queue_an_interrupted_reader_left_claimed() {
         .write(true)
         .open(&claimed)
         .unwrap()
-        .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
         .unwrap();
 
     let (up, rx) = spawn_server(ALWAYS);

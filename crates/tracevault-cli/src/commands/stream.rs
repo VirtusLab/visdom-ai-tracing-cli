@@ -291,6 +291,16 @@ pub fn append_pending(pending_path: &Path, json: &str) -> Result<(), io::Error> 
 /// files; they are then sent twice to the SAME target, where the server
 /// dedupes them (`chunk_index`, `event_uuid`).
 fn adopt_queue(from: &Path, into: &Path) -> Result<(), io::Error> {
+    // Under both queues' locks, taken in one order: a record another hook or
+    // `flush` puts back into either while this runs would be lost to the
+    // rename below, or to the removal after it.
+    let (first, second) = if from <= into {
+        (from, into)
+    } else {
+        (into, from)
+    };
+    let _first = crate::pending_queue::queue_lock(first)?;
+    let _second = crate::pending_queue::queue_lock(second)?;
     // Copied through, never held whole: a queue can be large.
     let mut adopted = match fs::File::open(from) {
         Ok(f) => f,
@@ -5564,7 +5574,7 @@ mod tests {
         adopt_queue(&from, &into).unwrap();
         assert_eq!(fs::read_to_string(&into).unwrap(), "a1\na2\nr1\n");
         assert!(!from.exists());
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert!(!into.with_extension("jsonl.adopting").exists());
     }
 
     /// A file another hook of the session is sending is left to it: not read,

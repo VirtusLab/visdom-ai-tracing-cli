@@ -36,10 +36,11 @@ use tracevault_protocol::streaming::{StreamEventRequest, StreamEventType};
 /// without a bound did that to the machine instead.
 pub const MAX_QUEUE_BYTES: u64 = 32 * 1024 * 1024;
 
-/// How old a claimed queue file must be before another hook takes it over as
-/// abandoned. Hooks are killed at 10 s and `flush` sends for longer, but only
-/// what it has already rewritten to the queue itself.
-const ABANDONED_AFTER: Duration = Duration::from_secs(60);
+/// How long a claimed queue file must have gone untouched before another
+/// reader takes it over as abandoned. A reader touches its claim with every
+/// record it takes from it, and the longest it can then be busy with one is
+/// a request's timeout (60 s, in `flush`; a hook is killed at 10 s).
+const ABANDONED_AFTER: Duration = Duration::from_secs(300);
 
 /// Whether the transcript lines of a queued record are read again from the
 /// agent's transcript file, going by the `tool` the record names. An absent
@@ -68,7 +69,7 @@ pub fn requeue(pending_path: &Path, json: &str) -> io::Result<()> {
 /// claimed. Without it a writer could open the file, have it claimed, read
 /// and removed, and then write into the removed file: a record nobody will
 /// ever read, whose lines the transcript's offset has moved past.
-fn queue_lock(pending_path: &Path) -> io::Result<fs::File> {
+pub(crate) fn queue_lock(pending_path: &Path) -> io::Result<fs::File> {
     // A hidden name: whatever lists a session directory's `pending*` files
     // must not take the lock for a queue.
     let name = pending_path
@@ -234,7 +235,10 @@ impl Claimed {
                     Err(e) if e.kind() == io::ErrorKind::NotFound => Box::new(std::iter::empty()),
                     Err(e) => Box::new(std::iter::once(Err(e))),
                 };
-            lines.filter(|line| !matches!(line, Ok(l) if l.trim().is_empty()))
+            lines
+                .filter(|line| !matches!(line, Ok(l) if l.trim().is_empty()))
+                // Still being read: not abandoned (see `ABANDONED_AFTER`).
+                .inspect(move |_| touch(path))
         })
     }
 
@@ -280,8 +284,14 @@ pub fn compacted(line: &str) -> Option<String> {
 
 /// Rewrite the queue at `pending_path` as [`compacted`] keeps it, one record
 /// at a time.
+///
+/// Every claim on the queue is taken over, whatever its age: this runs only
+/// under the directory's upgrade lock and before its mark exists, when no
+/// reader of this release can hold one, so a claim is what a compaction that
+/// was killed left behind, still uncompacted.
 fn compact(pending_path: &Path) -> io::Result<()> {
-    let claimed = claim(pending_path)?;
+    let every_claim = SystemTime::now() + ABANDONED_AFTER + ABANDONED_AFTER;
+    let claimed = claim_at(pending_path, every_claim)?;
     if claimed.is_empty() {
         return Ok(());
     }
@@ -315,14 +325,16 @@ pub fn upgrade(session_dir: &Path) -> io::Result<()> {
     if mark.exists() {
         return Ok(());
     }
-    let queues: Vec<PathBuf> = match fs::read_dir(session_dir) {
+    // Queues, and queues that exist only as the claim of a compaction that
+    // was killed.
+    let queues: std::collections::BTreeSet<PathBuf> = match fs::read_dir(session_dir) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())
-            .map(|e| e.path())
+            .filter_map(|e| queue_of(&e.path()))
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("pending") && n.ends_with(".jsonl"))
+                    .is_some_and(|n| n.starts_with("pending"))
             })
             .collect(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -550,6 +562,56 @@ mod tests {
 
         waiting.join().unwrap().unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), format!("{lines}\n"));
+    }
+
+    /// A compaction that was killed leaves the old queue under a claim's
+    /// name. The next upgrade finishes it, however recent the claim, instead
+    /// of marking the directory with the old records still in it.
+    #[test]
+    fn upgrade_finishes_a_compaction_that_was_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending-x.jsonl");
+        let lines = json(&record(Some("claude-code"), StreamEventType::Transcript, 4));
+        let event = record(Some("claude-code"), StreamEventType::ToolUse, 4);
+        fs::write(
+            dir.path().join("pending-x.jsonl.draining-killed"),
+            format!("{lines}\n{lines}\n{}\n", json(&event)),
+        )
+        .unwrap();
+
+        upgrade(dir.path()).unwrap();
+
+        let after = fs::read_to_string(&path).unwrap();
+        let records: Vec<&str> = after.lines().collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(parsed(records[0]).event_uuid, event.event_uuid);
+        assert_eq!(parsed(records[0]).transcript_lines, None);
+        assert!(!dir.path().join("pending-x.jsonl.draining-killed").exists());
+    }
+
+    /// A claim that is still being read is not taken for abandoned.
+    #[test]
+    fn reading_a_claim_keeps_it_from_being_taken_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending-x.jsonl");
+        let a = json(&record(Some("opencode"), StreamEventType::ToolUse, 1));
+        fs::write(&path, format!("{a}\n{a}\n")).unwrap();
+        let claimed = claim(&path).unwrap();
+        let file = claimed.files[0].clone();
+        let long_ago = SystemTime::now() - ABANDONED_AFTER - Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        let mut records = claimed.records();
+        records.next().unwrap().unwrap();
+        let other = claim(&path).unwrap();
+        assert!(other.is_empty(), "the reader is alive");
+        drop(records);
+        claimed.release();
     }
 
     #[test]

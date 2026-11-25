@@ -88,8 +88,12 @@ fn pending_queues_in(
     // `config.repo_id`. `status` counts these, so `flush` must be able to
     // drain them or they're stuck forever. If there's no bound repo_id,
     // skip it — there's nothing to attribute it to (best-effort).
+    // Also when it exists only as a claim an interrupted reader left.
     let legacy_path = session_dir.join("pending.jsonl");
-    if legacy_path.exists() {
+    let legacy_exists = fs::read_dir(session_dir)?
+        .filter_map(|e| e.ok())
+        .any(|e| crate::pending_queue::queue_of(&e.path()).as_ref() == Some(&legacy_path));
+    if legacy_exists {
         if let Some(repo_id) = bound_repo_id {
             pending_queues.push((legacy_path, QueueTarget::Repo(repo_id.to_string())));
         }
