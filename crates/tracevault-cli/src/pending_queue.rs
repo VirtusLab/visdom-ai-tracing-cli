@@ -260,25 +260,204 @@ impl Claimed {
 
     /// The claimed records in order, one at a time.
     pub fn records(&self) -> impl Iterator<Item = io::Result<String>> + Send + '_ {
-        self.files.iter().flat_map(|path| {
-            let lines: Box<dyn Iterator<Item = io::Result<String>> + Send> =
-                match fs::File::open(path) {
-                    Ok(file) => Box::new(io::BufReader::new(file).lines()),
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => Box::new(std::iter::empty()),
-                    Err(e) => Box::new(std::iter::once(Err(e))),
-                };
-            lines
-                .filter(|line| !matches!(line, Ok(l) if l.trim().is_empty()))
-                // Still being read: not abandoned (see `ABANDONED_AFTER`).
-                .inspect(move |_| touch(path))
-        })
+        let mut reader = self.reader();
+        std::iter::from_fn(move || reader.next_record().transpose())
     }
 
-    /// Remove the claimed files: every record was sent or queued again.
+    /// A reader that knows how far into the claim it is (see [`Reader`]).
+    pub fn reader(&self) -> Reader<'_> {
+        Reader {
+            files: &self.files,
+            file: 0,
+            open: None,
+            offset: 0,
+            last: Position { file: 0, offset: 0 },
+        }
+    }
+
+    /// The same claim, as one on the queue at `pending_path`: files claimed
+    /// from another queue are renamed to claims on this one, in order. For a
+    /// queue that is adopted (a repo switch): from here on its records are
+    /// sent as this queue's, and whoever takes the claim over after its
+    /// reader died must send them there too, not to the target they were
+    /// queued for.
+    pub fn retarget(mut self, pending_path: &Path) -> io::Result<Claimed> {
+        let (Some(dir), Some(prefix)) = (pending_path.parent(), claim_prefix(pending_path)) else {
+            return Ok(self);
+        };
+        for path in &mut self.files {
+            let named_for_it = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix));
+            if !named_for_it {
+                let renamed = dir.join(format!("{prefix}{}", uuid::Uuid::now_v7()));
+                fs::rename(&*path, &renamed)?;
+                *path = renamed;
+            }
+        }
+        Ok(self)
+    }
+
+    /// Give the claim up. With `rest` (where a [`Reader`] stopped) the
+    /// records from there on stay queued, in order and ahead of anything
+    /// queued since; without it every record was dealt with and nothing
+    /// stays.
+    ///
+    /// The rest is not copied back into the queue: each file is left as a
+    /// claim that counts as abandoned at once, cut down to what was not read
+    /// by replacing it in one step. A reader that dies anywhere in this
+    /// leaves every record in exactly one file, so recovery neither loses nor
+    /// repeats one. When nothing else was queued meanwhile, the one file
+    /// left takes the queue's own name again.
+    pub fn finish(self, rest: Option<Position>, pending_path: &Path) -> io::Result<()> {
+        let Some(rest) = rest else {
+            for path in &self.files {
+                let _ = fs::remove_file(path);
+            }
+            return Ok(());
+        };
+        let mut left = Vec::new();
+        for (i, path) in self.files.iter().enumerate() {
+            if i < rest.file {
+                let _ = fs::remove_file(path);
+                continue;
+            }
+            let from = if i == rest.file { rest.offset } else { 0 };
+            if cut(path, from)? {
+                left.push(path);
+            }
+        }
+        if let [only] = left[..] {
+            let _lock = queue_lock(pending_path)?;
+            if !pending_path.exists() && claimed_bytes(pending_path) == file_len(only) {
+                fs::rename(only, pending_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove the claimed files: every record was dealt with.
     pub fn release(self) {
         for path in &self.files {
             let _ = fs::remove_file(path);
         }
+    }
+}
+
+fn file_len(path: &Path) -> u64 {
+    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Leave of the claimed file `path` what starts at byte `from`, as a claim
+/// that counts as abandoned at once (its modification time is the epoch).
+/// `false` when nothing is left and the file is gone. The file is replaced
+/// in one step, never partly written.
+fn cut(path: &Path, from: u64) -> io::Result<bool> {
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if from >= file.metadata()?.len() {
+        fs::remove_file(path)?;
+        return Ok(false);
+    }
+    if from == 0 {
+        OpenOptions::new()
+            .append(true)
+            .open(path)?
+            .set_modified(SystemTime::UNIX_EPOCH)?;
+        return Ok(true);
+    }
+    // A hidden name, so the half-written file is no claim to anybody.
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!(".{name}.rest"));
+    let mut write = || -> io::Result<()> {
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(from))?;
+        let mut out = fs::File::create(&tmp)?;
+        io::copy(&mut file, &mut out)?;
+        out.set_modified(SystemTime::UNIX_EPOCH)?;
+        out.sync_all()?;
+        fs::rename(&tmp, path)
+    };
+    write()
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })
+        .map(|()| true)
+}
+
+/// Where a [`Reader`] is in a claim: a record's first byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Position {
+    file: usize,
+    offset: u64,
+}
+
+/// Reads a claim's records in order and can tell where the last one it
+/// returned began, which is where a reader that could not send it stops:
+/// [`Claimed::finish`] keeps what is from there on.
+pub struct Reader<'a> {
+    files: &'a [PathBuf],
+    file: usize,
+    open: Option<io::BufReader<fs::File>>,
+    offset: u64,
+    last: Position,
+}
+
+impl Reader<'_> {
+    /// The next record, or `None` at the claim's end. Blank lines are passed
+    /// over. Reading a file marks it as in use (see [`ABANDONED_AFTER`]).
+    pub fn next_record(&mut self) -> io::Result<Option<String>> {
+        loop {
+            let Some(path) = self.files.get(self.file) else {
+                self.last = Position {
+                    file: self.file,
+                    offset: 0,
+                };
+                return Ok(None);
+            };
+            if self.open.is_none() {
+                match fs::File::open(path) {
+                    Ok(f) => self.open = Some(io::BufReader::new(f)),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        self.file += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+                self.offset = 0;
+            }
+            let mut line = String::new();
+            let read = self
+                .open
+                .as_mut()
+                .expect("opened above")
+                .read_line(&mut line)?;
+            if read == 0 {
+                self.open = None;
+                self.file += 1;
+                continue;
+            }
+            self.last = Position {
+                file: self.file,
+                offset: self.offset,
+            };
+            self.offset += read as u64;
+            touch(path);
+            let record = line.trim();
+            if !record.is_empty() {
+                return Ok(Some(record.to_string()));
+            }
+        }
+    }
+
+    /// Where the record [`Self::next_record`] returned last began: with
+    /// [`Claimed::finish`], that record and all after it stay queued.
+    pub fn before_last(&self) -> Position {
+        self.last
     }
 }
 
@@ -324,16 +503,28 @@ pub fn compacted(line: &str) -> Option<String> {
 fn compact(pending_path: &Path) -> io::Result<()> {
     let every_claim = SystemTime::now() + ABANDONED_AFTER + ABANDONED_AFTER;
     let claimed = claim_at(pending_path, every_claim)?;
-    if claimed.is_empty() {
-        return Ok(());
+    // Each file is replaced by its compacted self in one step, so a
+    // compaction that is killed leaves files that are either done or not,
+    // and doing a done one again changes nothing.
+    for path in &claimed.files {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let tmp = path.with_file_name(format!(".{name}.compacting"));
+        let rewrite = || -> io::Result<()> {
+            let mut out = io::BufWriter::new(fs::File::create(&tmp)?);
+            for line in io::BufReader::new(fs::File::open(path)?).lines() {
+                if let Some(kept) = compacted(&line?) {
+                    writeln!(out, "{kept}")?;
+                }
+            }
+            out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+            fs::rename(&tmp, path)
+        };
+        rewrite().inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })?;
     }
-    for record in claimed.records() {
-        if let Some(kept) = compacted(&record?) {
-            requeue(pending_path, &kept)?;
-        }
-    }
-    claimed.release();
-    Ok(())
+    // Hand everything back, unread.
+    claimed.finish(Some(Position { file: 0, offset: 0 }), pending_path)
 }
 
 /// Marks a session directory whose queues hold every line once (see the
@@ -591,6 +782,123 @@ mod tests {
         assert_eq!(got, vec![a, b]);
         claimed.release();
         assert_eq!(files(dir.path()), 0);
+    }
+
+    fn queue_of_three(path: &Path) -> Vec<String> {
+        let records: Vec<String> = (0..3)
+            .map(|_| json(&record(Some("opencode"), StreamEventType::ToolUse, 1)))
+            .collect();
+        fs::write(path, format!("{}\n", records.join("\n"))).unwrap();
+        records
+    }
+
+    fn read_all(path: &Path) -> Vec<String> {
+        let claimed = claim_at(path, SystemTime::now() + ABANDONED_AFTER * 2).unwrap();
+        let got = claimed.records().map(Result::unwrap).collect();
+        claimed
+            .finish(Some(Position { file: 0, offset: 0 }), path)
+            .unwrap();
+        got
+    }
+
+    /// A reader that stops at a record leaves it and the ones after it
+    /// queued, once, under the queue's own name when nothing else is there.
+    #[test]
+    fn finishing_part_way_keeps_exactly_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending-x.jsonl");
+        let records = queue_of_three(&path);
+
+        let claimed = claim(&path).unwrap();
+        let mut reader = claimed.reader();
+        assert_eq!(reader.next_record().unwrap().as_ref(), Some(&records[0]));
+        assert_eq!(reader.next_record().unwrap().as_ref(), Some(&records[1]));
+        let stopped = reader.before_last();
+        drop(reader);
+        claimed.finish(Some(stopped), &path).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{}\n{}\n", records[1], records[2])
+        );
+        assert_eq!(files(dir.path()), 1);
+    }
+
+    /// A reader that dies after reading part of its claim, or while giving
+    /// it up, leaves each record in one file: whoever recovers it reads
+    /// every record once, however often that happens.
+    #[test]
+    fn a_reader_that_dies_leaves_no_record_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending-x.jsonl");
+        let records = queue_of_three(&path);
+
+        for _ in 0..3 {
+            // Reads two records, puts nothing back, and is gone.
+            let claimed = claim_at(&path, SystemTime::now() + ABANDONED_AFTER * 2).unwrap();
+            let mut reader = claimed.reader();
+            reader.next_record().unwrap();
+            reader.next_record().unwrap();
+            drop(reader);
+            std::mem::forget(claimed);
+        }
+        assert_eq!(read_all(&path), records);
+        assert_eq!(read_all(&path), records, "handing back repeats nothing");
+        assert!(file_len(&path) > 0 && files(dir.path()) == 1);
+    }
+
+    /// While something else was queued meanwhile, the rest stays a claim
+    /// that the next reader takes first, at once.
+    #[test]
+    fn the_rest_is_read_ahead_of_what_was_queued_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending-x.jsonl");
+        let records = queue_of_three(&path);
+        let newer = json(&record(Some("opencode"), StreamEventType::ToolUse, 1));
+
+        let claimed = claim(&path).unwrap();
+        let mut reader = claimed.reader();
+        reader.next_record().unwrap();
+        let stopped = reader.before_last();
+        drop(reader);
+        assert!(try_append(&path, &newer).unwrap());
+        claimed.finish(Some(stopped), &path).unwrap();
+
+        let next = claim(&path).unwrap();
+        let got: Vec<String> = next.records().map(Result::unwrap).collect();
+        let mut want = records.clone();
+        want.push(newer);
+        assert_eq!(got, want);
+        next.release();
+        assert_eq!(files(dir.path()), 0);
+    }
+
+    /// An adopted queue's files become claims on the queue that adopts it,
+    /// so a recovery sends them where the adoption was sending them.
+    #[test]
+    fn an_adopted_claim_is_recovered_as_the_adopting_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("pending-project-p.jsonl");
+        let repo = dir.path().join("pending-r.jsonl");
+        let records = queue_of_three(&project);
+
+        let claimed = claim(&project).unwrap().retarget(&repo).unwrap();
+        // The hook dies here.
+        std::mem::forget(claimed);
+
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.ends_with(".lock"))
+            .collect();
+        assert_eq!(names.len(), 1);
+        assert!(
+            names[0].starts_with("pending-r.jsonl.draining-"),
+            "{names:?}"
+        );
+        assert_eq!(queue_of(&dir.path().join(&names[0])), Some(repo.clone()));
+        assert_eq!(read_all(&repo), records);
+        assert!(read_all(&project).is_empty());
     }
 
     #[test]

@@ -587,6 +587,55 @@ fn flush_sends_what_an_ended_session_left_unread_in_its_transcript() {
     assert_eq!(rx.try_iter().count(), 0);
 }
 
+/// What `flush` reads from a transcript and cannot send stays there, in every
+/// batch and not only the first: the lines after the offset are where the
+/// catch-up sweep of a later session start looks for the `cost-state`
+/// report, and a queued copy would move the offset past it.
+#[test]
+fn flush_leaves_what_it_cannot_send_in_the_transcript() {
+    let fx = Fixture::new();
+    fx.lines(1, 100);
+    let (up, _rx) = spawn_server(ALWAYS);
+    fx.hook(&up);
+
+    // 9 MB more, unread: three batches for `flush`.
+    fx.lines(90, 100_000);
+    let before = fx.offset();
+    let (flaky, rx) = spawn_server(12);
+    let out = fx.command(&flaky).arg("flush").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let stored_now = stored(&rx.try_iter().collect::<Vec<_>>()).len();
+    assert!(stored_now > 0 && stored_now < 90, "{stored_now}");
+    let offset = fx.offset();
+    assert!(
+        offset > before + 4 * 1024 * 1024,
+        "past the first batch: {offset}"
+    );
+    assert!(offset < fx.transcript_len());
+    assert!(
+        stored(&queued(&fx.queue())).is_empty(),
+        "no line of the transcript is queued"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("of 1 not"), "{stdout}");
+
+    // The rest goes with the next flush: every line once.
+    let (up, rx) = spawn_server(ALWAYS);
+    assert!(fx
+        .command(&up)
+        .arg("flush")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert_eq!(
+        stored(&rx.try_iter().collect::<Vec<_>>()).len(),
+        90 - stored_now
+    );
+    assert_eq!(fx.offset(), fx.transcript_len());
+}
+
 /// `Stop` may be the session's last hook, so it does not leave the rest of a
 /// backlog for a next one: it reads to the end, a batch at a time, and what
 /// it cannot send in time it queues.

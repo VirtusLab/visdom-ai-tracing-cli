@@ -1276,7 +1276,9 @@ async fn deliver_subagent_transcripts(
     deadline: std::time::Instant,
     wait_for_lock: Option<std::time::Instant>,
     warned: &mut bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
+    // Whether every file was read to its end and all of it accepted.
+    let mut complete = true;
     for file in crate::subagents::transcripts(transcript_path) {
         let offset_path = crate::subagents::offset_path(session_dir, &file);
         // Held until the offset is written (see `subagents::try_lock`).
@@ -1291,6 +1293,7 @@ async fn deliver_subagent_transcripts(
         let _lock = match lock {
             Ok(Some(lock)) => lock,
             Ok(None) => {
+                complete = false;
                 if wait_for_lock.is_some() {
                     eprintln!(
                         "{TOP}: warning: skipping subagent transcript {}: \
@@ -1305,6 +1308,7 @@ async fn deliver_subagent_transcripts(
                     "{TOP}: warning: skipping subagent transcript {}: cannot lock: {e}",
                     file.display()
                 );
+                complete = false;
                 continue;
             }
         };
@@ -1321,6 +1325,7 @@ async fn deliver_subagent_transcripts(
                         "{TOP}: warning: skipping subagent transcript {}: {e}",
                         file.display()
                     );
+                    complete = false;
                     break;
                 }
             };
@@ -1356,12 +1361,16 @@ async fn deliver_subagent_transcripts(
             if let Some(next) = next {
                 crate::subagents::write_offset(&offset_path, next)?;
             }
-            if wait_for_lock.is_none() || next != Some(batch.end) {
+            let stopped_short = next != Some(batch.end);
+            if wait_for_lock.is_none() || stopped_short {
+                let unread = fs::metadata(&file).is_ok_and(|m| m.len() as i64 > batch.end);
+                complete &= delivered.all && !stopped_short && !unread;
                 break;
             }
+            complete &= delivered.all;
         }
     }
-    Ok(())
+    Ok(complete)
 }
 
 /// Choose the transcript source for a stream event. Inline records (from a
@@ -1777,9 +1786,11 @@ pub(crate) enum Sender {
 /// What a [`stream_event`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sent {
-    /// Every request was accepted: nothing was left in the queue.
+    /// Every request was accepted, and nothing this event was to send is
+    /// left in the queue or unread.
     Accepted,
-    /// Something was queued: a send failed, or the deadline came first.
+    /// Something was not sent: a send failed, the deadline came first, or
+    /// another hook held a transcript this one was to read.
     Queued,
     /// Nothing was sent: no attribution resolved, or (catch-up) not the one
     /// the session recorded.
@@ -2155,8 +2166,10 @@ pub(crate) async fn stream_event(
     // The adopted queue is read first (its events are older), and with it
     // whatever a reader that died left claimed from it: after the switch no
     // hook reads that queue under its own name again.
+    // Its files become claims on this target's queue before anything is
+    // sent, so a reader that takes them over sends them here as well.
     let claimed = match adopted {
-        Some(adopted) => crate::pending_queue::claim(&adopted)?,
+        Some(adopted) => crate::pending_queue::claim(&adopted)?.retarget(&pending_path)?,
         None => crate::pending_queue::Claimed::default(),
     }
     .then(crate::pending_queue::claim(&pending_path)?);
@@ -2168,44 +2181,50 @@ pub(crate) async fn stream_event(
     let mut warned = false;
 
     // Send pending events first, one record at a time (the queue is never
-    // held whole in memory). From the first one that fails, or past the
-    // delivery budget, the rest goes back to the queue unsent, in order: the
-    // failed event and the ones never attempted, not those the server already
-    // answered. The claimed file is removed only once every record was sent
-    // or queued again, so a hook killed at its timeout loses none of them (a
-    // later hook takes the claim over), and a hook that queues meanwhile
-    // writes to a new file.
-    for record in claimed.records() {
-        let record = record?;
-        if !send_failed {
-            let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(&record) else {
-                continue;
-            };
-            if std::time::Instant::now() >= deadline {
-                send_failed = true;
-            } else {
-                // Capped like `deliver_parts`, so the subagent sweep below is
-                // still reached.
-                let failure = match tokio::time::timeout_at(
-                    (deadline + IN_FLIGHT_GRACE).into(),
-                    send_stream_event(&client, &attribution, force, &pending_req, &mut warned),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => continue,
-                    Ok(Err(e)) => e.to_string(),
-                    Err(_) => "no answer in time".to_string(),
-                };
-                warn_unsent(&mut warned, &failure);
-                // A record the server (or a proxy before it) finds too large
-                // will be found so again: it is kept, since its lines are
-                // nowhere else, but it must not hold up what is behind it.
-                send_failed = !too_large(&failure);
-            }
+    // held whole in memory). At the first one that fails, or past the
+    // delivery budget, the hook stops, and that record and the ones never
+    // attempted stay queued, in order, ahead of what this hook queues below.
+    // They are not copied back: the claim is cut down to them (see
+    // `Claimed::finish`), so a hook killed at its timeout leaves every
+    // record in one place, and a hook that queues meanwhile writes to a new
+    // file.
+    let mut rest = None;
+    let mut reader = claimed.reader();
+    while let Some(record) = reader.next_record()? {
+        let Ok(pending_req) = serde_json::from_str::<StreamEventRequest>(&record) else {
+            continue;
+        };
+        if std::time::Instant::now() >= deadline {
+            send_failed = true;
+            rest = Some(reader.before_last());
+            break;
         }
-        crate::pending_queue::requeue(&pending_path, &record)?;
+        // Capped like `deliver_parts`, so the subagent sweep below is still
+        // reached.
+        let failure = match tokio::time::timeout_at(
+            (deadline + IN_FLIGHT_GRACE).into(),
+            send_stream_event(&client, &attribution, force, &pending_req, &mut warned),
+        )
+        .await
+        {
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => "no answer in time".to_string(),
+        };
+        warn_unsent(&mut warned, &failure);
+        if too_large(&failure) {
+            // A record the server (or a proxy before it) finds too large
+            // will be found so again: it is kept, since its lines are nowhere
+            // else, but behind the others, which it must not hold up.
+            crate::pending_queue::requeue(&pending_path, &record)?;
+            continue;
+        }
+        send_failed = true;
+        rest = Some(reader.before_last());
+        break;
     }
-    claimed.release();
+    drop(reader);
+    claimed.finish(rest, &pending_path)?;
 
     // Send the current event — several requests when its transcript batch
     // exceeds the request cap (see `split_into_parts`), never dropping lines.
@@ -2213,6 +2232,15 @@ pub(crate) async fn stream_event(
     // ended the session on the server.
     let sends_event = sends_main
         && !(req.event_type == StreamEventType::Transcript && req.transcript_lines.is_none());
+    // One answer for every batch of this event, the ones a `Stop` or a
+    // `flush` reads on to included.
+    let unsent = if is_inline {
+        Unsent::Inline
+    } else if event_type == "session-end" {
+        Unsent::StayInFile
+    } else {
+        Unsent::Queued
+    };
     let delivered = if sends_event {
         deliver_parts(
             &client,
@@ -2222,13 +2250,7 @@ pub(crate) async fn stream_event(
             &pending_path,
             send_failed,
             deadline,
-            if is_inline {
-                Unsent::Inline
-            } else if event_type == "session-end" {
-                Unsent::StayInFile
-            } else {
-                Unsent::Queued
-            },
+            unsent,
             &mut warned,
         )
         .await?
@@ -2290,7 +2312,7 @@ pub(crate) async fn stream_event(
                     &pending_path,
                     send_failed || !all_accepted,
                     deadline,
-                    Unsent::Queued,
+                    unsent,
                     &mut warned,
                 )
                 .await?;
@@ -2309,8 +2331,9 @@ pub(crate) async fn stream_event(
     // out of the main file). Swept on every hook, not only on `SubagentStop`,
     // so a long-running or background subagent is sent while it runs, and
     // the final hooks read every file to its end.
+    let mut complete = !send_failed && all_accepted && sends_lines;
     if sender != Sender::CatchUp && agent == crate::agent::Agent::ClaudeCode {
-        deliver_subagent_transcripts(
+        complete &= deliver_subagent_transcripts(
             &client,
             &attribution,
             force,
@@ -2327,7 +2350,7 @@ pub(crate) async fn stream_event(
         .await?;
     }
 
-    Ok(if !send_failed && all_accepted {
+    Ok(if complete {
         Sent::Accepted
     } else {
         Sent::Queued

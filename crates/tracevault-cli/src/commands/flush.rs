@@ -310,8 +310,9 @@ async fn drain_queue(
 
     let mut sent = 0u64;
     let mut failed = 0u64;
-    // After a refusal nothing more is tried: the rest goes back unsent.
-    let mut refused = false;
+    // Where the drain stopped, when it did: from there on the claim's
+    // records stay queued as they are (see `Claimed::finish`).
+    let mut rest = None;
 
     // Label the progress and warning lines with the session directory the
     // queue lives in. It is the same id the hook stamped on every event here
@@ -324,13 +325,9 @@ async fn drain_queue(
         .and_then(|n| n.to_str())
         .unwrap_or("?");
 
-    for (i, record) in claimed.records().enumerate() {
-        let record = record?;
-        if refused {
-            crate::pending_queue::requeue(pending_path, &record)?;
-            failed += 1;
-            continue;
-        }
+    let mut reader = claimed.reader();
+    let mut n = 0u64;
+    while let Some(record) = reader.next_record()? {
         let mut event = match serde_json::from_str::<StreamEventRequest>(&record) {
             Ok(event) => event,
             Err(e) => {
@@ -338,10 +335,10 @@ async fn drain_queue(
                 continue;
             }
         };
+        n += 1;
         eprint!(
-            "\r  Session {} — event {} ...",
+            "\r  Session {} — event {n} ...",
             display_prefix(queue_dir_name),
-            i + 1,
         );
         event.truncate_large_fields();
         match send_queued_event(client, target, capture_pid, force, &event).await {
@@ -369,16 +366,20 @@ async fn drain_queue(
                     "{}",
                     crate::commands::stream::refused_error(pid, &kind, force)
                 );
-                // The refused event and the untried rest are failed, like
-                // the earlier failures.
-                crate::pending_queue::requeue(pending_path, &serde_json::to_string(&event)?)?;
+                // The refused event and the untried rest stay queued and
+                // are failed, like the earlier failures.
+                rest = Some(reader.before_last());
                 failed += 1;
-                refused = true;
+                while reader.next_record()?.is_some() {
+                    failed += 1;
+                }
+                break;
             }
         }
     }
     eprintln!();
-    claimed.release();
+    drop(reader);
+    claimed.finish(rest, pending_path)?;
     Ok((sent, failed))
 }
 

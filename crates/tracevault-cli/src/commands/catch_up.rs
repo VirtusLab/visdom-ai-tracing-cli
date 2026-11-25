@@ -325,7 +325,7 @@ pub(crate) async fn send_rest(
     {
         Ok(sent) => Some(sent),
         Err(e) => {
-            eprintln!("{TOP}: cannot send the rest of session {session_id}: {e}");
+            eprintln!("{TOP}: cannot send the rest of a session: {e}");
             Some(stream::Sent::Queued)
         }
     }
