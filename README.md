@@ -332,8 +332,11 @@ directories, so after a new `login` or `init` its hooks would find no login and 
 ## Install
 
 ```bash
-brew install VirtusLab/visdom-ai-tracing/tracevault
+brew install VirtusLab/visdom/visdom
 ```
+
+(`brew install VirtusLab/visdom/tracevault` for the `tracevault` binary; the tap was
+`VirtusLab/visdom-ai-tracing` before, and that name still resolves.)
 
 or from crates.io:
 
@@ -1224,12 +1227,14 @@ Releases are automated with [release-plz](https://release-plz.dev) by
 1. It opens (or updates) a release PR that bumps versions and the changelog.
 2. Merging that release PR publishes the crates, creates the tags and GitHub releases, and, when
    `tracevault-cli` was released, starts `release-binaries.yml` for the binaries and the
-   Homebrew formula.
+   Homebrew formulae (`visdom` and `tracevault`, in the tap `VirtusLab/homebrew-visdom`; the
+   workflow needs the `HOMEBREW_TAP_TOKEN` secret, a token that may write that repository's
+   contents).
 
 `tracevault-cli` and `visdom-ai-tracing-protocol` share the workspace version. `visdom-cli` has
 its own (1.0 and on), set in `crates/visdom-cli/Cargo.toml`; its binary still ships in the
-`tracevault-cli` release archives, so the archive and the Homebrew formula carry `tracevault`'s
-version while `visdom --version` prints its own.
+`tracevault-cli` release archives, so the archive and its download URLs carry `tracevault`'s
+version while `visdom --version` and the `visdom` formula carry its own.
 
 GitHub sometimes does not fire the `push` event after a squash merge. If a merge to `main`
 produced no "Release-plz" run (check `gh run list --workflow release-plz.yml`), start one by
