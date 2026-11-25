@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/visdom-v1.1.0...visdom-v1.1.1) - 2026-11-25
+
+### Other
+
+- updated the following local packages: tracevault-cli
+
 ## [1.1.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/visdom-v1.0.0...visdom-v1.1.0) - 2026-11-24
 
 ### Added
