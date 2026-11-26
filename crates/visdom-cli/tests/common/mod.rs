@@ -17,6 +17,24 @@ pub mod http;
 /// claude.ai login: shaped like Claude Code's OAuth tokens.
 pub const FAKE_LOGIN_TOKEN: &str = "sk-ant-oat01-fake-login";
 
+/// What the stand-ins for Claude Code answer to `auth status` unless
+/// `FAKE_CLAUDE_AUTH_STATUS` gives another answer: signed in with a
+/// claude.ai subscription, as Claude Code 2.1.332 prints it.
+pub const SUBSCRIPTION_LOGIN: &str = r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"team"}"#;
+
+/// The first lines of a shell stand-in for Claude Code: `auth status`
+/// answers as [`SUBSCRIPTION_LOGIN`] (or `FAKE_CLAUDE_AUTH_STATUS`), exits
+/// 1 when signed out as Claude Code does, and is not recorded as a run.
+fn shell_auth_status() -> String {
+    format!(
+        "if [ \"$1\" = auth ] && [ \"$2\" = status ]; then\n  \
+         if [ -n \"$FAKE_CLAUDE_AUTH_STATUS\" ]; then status=\"$FAKE_CLAUDE_AUTH_STATUS\"; \
+         else status='{SUBSCRIPTION_LOGIN}'; fi\n  \
+         printf '%s\\n' \"$status\"\n  \
+         case \"$status\" in *'\"loggedIn\":false'*) exit 1;; esac\n  exit 0\nfi\n"
+    )
+}
+
 pub struct Sandbox {
     pub home: TempDir,
     pub repo: TempDir,
@@ -52,6 +70,12 @@ impl Sandbox {
         config_root.join("visdom/config.toml")
     }
 
+    /// Where `visdom` reads the Claude Code settings an organisation manages,
+    /// in this sandbox (none unless a test writes them).
+    pub fn managed_settings(&self) -> PathBuf {
+        self.home.path().join("managed-settings.json")
+    }
+
     pub fn write_user_config(&self, content: &str) {
         let path = self.user_config();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -67,6 +91,9 @@ impl Sandbox {
             .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
             .env("CODEX_HOME", self.home.path().join(".codex"))
             .env("XDG_STATE_HOME", self.home.path().join(".local/state"))
+            // The machine's own managed Claude Code settings are not the
+            // sandbox's.
+            .env("VISDOM_CLAUDE_MANAGED_SETTINGS", self.managed_settings())
             .stdin(Stdio::null());
         for name in [
             "SERVER_URL",
@@ -135,7 +162,8 @@ impl Sandbox {
         let script = dir.join("recording-agent");
         let log = dir.join("recording-agent.log");
         let mut text = format!(
-            "#!/bin/sh\nexec >> '{}'\nfor a in \"$@\"; do printf 'arg:%s\\n' \"$a\"; done\n",
+            "#!/bin/sh\n{}exec >> '{}'\nfor a in \"$@\"; do printf 'arg:%s\\n' \"$a\"; done\n",
+            shell_auth_status(),
             log.display()
         );
         for name in variables {
@@ -174,6 +202,10 @@ impl Sandbox {
             r#"#!/usr/bin/env python3
 import json, os, stat, subprocess, sys, time, urllib.request, urllib.error
 args = sys.argv[1:]
+if args[:2] == ["auth", "status"]:
+    status = os.environ.get("FAKE_CLAUDE_AUTH_STATUS") or '{SUBSCRIPTION_LOGIN}'
+    print(status)
+    sys.exit(0 if json.loads(status).get("loggedIn") else 1)
 record = {{"args": args}}
 flag = {{}}
 if "--settings" in args:
@@ -241,7 +273,8 @@ with open({log:?}, "a") as f:
         fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf '%s|%s\\n' \"$(pwd -P)\" \"$*\" >> '{}'\n",
+                "#!/bin/sh\n{}printf '%s|%s\\n' \"$(pwd -P)\" \"$*\" >> '{}'\n",
+                shell_auth_status(),
                 log.display()
             ),
         )

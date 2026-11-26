@@ -78,7 +78,10 @@ could have settled:
 - it issues your personal key and tries it on the LLM gateway;
 - it writes down the model alias the agent will ask for (`[gateway] claude_code_model` /
   `codex_model`): the one picked for the agent, or, when none of the aliases is named for it, the
-  one you pick;
+  one you pick (paid by a subscription, only aliases that take a subscription call);
+- paid by a subscription, it checks that the setup is consistent and that the deployment
+  supports it (see [Checks of a subscription setup](#checks-of-a-subscription-setup)), and fails
+  when it is not;
 - it prints what it set up and **where each setting comes from**:
 
   ```text
@@ -240,7 +243,8 @@ With `subscription`, `visdom` starts Claude Code like this:
   gives less than two weeks); then a new one is issued, and the old one keeps working for the
   sessions that have it until it expires. `visdom logout` revokes them all at the console.
   A gateway whose console does not know subscription keys yet (it answers with an ordinary key)
-  or that does not take subscription traffic stops the launch with its reason.
+  or that does not take subscription traffic stops the launch with its reason (see
+  [Checks of a subscription setup](#checks-of-a-subscription-setup)).
 - There is **no key helper**: Claude Code ranks `apiKeyHelper` above its claude.ai login, so the
   settings `visdom` passes set it to nothing, which also undoes one in your own Claude settings.
   The key goes in the `x-litellm-api-key` header (`ANTHROPIC_CUSTOM_HEADERS`; one of that name
@@ -271,6 +275,35 @@ value that would win. `visdom doctor` and init's summary show the value and wher
 says why (hooks have no gateway key that would pay or not pay). A workspace policy `enforced`
 allows either value — it means through the gateway, not paid by the project; under `direct` the
 setting is unused.
+
+#### Checks of a subscription setup
+
+With `billing = subscription`, `visdom init` ends with a check that the whole setup is consistent
+and that this deployment supports it, so that you learn it at init and not at the first failed
+request. `visdom doctor` and a plain `visdom` run the same checks. Each is a finding:
+
+| Finding | Checks | When it fails |
+| --- | --- | --- |
+| `gateway.subscription` | The gateway takes subscription traffic: `subscriptionTraffic` in the console's `GET /api/settings` is `allowed`. `denied`, or no such field (a gateway from before the setting), counts as not supported. | See below. |
+| `gateway.claude_login` | Claude Code is signed in with a claude.ai subscription: `claude auth status` (run without `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`, as the session would be) says `authMethod: claude.ai`, or that a claude.ai login is stored. | Not signed in, or signed in with an Anthropic Console key: start `claude` and run `/login` with your claude.ai account. A Claude Code that cannot answer is reported as not checked and stops nothing. |
+| `gateway.subscription_model` | The model alias is one the gateway takes a subscription call on (`subscription: true` in the project's `models` in `GET /api/me/keys`; only aliases served by Anthropic directly). | Names the aliases that do; set `claude_code_model` under `[gateway]` (or `VISDOM_GATEWAY_MODEL`) to one of them. A gateway that does not publish the list is a warning. |
+| `gateway.subscription_key` | A subscription key is issued (or the kept one reused) and the gateway accepts it (`GET /v1/models`); with its expiry date. `visdom doctor` issues none: it tries the kept key, and without one says that `visdom` gets one when it starts. | The console's or the gateway's reason; its `subscription_traffic_denied` code is the message below. |
+| `gateway.claude_settings` | Nothing in Claude Code's settings takes the session over from the claude.ai login. | Settings your organisation manages (`/etc/claude-code/managed-settings.json`, on macOS `/Library/Application Support/ClaudeCode/managed-settings.json`) that set `apiKeyHelper`, `forceLoginMethod` other than `claudeai`, or `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS` in `env` are an error: they come after `visdom`'s. An `apiKeyHelper` in your own settings (`~/.claude/settings.json`, the project's `.claude/settings*.json`) is a warning: `visdom` sets it aside, but a Claude Code started without it (`source <(visdom env)`) would use it. |
+
+When the gateway does not take subscription traffic, `visdom init` prints exactly
+
+```text
+Your platform configuration doesn't support subscription traffic through visdom gateway. Contact your platform administrator or use Claude API key or agent hooks
+  Claude API key (the project pays): visdom --billing project init; agent hooks: visdom --mode hooks init
+```
+
+and exits 1 before asking for a key. Any other failed check also makes `init` exit 1, after
+listing what to correct. In `init`, the model alias question offers only the aliases that take a
+subscription call, and an alias picked without asking is one of them.
+
+`visdom doctor` exits 1 on any of these errors. A plain `visdom` treats them as it treats any
+gateway that cannot be used: under a workspace policy `enforced` the agent is not started;
+otherwise it is started with hooks tracing, and the findings above it say why.
 
 Through the gateway, the gateway sees and forwards the subscription's traffic, including its
 credential. Whether your organisation's arrangement with Anthropic permits that is for your

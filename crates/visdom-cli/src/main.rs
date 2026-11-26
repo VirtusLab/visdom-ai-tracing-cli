@@ -22,6 +22,7 @@ use visdom_cli::interactive::InitScope;
 use visdom_cli::mode::{
     configured_mode, ModeReason, TracingMode, TrafficPolicy, GATEWAY_SESSION_ENV, MODE_ENV,
 };
+use visdom_cli::subscription;
 use visdom_cli::suite::PolicyState;
 use visdom_cli::{config, interactive};
 use visdom_cli::{doctor as checks, env_alias, instructions, launch};
@@ -264,6 +265,7 @@ fn doctor(
 ) -> ! {
     let env = Environment::current();
     let mut session = gather(&env, agent, mode, billing, runtime);
+    check_subscription(&mut session, runtime, true);
     let mut findings = session.collect();
     let policy = policy_for(fix_flag, yes, true, stdin_is_tty());
     if policy != FixPolicy::Never && findings.iter().any(|f| f.fix.is_some()) {
@@ -271,6 +273,7 @@ fn doctor(
         print_attention(&findings);
         if fix(&findings, policy, &mut RealExecutor::new(json, policy)).applied {
             session = gather(&env, agent, mode, billing, runtime);
+            check_subscription(&mut session, runtime, true);
             findings = session.collect();
         }
     }
@@ -280,6 +283,18 @@ fn doctor(
         print!("{}", render_text(&findings));
     }
     exit(exit_code(&findings))
+}
+
+/// Check that a session on the developer's Claude subscription can work here
+/// (nothing for any other session). `doctor` also tries the kept key; a
+/// launch gets or tries its key when it prepares the gateway.
+fn check_subscription(session: &mut Session, runtime: &tokio::runtime::Runtime, doctor: bool) {
+    if !session.on_subscription() {
+        return;
+    }
+    let model = session.subscription_model();
+    let key = doctor.then(|| session.kept_subscription_key(runtime, now()));
+    session.check_subscription(model.as_deref(), key.as_ref());
 }
 
 /// The agent `visdom init` sets up: the one typed, else the one configured
@@ -683,9 +698,19 @@ fn init_gateway(
             }
         }
     }
+    // Paid by a subscription: first of all, whether the platform takes it.
+    // A gateway that says nothing of it (an older one) does not.
+    let on_subscription = session.on_subscription();
+    if let (true, Some(Ok(plan))) = (on_subscription, &session.gateway) {
+        if !plan.subscription_traffic.supported() {
+            subscription_not_supported();
+        }
+    }
     let visdom = std::env::current_exe().unwrap_or_else(|_| "visdom".into());
     let mut prepared = match launch::prepare_gateway(&session, runtime, &visdom, now()) {
         Ok(prepared) => prepared,
+        // The console refused the subscription key: the deployment denies it.
+        Err(why) if subscription::is_not_supported(&why) => subscription_not_supported(),
         Err(why) => {
             eprintln!("visdom: the AI Gateway is not ready: {why}");
             eprintln!(
@@ -695,9 +720,10 @@ fn init_gateway(
             exit(1);
         }
     };
-    let Some(Ok(plan)) = &session.gateway else {
+    let Some(Ok(plan)) = session.gateway.clone() else {
         return;
     };
+    let plan = &plan;
     let mut sources = session.gateway_sources.clone();
     let in_user_config = |key: &str| {
         Some(format!(
@@ -738,24 +764,45 @@ fn init_gateway(
     if sources.model.is_none() {
         // Nobody named a model: the one picked for the agent, else theirs to
         // pick. Written down either way, so it does not change by itself.
+        // Paid by a subscription, only the aliases that take it are offered.
         let picked = prepared.launch.model.clone().or_else(|| {
-            asking
+            (asking && !prepared.pickable.is_empty())
                 .then(|| {
                     interactive::ask_choice(
                         &format!(
                             "Which model alias should {} ask the AI Gateway for?",
                             agent.label()
                         ),
-                        &prepared.available,
+                        &prepared.pickable,
                     )
                 })
                 .flatten()
-                .map(|i| prepared.available[i].clone())
+                .map(|i| prepared.pickable[i].clone())
         });
         if let Some(model) = picked {
             save_gateway(&session.user_config_path, &model_key, &model);
             sources.model = in_user_config(&model_key);
             prepared.launch.model = Some(model);
+        }
+    }
+    if on_subscription {
+        // The final check: everything the session on the subscription needs,
+        // with the key just issued (or kept) and accepted.
+        session.gateway_sources = sources.clone();
+        session.check_subscription(
+            prepared.launch.model.as_deref(),
+            Some(&subscription::KeyState::Accepted {
+                expires_at: prepared.key_expires_at,
+            }),
+        );
+        print_attention(&session.subscription);
+        if session.subscription_blocked() {
+            eprintln!(
+                "visdom: the AI Gateway is not ready for {} on your Claude subscription: correct \
+                 what is marked above and run `visdom init` again",
+                agent.label()
+            );
+            exit(1);
         }
     }
     if let Err(why) = launch::usable_model(
@@ -780,6 +827,14 @@ fn init_gateway(
             &session.user_config_path,
         )
     );
+}
+
+/// The platform does not take subscription traffic: said in the product
+/// owner's words, with the commands for the two ways out, and init fails.
+fn subscription_not_supported() -> ! {
+    eprintln!("{}", subscription::NOT_SUPPORTED);
+    eprintln!("  {}", subscription::ALTERNATIVES);
+    exit(1)
 }
 
 /// Who pays at the next plain `visdom` here, as the files say now.
@@ -935,6 +990,25 @@ fn agent_command(
         return hooks(session);
     }
     stop_on_billing(session);
+    let required = matches!(
+        session.mode.reason,
+        ModeReason::Policy(TrafficPolicy::Enforced)
+    );
+    if session.subscription_blocked() {
+        // Why was said with the findings above.
+        if required {
+            eprintln!(
+                "visdom: the workspace requires the AI Gateway, which cannot take this session \
+                 on your Claude subscription, so the agent is not started"
+            );
+            exit(1);
+        }
+        eprintln!(
+            "visdom: the AI Gateway cannot take this session on your Claude subscription: \
+             starting the agent with hooks tracing instead"
+        );
+        return hooks(session);
+    }
     let visdom = std::env::current_exe().unwrap_or_else(|_| "visdom".into());
     let prepared = launch::prepare_gateway(session, runtime, &visdom, now()).and_then(|prepared| {
         session
@@ -959,10 +1033,7 @@ fn agent_command(
             if matches!(session.gateway, Some(Ok(_))) {
                 eprintln!("visdom: {why}");
             }
-            if matches!(
-                session.mode.reason,
-                ModeReason::Policy(TrafficPolicy::Enforced)
-            ) {
+            if required {
                 eprintln!(
                     "visdom: the workspace requires the AI Gateway, so the agent is not started"
                 );
@@ -998,11 +1069,13 @@ fn check_and_launch(
 ) -> ! {
     let env = Environment::current();
     let mut session = gather(&env, agent, mode, billing, &runtime);
+    check_subscription(&mut session, &runtime, false);
     let findings = session.collect();
     print_attention(&findings);
     let policy = policy_for(false, yes, false, stdin_is_tty());
     if fix(&findings, policy, &mut RealExecutor::new(false, policy)).applied {
         session = gather(&env, agent, mode, billing, &runtime);
+        check_subscription(&mut session, &runtime, false);
         // What is still open, once, above the agent.
         print_attention(&session.collect());
     } else if policy == FixPolicy::Never && findings.iter().any(|f| f.fix.is_some()) {

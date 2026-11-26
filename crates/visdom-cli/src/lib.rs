@@ -17,6 +17,7 @@ pub mod instructions;
 pub mod interactive;
 pub mod launch;
 pub mod mode;
+pub mod subscription;
 pub mod suite;
 #[cfg(test)]
 mod test_http;

@@ -5,7 +5,7 @@ use tracevault_cli::agent::Agent;
 
 use crate::billing::{Billing, BillingUse, ResolvedBilling};
 use crate::finding::{Finding, Severity};
-use crate::gateway::OpenProject;
+use crate::gateway::{OpenProject, SubscriptionTraffic};
 use crate::mode::{ModeReason, ResolvedMode, TracingMode, TrafficPolicy};
 use crate::suite::PolicyState;
 
@@ -20,6 +20,8 @@ pub struct GatewayPlan {
     /// The LLM gateway the agent calls.
     pub llm_url: String,
     pub project: OpenProject,
+    /// Whether the gateway takes calls paid by a Claude subscription.
+    pub subscription_traffic: SubscriptionTraffic,
 }
 
 /// The mode, and the policy behind it. Nothing here needs attention unless
@@ -207,7 +209,9 @@ mod tests {
                 id: "p-1".to_string(),
                 slug: "alpha".to_string(),
                 name: "Alpha".to_string(),
+                models: None,
             },
+            subscription_traffic: SubscriptionTraffic::Allowed,
         }
     }
 

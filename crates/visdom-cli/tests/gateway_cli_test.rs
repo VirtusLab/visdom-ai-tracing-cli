@@ -1818,8 +1818,8 @@ fn a_workspaces_new_config_keeps_the_billing_chosen_further_up() {
         SUITE,
         ("GET /api/v1/workspace/settings", 200, &settings),
         PROJECTS,
-        SETTINGS,
-        ONE_PROJECT,
+        SUB_SETTINGS,
+        SUB_PROJECT,
         SUB_ISSUE,
         MODELS,
     ]);
@@ -1872,15 +1872,29 @@ fn gateway_server(policy_name: &str) -> MockServer {
     ])
 }
 
-/// A gateway whose console issues a subscription key first, then an
-/// ordinary one, and whose LLM endpoint answers messages.
+/// The console's settings of a gateway that takes subscription traffic.
+const SUB_SETTINGS: (&str, u16, &str) = (
+    "GET /api/settings",
+    200,
+    r#"{"llmGatewayUrl":"{URL}","mcpGatewayUrl":"{URL}","suite":[],"controlPlaneUrl":"{URL}","subscriptionTraffic":"allowed"}"#,
+);
+/// One project, whose models say which take a subscription call.
+const SUB_PROJECT: (&str, u16, &str) = (
+    "GET /api/me/keys",
+    200,
+    r#"{"hours":24,"projects":[{"id":"p-1","slug":"alpha","name":"Alpha","budget":null,"models":[{"alias":"gpt-general","subscription":false},{"alias":"claude-sonnet","subscription":true}]}],"keys":[]}"#,
+);
+
+/// A gateway that takes subscription traffic, whose console issues a
+/// subscription key first, then an ordinary one, and whose LLM endpoint
+/// answers messages.
 fn subscription_server(policy_name: &str) -> MockServer {
     let settings = policy(policy_name);
     MockServer::start(&[
         SUITE,
         ("GET /api/v1/workspace/settings", 200, &settings),
-        SETTINGS,
-        ONE_PROJECT,
+        SUB_SETTINGS,
+        SUB_PROJECT,
         SUB_ISSUE,
         ISSUE,
         MODELS,
@@ -1906,8 +1920,7 @@ fn finding(output: &std::process::Output, id: &str) -> serde_json::Value {
 #[test]
 fn init_saves_the_billing_given_on_the_command_line() {
     let server = subscription_server("per_agent");
-    let sb = Sandbox::new();
-    sb.log_in(&server.url, PERSON_TOKEN);
+    let (sb, log) = sandbox(&server);
     let output = sb
         .visdom(sb.repo.path())
         .args(["--mode", "gateway", "--billing", "subscription", "init"])
@@ -1923,14 +1936,8 @@ fn init_saves_the_billing_given_on_the_command_line() {
     let config = std::fs::read_to_string(sb.user_config()).unwrap();
     assert!(config.contains("billing = \"subscription\""), "{config}");
     assert!(config.contains("tracing_mode = \"gateway\""), "{config}");
+    assert!(lines(&log).is_empty(), "`auth status` is not a run");
 
-    let (agent, log) = sb.recording_agent(&VARIABLES);
-    let mut config = config;
-    config.push_str(&format!(
-        "\n[agents]\nclaude_code = \"{}\"\n",
-        agent.display()
-    ));
-    sb.write_user_config(&config);
     let output = sb.visdom(sb.repo.path()).output().unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let recorded = lines(&log);

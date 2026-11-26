@@ -68,6 +68,11 @@ pub struct Prepared {
     pub notes: Vec<String>,
     /// The model aliases the key may call.
     pub available: Vec<String>,
+    /// Those of them this session may ask for: paid by a subscription, the
+    /// ones the gateway takes such a call on; otherwise all.
+    pub pickable: Vec<String>,
+    /// When the key expires, in Unix seconds.
+    pub key_expires_at: i64,
 }
 
 /// Everything the agent needs to run through the gateway: the developer's
@@ -122,10 +127,16 @@ pub fn prepare_gateway(
     };
     let key = ensured.key;
     let mut notes: Vec<String> = Vec::new();
+    // Paid by a subscription, only an alias the gateway takes such a call on
+    // will do.
+    let pickable = match billing {
+        Billing::Subscription => crate::subscription::eligible_of(&plan.project, &available),
+        Billing::Project => available.clone(),
+    };
     let model = gateway::pick_model(
         session.ctx.agent,
         session.gateway_model.as_deref(),
-        &available,
+        &pickable,
     );
     if let Some(configured) = model
         .as_deref()
@@ -161,7 +172,10 @@ pub fn prepare_gateway(
         .filter(|id| !id.trim().is_empty())
         .or_else(|| tracevault_cli::user_default::load().map(|binding| binding.repo_id))
         .filter(|id| !id.trim().is_empty());
+    let key_expires_at = key.expires_at;
     Ok(Prepared {
+        key_expires_at,
+        pickable,
         launch: GatewayLaunch {
             llm_url: plan.llm_url.clone(),
             key: key.secret,

@@ -164,7 +164,7 @@ fn header_value(value: &str) -> String {
 /// gateway while the hooks record nothing. (`CLAUDE_CODE_USE_GATEWAY` is
 /// Claude Code's own gateway sign-in, which is not this key helper's.) The
 /// list is Claude Code's: a switch it gains has to be added here.
-const CLAUDE_OTHER_PROVIDERS: [&str; 7] = [
+pub(crate) const CLAUDE_OTHER_PROVIDERS: [&str; 7] = [
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
