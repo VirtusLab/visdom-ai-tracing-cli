@@ -668,6 +668,14 @@ fn init_gateway(
                 project_file.display()
             );
         }
+        // Who pays, when a config further up said it, is kept the same way:
+        // otherwise the next `visdom` here would let the project pay.
+        if for_workspace && session.billing.source == billing::BillingSource::Repo {
+            let after = gather(&env, Some(agent), flag, None, runtime);
+            if after.billing.billing != session.billing.billing {
+                save_gateway(project_file, "billing", session.billing.billing.name());
+            }
+        }
     }
     let model_key = format!("{}_model", config::agent_config_key(agent));
     if sources.model.is_none() {

@@ -1799,6 +1799,47 @@ fn a_workspaces_new_config_keeps_the_mode_chosen_further_up() {
     );
 }
 
+/// Who pays, named further up, is kept in a workspace folder's new config
+/// too: otherwise that file would hide it and the project would pay.
+#[test]
+fn a_workspaces_new_config_keeps_the_billing_chosen_further_up() {
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        PROJECTS,
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let (sb, log) = sandbox(&server);
+    let above = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(above.path().join(".visdom")).unwrap();
+    std::fs::write(
+        above.path().join(".visdom/config.toml"),
+        "tracing_mode = \"gateway\"\n\n[gateway]\nbilling = \"subscription\"\n",
+    )
+    .unwrap();
+    let folder = above.path().join("platform");
+    std::fs::create_dir_all(&folder).unwrap();
+    let output = sb
+        .visdom(&folder)
+        .args(["init", "--workspace", "--project", "my-platform"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let own = std::fs::read_to_string(folder.join(".visdom/config.toml")).unwrap();
+    assert!(own.contains("billing = \"subscription\""), "{own}");
+
+    // Still the subscription: the launch stops rather than let the project pay.
+    let output = sb.visdom(&folder).output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(lines(&log)
+        .iter()
+        .all(|l| l != "VISDOM_GATEWAY_SESSION=claude-code"));
+}
+
 fn gateway_server(policy_name: &str) -> MockServer {
     let settings = policy(policy_name);
     MockServer::start(&[
