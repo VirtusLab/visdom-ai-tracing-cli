@@ -441,15 +441,20 @@ mod signals {
     use std::sync::atomic::{AtomicI32, Ordering};
 
     static CHILD: AtomicI32 = AtomicI32::new(0);
+    /// A termination or hang-up that came before the agent was started: it
+    /// is passed on as soon as the agent is there, not lost.
+    static PENDING: AtomicI32 = AtomicI32::new(0);
 
     extern "C" fn on_signal(signal: libc::c_int) {
         if signal == libc::SIGTERM || signal == libc::SIGHUP {
-            let child = CHILD.load(Ordering::Relaxed);
+            let child = CHILD.load(Ordering::SeqCst);
             if child > 0 {
                 // SAFETY: kill is async-signal-safe.
                 unsafe {
                     libc::kill(child, signal);
                 }
+            } else {
+                PENDING.store(signal, Ordering::SeqCst);
             }
         }
     }
@@ -471,7 +476,18 @@ mod signals {
     }
 
     pub fn pass_on_to(child: u32) {
-        CHILD.store(i32::try_from(child).unwrap_or(0), Ordering::Relaxed);
+        let Ok(child) = i32::try_from(child) else {
+            return;
+        };
+        CHILD.store(child, Ordering::SeqCst);
+        // One that came while the agent was being started.
+        let pending = PENDING.swap(0, Ordering::SeqCst);
+        if pending != 0 {
+            // SAFETY: signalling the agent just started.
+            unsafe {
+                libc::kill(child, pending);
+            }
+        }
     }
 
     /// Whether process `pid` exists (or may: one of another user's).

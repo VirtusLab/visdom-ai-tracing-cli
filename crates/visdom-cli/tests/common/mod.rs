@@ -209,6 +209,8 @@ for line in env.get("ANTHROPIC_CUSTOM_HEADERS", "").splitlines():
         name, value = line.split(":", 1)
         headers[name.strip()] = value.strip()
 wait = os.environ.get("FAKE_CLAUDE_WAIT_FOR")
+if wait:
+    open(wait + ".started", "w").close()
 while wait and not os.path.exists(wait):
     time.sleep(0.05)
 request = urllib.request.Request(env["ANTHROPIC_BASE_URL"].rstrip("/") + "/v1/messages",
