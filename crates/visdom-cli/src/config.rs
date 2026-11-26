@@ -8,6 +8,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Deserializer};
 use tracevault_cli::agent::Agent;
 
+use crate::billing::{parse_billing, Billing};
 use crate::mode::{parse_mode, TracingMode};
 
 /// `<config dir>/visdom/config.toml`.
@@ -52,6 +53,10 @@ pub struct GatewayConfig {
     /// The model alias Codex asks the gateway for.
     #[serde(default, alias = "codex-model")]
     pub codex_model: Option<String>,
+    /// Who pays for the agent's calls through the gateway: `project` (the
+    /// default) or `subscription`.
+    #[serde(default, deserialize_with = "de_billing")]
+    pub billing: Option<Billing>,
 }
 
 impl GatewayConfig {
@@ -103,6 +108,9 @@ pub struct RepoConfig {
 pub struct RepoGatewayConfig {
     #[serde(default)]
     pub project: Option<String>,
+    /// Who pays, when the repository or workspace folder says so.
+    #[serde(default, deserialize_with = "de_billing")]
+    pub billing: Option<Billing>,
 }
 
 /// The `[agents]` key that overrides `agent`'s executable.
@@ -135,6 +143,15 @@ fn de_mode<'de, D: Deserializer<'de>>(d: D) -> Result<Option<TracingMode>, D::Er
     match Option::<String>::deserialize(d)? {
         None => Ok(None),
         Some(name) => parse_mode(&name)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+fn de_billing<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Billing>, D::Error> {
+    match Option::<String>::deserialize(d)? {
+        None => Ok(None),
+        Some(name) => parse_billing(&name)
             .map(Some)
             .map_err(serde::de::Error::custom),
     }
@@ -375,6 +392,27 @@ mod tests {
             Some("gpt-general")
         );
         assert_eq!(user.gateway.model_for(Agent::Amp), None);
+        assert_eq!(user.gateway.billing, None);
+    }
+
+    #[test]
+    fn who_pays_is_read_from_both_files_and_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = user_config_path_in(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[gateway]\nbilling = \"subscription\"\n").unwrap();
+        let user = load_user_config_in(tmp.path()).unwrap();
+        assert_eq!(user.gateway.billing, Some(Billing::Subscription));
+
+        let repo_path = repo_config_path_in(tmp.path());
+        std::fs::create_dir_all(repo_path.parent().unwrap()).unwrap();
+        std::fs::write(&repo_path, "[gateway]\nbilling = \"project\"\n").unwrap();
+        let repo = load_repo_config_in(tmp.path()).unwrap();
+        assert_eq!(repo.gateway.billing, Some(Billing::Project));
+
+        std::fs::write(&path, "[gateway]\nbilling = \"free\"\n").unwrap();
+        let err = load_user_config_in(tmp.path()).unwrap_err();
+        assert!(err.contains("project or subscription"), "{err}");
     }
 
     #[test]

@@ -81,6 +81,7 @@ impl Sandbox {
             "VISDOM_GATEWAY_SESSION",
             "VISDOM_GATEWAY_URL",
             "VISDOM_CONTROL_PLANE_URL",
+            "VISDOM_GATEWAY_BILLING",
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_BASE_URL",

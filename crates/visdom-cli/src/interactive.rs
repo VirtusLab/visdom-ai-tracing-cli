@@ -7,6 +7,7 @@ use std::path::Path;
 
 use tracevault_cli::agent::Agent;
 
+use crate::billing::Billing;
 use crate::mode::TracingMode;
 
 /// Whether there is somebody to ask.
@@ -115,6 +116,31 @@ pub fn ask_mode() -> Option<TracingMode> {
         )?;
         match parse_mode_choice(&answer) {
             Some(mode) => return Some(mode),
+            None => eprintln!("Answer 1 or 2."),
+        }
+    }
+}
+
+/// Who pays, as an answer names it: its number in the list, or its name. An
+/// empty answer takes the default, the project. `None` when it names neither.
+pub fn parse_billing_choice(answer: &str) -> Option<Billing> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "project" => Some(Billing::Project),
+        "2" | "subscription" => Some(Billing::Subscription),
+        _ => None,
+    }
+}
+
+/// Ask who pays for Claude Code's calls through the gateway. `None` at end of
+/// input: nothing chosen.
+pub fn ask_billing() -> Option<Billing> {
+    loop {
+        let answer = ask_line(
+            "Who pays for Claude Code's calls through the AI Gateway? [1] the project (gateway \
+             key)  [2] my Claude subscription  (default 1):",
+        )?;
+        match parse_billing_choice(&answer) {
+            Some(billing) => return Some(billing),
             None => eprintln!("Answer 1 or 2."),
         }
     }
@@ -289,6 +315,18 @@ mod tests {
         assert_eq!(parse_mode_choice("2"), Some(TracingMode::Gateway));
         assert_eq!(parse_mode_choice("3"), None);
         assert_eq!(parse_mode_choice("proxy"), None);
+    }
+
+    #[test]
+    fn billing_choice_by_number_name_or_default() {
+        assert_eq!(parse_billing_choice(""), Some(Billing::Project));
+        assert_eq!(parse_billing_choice(" 1 "), Some(Billing::Project));
+        assert_eq!(parse_billing_choice("2"), Some(Billing::Subscription));
+        assert_eq!(
+            parse_billing_choice("Subscription"),
+            Some(Billing::Subscription)
+        );
+        assert_eq!(parse_billing_choice("3"), None);
     }
 
     #[test]

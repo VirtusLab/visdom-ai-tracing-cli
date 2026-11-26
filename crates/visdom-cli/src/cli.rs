@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use tracevault_cli::agent::Agent;
 use tracevault_cli::cli::{Command, InitArgs, LoginArgs};
 
+use crate::billing::Billing;
 use crate::mode::TracingMode;
 
 #[derive(Parser)]
@@ -28,6 +29,13 @@ pub struct VisdomCli {
     /// The workspace's AI traffic policy may require one of them.
     #[arg(long, value_enum)]
     pub mode: Option<TracingMode>,
+    /// Who pays for the agent's calls through the AI Gateway: the project
+    /// (its gateway key) or your Claude subscription (Claude Code only).
+    /// Default: the VISDOM_GATEWAY_BILLING variable, then `billing` under
+    /// [gateway] in `.visdom/config.toml`, then in the user config, then
+    /// project. `visdom --billing … init` saves it.
+    #[arg(long, value_enum)]
+    pub billing: Option<Billing>,
     /// Apply every offered fix without asking.
     #[arg(long)]
     pub yes: bool,
@@ -63,6 +71,9 @@ pub enum VisdomCommand {
         /// The tracing mode to check (see `visdom --help`).
         #[arg(long, value_enum)]
         mode: Option<TracingMode>,
+        /// Who pays through the gateway, to check (see `visdom --help`).
+        #[arg(long, value_enum)]
+        billing: Option<Billing>,
     },
     /// Print the developer's AI Gateway key for a project: what a launched
     /// agent runs to get, and renew, its key.
@@ -139,6 +150,29 @@ mod tests {
     }
 
     #[test]
+    fn who_pays_is_an_option_of_the_launch_init_and_doctor() {
+        let cli = parse(&[
+            "visdom",
+            "--mode",
+            "gateway",
+            "--billing",
+            "subscription",
+            "init",
+        ]);
+        assert_eq!(cli.billing, Some(Billing::Subscription));
+        assert!(matches!(cli.command, Some(VisdomCommand::Init { .. })));
+        let cli = parse(&["visdom", "doctor", "--billing", "project"]);
+        assert!(matches!(
+            cli.command,
+            Some(VisdomCommand::Doctor {
+                billing: Some(Billing::Project),
+                ..
+            })
+        ));
+        assert!(VisdomCli::try_parse_from(["visdom", "--billing", "free"]).is_err());
+    }
+
+    #[test]
     fn the_key_helper_takes_a_console_and_a_project() {
         let cli = parse(&[
             "visdom",
@@ -212,7 +246,8 @@ mod tests {
                 fix: false,
                 yes: false,
                 agent: None,
-                mode: None
+                mode: None,
+                billing: None
             })
         ));
     }

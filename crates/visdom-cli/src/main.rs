@@ -6,6 +6,7 @@ use clap::{CommandFactory, FromArgMatches};
 use tracevault_cli::agent::Agent;
 use tracevault_cli::cli::{run, Command, InitArgs};
 use visdom_cli::agents::McpScope;
+use visdom_cli::billing::{self, Billing, BillingUse};
 use visdom_cli::cli::{VisdomCli, VisdomCommand};
 use visdom_cli::components::CredentialState;
 use visdom_cli::doctor::git_toplevel;
@@ -79,7 +80,7 @@ fn main() {
             if launched {
                 init_bazaar(&runtime, agent, scope.scope);
                 init_mode(&runtime, agent, cli.mode);
-                init_gateway(&runtime, agent, cli.mode, scope.scope);
+                init_gateway(&runtime, agent, cli.mode, cli.billing, scope.scope);
             }
         }
         Some(VisdomCommand::Doctor {
@@ -88,10 +89,12 @@ fn main() {
             yes,
             agent,
             mode,
+            billing,
         }) => doctor(
             &runtime,
             agent.or(cli.agent),
             mode.or(cli.mode),
+            billing.or(cli.billing),
             fix,
             yes || cli.yes,
             json,
@@ -99,12 +102,15 @@ fn main() {
         Some(VisdomCommand::GatewayKey { console, project }) => {
             gateway_key(&runtime, &console, &project)
         }
-        Some(VisdomCommand::Env { agent }) => env_script(&runtime, agent.or(cli.agent)),
+        Some(VisdomCommand::Env { agent }) => {
+            env_script(&runtime, agent.or(cli.agent), cli.billing)
+        }
         Some(VisdomCommand::Instructions { agent, mode }) => {
             let session = gather(
                 &Environment::current(),
                 agent.or(cli.agent),
                 mode.or(cli.mode),
+                cli.billing,
                 &runtime,
             );
             // Through the gateway when that is the mode and it can be used:
@@ -118,6 +124,7 @@ fn main() {
             runtime,
             cli.agent,
             cli.mode,
+            cli.billing,
             cli.yes,
             !cli.no_instructions,
             &cli.agent_args,
@@ -188,9 +195,10 @@ fn gather(
     env: &Environment,
     agent: Option<Agent>,
     mode: Option<TracingMode>,
+    billing: Option<Billing>,
     runtime: &tokio::runtime::Runtime,
 ) -> Session {
-    match Session::gather(env, agent, mode, runtime) {
+    match Session::gather(env, agent, mode, billing, runtime) {
         Ok(session) => {
             for warning in &session.warnings {
                 eprintln!("visdom: warning: {warning}");
@@ -212,19 +220,20 @@ fn doctor(
     runtime: &tokio::runtime::Runtime,
     agent: Option<Agent>,
     mode: Option<TracingMode>,
+    billing: Option<Billing>,
     fix_flag: bool,
     yes: bool,
     json: bool,
 ) -> ! {
     let env = Environment::current();
-    let mut session = gather(&env, agent, mode, runtime);
+    let mut session = gather(&env, agent, mode, billing, runtime);
     let mut findings = session.collect();
     let policy = policy_for(fix_flag, yes, true, stdin_is_tty());
     if policy != FixPolicy::Never && findings.iter().any(|f| f.fix.is_some()) {
         // What is wrong, before asking to change it.
         print_attention(&findings);
         if fix(&findings, policy, &mut RealExecutor::new(json, policy)).applied {
-            session = gather(&env, agent, mode, runtime);
+            session = gather(&env, agent, mode, billing, runtime);
             findings = session.collect();
         }
     }
@@ -340,7 +349,7 @@ fn init_login(runtime: &tokio::runtime::Runtime, args: &InitArgs) {
         return;
     }
     let env = Environment::current();
-    let session = gather(&env, Some(args.agent), None, runtime);
+    let session = gather(&env, Some(args.agent), None, None, runtime);
     if session.ctx.credential != CredentialState::Missing {
         return;
     }
@@ -371,7 +380,7 @@ fn init_bazaar(runtime: &tokio::runtime::Runtime, agent: Agent, scope: InitScope
         InitScope::Repo => McpScope::Local,
         InitScope::Machine | InitScope::Workspace => McpScope::User,
     };
-    let mut session = gather(&env, Some(agent), None, runtime);
+    let mut session = gather(&env, Some(agent), None, None, runtime);
     session.mcp_scope = mcp_scope;
     // Nobody knows the bazaar URL: ask, and remember the answer for next time.
     if matches!(session.bazaar_url, Ok(None)) && interactive::is_interactive() {
@@ -392,7 +401,7 @@ fn init_bazaar(runtime: &tokio::runtime::Runtime, agent: Agent, scope: InitScope
     let policy = FixPolicy::All;
     let summary = fix(&bazaar, policy, &mut RealExecutor::new(false, policy));
     let findings = if summary.applied {
-        let mut after = gather(&env, Some(agent), None, runtime);
+        let mut after = gather(&env, Some(agent), None, None, runtime);
         after.mcp_scope = mcp_scope;
         // The URL just typed counts even if it could not be saved.
         if matches!(after.bazaar_url, Ok(None)) {
@@ -420,7 +429,7 @@ fn init_bazaar(runtime: &tokio::runtime::Runtime, agent: Agent, scope: InitScope
 /// config. A policy that decides is said instead.
 fn init_mode(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<TracingMode>) {
     let env = Environment::current();
-    let session = gather(&env, Some(agent), flag, runtime);
+    let session = gather(&env, Some(agent), flag, None, runtime);
     match session.mode.reason {
         ModeReason::Policy(TrafficPolicy::Enforced) => {
             println!(
@@ -554,6 +563,7 @@ fn init_gateway(
     runtime: &tokio::runtime::Runtime,
     agent: Agent,
     flag: Option<TracingMode>,
+    billing_flag: Option<Billing>,
     scope: InitScope,
 ) {
     let env = Environment::current();
@@ -573,11 +583,19 @@ fn init_gateway(
     let for_workspace = workspace_file.is_some();
     let project_file =
         &workspace_file.unwrap_or_else(|| config::user_config_path_in(&env.config_root));
-    let mut session = gather(&env, Some(agent), flag, runtime);
+    let mut session = gather(&env, Some(agent), flag, billing_flag, runtime);
+    if let BillingUse::Rejected(why) = &session.billing_use {
+        eprintln!("visdom: {why}");
+        exit(2);
+    }
     if session.mode.mode != TracingMode::Gateway {
         return;
     }
     let asking = interactive::is_interactive();
+    // Right after the mode: who pays for Claude Code's calls through it.
+    if agent == Agent::ClaudeCode && init_billing(&session, billing_flag, asking) {
+        session = gather(&env, Some(agent), flag, billing_flag, runtime);
+    }
     // Several projects: the choice is the developer's.
     if asking && session.gateway_sources.project.is_none() {
         let open = match (&session.console_url, &session.token) {
@@ -599,7 +617,7 @@ fn init_gateway(
                 interactive::ask_choice("Which AI Gateway project is this for?", &names)
             {
                 save_gateway(project_file, "project", &open[i].slug);
-                session = gather(&env, Some(agent), flag, runtime);
+                session = gather(&env, Some(agent), flag, billing_flag, runtime);
             }
         }
     }
@@ -639,7 +657,7 @@ fn init_gateway(
         let chosen_in_files = session.mode.reason == ModeReason::Chosen && flag.is_none();
         if for_workspace
             && chosen_in_files
-            && gather(&env, Some(agent), None, runtime).mode.mode != TracingMode::Gateway
+            && gather(&env, Some(agent), None, None, runtime).mode.mode != TracingMode::Gateway
         {
             if let Err(e) = interactive::save_tracing_mode(project_file, TracingMode::Gateway) {
                 eprintln!("visdom: the tracing mode could not be saved: {e}");
@@ -693,17 +711,73 @@ fn init_gateway(
             plan,
             &sources,
             prepared.launch.model.as_deref(),
+            &session.billing,
             &session.user_config_path,
         )
     );
 }
 
+/// Who pays for Claude Code's calls through the gateway, in `visdom init`:
+/// `--billing` is saved to the user config without asking; with nothing
+/// chosen anywhere and somebody to ask, the answer is. A saved value that the
+/// environment or the repository's config overrules stops init, as for the
+/// mode. `true` when something was saved.
+fn init_billing(session: &Session, flag: Option<Billing>, asking: bool) -> bool {
+    let billing = match flag {
+        Some(billing) => billing,
+        None if session.billing.source == billing::BillingSource::Default && asking => {
+            match interactive::ask_billing() {
+                Some(billing) => billing,
+                None => return false,
+            }
+        }
+        None => return false,
+    };
+    let path = &session.user_config_path;
+    save_gateway(path, "billing", billing.name());
+    let env = Environment::current();
+    let user = config::load_user_config_in(&env.config_root).unwrap_or_default();
+    let repo = checks_repo_config(&env);
+    let next = billing::configured_billing(
+        None,
+        env.gateway_billing.as_deref(),
+        repo.gateway.billing,
+        user.gateway.billing,
+        &path.display().to_string(),
+    );
+    match next {
+        Ok(next) if next.billing == billing => true,
+        next => {
+            let said_by = match next {
+                Ok(next) => next.describe(),
+                Err(e) => e,
+            };
+            eprintln!(
+                "visdom: billing = \"{billing}\" was saved to your config, but {said_by} comes \
+                 first: a plain `visdom` here would not use it. Change it there, or pass \
+                 --billing {billing} each time."
+            );
+            exit(1);
+        }
+    }
+}
+
 /// `visdom env`: the shell commands for an agent started without `visdom`.
 /// Only they go to stdout.
-fn env_script(runtime: &tokio::runtime::Runtime, agent: Option<Agent>) -> ! {
+fn env_script(
+    runtime: &tokio::runtime::Runtime,
+    agent: Option<Agent>,
+    billing_flag: Option<Billing>,
+) -> ! {
     let env = Environment::current();
     // Asking for these is asking for the gateway, whatever the mode at rest.
-    let session = gather(&env, agent, Some(TracingMode::Gateway), runtime);
+    let session = gather(
+        &env,
+        agent,
+        Some(TracingMode::Gateway),
+        billing_flag,
+        runtime,
+    );
     if session.mode.mode != TracingMode::Gateway {
         eprintln!(
             "visdom: the workspace's AI traffic policy keeps sessions off the AI Gateway: \
@@ -711,6 +785,7 @@ fn env_script(runtime: &tokio::runtime::Runtime, agent: Option<Agent>) -> ! {
         );
         exit(1);
     }
+    stop_on_billing(&session);
     let visdom = std::env::current_exe().unwrap_or_else(|_| "visdom".into());
     let script = launch::prepare_gateway(&session, runtime, &visdom, now()).and_then(|prepared| {
         let project = match &session.gateway {
@@ -790,6 +865,7 @@ fn agent_command(
     if session.mode.mode != TracingMode::Gateway {
         return hooks(session);
     }
+    stop_on_billing(session);
     let visdom = std::env::current_exe().unwrap_or_else(|_| "visdom".into());
     let prepared = launch::prepare_gateway(session, runtime, &visdom, now()).and_then(|prepared| {
         session
@@ -829,6 +905,23 @@ fn agent_command(
     }
 }
 
+/// Stop before an agent is started through the gateway in a way the billing
+/// does not allow: a combination that cannot work (exit 2, like a mode that
+/// names none), or the subscription, which this version cannot start the
+/// agent on yet — rather than let the project pay without being asked to.
+fn stop_on_billing(session: &Session) {
+    if let BillingUse::Rejected(why) = &session.billing_use {
+        eprintln!("visdom: {why}");
+        exit(2);
+    }
+    if session.billing_use == BillingUse::Applies {
+        if let Some(why) = billing::launch_unavailable(&session.billing) {
+            eprintln!("visdom: {why}");
+            exit(1);
+        }
+    }
+}
+
 /// Plain `visdom`: check, offer the fixes, start the agent. Findings never
 /// stop the agent from starting; only a gateway the workspace requires and
 /// that cannot be used does.
@@ -836,17 +929,18 @@ fn check_and_launch(
     runtime: tokio::runtime::Runtime,
     agent: Option<Agent>,
     mode: Option<TracingMode>,
+    billing: Option<Billing>,
     yes: bool,
     instructions: bool,
     agent_args: &[String],
 ) -> ! {
     let env = Environment::current();
-    let mut session = gather(&env, agent, mode, &runtime);
+    let mut session = gather(&env, agent, mode, billing, &runtime);
     let findings = session.collect();
     print_attention(&findings);
     let policy = policy_for(false, yes, false, stdin_is_tty());
     if fix(&findings, policy, &mut RealExecutor::new(false, policy)).applied {
-        session = gather(&env, agent, mode, &runtime);
+        session = gather(&env, agent, mode, billing, &runtime);
         // What is still open, once, above the agent.
         print_attention(&session.collect());
     } else if policy == FixPolicy::Never && findings.iter().any(|f| f.fix.is_some()) {
@@ -854,6 +948,13 @@ fn check_and_launch(
     }
     // After the fixes: what was just set up is what the agent is told about.
     session.agent_instructions &= instructions;
+    // A billing that cannot be used here (a subscription outside the
+    // gateway, or for Codex) is a setting to correct, in hooks mode too. Why
+    // was said with the findings above.
+    if matches!(session.billing_use, BillingUse::Rejected(_)) {
+        eprintln!("visdom: the agent is not started: correct the billing (gateway.billing above)");
+        exit(2);
+    }
     // In the directory visdom was run in, like starting the agent by hand.
     let cmd = agent_command(&session, &runtime, agent_args);
     // The agent takes over this process: no runtime threads may outlive it.
