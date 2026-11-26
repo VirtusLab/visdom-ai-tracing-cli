@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use common::http::MockServer;
-use common::{stderr, stdout, Sandbox};
+use common::{stderr, stdout, Sandbox, FAKE_LOGIN_TOKEN};
 
 const PERSON_TOKEN: &str = "person-access-token";
 const VARIABLES: [&str; 8] = [
@@ -47,6 +47,16 @@ const ISSUE: (&str, u16, &str) = (
     "POST /api/me/keys",
     201,
     r#"{"secret":"sk-personal","id":"h","name":"personal-dev-1","expiresAt":"2099-01-01T00:00:00Z"}"#,
+);
+const SUB_ISSUE: (&str, u16, &str) = (
+    "POST /api/me/keys",
+    201,
+    r#"{"secret":"sk-subscription","id":"sub-hash-1","name":"subscription-dev-1","expiresAt":"2099-01-01T00:00:00Z","billing":"subscription"}"#,
+);
+const MESSAGES: (&str, u16, &str) = (
+    "POST /v1/messages",
+    200,
+    r#"{"type":"message","content":[{"type":"text","text":"hi"}]}"#,
 );
 const MODELS: (&str, u16, &str) = (
     "GET /v1/models",
@@ -1810,7 +1820,7 @@ fn a_workspaces_new_config_keeps_the_billing_chosen_further_up() {
         PROJECTS,
         SETTINGS,
         ONE_PROJECT,
-        ISSUE,
+        SUB_ISSUE,
         MODELS,
     ]);
     let (sb, log) = sandbox(&server);
@@ -1832,12 +1842,22 @@ fn a_workspaces_new_config_keeps_the_billing_chosen_further_up() {
     let own = std::fs::read_to_string(folder.join(".visdom/config.toml")).unwrap();
     assert!(own.contains("billing = \"subscription\""), "{own}");
 
-    // Still the subscription: the launch stops rather than let the project pay.
+    // Still the subscription: Claude Code is started on it, and only a
+    // subscription key was ever asked for.
     let output = sb.visdom(&folder).output().unwrap();
-    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    assert!(lines(&log)
-        .iter()
-        .all(|l| l != "VISDOM_GATEWAY_SESSION=claude-code"));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(lines(&log).contains(&"VISDOM_GATEWAY_SESSION=claude-code".to_string()));
+    for asked in server.requests() {
+        if asked.route == "POST /api/me/keys" {
+            assert!(
+                asked.body.contains(r#""billing":"subscription""#),
+                "{}",
+                asked.body
+            );
+        }
+    }
+    let args = args(&log);
+    assert!(!args[1].starts_with('{'), "settings in a file: {args:?}");
 }
 
 fn gateway_server(policy_name: &str) -> MockServer {
@@ -1849,6 +1869,22 @@ fn gateway_server(policy_name: &str) -> MockServer {
         ONE_PROJECT,
         ISSUE,
         MODELS,
+    ])
+}
+
+/// A gateway whose console issues a subscription key first, then an
+/// ordinary one, and whose LLM endpoint answers messages.
+fn subscription_server(policy_name: &str) -> MockServer {
+    let settings = policy(policy_name);
+    MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        SUB_ISSUE,
+        ISSUE,
+        MODELS,
+        MESSAGES,
     ])
 }
 
@@ -1865,12 +1901,11 @@ fn finding(output: &std::process::Output, id: &str) -> serde_json::Value {
 }
 
 /// `visdom --mode gateway --billing subscription init` saves who pays without
-/// asking and shows it with its source. Starting Claude Code on the
-/// subscription is not in this version: a launch stops instead of letting the
-/// project pay.
+/// asking, gets a subscription key and shows it with its source; the next
+/// `visdom` starts Claude Code on it, `--billing project` on the project.
 #[test]
 fn init_saves_the_billing_given_on_the_command_line() {
-    let server = gateway_server("per_agent");
+    let server = subscription_server("per_agent");
     let sb = Sandbox::new();
     sb.log_in(&server.url, PERSON_TOKEN);
     let output = sb
@@ -1883,7 +1918,7 @@ fn init_saves_the_billing_given_on_the_command_line() {
     assert!(said.contains("AI Gateway ready for Claude Code"), "{said}");
     assert!(said.contains("my Claude subscription"), "{said}");
     assert!(said.contains("(--billing)"), "{said}");
-    assert!(said.contains("not available in this version"), "{said}");
+    assert!(said.contains("a subscription key"), "{said}");
     assert!(!said.to_lowercase().contains("terms"), "{said}");
     let config = std::fs::read_to_string(sb.user_config()).unwrap();
     assert!(config.contains("billing = \"subscription\""), "{config}");
@@ -1897,13 +1932,14 @@ fn init_saves_the_billing_given_on_the_command_line() {
     ));
     sb.write_user_config(&config);
     let output = sb.visdom(sb.repo.path()).output().unwrap();
-    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let recorded = lines(&log);
+    assert!(recorded.contains(&"VISDOM_GATEWAY_SESSION=claude-code".to_string()));
     assert!(
-        stderr(&output).contains("not available in this version of visdom yet"),
-        "{}",
-        stderr(&output)
+        recorded.contains(&"CLAUDE_CODE_API_KEY_HELPER_TTL_MS unset".to_string()),
+        "no key helper: {recorded:?}"
     );
-    assert!(lines(&log).is_empty(), "the agent must not have run");
+    assert_eq!(count(&server, "POST /api/me/keys"), 1, "init's key is kept");
     // `--billing project` for one run starts it, paid by the project.
     let output = sb
         .visdom(sb.repo.path())
@@ -1937,9 +1973,13 @@ fn init_and_doctor_show_a_saved_billing_and_where_it_is() {
         .output()
         .unwrap();
     let billing = finding(&output, "gateway.billing");
-    assert_eq!(billing["severity"], "warn", "{billing}");
+    assert_eq!(billing["severity"], "ok", "{billing}");
     let message = billing["message"].as_str().unwrap();
     assert!(message.contains("billing under [gateway] in"), "{message}");
+    assert!(
+        message.contains("your Claude subscription pays"),
+        "{message}"
+    );
     // The environment comes before the file.
     let output = sb
         .visdom(sb.repo.path())
@@ -1960,7 +2000,12 @@ fn init_and_doctor_show_a_saved_billing_and_where_it_is() {
         .env("VISDOM_GATEWAY_BILLING", " ")
         .output()
         .unwrap();
-    assert_eq!(finding(&output, "gateway.billing")["severity"], "warn");
+    let billing = finding(&output, "gateway.billing");
+    let message = billing["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("billing = subscription (billing under [gateway] in"),
+        "the file's, not the blank variable's: {message}"
+    );
     let output = sb
         .visdom(sb.repo.path())
         .args(["doctor", "--json"])
@@ -2059,11 +2104,13 @@ fn init_fails_when_the_billing_it_saves_would_be_overruled() {
     assert!(!stdout(&output).contains("AI Gateway ready"));
 }
 
-/// `visdom env` with the subscription: no script that would let the project
-/// pay, an error saying it is not available yet; Codex is refused outright.
+/// `visdom env` with the subscription: no bearer token; the subscription key
+/// goes into the custom headers through `visdom gateway-key --billing
+/// subscription`, so the script holds no secret. A Claude Code started from
+/// that shell keeps its login. Codex is refused outright.
 #[test]
-fn env_refuses_a_subscription_it_cannot_set_up() {
-    let server = gateway_server("per_agent");
+fn env_sends_a_claude_on_its_subscription_through_the_gateway() {
+    let server = subscription_server("per_agent");
     let sb = Sandbox::new();
     sb.log_in(&server.url, PERSON_TOKEN);
     let output = sb
@@ -2071,13 +2118,26 @@ fn env_refuses_a_subscription_it_cannot_set_up() {
         .args(["--billing", "subscription", "env"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
-    assert!(
-        stderr(&output).contains("not available in this version of visdom yet"),
-        "{}",
-        stderr(&output)
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let script = stdout(&output);
+    assert!(!script.contains("sk-subscription"), "{script}");
+    assert!(!script.contains("ANTHROPIC_AUTH_TOKEN="), "{script}");
+    assert!(script.contains("--billing subscription"), "{script}");
+    let (agent, log) = sb.fake_claude_code();
+    let run = sourced(
+        &sb,
+        &format!("export ANTHROPIC_API_KEY=sk-mine ANTHROPIC_AUTH_TOKEN=tok-mine\n{script}"),
+        &format!("'{}' -p hi", agent.display()),
     );
+    assert!(run.status.success(), "{}", stderr(&run));
+    assert_eq!(fake_runs(&log)[0]["status"], 200);
+    let sent = last_message(&server);
+    assert_eq!(
+        sent.authorization.as_deref(),
+        Some(format!("Bearer {FAKE_LOGIN_TOKEN}").as_str())
+    );
+    assert_eq!(sent.header("x-litellm-api-key"), ["Bearer sk-subscription"]);
+    assert_eq!(count(&server, "POST /api/me/keys"), 1, "the kept key");
     let output = sb
         .visdom(sb.repo.path())
         .args(["env", "--agent", "codex"])
@@ -2119,4 +2179,324 @@ fn codex_init_keeps_an_explicit_project_billing() {
     let config = std::fs::read_to_string(sb.user_config()).unwrap();
     assert!(config.contains("billing = \"project\""), "{config}");
     assert!(stdout(&output).contains("AI Gateway ready for Codex"));
+}
+
+/// The runs [`Sandbox::fake_claude_code`] logged, one JSON object each.
+fn fake_runs(log: &Path) -> Vec<serde_json::Value> {
+    lines(log)
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// The last `POST /v1/messages` the gateway got.
+fn last_message(server: &MockServer) -> common::http::Recorded {
+    server
+        .requests()
+        .into_iter()
+        .rfind(|r| r.route == "POST /v1/messages")
+        .expect("a message was sent")
+}
+
+/// A sandbox logged in to `server` whose Claude Code is the stand-in that
+/// sends one request, and whose developer has a key helper and a key of
+/// their own in Claude Code's user settings.
+fn subscription_sandbox(server: &MockServer) -> (Sandbox, std::path::PathBuf) {
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let (agent, log) = sb.fake_claude_code();
+    sb.write_user_config(&format!(
+        "[agents]\nclaude_code = \"{}\"\n",
+        agent.display()
+    ));
+    let claude = sb.home.path().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::write(
+        claude.join("settings.json"),
+        r#"{"apiKeyHelper":"echo sk-dev-helper","env":{"ANTHROPIC_API_KEY":"sk-dev-settings"}}"#,
+    )
+    .unwrap();
+    (sb, log)
+}
+
+/// Where a launch writes its private settings in the sandbox.
+fn private_dir(sb: &Sandbox) -> std::path::PathBuf {
+    sb.home.path().join(".local/state/visdom")
+}
+
+fn settings_files(sb: &Sandbox) -> Vec<String> {
+    std::fs::read_dir(private_dir(sb))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("claude-settings-"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `billing = subscription`: Claude Code keeps its claude.ai login, so the
+/// request carries the subscription token as it is, and the subscription key
+/// in `x-litellm-api-key`. Nothing of the developer's own — a key helper or a
+/// key in their Claude settings, keys in the environment, a stale gateway
+/// header — takes over. The key is on no command line: the settings are in a
+/// file only the user can read, removed when the agent exits.
+#[test]
+fn a_subscription_session_keeps_the_login_and_sends_the_key_in_a_header() {
+    let server = subscription_server("per_agent");
+    let (sb, log) = subscription_sandbox(&server);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args([
+            "--mode",
+            "gateway",
+            "--billing",
+            "subscription",
+            "--",
+            "-p",
+            "hi",
+        ])
+        .env("ANTHROPIC_API_KEY", "sk-dev-env")
+        .env("ANTHROPIC_AUTH_TOKEN", "tok-dev-env")
+        .env(
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "x-litellm-api-key: Bearer sk-stale\nx-team: blue",
+        )
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let sent = last_message(&server);
+    assert_eq!(
+        sent.authorization.as_deref(),
+        Some(format!("Bearer {FAKE_LOGIN_TOKEN}").as_str()),
+        "the login's token, untouched"
+    );
+    assert_eq!(sent.header("x-litellm-api-key"), ["Bearer sk-subscription"]);
+    assert!(sent.header("x-api-key").is_empty(), "{:?}", sent.headers);
+    assert_eq!(sent.header("x-tracevault-agent"), ["claude-code"]);
+    assert_eq!(sent.header("x-team"), ["blue"]);
+    assert_eq!(sent.header("x-tracevault-session").len(), 1);
+
+    let run = &fake_runs(&log)[0];
+    assert_eq!(run["status"], 200);
+    assert_eq!(run["settings"]["apiKeyHelper"], "", "no key helper");
+    assert_eq!(run["settings_mode"], "0o600");
+    assert_eq!(run["settings_left"], true, "there while the agent ran");
+    let path = run["settings_path"].as_str().unwrap();
+    assert!(
+        path.starts_with(&private_dir(&sb).to_string_lossy().into_owned()),
+        "{path}"
+    );
+    let args: Vec<String> = serde_json::from_value(run["args"].clone()).unwrap();
+    assert!(
+        !args.iter().any(|a| a.contains("sk-subscription")),
+        "{args:?}"
+    );
+    assert_eq!(args[args.len() - 2..], ["-p", "hi"]);
+    assert!(settings_files(&sb).is_empty(), "removed when it exited");
+
+    // Asked for as a subscription key, and checked on the LLM gateway with
+    // it as the bearer token.
+    let issued: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.route == "POST /api/me/keys")
+        .collect();
+    assert_eq!(issued.len(), 1);
+    assert_eq!(
+        issued[0].body,
+        r#"{"projectId":"p-1","billing":"subscription"}"#
+    );
+    let models = server
+        .requests()
+        .into_iter()
+        .find(|r| r.route == "GET /v1/models")
+        .unwrap();
+    assert_eq!(
+        models.authorization.as_deref(),
+        Some("Bearer sk-subscription")
+    );
+
+    // The same stand-in paid by the project: the key helper's key is sent
+    // instead of the login — so the one above is the subscription's doing.
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway", "--billing", "project"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let sent = last_message(&server);
+    assert_eq!(sent.header("x-api-key"), ["sk-personal"]);
+    assert!(sent.header("x-litellm-api-key").is_empty());
+    assert_eq!(sent.authorization, None);
+}
+
+/// A second `visdom` started while the first runs gets the kept subscription
+/// key and its own settings file; the first one's key is not revoked and its
+/// file is not touched, so it carries on.
+#[test]
+fn a_second_subscription_session_does_not_break_the_first() {
+    let server = subscription_server("per_agent");
+    let (sb, log) = subscription_sandbox(&server);
+    let go = sb.home.path().join("go");
+    let first = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway", "--billing", "subscription"])
+        .env("FAKE_CLAUDE_WAIT_FOR", &go)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while settings_files(&sb).is_empty() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the first session did not start"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let second = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway", "--billing", "subscription"])
+        .output()
+        .unwrap();
+    assert_eq!(second.status.code(), Some(0), "{}", stderr(&second));
+    assert_eq!(
+        settings_files(&sb).len(),
+        1,
+        "the first one's is still there"
+    );
+    std::fs::write(&go, "").unwrap();
+    let first = first.wait_with_output().unwrap();
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+
+    let runs = fake_runs(&log);
+    assert_eq!(runs.len(), 2);
+    for run in &runs {
+        assert_eq!(run["status"], 200, "{run}");
+        assert_eq!(run["settings_left"], true, "{run}");
+    }
+    assert_ne!(runs[0]["settings_path"], runs[1]["settings_path"]);
+    let messages: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.route == "POST /v1/messages")
+        .collect();
+    assert_eq!(messages.len(), 2);
+    for sent in &messages {
+        assert_eq!(sent.header("x-litellm-api-key"), ["Bearer sk-subscription"]);
+    }
+    assert_eq!(count(&server, "POST /api/me/keys"), 1, "one key, shared");
+    assert!(
+        !server.routes().iter().any(|r| r.starts_with("DELETE")),
+        "nothing revoked"
+    );
+    assert!(settings_files(&sb).is_empty());
+}
+
+/// `visdom gateway-key --billing subscription` hands out the kept
+/// subscription key until a week before it expires, then a new one — and
+/// the old one is not revoked, and stays kept for logout to revoke.
+#[test]
+fn the_subscription_key_is_renewed_a_week_before_it_expires() {
+    let server = MockServer::start(&[SUB_ISSUE]);
+    let (sb, _log) = sandbox(&server);
+    let store = sb.home.path().join(".config/visdom/gateway-keys.json");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let kept = |days: u64| {
+        serde_json::json!([{
+            "console_url": server.url, "project_id": "p-1", "account": "",
+            "secret": "sk-sub-old", "expires_at": now + days * 86_400,
+            "billing": "subscription", "id": "old-id",
+        }])
+        .to_string()
+    };
+    let helper = || {
+        sb.visdom(sb.repo.path())
+            .args([
+                "gateway-key",
+                "--console",
+                &server.url,
+                "--project",
+                "p-1",
+                "--billing",
+                "subscription",
+            ])
+            .output()
+            .unwrap()
+    };
+    std::fs::write(&store, kept(8)).unwrap();
+    assert_eq!(stdout(&helper()), "sk-sub-old\n");
+    assert!(server.requests().is_empty());
+
+    std::fs::write(&store, kept(6)).unwrap();
+    let output = helper();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "sk-subscription\n");
+    let asked = server.requests();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(
+        asked[0].body,
+        r#"{"projectId":"p-1","billing":"subscription"}"#
+    );
+    let kept = std::fs::read_to_string(&store).unwrap();
+    assert!(
+        kept.contains("sk-sub-old") && kept.contains("sk-subscription"),
+        "{kept}"
+    );
+    // An ordinary key is another kind: the subscription key is not it.
+    let plain = MockServer::start(&[ISSUE]);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["gateway-key", "--console", &plain.url, "--project", "p-1"])
+        .output()
+        .unwrap();
+    assert_eq!(stdout(&output), "sk-personal\n");
+}
+
+/// `visdom logout` revokes the kept subscription key at the console (as the
+/// person) before it forgets it.
+#[test]
+fn logging_out_revokes_the_kept_subscription_key() {
+    let server = MockServer::start(&[SUB_ISSUE, ("DELETE /api/me/keys/sub-hash-1", 204, "")]);
+    let (sb, _log) = sandbox(&server);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args([
+            "gateway-key",
+            "--console",
+            &server.url,
+            "--project",
+            "p-1",
+            "--billing",
+            "subscription",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(stdout(&output), "sk-subscription\n", "{}", stderr(&output));
+    let store = sb.home.path().join(".config/visdom/gateway-keys.json");
+    assert!(store.exists());
+    let output = sb.visdom(sb.repo.path()).arg("logout").output().unwrap();
+    let revoked: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.route.starts_with("DELETE"))
+        .collect();
+    assert_eq!(revoked.len(), 1, "{}", stderr(&output));
+    assert_eq!(revoked[0].route, "DELETE /api/me/keys/sub-hash-1");
+    assert_eq!(
+        revoked[0].authorization.as_deref(),
+        Some("Bearer person-access-token")
+    );
+    assert!(!store.exists(), "the keys go with the login");
+    assert!(
+        !stderr(&output).contains("could not be revoked"),
+        "{}",
+        stderr(&output)
+    );
 }

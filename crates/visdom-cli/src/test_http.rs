@@ -11,6 +11,20 @@ pub struct Recorded {
     pub route: String,
     pub authorization: Option<String>,
     pub body: String,
+    /// Every header, its name in lower case, in the order sent.
+    pub headers: Vec<(String, String)>,
+}
+
+impl Recorded {
+    /// The values of the header `name` (lower case). Used by the CLI tests.
+    #[allow(dead_code)]
+    pub fn header(&self, name: &str) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
 }
 
 pub struct MockServer {
@@ -85,12 +99,14 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<Recorded> {
     let route = format!("{} {}", parts.next()?, parts.next()?);
     let mut authorization = None;
     let mut length = 0usize;
+    let mut headers = Vec::new();
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).ok()? == 0 || header.trim().is_empty() {
             break;
         }
         if let Some((name, value)) = header.split_once(':') {
+            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
             match name.trim().to_ascii_lowercase().as_str() {
                 "authorization" => authorization = Some(value.trim().to_string()),
                 "content-length" => length = value.trim().parse().unwrap_or(0),
@@ -104,5 +120,6 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<Recorded> {
         route,
         authorization,
         body: String::from_utf8_lossy(&body).into_owned(),
+        headers,
     })
 }

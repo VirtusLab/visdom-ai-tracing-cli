@@ -112,14 +112,18 @@ pub trait AgentAdapter {
     /// The command that starts the agent with `args` and its LLM traffic
     /// going through the AI Gateway. `env` reads the current environment.
     /// `Err` when the caller's own `args` would take the session elsewhere.
+    /// A private file it comes with is the caller's to remove once the agent
+    /// has exited.
     fn launch_via_gateway(
         &self,
         args: &[String],
         gateway: &via_gateway::GatewayLaunch,
         env: &dyn Fn(&str) -> Option<String>,
-    ) -> Result<std::process::Command, String> {
+    ) -> Result<via_gateway::AgentCommand, String> {
         match self.agent() {
-            Agent::Codex => via_gateway::codex_command(self.program(), args, gateway),
+            Agent::Codex => {
+                via_gateway::codex_command(self.program(), args, gateway).map(Into::into)
+            }
             _ => via_gateway::claude_command(self.program(), args, gateway, env),
         }
     }
