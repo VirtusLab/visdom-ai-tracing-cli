@@ -603,14 +603,24 @@ fn init_gateway(
     }
     let asking = interactive::is_interactive();
     // Right after the mode: who pays for Claude Code's calls through it.
-    if agent == Agent::ClaudeCode && init_billing(&session, billing_flag, asking) {
+    // Asked for Claude Code only; a `--billing` given is kept for any agent
+    // (for Codex only `project` gets this far).
+    let ask_billing = asking && agent == Agent::ClaudeCode;
+    if init_billing(&session, billing_flag, ask_billing) {
         session = gather(&env, Some(agent), flag, billing_flag, runtime);
     }
     // Who pays, as a config further up says it: a folder's new config file
-    // would hide it, so it is copied there (below) once the file exists.
+    // would hide it, so it goes into that file together with the project,
+    // whichever step writes it first.
     let inherited_billing = (for_workspace
         && session.billing.source == billing::BillingSource::Repo)
         .then_some(session.billing.billing);
+    let save_project = |slug: &str| {
+        save_gateway(project_file, "project", slug);
+        if let Some(inherited) = inherited_billing {
+            save_gateway(project_file, "billing", inherited.name());
+        }
+    };
     // Several projects: the choice is the developer's.
     if asking && session.gateway_sources.project.is_none() {
         let open = match (&session.console_url, &session.token) {
@@ -631,7 +641,7 @@ fn init_gateway(
             if let Some(i) =
                 interactive::ask_choice("Which AI Gateway project is this for?", &names)
             {
-                save_gateway(project_file, "project", &open[i].slug);
+                save_project(&open[i].slug);
                 session = gather(&env, Some(agent), flag, billing_flag, runtime);
             }
         }
@@ -661,7 +671,7 @@ fn init_gateway(
     if sources.project.is_none() || (for_workspace && !workspace_names_project) {
         // The only project open today: written down, so that being given
         // access to another one later does not leave the choice open.
-        save_gateway(project_file, "project", &plan.project.slug);
+        save_project(&plan.project.slug);
         sources.project = Some(format!(
             "project under [gateway] in {}",
             project_file.display()
@@ -685,13 +695,6 @@ fn init_gateway(
                 "Saved tracing_mode = \"gateway\" to {}",
                 project_file.display()
             );
-        }
-    }
-    // Who pays, when a config further up said it, is kept the same way:
-    // otherwise the next `visdom` here would let the project pay.
-    if let Some(inherited) = inherited_billing {
-        if !matches!(next_billing(&env), Ok(next) if next.billing == inherited) {
-            save_gateway(project_file, "billing", inherited.name());
         }
     }
     let model_key = format!("{}_model", config::agent_config_key(agent));

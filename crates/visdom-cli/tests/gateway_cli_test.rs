@@ -2092,3 +2092,31 @@ fn env_refuses_a_subscription_it_cannot_set_up() {
         stderr(&output)
     );
 }
+
+/// Codex is not asked who pays, but `--billing project` given to its init is
+/// kept: a subscription saved earlier (for Claude Code) would otherwise stop
+/// every Codex launch.
+#[test]
+fn codex_init_keeps_an_explicit_project_billing() {
+    let server = gateway_server("per_agent");
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    sb.write_user_config("[gateway]\nbilling = \"subscription\"\n");
+    let output = sb
+        .visdom(sb.repo.path())
+        .args([
+            "--mode",
+            "gateway",
+            "--billing",
+            "project",
+            "init",
+            "--agent",
+            "codex",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let config = std::fs::read_to_string(sb.user_config()).unwrap();
+    assert!(config.contains("billing = \"project\""), "{config}");
+    assert!(stdout(&output).contains("AI Gateway ready for Codex"));
+}
