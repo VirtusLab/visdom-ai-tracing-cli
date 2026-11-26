@@ -2500,3 +2500,67 @@ fn logging_out_revokes_the_kept_subscription_key() {
         stderr(&output)
     );
 }
+
+/// Send `signal` (`-INT`, `-TERM`) to process `pid`.
+fn signal(pid: u32, signal: &str) {
+    let status = std::process::Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// Start a subscription session whose agent waits for `go`, and return once
+/// its settings file exists (the agent runs).
+fn waiting_session(sb: &Sandbox, go: &Path) -> std::process::Child {
+    let child = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway", "--billing", "subscription"])
+        .env("FAKE_CLAUDE_WAIT_FOR", go)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while settings_files(sb).is_empty() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the session did not start"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child
+}
+
+/// While the agent runs as its child, `visdom` waits out an interrupt (the
+/// terminal sends it to the agent too, which decides), passes a termination
+/// on to the agent, and removes the settings file however the agent ends.
+#[test]
+fn a_subscription_session_waits_out_an_interrupt_and_passes_a_termination_on() {
+    let server = subscription_server("per_agent");
+    let (sb, log) = subscription_sandbox(&server);
+    let go = sb.home.path().join("go");
+
+    // An interrupt to visdom alone: it keeps waiting, the agent finishes.
+    let mut session = waiting_session(&sb, &go);
+    signal(session.id(), "-INT");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(session.try_wait().unwrap().is_none(), "visdom still waits");
+    std::fs::write(&go, "").unwrap();
+    assert_eq!(session.wait().unwrap().code(), Some(0));
+    assert_eq!(fake_runs(&log).len(), 1);
+    assert!(settings_files(&sb).is_empty());
+
+    // A termination: the agent gets it and ends by it, and visdom reports it
+    // as a shell would.
+    std::fs::remove_file(&go).unwrap();
+    let mut session = waiting_session(&sb, &go);
+    signal(session.id(), "-TERM");
+    let status = session.wait().unwrap();
+    assert_eq!(status.code(), Some(128 + 15), "{status:?}");
+    assert_eq!(fake_runs(&log).len(), 1, "the agent did not get to send");
+    assert!(
+        settings_files(&sb).is_empty(),
+        "removed after the agent ended"
+    );
+}

@@ -198,6 +198,16 @@ fn gateway_key(
 fn forget_gateway_keys(runtime: &tokio::runtime::Runtime) {
     let env = Environment::current();
     let store = KeyStore::at(key_store_path_in(&env.config_root));
+    // Held from the snapshot to the clearing: a key another `visdom` issues
+    // meanwhile would otherwise be forgotten unrevoked. It waits, and keeps
+    // its key after this logout.
+    let _lock = match store.lock() {
+        Ok(lock) => Some(lock),
+        Err(e) => {
+            eprintln!("visdom: warning: the AI Gateway key store could not be locked: {e}");
+            None
+        }
+    };
     if !store.kept(now()).is_empty() {
         match checks::person_token(&env.cwd, runtime) {
             Ok(token) => {
