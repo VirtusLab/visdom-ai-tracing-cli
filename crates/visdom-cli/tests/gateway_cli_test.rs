@@ -2058,3 +2058,37 @@ fn init_fails_when_the_billing_it_saves_would_be_overruled() {
     assert!(said.contains(".visdom/config.toml"), "{said}");
     assert!(!stdout(&output).contains("AI Gateway ready"));
 }
+
+/// `visdom env` with the subscription: no script that would let the project
+/// pay, an error saying it is not available yet; Codex is refused outright.
+#[test]
+fn env_refuses_a_subscription_it_cannot_set_up() {
+    let server = gateway_server("per_agent");
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--billing", "subscription", "env"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("not available in this version of visdom yet"),
+        "{}",
+        stderr(&output)
+    );
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["env", "--agent", "codex"])
+        .env("VISDOM_GATEWAY_BILLING", "subscription")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("not supported yet for Codex"),
+        "{}",
+        stderr(&output)
+    );
+}

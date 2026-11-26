@@ -61,7 +61,7 @@ fn main() {
             let agent = args.agent;
             let launched = matches!(agent, Agent::ClaudeCode | Agent::Codex);
             if launched {
-                init_login(&runtime, &args);
+                init_login(&runtime, &args, cli.billing);
             }
             // A workspace has no hooks of its own: chosen from the question,
             // the machine-wide ones are installed with it.
@@ -78,8 +78,8 @@ fn main() {
                 runtime.block_on(run(Command::Init(machine)));
             }
             if launched {
-                init_bazaar(&runtime, agent, scope.scope);
-                init_mode(&runtime, agent, cli.mode);
+                init_bazaar(&runtime, agent, cli.billing, scope.scope);
+                init_mode(&runtime, agent, cli.mode, cli.billing);
                 init_gateway(&runtime, agent, cli.mode, cli.billing, scope.scope);
             }
         }
@@ -344,12 +344,12 @@ fn machine_wide(args: &InitArgs) -> InitArgs {
 /// tracing server (unless `--server-url` or an earlier setup names it) and log
 /// in, instead of failing with "log in first". Without a terminal nothing
 /// happens here and `init` reports what is missing.
-fn init_login(runtime: &tokio::runtime::Runtime, args: &InitArgs) {
+fn init_login(runtime: &tokio::runtime::Runtime, args: &InitArgs, billing: Option<Billing>) {
     if !interactive::is_interactive() {
         return;
     }
     let env = Environment::current();
-    let session = gather(&env, Some(args.agent), None, None, runtime);
+    let session = gather(&env, Some(args.agent), None, billing, runtime);
     if session.ctx.credential != CredentialState::Missing {
         return;
     }
@@ -372,7 +372,12 @@ fn init_login(runtime: &tokio::runtime::Runtime, args: &InitArgs) {
 /// `init` is asking for this, so the registration is shown and applied, not
 /// offered. What init cannot do (an unknown bazaar URL, an entry it will not
 /// replace) is reported; a registration that fails makes init fail.
-fn init_bazaar(runtime: &tokio::runtime::Runtime, agent: Agent, scope: InitScope) {
+fn init_bazaar(
+    runtime: &tokio::runtime::Runtime,
+    agent: Agent,
+    billing: Option<Billing>,
+    scope: InitScope,
+) {
     let env = Environment::current();
     // For a repository the registration is that project directory's; a
     // machine or a folder of checkouts has sessions in many directories.
@@ -380,7 +385,7 @@ fn init_bazaar(runtime: &tokio::runtime::Runtime, agent: Agent, scope: InitScope
         InitScope::Repo => McpScope::Local,
         InitScope::Machine | InitScope::Workspace => McpScope::User,
     };
-    let mut session = gather(&env, Some(agent), None, None, runtime);
+    let mut session = gather(&env, Some(agent), None, billing, runtime);
     session.mcp_scope = mcp_scope;
     // Nobody knows the bazaar URL: ask, and remember the answer for next time.
     if matches!(session.bazaar_url, Ok(None)) && interactive::is_interactive() {
@@ -401,7 +406,7 @@ fn init_bazaar(runtime: &tokio::runtime::Runtime, agent: Agent, scope: InitScope
     let policy = FixPolicy::All;
     let summary = fix(&bazaar, policy, &mut RealExecutor::new(false, policy));
     let findings = if summary.applied {
-        let mut after = gather(&env, Some(agent), None, None, runtime);
+        let mut after = gather(&env, Some(agent), None, billing, runtime);
         after.mcp_scope = mcp_scope;
         // The URL just typed counts even if it could not be saved.
         if matches!(after.bazaar_url, Ok(None)) {
@@ -427,9 +432,14 @@ fn init_bazaar(runtime: &tokio::runtime::Runtime, agent: Agent, scope: InitScope
 /// Asked only when it is theirs to choose — nothing chosen yet, a gateway to
 /// choose, and no workspace policy deciding it — and remembered in their
 /// config. A policy that decides is said instead.
-fn init_mode(runtime: &tokio::runtime::Runtime, agent: Agent, flag: Option<TracingMode>) {
+fn init_mode(
+    runtime: &tokio::runtime::Runtime,
+    agent: Agent,
+    flag: Option<TracingMode>,
+    billing: Option<Billing>,
+) {
     let env = Environment::current();
-    let session = gather(&env, Some(agent), flag, None, runtime);
+    let session = gather(&env, Some(agent), flag, billing, runtime);
     match session.mode.reason {
         ModeReason::Policy(TrafficPolicy::Enforced) => {
             println!(
@@ -596,6 +606,11 @@ fn init_gateway(
     if agent == Agent::ClaudeCode && init_billing(&session, billing_flag, asking) {
         session = gather(&env, Some(agent), flag, billing_flag, runtime);
     }
+    // Who pays, as a config further up says it: a folder's new config file
+    // would hide it, so it is copied there (below) once the file exists.
+    let inherited_billing = (for_workspace
+        && session.billing.source == billing::BillingSource::Repo)
+        .then_some(session.billing.billing);
     // Several projects: the choice is the developer's.
     if asking && session.gateway_sources.project.is_none() {
         let open = match (&session.console_url, &session.token) {
@@ -657,7 +672,10 @@ fn init_gateway(
         let chosen_in_files = session.mode.reason == ModeReason::Chosen && flag.is_none();
         if for_workspace
             && chosen_in_files
-            && gather(&env, Some(agent), None, None, runtime).mode.mode != TracingMode::Gateway
+            && gather(&env, Some(agent), None, billing_flag, runtime)
+                .mode
+                .mode
+                != TracingMode::Gateway
         {
             if let Err(e) = interactive::save_tracing_mode(project_file, TracingMode::Gateway) {
                 eprintln!("visdom: the tracing mode could not be saved: {e}");
@@ -668,13 +686,12 @@ fn init_gateway(
                 project_file.display()
             );
         }
-        // Who pays, when a config further up said it, is kept the same way:
-        // otherwise the next `visdom` here would let the project pay.
-        if for_workspace && session.billing.source == billing::BillingSource::Repo {
-            let after = gather(&env, Some(agent), flag, None, runtime);
-            if after.billing.billing != session.billing.billing {
-                save_gateway(project_file, "billing", session.billing.billing.name());
-            }
+    }
+    // Who pays, when a config further up said it, is kept the same way:
+    // otherwise the next `visdom` here would let the project pay.
+    if let Some(inherited) = inherited_billing {
+        if !matches!(next_billing(&env), Ok(next) if next.billing == inherited) {
+            save_gateway(project_file, "billing", inherited.name());
         }
     }
     let model_key = format!("{}_model", config::agent_config_key(agent));
@@ -725,6 +742,21 @@ fn init_gateway(
     );
 }
 
+/// Who pays at the next plain `visdom` here, as the files say now.
+fn next_billing(env: &Environment) -> Result<billing::ResolvedBilling, String> {
+    let user = config::load_user_config_in(&env.config_root).unwrap_or_default();
+    let repo = checks_repo_config(env);
+    billing::configured_billing(
+        None,
+        env.gateway_billing.as_deref(),
+        repo.gateway.billing,
+        user.gateway.billing,
+        &config::user_config_path_in(&env.config_root)
+            .display()
+            .to_string(),
+    )
+}
+
 /// Who pays for Claude Code's calls through the gateway, in `visdom init`:
 /// `--billing` is saved to the user config without asking; with nothing
 /// chosen anywhere and somebody to ask, the answer is. A saved value that the
@@ -741,19 +773,8 @@ fn init_billing(session: &Session, flag: Option<Billing>, asking: bool) -> bool 
         }
         None => return false,
     };
-    let path = &session.user_config_path;
-    save_gateway(path, "billing", billing.name());
-    let env = Environment::current();
-    let user = config::load_user_config_in(&env.config_root).unwrap_or_default();
-    let repo = checks_repo_config(&env);
-    let next = billing::configured_billing(
-        None,
-        env.gateway_billing.as_deref(),
-        repo.gateway.billing,
-        user.gateway.billing,
-        &path.display().to_string(),
-    );
-    match next {
+    save_gateway(&session.user_config_path, "billing", billing.name());
+    match next_billing(&Environment::current()) {
         Ok(next) if next.billing == billing => true,
         next => {
             let said_by = match next {
