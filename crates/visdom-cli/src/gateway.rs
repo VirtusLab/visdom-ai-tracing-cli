@@ -404,6 +404,10 @@ struct StoredKey {
     /// Unix seconds when it was kept, which is when it was issued.
     #[serde(default)]
     issued_at: i64,
+    /// The gateway refused it (revoked elsewhere): never handed out again,
+    /// but kept until it expires, for logout to revoke.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    refused: bool,
 }
 
 impl StoredKey {
@@ -416,7 +420,8 @@ impl StoredKey {
 
     /// Whether it is still handed out at `now`, rather than replaced.
     fn lasts(&self, now: i64) -> bool {
-        self.expires_at - now >= renew_before(self.billing, self.issued_at, self.expires_at)
+        !self.refused
+            && self.expires_at - now >= renew_before(self.billing, self.issued_at, self.expires_at)
     }
 }
 
@@ -549,7 +554,21 @@ impl KeyStore {
             billing,
             id: key.id.clone(),
             issued_at: now,
+            refused: false,
         });
+        let text = serde_json::to_string(&keys).map_err(|e| e.to_string())?;
+        write_private(&self.path, &text)
+            .map_err(|e| format!("cannot write {}: {e}", self.path.display()))
+    }
+
+    /// Mark the kept key `secret` as refused by the gateway: it is not handed
+    /// out again, but stays for logout to revoke. Call under [`Self::lock`].
+    pub fn refuse(&self, secret: &str) -> Result<(), String> {
+        let mut keys = self.load();
+        let Some(key) = keys.iter_mut().find(|k| k.secret == secret) else {
+            return Ok(());
+        };
+        key.refused = true;
         let text = serde_json::to_string(&keys).map_err(|e| e.to_string())?;
         write_private(&self.path, &text)
             .map_err(|e| format!("cannot write {}: {e}", self.path.display()))
@@ -639,6 +658,11 @@ pub async fn ensure_key(
         .await
         .map_err(|e| e.to_string())
         .and_then(|locked| locked.map_err(|e| e.to_string()));
+    // A key the gateway refused is not offered again by any later session
+    // (a subscription key stays kept, and may outlast its replacement).
+    if let (Some(secret), Ok(_)) = (rejected, &lock) {
+        let _ = store.refuse(secret);
+    }
     let stored = store
         .usable(console_url, project_id, &account, billing, now)
         .filter(|key| Some(key.secret.as_str()) != rejected);
@@ -1676,5 +1700,47 @@ mod tests {
             warnings[0].contains("personal key stays valid"),
             "{warnings:?}"
         );
+    }
+
+    /// A subscription key the gateway refused is not handed out again, even
+    /// when it would outlast its replacement; it stays kept for logout.
+    #[tokio::test]
+    async fn a_refused_subscription_key_does_not_come_back() {
+        let http = reqwest::Client::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KeyStore::at(key_store_path_in(tmp.path()));
+        let answer = subscription_answer("sk-new", "h-new", "2099-01-01T00:00:00Z");
+        let server = MockServer::start(&[("POST /api/me/keys", 201, &answer)]);
+        let sub = Billing::Subscription;
+        let old = IssuedKey {
+            secret: "sk-old".to_string(),
+            expires_at: 9_000_000_000,
+            id: Some("h-old".to_string()),
+        };
+        store.keep(&server.url, "p-1", "", sub, &old, 0).unwrap();
+        let renewed = ensure_key(
+            &http,
+            &server.url,
+            "tok",
+            "p-1",
+            sub,
+            &store,
+            0,
+            Some("sk-old"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (renewed.key.secret.as_str(), renewed.issued),
+            ("sk-new", true)
+        );
+        // The next session, which was not told, gets the new one too.
+        let next = ensure_key(&http, &server.url, "tok", "p-1", sub, &store, 0, None)
+            .await
+            .unwrap();
+        assert_eq!((next.key.secret.as_str(), next.issued), ("sk-new", false));
+        assert_eq!(server.routes().len(), 1);
+        let ids: Vec<_> = store.kept(0).into_iter().filter_map(|k| k.id).collect();
+        assert_eq!(ids, ["h-old", "h-new"]);
     }
 }

@@ -592,6 +592,22 @@ mod tests {
         remove_stale_private_files(&dir.join("missing"));
     }
 
+    /// A termination that comes before the agent's pid is known is passed on
+    /// to the agent as soon as it is.
+    #[cfg(unix)]
+    #[test]
+    fn a_termination_before_the_agent_runs_is_passed_on_to_it() {
+        signals::wait_them_out();
+        // SAFETY: the handler only records it: no agent is known yet.
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+        let mut agent = Command::new("sleep").arg("30").spawn().unwrap();
+        signals::pass_on_to(agent.id());
+        let status = agent.wait().unwrap();
+        assert_eq!(exit_code(status), 128 + 15, "{status:?}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_shell_reports_a_signalled_agent_as_128_plus_the_signal() {
