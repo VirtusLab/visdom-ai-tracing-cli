@@ -22,6 +22,7 @@ use crate::instructions::{self, Facts, Told};
 use crate::mode::{configured_mode, effective_mode, ResolvedMode, TracingMode, MODE_ENV};
 use crate::subscription::{self, KeyState};
 use crate::suite::{self, PolicyState, SuiteMap};
+use crate::surface::{resolve_surface, Surface, SURFACE_ENV};
 
 /// The first of `candidates` that is set to something.
 fn first_set(candidates: [Option<String>; 3]) -> Option<String> {
@@ -107,6 +108,8 @@ pub struct Environment {
     pub gateway_model: Option<String>,
     /// `VISDOM_GATEWAY_BILLING`: who pays for the calls through the gateway.
     pub gateway_billing: Option<String>,
+    /// `VISDOM_SURFACE`.
+    pub surface: Option<String>,
 }
 
 impl Environment {
@@ -127,6 +130,7 @@ impl Environment {
             gateway_project: set(GATEWAY_PROJECT_ENV),
             gateway_model: set(GATEWAY_MODEL_ENV),
             gateway_billing: set(billing::BILLING_ENV),
+            surface: set(SURFACE_ENV),
             home,
         }
     }
@@ -171,6 +175,8 @@ pub struct Session {
     pub billing_use: BillingUse,
     /// What [`Session::check_subscription`] found; empty until it runs.
     pub subscription: Vec<Finding>,
+    /// Where the agent opens.
+    pub surface: Surface,
 }
 
 impl Session {
@@ -182,6 +188,19 @@ impl Session {
         agent_flag: Option<Agent>,
         mode_flag: Option<TracingMode>,
         billing_flag: Option<Billing>,
+        runtime: &tokio::runtime::Runtime,
+    ) -> Result<Session, String> {
+        Session::gather_on(env, agent_flag, mode_flag, billing_flag, None, runtime)
+    }
+
+    /// [`Session::gather`] for a command that takes `--surface`. A surface in
+    /// the environment that names none is an error too.
+    pub fn gather_on(
+        env: &Environment,
+        agent_flag: Option<Agent>,
+        mode_flag: Option<TracingMode>,
+        billing_flag: Option<Billing>,
+        surface_flag: Option<Surface>,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Session, String> {
         let mut warnings = Vec::new();
@@ -201,6 +220,12 @@ impl Session {
             .unwrap_or_default();
         let repo: RepoConfig = repo;
         let agent = config::resolve_agent(agent_flag, env.agent.as_deref(), &repo, &user)?;
+        let surface = resolve_surface(
+            surface_flag,
+            env.surface.as_deref(),
+            repo.surface,
+            user.surface,
+        )?;
         let chosen = configured_mode(
             mode_flag,
             env.mode.as_deref(),
@@ -359,6 +384,7 @@ impl Session {
             },
             config_root: env.config_root.clone(),
             agent_instructions: user.agent_instructions.unwrap_or(true),
+            surface,
             billing,
             billing_use,
             subscription: Vec::new(),

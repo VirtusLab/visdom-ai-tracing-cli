@@ -19,5 +19,6 @@ pub mod launch;
 pub mod mode;
 pub mod subscription;
 pub mod suite;
+pub mod surface;
 #[cfg(test)]
 mod test_http;

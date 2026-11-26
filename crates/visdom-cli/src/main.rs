@@ -24,6 +24,7 @@ use visdom_cli::mode::{
 };
 use visdom_cli::subscription;
 use visdom_cli::suite::PolicyState;
+use visdom_cli::surface::Surface;
 use visdom_cli::{config, interactive};
 use visdom_cli::{doctor as checks, env_alias, instructions, launch};
 
@@ -129,6 +130,7 @@ fn main() {
             cli.agent,
             cli.mode,
             cli.billing,
+            cli.surface,
             cli.yes,
             !cli.no_instructions,
             &cli.agent_args,
@@ -236,7 +238,19 @@ fn gather(
     billing: Option<Billing>,
     runtime: &tokio::runtime::Runtime,
 ) -> Session {
-    match Session::gather(env, agent, mode, billing, runtime) {
+    gather_on(env, agent, mode, billing, None, runtime)
+}
+
+/// [`gather`] for the commands that take `--surface`.
+fn gather_on(
+    env: &Environment,
+    agent: Option<Agent>,
+    mode: Option<TracingMode>,
+    billing: Option<Billing>,
+    surface: Option<Surface>,
+    runtime: &tokio::runtime::Runtime,
+) -> Session {
+    match Session::gather_on(env, agent, mode, billing, surface, runtime) {
         Ok(session) => {
             for warning in &session.warnings {
                 eprintln!("visdom: warning: {warning}");
@@ -1090,18 +1104,19 @@ fn check_and_launch(
     agent: Option<Agent>,
     mode: Option<TracingMode>,
     billing: Option<Billing>,
+    surface: Option<Surface>,
     yes: bool,
     instructions: bool,
     agent_args: &[String],
 ) -> ! {
     let env = Environment::current();
-    let mut session = gather(&env, agent, mode, billing, &runtime);
+    let mut session = gather_on(&env, agent, mode, billing, surface, &runtime);
     check_subscription(&mut session, &runtime, false, agent_args);
     let findings = session.collect();
     print_attention(&findings);
     let policy = policy_for(false, yes, false, stdin_is_tty());
     if fix(&findings, policy, &mut RealExecutor::new(false, policy)).applied {
-        session = gather(&env, agent, mode, billing, &runtime);
+        session = gather_on(&env, agent, mode, billing, surface, &runtime);
         check_subscription(&mut session, &runtime, false, agent_args);
         // What is still open, once, above the agent.
         print_attention(&session.collect());

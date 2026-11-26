@@ -6,6 +6,7 @@ use tracevault_cli::cli::{Command, InitArgs, LoginArgs};
 
 use crate::billing::Billing;
 use crate::mode::TracingMode;
+use crate::surface::Surface;
 
 #[derive(Parser)]
 #[command(
@@ -36,6 +37,11 @@ pub struct VisdomCli {
     /// project. `visdom --billing … init` saves it.
     #[arg(long, value_enum)]
     pub billing: Option<Billing>,
+    /// Where the agent opens: terminal or desktop (the Claude Desktop app).
+    /// Default: the VISDOM_SURFACE variable, then `.visdom/config.toml` in the
+    /// repository, then the user config (`surface`), then terminal.
+    #[arg(long, value_enum)]
+    pub surface: Option<Surface>,
     /// Apply every offered fix without asking.
     #[arg(long)]
     pub yes: bool,
@@ -135,6 +141,15 @@ mod tests {
             Ok(cli) => cli,
             Err(e) => panic!("{args:?} must parse: {e}"),
         }
+    }
+
+    #[test]
+    fn the_surface_is_an_option_of_the_launch() {
+        assert_eq!(
+            parse(&["visdom", "--surface", "desktop"]).surface,
+            Some(Surface::Desktop)
+        );
+        assert!(VisdomCli::try_parse_from(["visdom", "--surface", "web"]).is_err());
     }
 
     #[test]

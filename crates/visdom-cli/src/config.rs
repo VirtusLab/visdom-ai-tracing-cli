@@ -10,6 +10,7 @@ use tracevault_cli::agent::Agent;
 
 use crate::billing::{parse_billing, Billing};
 use crate::mode::{parse_mode, TracingMode};
+use crate::surface::{parse_surface, Surface};
 
 /// `<config dir>/visdom/config.toml`.
 #[derive(Debug, Default, Deserialize)]
@@ -23,6 +24,9 @@ pub struct UserConfig {
     /// How this developer's sessions are traced: `hooks` or `gateway`.
     #[serde(default, deserialize_with = "de_mode")]
     pub tracing_mode: Option<TracingMode>,
+    /// Where the agent opens: `terminal` or `desktop`.
+    #[serde(default, deserialize_with = "de_surface")]
+    pub surface: Option<Surface>,
     /// Control Plane's address, when the server does not publish it.
     #[serde(default)]
     pub control_plane_url: Option<String>,
@@ -99,6 +103,10 @@ pub struct RepoConfig {
     /// the command line or in the environment still wins.
     #[serde(default, deserialize_with = "de_mode")]
     pub tracing_mode: Option<TracingMode>,
+    /// Where the agent opens here; a developer's own choice on the command
+    /// line or in the environment still wins.
+    #[serde(default, deserialize_with = "de_surface")]
+    pub surface: Option<Surface>,
     #[serde(default)]
     pub gateway: RepoGatewayConfig,
 }
@@ -152,6 +160,15 @@ fn de_billing<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Billing>, D::Err
     match Option::<String>::deserialize(d)? {
         None => Ok(None),
         Some(name) => parse_billing(&name)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+fn de_surface<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Surface>, D::Error> {
+    match Option::<String>::deserialize(d)? {
+        None => Ok(None),
+        Some(name) => parse_surface(&name)
             .map(Some)
             .map_err(serde::de::Error::custom),
     }
@@ -225,6 +242,15 @@ pub fn resolve_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_config_files_take_a_surface() {
+        let user: UserConfig = toml::from_str("surface = \"desktop\"").unwrap();
+        assert_eq!(user.surface, Some(Surface::Desktop));
+        let repo: RepoConfig = toml::from_str("surface = \"terminal\"").unwrap();
+        assert_eq!(repo.surface, Some(Surface::Terminal));
+        assert!(toml::from_str::<UserConfig>("surface = \"web\"").is_err());
+    }
 
     fn user(agent: Option<Agent>) -> UserConfig {
         UserConfig {
