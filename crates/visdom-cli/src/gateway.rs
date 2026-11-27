@@ -40,6 +40,79 @@ pub struct OpenProject {
     pub id: String,
     pub slug: String,
     pub name: String,
+    /// The project's model aliases, each with whether the gateway takes a
+    /// call paid by a Claude subscription on it. `None`: the gateway does not
+    /// say (a version from before the list).
+    #[serde(default)]
+    pub models: Option<Vec<ProjectModel>>,
+}
+
+/// One alias of a project's allow-list, as `GET /api/me/keys` lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct ProjectModel {
+    pub alias: String,
+    /// Served by direct Anthropic deployments only: the gateway takes a call
+    /// paid by a Claude subscription on it, and refuses one on any other
+    /// alias (HTTP 403, code `subscription_model`).
+    #[serde(default)]
+    pub subscription: bool,
+}
+
+impl OpenProject {
+    /// The aliases a call paid by a Claude subscription may use, when the
+    /// gateway says which.
+    pub fn subscription_aliases(&self) -> Option<Vec<String>> {
+        self.models.as_ref().map(|models| {
+            models
+                .iter()
+                .filter(|m| m.subscription)
+                .map(|m| m.alias.clone())
+                .collect()
+        })
+    }
+}
+
+/// Whether the gateway takes calls paid by a Claude subscription, as its
+/// console publishes it (`subscriptionTraffic` in `GET /api/settings`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionTraffic {
+    Allowed,
+    /// The deployment refuses them (`VISDOM_SUBSCRIPTION_TRAFFIC=deny`).
+    Denied,
+    /// The console says nothing about it: a gateway from before the setting,
+    /// which does not support subscription traffic either. A value this
+    /// version does not know is read the same way.
+    Unpublished,
+}
+
+impl SubscriptionTraffic {
+    /// Whether a session paid by a Claude subscription can go through it.
+    pub fn supported(self) -> bool {
+        self == SubscriptionTraffic::Allowed
+    }
+}
+
+/// The code the console and the gateway refuse subscription traffic with
+/// while the deployment denies it.
+pub const SUBSCRIPTION_TRAFFIC_DENIED: &str = "subscription_traffic_denied";
+
+/// What the console's settings say about the gateway.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsoleSettings {
+    /// The LLM gateway's public address.
+    pub llm_url: String,
+    pub subscription_traffic: SubscriptionTraffic,
+}
+
+/// The machine-readable code of a refusal (`{"code": …}` as the console
+/// answers, or `{"error": {"code": …}}` as the LLM gateway does), if any.
+fn refusal_code(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value
+        .get("code")
+        .or_else(|| value.get("error").and_then(|e| e.get("code")))
+        .and_then(|c| c.as_str())
+        .map(String::from)
 }
 
 /// A personal key as issued.
@@ -52,8 +125,13 @@ pub struct IssuedKey {
     pub id: Option<String>,
 }
 
-/// The console's refusal, in its own words when it gave any.
+/// The console's refusal, in its own words when it gave any. A refusal
+/// because the deployment denies subscription traffic is
+/// [`crate::subscription::NOT_SUPPORTED`], word for word.
 fn refusal(what: &str, status: reqwest::StatusCode, body: &str) -> String {
+    if refusal_code(body).as_deref() == Some(SUBSCRIPTION_TRAFFIC_DENIED) {
+        return crate::subscription::NOT_SUPPORTED.to_string();
+    }
     #[derive(Deserialize)]
     struct Refusal {
         error: String,
@@ -95,16 +173,19 @@ fn base(url: &str) -> &str {
     url.trim_end_matches('/')
 }
 
-/// The LLM gateway's public address, from the console's settings.
-pub async fn llm_gateway_url(
+/// The LLM gateway's public address and whether it takes subscription
+/// traffic, from the console's settings.
+pub async fn console_settings(
     http: &reqwest::Client,
     console_url: &str,
     token: &str,
-) -> Result<String, String> {
+) -> Result<ConsoleSettings, String> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Settings {
         llm_gateway_url: String,
+        #[serde(default)]
+        subscription_traffic: Option<serde_json::Value>,
     }
     let what = "cannot read the AI Gateway's address";
     let request = http
@@ -112,11 +193,22 @@ pub async fn llm_gateway_url(
         .bearer_auth(token);
     let settings: Settings = parse(what, &read(what, console_url, request).await?)?;
     let url = base(&settings.llm_gateway_url).to_string();
-    if crate::components::bazaar::is_http_url(&url) {
-        Ok(url)
-    } else {
-        Err(format!("{what}: `{url}` is not an http(s) URL"))
+    if !crate::components::bazaar::is_http_url(&url) {
+        return Err(format!("{what}: `{url}` is not an http(s) URL"));
     }
+    let subscription_traffic = match settings
+        .subscription_traffic
+        .as_ref()
+        .and_then(|v| v.as_str())
+    {
+        Some("allowed") => SubscriptionTraffic::Allowed,
+        Some("denied") => SubscriptionTraffic::Denied,
+        _ => SubscriptionTraffic::Unpublished,
+    };
+    Ok(ConsoleSettings {
+        llm_url: url,
+        subscription_traffic,
+    })
 }
 
 /// The projects the developer may issue a personal key for.
@@ -284,6 +376,13 @@ pub async fn models(
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
+        if refusal_code(&body).as_deref() == Some(SUBSCRIPTION_TRAFFIC_DENIED) {
+            // Another key would be refused the same way.
+            return Err(failed(
+                crate::subscription::NOT_SUPPORTED.to_string(),
+                false,
+            ));
+        }
         let rejected = matches!(status.as_u16(), 401 | 403);
         let why = if rejected {
             format!(
@@ -518,6 +617,31 @@ impl KeyStore {
             })
     }
 
+    /// The stored key of the kind `billing` of `account` for this console
+    /// and project that lasts longest, if any has not expired and was not
+    /// refused, however little it has left: what a check tries, changing
+    /// nothing. (A launch replaces one inside its renewal window; see
+    /// [`Self::usable`].)
+    pub fn unexpired(
+        &self,
+        console_url: &str,
+        project_id: &str,
+        account: &str,
+        billing: Billing,
+        now: i64,
+    ) -> Option<IssuedKey> {
+        self.load()
+            .into_iter()
+            .filter(|k| k.is_for(console_url, project_id, account, billing))
+            .filter(|k| !k.refused && k.expires_at > now)
+            .max_by_key(|k| k.expires_at)
+            .map(|k| IssuedKey {
+                secret: k.secret,
+                expires_at: k.expires_at,
+                id: k.id,
+            })
+    }
+
     /// Keep `key` of the kind `billing`, dropping keys that have expired. An
     /// ordinary key replaces the one for the same console and project
     /// (whoever's it was: this machine's user is now `account`), as issuing
@@ -727,6 +851,7 @@ mod tests {
             id: id.to_string(),
             slug: slug.to_string(),
             name: slug.to_uppercase(),
+            models: None,
         }
     }
 
@@ -739,13 +864,78 @@ mod tests {
             r#"{"llmGatewayUrl":"https://llm.example.com/","mcpGatewayUrl":"https://mcp.example.com","suite":[],"controlPlaneUrl":null}"#,
         )]);
         assert_eq!(
-            llm_gateway_url(&http, &format!("{}/", server.url), "tok").await,
-            Ok("https://llm.example.com".to_string())
+            console_settings(&http, &format!("{}/", server.url), "tok").await,
+            Ok(ConsoleSettings {
+                llm_url: "https://llm.example.com".to_string(),
+                // A console from before the setting: not supported.
+                subscription_traffic: SubscriptionTraffic::Unpublished,
+            })
         );
         assert_eq!(
             server.requests()[0].authorization.as_deref(),
             Some("Bearer tok")
         );
+    }
+
+    #[tokio::test]
+    async fn the_settings_say_whether_subscription_traffic_is_taken() {
+        let http = reqwest::Client::new();
+        for (said, read) in [
+            (r#""allowed""#, SubscriptionTraffic::Allowed),
+            (r#""denied""#, SubscriptionTraffic::Denied),
+            (r#""maybe""#, SubscriptionTraffic::Unpublished),
+            ("null", SubscriptionTraffic::Unpublished),
+            ("true", SubscriptionTraffic::Unpublished),
+        ] {
+            let body = format!(
+                r#"{{"llmGatewayUrl":"https://llm.example.com","subscriptionTraffic":{said}}}"#
+            );
+            let server = MockServer::start(&[("GET /api/settings", 200, &body)]);
+            let settings = console_settings(&http, &server.url, "tok").await.unwrap();
+            assert_eq!(settings.subscription_traffic, read, "{said}");
+        }
+        assert!(SubscriptionTraffic::Allowed.supported());
+        assert!(!SubscriptionTraffic::Denied.supported());
+        assert!(!SubscriptionTraffic::Unpublished.supported());
+    }
+
+    #[tokio::test]
+    async fn a_projects_models_say_which_take_a_subscription() {
+        let http = reqwest::Client::new();
+        let server = MockServer::start(&[(
+            "GET /api/me/keys",
+            200,
+            r#"{"projects":[{"id":"p-1","slug":"alpha","name":"Alpha","models":[{"alias":"claude-sonnet","subscription":true},{"alias":"gpt-general","subscription":false}]}],"keys":[]}"#,
+        )]);
+        let open = open_projects(&http, &server.url, "tok").await.unwrap();
+        assert_eq!(
+            open[0].subscription_aliases(),
+            Some(vec!["claude-sonnet".to_string()])
+        );
+        assert_eq!(project("p-2", "beta").subscription_aliases(), None);
+    }
+
+    #[tokio::test]
+    async fn a_denied_subscription_key_is_the_platforms_message() {
+        let http = reqwest::Client::new();
+        let server = MockServer::start(&[(
+            "POST /api/me/keys",
+            403,
+            r#"{"error":"This gateway does not take subscription traffic (VISDOM_SUBSCRIPTION_TRAFFIC=deny), so it issues no subscription keys; use an ordinary personal key","code":"subscription_traffic_denied"}"#,
+        )]);
+        let err = issue_key(&http, &server.url, "tok", "p-1", Billing::Subscription, 0)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err, crate::subscription::NOT_SUPPORTED);
+        let server = MockServer::start(&[(
+            "GET /v1/models",
+            403,
+            r#"{"error":{"message":"no","type":"permission_error","code":"subscription_traffic_denied"}}"#,
+        )]);
+        let err = models(&http, &server.url, "sk").await.unwrap_err();
+        assert_eq!(err.why, crate::subscription::NOT_SUPPORTED);
+        assert!(!err.rejected, "another key would not help");
     }
 
     #[tokio::test]
@@ -761,7 +951,8 @@ mod tests {
             Ok(vec![OpenProject {
                 id: "p-1".to_string(),
                 slug: "alpha".to_string(),
-                name: "Alpha".to_string()
+                name: "Alpha".to_string(),
+                models: None,
             }])
         );
     }
@@ -1454,22 +1645,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_deployment_that_denies_subscription_traffic_is_quoted() {
-        let http = reqwest::Client::new();
-        let server = MockServer::start(&[(
-            "POST /api/me/keys",
-            403,
-            r#"{"error":"This gateway does not take subscription traffic (VISDOM_SUBSCRIPTION_TRAFFIC=deny), so it issues no subscription keys; use an ordinary personal key","code":"subscription_traffic_denied"}"#,
-        )]);
-        let err = issue_key(&http, &server.url, "tok", "p-1", Billing::Subscription, 0)
-            .await
-            .err()
-            .unwrap();
-        assert!(err.contains("does not take subscription traffic"), "{err}");
-        assert!(err.contains("HTTP 403"), "{err}");
-    }
-
     #[test]
     fn a_subscription_key_is_renewed_a_week_before_it_expires() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1506,6 +1681,17 @@ mod tests {
         );
         assert!(store
             .usable("https://gw", "p-1", "a", sub, expires - week + 1)
+            .is_none());
+        // A check still finds it, until it expires or is refused.
+        assert_eq!(
+            store
+                .unexpired("https://gw", "p-1", "a", sub, expires - 1)
+                .unwrap()
+                .secret,
+            "first"
+        );
+        assert!(store
+            .unexpired("https://gw", "p-1", "a", sub, expires)
             .is_none());
         // The next one does not replace it in the store: the first stays
         // until it expires, for logout to revoke, and the new one is used.

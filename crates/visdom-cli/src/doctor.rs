@@ -20,6 +20,7 @@ use crate::fixes::{apply_fixes, FixExecutor, FixOutcome, FixPolicy};
 use crate::gateway;
 use crate::instructions::{self, Facts, Told};
 use crate::mode::{configured_mode, effective_mode, ResolvedMode, TracingMode, MODE_ENV};
+use crate::subscription::{self, KeyState};
 use crate::suite::{self, PolicyState, SuiteMap};
 
 /// The first of `candidates` that is set to something.
@@ -168,6 +169,8 @@ pub struct Session {
     pub billing: ResolvedBilling,
     /// Whether that can be used in this session's mode with this agent.
     pub billing_use: BillingUse,
+    /// What [`Session::check_subscription`] found; empty until it runs.
+    pub subscription: Vec<Finding>,
 }
 
 impl Session {
@@ -358,7 +361,127 @@ impl Session {
             agent_instructions: user.agent_instructions.unwrap_or(true),
             billing,
             billing_use,
+            subscription: Vec::new(),
         })
+    }
+
+    /// Whether the agent is to be started through the gateway on the
+    /// developer's own Claude subscription.
+    pub fn on_subscription(&self) -> bool {
+        self.mode.mode == TracingMode::Gateway
+            && self.billing_use == BillingUse::Applies
+            && self.billing.billing == Billing::Subscription
+    }
+
+    /// The model alias a subscription session would ask for: the configured
+    /// one, else the first one named for the agent among those the gateway
+    /// takes a subscription call on.
+    pub fn subscription_model(&self) -> Option<String> {
+        let eligible = match &self.gateway {
+            Some(Ok(plan)) => plan.project.subscription_aliases().unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        gateway::pick_model(self.ctx.agent, self.gateway_model.as_deref(), &eligible)
+    }
+
+    /// Check that a subscription session can work here (see
+    /// [`crate::subscription`]); [`Session::collect`] then reports it.
+    /// `model` is the alias it would ask for, and `key` what is known of its
+    /// key (`None`: not checked here). Nothing when the session is not one.
+    /// `agent_args` are the caller's own options for the agent, which may
+    /// name another model.
+    pub fn check_subscription(
+        &mut self,
+        model: Option<&str>,
+        agent_args: &[String],
+        key: Option<&KeyState>,
+    ) {
+        self.subscription.clear();
+        if !self.on_subscription() {
+            return;
+        }
+        if let Some(Ok(plan)) = &self.gateway {
+            self.subscription
+                .push(subscription::traffic_finding(plan.subscription_traffic));
+        }
+        self.subscription
+            .push(subscription::login_finding(&subscription::claude_login(
+                self.adapter.program(),
+                agent_args,
+                &crate::launch::private_dir(&self.config_root),
+            )));
+        // Claude Code reads a project's `.claude/` settings in the checkout,
+        // or, outside one, where it is started.
+        let project_dir = self
+            .ctx
+            .workdir
+            .checkout
+            .clone()
+            .unwrap_or_else(|| self.ctx.workdir.start_dir.clone());
+        if let Some(Ok(plan)) = &self.gateway {
+            // What the launch keeps of the environment, Claude Code's
+            // settings and the caller's options wins over visdom's alias:
+            // each is checked.
+            let claude_env = subscription::ClaudeEnv::read(
+                &subscription::managed_settings_path(),
+                &self.ctx.home,
+                Some(&project_dir),
+                agent_args,
+            );
+            let uses = subscription::models_in_use(model, agent_args, &|name| {
+                claude_env.get(name, &|name| std::env::var(name).ok())
+            });
+            self.subscription.push(subscription::model_finding(
+                &uses,
+                self.gateway_sources.model.as_deref(),
+                &plan.project,
+                &format!("{}_model", config::agent_config_key(self.ctx.agent)),
+            ));
+        }
+        if let Some(key) = key {
+            self.subscription.push(subscription::key_finding(key));
+        }
+        self.subscription.push(subscription::settings_finding(
+            &subscription::managed_settings_path(),
+            &self.ctx.home,
+            Some(&project_dir),
+        ));
+    }
+
+    /// The kept subscription key, tried on the LLM gateway; none is issued
+    /// (`visdom doctor` changes nothing at the gateway). Any key that has not
+    /// expired is tried, also one close enough to its end that the next
+    /// launch replaces it.
+    pub fn kept_subscription_key(&self, runtime: &tokio::runtime::Runtime, now: i64) -> KeyState {
+        let (Some(Ok(plan)), Some(token)) = (&self.gateway, &self.token) else {
+            return KeyState::NoneKept;
+        };
+        let store = gateway::KeyStore::at(gateway::key_store_path_in(&self.config_root));
+        let kept = store.unexpired(
+            &plan.console_url,
+            &plan.project.id,
+            &gateway::account_of(token),
+            Billing::Subscription,
+            now,
+        );
+        let Some(key) = kept else {
+            return KeyState::NoneKept;
+        };
+        match runtime.block_on(gateway::models(&http_client(), &plan.llm_url, &key.secret)) {
+            Ok(_) => KeyState::Accepted {
+                expires_at: key.expires_at,
+            },
+            Err(refusal) if refusal.rejected => KeyState::KeptRefused,
+            Err(refusal) => KeyState::Failed(refusal.why),
+        }
+    }
+
+    /// Whether a subscription session cannot work here, as far as
+    /// [`Session::check_subscription`] found.
+    pub fn subscription_blocked(&self) -> bool {
+        self.subscription
+            .iter()
+            .any(|f| f.severity == crate::finding::Severity::Error)
     }
 
     /// What an agent started now would have of Visdom's, `through_gateway`
@@ -421,6 +544,7 @@ impl Session {
             &self.billing,
             &self.billing_use,
         ));
+        findings.extend(self.subscription.iter().cloned());
         findings.extend(bazaar::check(
             self.bazaar_url
                 .as_ref()
@@ -504,13 +628,14 @@ pub async fn plan_gateway(
         "the AI Gateway needs a Visdom account login (an API key does not work there): run \
          `visdom login`",
     )?;
-    let llm_url = gateway::llm_gateway_url(http, &console_url, token).await?;
+    let settings = gateway::console_settings(http, &console_url, token).await?;
     let open = gateway::open_projects(http, &console_url, token).await?;
     let project = gateway::pick_project(project, &open)?;
     Ok(GatewayPlan {
         console_url,
-        llm_url,
+        llm_url: settings.llm_url,
         project,
+        subscription_traffic: settings.subscription_traffic,
     })
 }
 

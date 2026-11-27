@@ -72,7 +72,7 @@ pub const CLAUDE_SETTINGS_PREFIX: &str = "claude-settings-";
 /// Write `text` to a new file in `dir` that only the user can read, named
 /// after this process (so a file left by a process that has gone can be told
 /// apart), and return its path.
-fn write_private_file(dir: &Path, text: &str) -> Result<PathBuf, String> {
+pub(crate) fn write_private_file(dir: &Path, text: &str) -> Result<PathBuf, String> {
     use std::io::Write;
     let failed = |e: std::io::Error| {
         format!(
@@ -164,7 +164,7 @@ fn header_value(value: &str) -> String {
 /// gateway while the hooks record nothing. (`CLAUDE_CODE_USE_GATEWAY` is
 /// Claude Code's own gateway sign-in, which is not this key helper's.) The
 /// list is Claude Code's: a switch it gains has to be added here.
-const CLAUDE_OTHER_PROVIDERS: [&str; 7] = [
+pub(crate) const CLAUDE_OTHER_PROVIDERS: [&str; 7] = [
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
@@ -191,7 +191,7 @@ fn callers_session(args: &[String]) -> Option<&str> {
 
 /// The values `args` give `--settings`, each a file or a JSON text, and
 /// `args` without them. Options after `--` are the prompt's.
-fn split_settings(args: &[String]) -> (Vec<String>, Vec<String>) {
+pub(crate) fn split_settings(args: &[String]) -> (Vec<String>, Vec<String>) {
     let (mut given, mut rest) = (Vec::new(), Vec::new());
     let mut i = 0;
     while i < args.len() {
@@ -215,7 +215,9 @@ fn split_settings(args: &[String]) -> (Vec<String>, Vec<String>) {
 }
 
 /// The settings object a `--settings` value stands for.
-fn read_settings(value: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+pub(crate) fn read_settings(
+    value: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     let failed = |why: String| format!("the Claude Code settings given with --settings ({why})");
     let text = if value.trim_start().starts_with('{') {
         value.to_string()
@@ -371,9 +373,10 @@ pub fn claude_command(
     if let Some(model) = &gateway.model {
         // The project's allow-list has aliases, not Claude Code's defaults:
         // both the main and the small model must name one. A model the
-        // developer already chose stays.
+        // developer already chose stays; a blank one is no choice (Claude
+        // Code would fall back to its own default) and gets the alias.
         for name in ["ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"] {
-            if env(name).is_none() {
+            if env(name).is_none_or(|v| v.trim().is_empty()) {
                 cmd.env(name, model);
             }
         }
@@ -911,6 +914,13 @@ mod tests {
             "{headers}"
         );
         assert!(!headers.contains("x-tracevault-repo"), "{headers}");
+    }
+
+    #[test]
+    fn a_blank_model_variable_is_no_choice_and_gets_the_alias() {
+        let env = |name: &str| (name == "ANTHROPIC_MODEL").then(|| " ".to_string());
+        let set = envs_of(&claude(&[], &gateway(), &env));
+        assert_eq!(set["ANTHROPIC_MODEL"].as_deref(), Some("claude-sonnet"));
     }
 
     #[test]
