@@ -57,6 +57,26 @@ pub struct VisdomCli {
     pub agent_args: Vec<String>,
 }
 
+/// What `doctor --surface` takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum SurfaceChoice {
+    Terminal,
+    Desktop,
+    /// Both. The desktop is checked on top of the terminal's checks, so this
+    /// reports what `desktop` does.
+    All,
+}
+
+impl SurfaceChoice {
+    /// The surface whose checks cover the choice.
+    pub fn surface(self) -> Surface {
+        match self {
+            SurfaceChoice::Terminal => Surface::Terminal,
+            SurfaceChoice::Desktop | SurfaceChoice::All => Surface::Desktop,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum VisdomCommand {
     /// Check this project's Visdom wiring without launching an agent. Exits
@@ -80,6 +100,11 @@ pub enum VisdomCommand {
         /// Who pays through the gateway, to check (see `visdom --help`).
         #[arg(long, value_enum)]
         billing: Option<Billing>,
+        /// The surface to check: terminal, desktop (the Claude Desktop app,
+        /// on top of everything the terminal is checked for) or all.
+        /// Default: the one a plain `visdom` would open here.
+        #[arg(long, value_enum)]
+        surface: Option<SurfaceChoice>,
     },
     /// Print the developer's AI Gateway key for a project: what a launched
     /// agent runs to get, and renew, its key.
@@ -287,7 +312,8 @@ mod tests {
                 yes: false,
                 agent: None,
                 mode: None,
-                billing: None
+                billing: None,
+                surface: None
             })
         ));
     }

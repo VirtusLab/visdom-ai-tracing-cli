@@ -1059,6 +1059,23 @@ async fn send_stream_event(
     req: &StreamEventRequest,
     warned: &mut bool,
 ) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn std::error::Error>> {
+    let sent = send_stream_event_inner(client, attribution, force, req, warned).await;
+    if sent.is_ok() {
+        // The one place that knows the server took an event: what `visdom
+        // doctor` shows as evidence that a Claude Desktop session is traced.
+        crate::desktop_evidence::note_accepted_event(&req.session_id);
+    }
+    sent
+}
+
+/// [`send_stream_event`] without the note of an accepted event.
+async fn send_stream_event_inner(
+    client: &crate::api_client::ApiClient,
+    attribution: &Attribution,
+    force: AttributionForce,
+    req: &StreamEventRequest,
+    warned: &mut bool,
+) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn std::error::Error>> {
     let (repo_id, capture_pid) = match attribution {
         // Repo-less: there is no repo-scoped endpoint to fall back TO. A
         // deterministic refusal is an error (VIS-316) that goes through the

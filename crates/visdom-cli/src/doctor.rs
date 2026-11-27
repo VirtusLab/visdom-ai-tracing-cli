@@ -10,6 +10,7 @@ use tracevault_cli::credentials::Credential;
 
 use crate::agents::{adapter_for, AgentAdapter, AgentPaths, McpScope, Workdir};
 use crate::billing::{self, billing_use, Billing, BillingUse, ResolvedBilling};
+use crate::components::desktop::DesktopFacts;
 use crate::components::gateway::GatewayPlan;
 use crate::components::{
     bazaar, gateway as gateway_checks, tracing, CheckContext, CredentialState,
@@ -177,6 +178,8 @@ pub struct Session {
     pub subscription: Vec<Finding>,
     /// Where the agent opens.
     pub surface: Surface,
+    /// What the desktop surface is checked against; `None` in the terminal.
+    pub desktop: Option<DesktopFacts>,
 }
 
 impl Session {
@@ -351,6 +354,7 @@ impl Session {
         };
         let adapter = adapter_for(agent, paths, user.agents.program_for(agent))
             .ok_or_else(|| format!("visdom cannot launch {}", agent.tool_name()))?;
+        let adapter_program = adapter.program().to_string();
         Ok(Session {
             ctx: CheckContext {
                 mode: mode.mode,
@@ -384,6 +388,8 @@ impl Session {
             },
             config_root: env.config_root.clone(),
             agent_instructions: user.agent_instructions.unwrap_or(true),
+            desktop: (surface == Surface::Desktop)
+                .then(|| desktop_facts(env, adapter_program.as_str())),
             surface,
             billing,
             billing_use,
@@ -571,6 +577,13 @@ impl Session {
             &self.billing_use,
         ));
         findings.extend(self.subscription.iter().cloned());
+        if let Some(facts) = &self.desktop {
+            findings.extend(crate::components::desktop::check(
+                facts,
+                self.ctx.agent,
+                &self.mode,
+            ));
+        }
         findings.extend(bazaar::check(
             self.bazaar_url
                 .as_ref()
@@ -582,6 +595,36 @@ impl Session {
             self.mcp_scope,
         ));
         findings
+    }
+}
+
+/// What the desktop surface is checked against on this machine, `claude`
+/// being the terminal CLI `visdom` opens the app with.
+fn desktop_facts(env: &Environment, claude: &str) -> DesktopFacts {
+    use crate::components::desktop::{bundled_version, login_shell_path};
+    use crate::surface::Platform;
+    let platform = Platform::current();
+    let read = |name: &str| std::env::var(name).ok();
+    // The app reads what the login shell exports when it starts (macOS and
+    // Linux); on Windows it takes the user's environment, which is not this
+    // terminal's to know.
+    let hook_path = match platform {
+        Platform::MacOs | Platform::Linux => {
+            login_shell_path(&read("SHELL").unwrap_or_else(|| "/bin/sh".into()))
+        }
+        _ => None,
+    };
+    DesktopFacts {
+        app_installed: crate::desktop::app_installed(&platform, &env.home, &read),
+        cli: claude.to_string(),
+        cli_found: crate::desktop::find_program(claude, std::env::var_os("PATH").as_deref())
+            .is_some(),
+        home: env.home.clone(),
+        visdom_exe: std::env::current_exe().unwrap_or_else(|_| "visdom".into()),
+        hook_path,
+        bundled_version: bundled_version(&env.config_root),
+        evidence: tracevault_cli::desktop_evidence::load(&env.config_root),
+        platform,
     }
 }
 

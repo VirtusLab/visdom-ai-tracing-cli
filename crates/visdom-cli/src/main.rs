@@ -94,11 +94,15 @@ fn main() {
             agent,
             mode,
             billing,
+            surface,
         }) => doctor(
             &runtime,
-            agent.or(cli.agent),
-            mode.or(cli.mode),
-            billing.or(cli.billing),
+            Choices {
+                agent: agent.or(cli.agent),
+                mode: mode.or(cli.mode),
+                billing: billing.or(cli.billing),
+                surface: surface.map(|choice| choice.surface()).or(cli.surface),
+            },
             fix,
             yes || cli.yes,
             json,
@@ -128,10 +132,12 @@ fn main() {
         }
         None => check_and_launch(
             runtime,
-            cli.agent,
-            cli.mode,
-            cli.billing,
-            cli.surface,
+            Choices {
+                agent: cli.agent,
+                mode: cli.mode,
+                billing: cli.billing,
+                surface: cli.surface,
+            },
             cli.yes,
             !cli.no_instructions,
             &cli.agent_args,
@@ -269,17 +275,38 @@ fn stdin_is_tty() -> bool {
     std::io::stdin().is_terminal()
 }
 
-fn doctor(
-    runtime: &tokio::runtime::Runtime,
+/// What the command line chose for a session; `None` leaves it to the
+/// environment and the config files.
+#[derive(Clone, Copy)]
+struct Choices {
     agent: Option<Agent>,
     mode: Option<TracingMode>,
     billing: Option<Billing>,
+    surface: Option<Surface>,
+}
+
+impl Choices {
+    fn gather(self, env: &Environment, runtime: &tokio::runtime::Runtime) -> Session {
+        gather_on(
+            env,
+            self.agent,
+            self.mode,
+            self.billing,
+            self.surface,
+            runtime,
+        )
+    }
+}
+
+fn doctor(
+    runtime: &tokio::runtime::Runtime,
+    choices: Choices,
     fix_flag: bool,
     yes: bool,
     json: bool,
 ) -> ! {
     let env = Environment::current();
-    let mut session = gather(&env, agent, mode, billing, runtime);
+    let mut session = choices.gather(&env, runtime);
     check_subscription(&mut session, runtime, true, &[]);
     let mut findings = session.collect();
     let policy = policy_for(fix_flag, yes, true, stdin_is_tty());
@@ -287,7 +314,7 @@ fn doctor(
         // What is wrong, before asking to change it.
         print_attention(&findings);
         if fix(&findings, policy, &mut RealExecutor::new(json, policy)).applied {
-            session = gather(&env, agent, mode, billing, runtime);
+            session = choices.gather(&env, runtime);
             check_subscription(&mut session, runtime, true, &[]);
             findings = session.collect();
         }
@@ -1163,10 +1190,19 @@ fn desktop_open(
 fn open_desktop(open: desktop::DesktopOpen, session: &Session) -> ! {
     let closing = desktop::closing_for(&session.collect());
     let choose = open.choose_folder.clone();
+    // What `visdom doctor` measures a traced session against. Best effort.
+    let opened = || {
+        let _ = tracevault_cli::desktop_evidence::record_opened(
+            &session.config_root,
+            &session.ctx.workdir.start_dir,
+            now(),
+        );
+    };
     if open.detached {
         if let Err(why) = desktop::spawn_detached(open.command) {
             not_opened(&why);
         }
+        opened();
         eprintln!("{}", desktop::closing_line(&closing, choose.as_deref()));
         exit(0)
     }
@@ -1176,6 +1212,7 @@ fn open_desktop(open: desktop::DesktopOpen, session: &Session) -> ! {
     let program = command.get_program().to_string_lossy().into_owned();
     match command.status() {
         Ok(status) if status.success() => {
+            opened();
             eprintln!("{}", desktop::closing_line(&closing, choose.as_deref()));
             exit(0)
         }
@@ -1211,16 +1248,13 @@ fn open_desktop(open: desktop::DesktopOpen, session: &Session) -> ! {
 /// that cannot be used does.
 fn check_and_launch(
     runtime: tokio::runtime::Runtime,
-    agent: Option<Agent>,
-    mode: Option<TracingMode>,
-    billing: Option<Billing>,
-    surface: Option<Surface>,
+    choices: Choices,
     yes: bool,
     instructions: bool,
     agent_args: &[String],
 ) -> ! {
     let env = Environment::current();
-    let mut session = gather_on(&env, agent, mode, billing, surface, &runtime);
+    let mut session = choices.gather(&env, &runtime);
     // What the desktop cannot do is said before anything is changed.
     let desktop =
         (session.surface == Surface::Desktop).then(|| desktop_open(&session, &env, agent_args));
@@ -1229,7 +1263,7 @@ fn check_and_launch(
     print_attention(&findings);
     let policy = policy_for(false, yes, false, stdin_is_tty());
     if fix(&findings, policy, &mut RealExecutor::new(false, policy)).applied {
-        session = gather_on(&env, agent, mode, billing, surface, &runtime);
+        session = choices.gather(&env, &runtime);
         check_subscription(&mut session, &runtime, false, agent_args);
         // What is still open, once, above the agent.
         print_attention(&session.collect());

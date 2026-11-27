@@ -7,6 +7,7 @@ pub mod commands;
 pub mod config;
 pub mod context;
 pub mod credentials;
+pub mod desktop_evidence;
 pub mod hooks;
 pub(crate) mod inferred_repo;
 pub mod install_state;
