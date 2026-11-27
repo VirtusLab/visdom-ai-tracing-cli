@@ -3,7 +3,7 @@
 
 use tracevault_cli::agent::Agent;
 
-use crate::billing::{self, Billing, BillingUse, ResolvedBilling};
+use crate::billing::{Billing, BillingUse, ResolvedBilling};
 use crate::finding::{Finding, Severity};
 use crate::gateway::OpenProject;
 use crate::mode::{ModeReason, ResolvedMode, TracingMode, TrafficPolicy};
@@ -179,8 +179,12 @@ pub fn billing_finding(billing: &ResolvedBilling, usage: &BillingUse) -> Option<
         (BillingUse::Applies, Billing::Subscription) => Finding::new(
             COMPONENT,
             ID,
-            Severity::Warn,
-            billing::launch_unavailable(billing).unwrap_or_default(),
+            Severity::Ok,
+            format!(
+                "billing = {}: your Claude subscription pays for the agent's calls — Claude Code \
+                 keeps its claude.ai login and the gateway gets your subscription key",
+                billing.describe()
+            ),
         ),
     };
     Some(finding)
@@ -343,8 +347,12 @@ mod tests {
             source: BillingSource::Flag,
         };
         let finding = billing_finding(&sub, &BillingUse::Applies).unwrap();
-        assert_eq!(finding.severity, Severity::Warn);
-        assert!(finding.message.contains("not available"), "{finding:?}");
+        assert_eq!(finding.severity, Severity::Ok);
+        assert!(
+            finding.message.contains("your Claude subscription pays")
+                && finding.message.contains("claude.ai login"),
+            "{finding:?}"
+        );
         let finding = billing_finding(&sub, &BillingUse::Unused).unwrap();
         assert_eq!(finding.severity, Severity::Info);
         let finding = billing_finding(&sub, &BillingUse::Rejected("why".to_string())).unwrap();

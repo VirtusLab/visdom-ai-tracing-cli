@@ -85,6 +85,10 @@ pub enum VisdomCommand {
         /// The gateway project's id.
         #[arg(long)]
         project: String,
+        /// The kind of key: an ordinary personal key (the project pays) or a
+        /// subscription key (Claude Code on your claude.ai login).
+        #[arg(long, value_enum, default_value_t = Billing::Project)]
+        billing: Billing,
     },
     /// Print shell commands that send an agent started without `visdom`
     /// through the AI Gateway: `source <(visdom env)`. The key is not in the
@@ -183,14 +187,35 @@ mod tests {
             "p-1",
         ]);
         match cli.command {
-            Some(VisdomCommand::GatewayKey { console, project }) => {
+            Some(VisdomCommand::GatewayKey {
+                console,
+                project,
+                billing,
+            }) => {
                 assert_eq!(
-                    (console.as_str(), project.as_str()),
-                    ("https://gw.example.com", "p-1")
+                    (console.as_str(), project.as_str(), billing),
+                    ("https://gw.example.com", "p-1", Billing::Project)
                 );
             }
             _ => panic!("expected gateway-key"),
         }
+        let cli = parse(&[
+            "visdom",
+            "gateway-key",
+            "--console",
+            "https://gw.example.com",
+            "--project",
+            "p-1",
+            "--billing",
+            "subscription",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(VisdomCommand::GatewayKey {
+                billing: Billing::Subscription,
+                ..
+            })
+        ));
     }
 
     #[test]

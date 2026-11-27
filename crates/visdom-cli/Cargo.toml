@@ -37,5 +37,9 @@ uuid.workspace = true
 dirs = "6"
 toml = { version = "0.8", features = ["preserve_order"] }
 
+# Waiting out the terminal's signals while a launched agent runs as a child.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

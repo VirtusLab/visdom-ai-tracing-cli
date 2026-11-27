@@ -163,21 +163,6 @@ pub fn billing_use(billing: &ResolvedBilling, mode: &ResolvedMode, agent: Agent)
     BillingUse::Applies
 }
 
-/// Why a launch through the gateway with `billing` cannot start yet, if it
-/// cannot. Starting Claude Code on its subscription login is not in this
-/// version: a launch that silently let the project pay instead would be
-/// wrong, so it stops.
-pub fn launch_unavailable(billing: &ResolvedBilling) -> Option<String> {
-    (billing.billing == Billing::Subscription).then(|| {
-        format!(
-            "billing = subscription ({}): starting the agent on your Claude subscription through \
-             the AI Gateway is not available in this version of visdom yet. Use --billing \
-             project for now, or set billing to project",
-            billing.source.describe()
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,12 +336,5 @@ mod tests {
             ),
             BillingUse::Applies
         );
-    }
-
-    #[test]
-    fn only_a_subscription_launch_is_unavailable() {
-        assert!(launch_unavailable(&resolved(Project, BillingSource::Flag)).is_none());
-        let why = launch_unavailable(&sub(BillingSource::Flag)).unwrap();
-        assert!(why.contains("not available in this version"), "{why}");
     }
 }

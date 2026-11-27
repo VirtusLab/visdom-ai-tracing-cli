@@ -177,7 +177,7 @@ In gateway mode `visdom`:
   several are open to you), keeps it in `visdom/gateway-keys.json` readable by you only, and
   reuses it until shortly before it expires — a new key revokes the previous one, so sessions
   started side by side share one (the later ones wait for the first). A kept key is the account's
-  it was issued for, and `visdom logout` removes them all;
+  it was issued for, and `visdom logout` revokes them at the console and removes them all;
 - asks the LLM gateway for its models with that key before starting anything: a kept key the
   gateway no longer takes (you issued a newer one in the console) is replaced once;
 - gives everything to the launched agent only (environment and launch options); your agent's own
@@ -228,9 +228,36 @@ Inside gateway mode there is a second choice, `billing` under `[gateway]`:
   gateway key, as described above;
 - `subscription` — Claude Code's calls are paid by your own Claude subscription (its claude.ai
   login), while still going through the gateway. **Claude Code only**: for Codex it is refused as
-  not supported yet. **Not started yet by this version:** with `subscription`, `visdom` (and
-  `visdom env`) stop with an error instead of starting the agent, rather than let the project pay
-  for it; `--billing project` starts it the usual way meanwhile.
+  not supported yet.
+
+With `subscription`, `visdom` starts Claude Code like this:
+
+- It asks the console for a **subscription key** (`billing: "subscription"`) instead of the
+  ordinary personal key. A subscription key only works together with your own Claude
+  subscription token (the gateway refuses any call it does not pay for), lives about 30 days (the
+  gateway's `SUBSCRIPTION_KEY_TTL_HOURS`), and a new one revokes nothing. It is kept next to the
+  ordinary keys and reused until less than 7 days are left (half its life, for a key the gateway
+  gives less than two weeks); then a new one is issued, and the old one keeps working for the
+  sessions that have it until it expires. `visdom logout` revokes them all at the console.
+  A gateway whose console does not know subscription keys yet (it answers with an ordinary key)
+  or that does not take subscription traffic stops the launch with its reason.
+- There is **no key helper**: Claude Code ranks `apiKeyHelper` above its claude.ai login, so the
+  settings `visdom` passes set it to nothing, which also undoes one in your own Claude settings.
+  The key goes in the `x-litellm-api-key` header (`ANTHROPIC_CUSTOM_HEADERS`; one of that name
+  from your environment or `--settings` is replaced), and Claude Code's own `Authorization`
+  carries your subscription. `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are cleared as in any
+  gateway session; `CLAUDE_CODE_OAUTH_TOKEN` is a subscription login too and is left alone.
+- With the key among them, the settings are not put on the command line, where the process list
+  shows them: they are written to a file only you can read in your state directory
+  (`$XDG_STATE_HOME/visdom`, `~/.local/state/visdom`) and passed as `--settings <file>`. `visdom`
+  waits for Claude Code to exit and removes the file (a file left by a `visdom` that was killed
+  is removed by the next launch). Settings your organisation manages could still override the
+  headers; the gateway then refuses every call, which carries no key.
+- The gateway is still checked first, with the key as a bearer token (`GET /v1/models`), and the
+  capture hooks stay quiet as in any gateway session.
+- A refusal by one of the gateway's guardrails (HTTP 403) is shown by Claude Code as
+  "Failed to authenticate. API Error: 403 …": that is Claude Code's wording for any 403, not a
+  problem with your login.
 
 Who pays is `--billing`, then `VISDOM_GATEWAY_BILLING` (a blank one is ignored, one that names
 neither value is an error), then `[gateway] billing` in the repository's or workspace folder's
@@ -264,7 +291,12 @@ claude                               # now goes through the gateway
   (`visdom gateway-key …`), so it can be kept in a shell profile or an `.envrc` and shown around.
   The key is read when the script is sourced and lasts 24 hours at most: source it again then.
 - For Claude Code it sets `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, the attribution headers
-  and the model alias, and unsets `ANTHROPIC_API_KEY` and the provider switches. For Codex, whose
+  and the model alias, and unsets `ANTHROPIC_API_KEY` and the provider switches. With
+  `billing = subscription` there is no `ANTHROPIC_AUTH_TOKEN` (it would replace your claude.ai
+  login; it is unset too): the subscription key goes into the exported `ANTHROPIC_CUSTOM_HEADERS`
+  as `x-litellm-api-key`, still through `$(visdom gateway-key … --billing subscription)`, and lasts
+  weeks rather than hours. An `apiKeyHelper` in your Claude settings would outrank the login and
+  cannot be undone from the environment: start Claude Code with `visdom` then. For Codex, whose
   provider is given as options, it defines a `codex` shell function that adds them (so it works
   for `codex …` typed in that shell, not for a program that runs the `codex` executable itself).
 - It sets `VISDOM_GATEWAY_SESSION` to the agent's name, which switches that agent's capture
@@ -1011,8 +1043,8 @@ the binary you have installed.
 | `--server-url <URL>` | The Visdom server to sign in to (required) |
 | `--no-browser` | Only print the verification URL; also implied in CI, containers and Linux sessions without a display |
 
-**`visdom logout`** — revoke the refresh token at Keycloak (best-effort) and delete the
-credentials file.
+**`visdom logout`** — revoke the AI Gateway keys `visdom` keeps for you at the console, revoke
+the refresh token at Keycloak (best-effort) and delete the credentials file.
 
 **`visdom trace init [OPTIONS]`** — set up capture in the current directory, which must be the
 root of a git repository's primary checkout; see

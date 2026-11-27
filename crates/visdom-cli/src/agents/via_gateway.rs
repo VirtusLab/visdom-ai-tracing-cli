@@ -4,11 +4,17 @@
 //! and launch options — never written into the agent's configuration files:
 //! an agent started without `visdom` is exactly as it was.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tracevault_cli::agent::Agent;
 
+use crate::billing::Billing;
 use crate::mode::{TracingMode, GATEWAY_SESSION_ENV, MODE_ENV};
+
+/// The header the gateway takes its key from when Claude Code's own
+/// `Authorization` carries the developer's subscription token.
+pub const GATEWAY_KEY_HEADER: &str = "x-litellm-api-key";
 
 /// The environment variable Codex reads the gateway key from.
 pub const CODEX_KEY_ENV: &str = "VISDOM_GATEWAY_API_KEY";
@@ -36,6 +42,89 @@ pub struct GatewayLaunch {
     pub repo_id: Option<String>,
     /// The id the session gets, so the gateway's records join one session.
     pub session_id: String,
+    /// Who pays: with `Subscription`, Claude Code keeps its own claude.ai
+    /// login and `key` is a subscription key, sent in [`GATEWAY_KEY_HEADER`].
+    pub billing: Billing,
+    /// Where a launch writes what must not be on its command line (the
+    /// user's own state directory).
+    pub private_dir: PathBuf,
+}
+
+/// An agent's command, and the private file it was given, which is removed
+/// once the agent has exited.
+pub struct AgentCommand {
+    pub cmd: Command,
+    pub private_file: Option<PathBuf>,
+}
+
+impl From<Command> for AgentCommand {
+    fn from(cmd: Command) -> Self {
+        AgentCommand {
+            cmd,
+            private_file: None,
+        }
+    }
+}
+
+/// The prefix of the settings files Claude Code launches are given.
+pub const CLAUDE_SETTINGS_PREFIX: &str = "claude-settings-";
+
+/// Write `text` to a new file in `dir` that only the user can read, named
+/// after this process (so a file left by a process that has gone can be told
+/// apart), and return its path.
+fn write_private_file(dir: &Path, text: &str) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let failed = |e: std::io::Error| {
+        format!(
+            "the Claude Code settings could not be written to {}: {e}",
+            dir.display()
+        )
+    };
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir).map_err(failed)?;
+    let path = dir.join(format!(
+        "{CLAUDE_SETTINGS_PREFIX}{}-{}.json",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = options
+        .open(&path)
+        .and_then(|mut file| file.write_all(text.as_bytes()));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&path);
+        return Err(failed(e));
+    }
+    Ok(path)
+}
+
+/// Whether a line of `ANTHROPIC_CUSTOM_HEADERS` sets the header `name`.
+fn sets_header(line: &str, name: &str) -> bool {
+    line.split_once(':')
+        .is_some_and(|(header, _)| header.trim().eq_ignore_ascii_case(name))
+}
+
+/// `headers` without the lines that set the gateway key: `visdom` adds its
+/// own, and one left from elsewhere (an outer gateway session's environment)
+/// would be sent beside it.
+fn without_gateway_key(headers: &str) -> String {
+    headers
+        .lines()
+        .filter(|line| !sets_header(line, GATEWAY_KEY_HEADER))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Whether `args` already carry one of `options` (as `--name value` or
@@ -153,22 +242,35 @@ fn read_settings(value: &str) -> Result<serde_json::Map<String, serde_json::Valu
 /// organisation manages come after everything and are not `visdom`'s to
 /// overrule.)
 ///
-/// - The key comes from `apiKeyHelper`, so a key renewed during a long
-///   session is picked up. Settings the caller passes with `--settings` are
-///   kept, merged under these.
+/// - The project pays (`billing = project`): the key comes from
+///   `apiKeyHelper`, so a key renewed during a long session is picked up.
+/// - The developer's subscription pays (`billing = subscription`): Claude
+///   Code keeps its own claude.ai login, which `apiKeyHelper` would outrank,
+///   so there is none — the settings set it to nothing, which also undoes
+///   one in the developer's own settings files. The subscription key goes in
+///   the `x-litellm-api-key` header instead (replacing one from elsewhere),
+///   and with it in the settings, they are written to a file only the user
+///   can read rather than onto the command line, where any process list
+///   would show them. The caller removes the file once the agent has exited.
+///   Settings an organisation manages could still override the headers: the
+///   gateway then refuses every request, which has no key.
+/// - Settings the caller passes with `--settings` are kept, merged under
+///   these.
 /// - The session id is fixed up front and sent with every request. A caller
 ///   who names the session themselves gets theirs sent; one who leaves it to
 ///   Claude Code (`--continue`, a picker) gets none, and the gateway's
 ///   records of that session carry no session id.
 ///
 /// `Err` when the caller's own `--settings` cannot be read: they could not be
-/// merged, and passing them on unread could undo the routing.
+/// merged, and passing them on unread could undo the routing. Also when the
+/// private settings file cannot be written.
 pub fn claude_command(
     program: &str,
     args: &[String],
     gateway: &GatewayLaunch,
     env: &dyn Fn(&str) -> Option<String>,
-) -> Result<Command, String> {
+) -> Result<AgentCommand, String> {
+    let subscription = gateway.billing == Billing::Subscription;
     let (given, args) = split_settings(args);
     let mut settings = serde_json::Map::new();
     for value in &given {
@@ -205,6 +307,7 @@ pub fn claude_command(
     let mut headers: Vec<String> = [env("ANTHROPIC_CUSTOM_HEADERS"), callers_headers]
         .into_iter()
         .flatten()
+        .map(|h| without_gateway_key(&h))
         .filter(|h| !h.trim().is_empty())
         .collect();
     headers.push(format!(
@@ -216,6 +319,12 @@ pub fn claude_command(
     }
     if let Some(session) = session {
         headers.push(format!("x-tracevault-session: {}", header_value(session)));
+    }
+    if subscription {
+        headers.push(format!(
+            "{GATEWAY_KEY_HEADER}: Bearer {}",
+            header_value(&gateway.key)
+        ));
     }
     let headers = headers.join("\n");
 
@@ -231,11 +340,13 @@ pub fn claude_command(
         (MODE_ENV, TracingMode::Gateway.name().to_string()),
         ("ANTHROPIC_BASE_URL", gateway.llm_url.clone()),
         ("ANTHROPIC_CUSTOM_HEADERS", headers),
-        (
+    ];
+    if !subscription {
+        routing.push((
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
             CLAUDE_KEY_TTL_MS.into(),
-        ),
-    ];
+        ));
+    }
     // Claude Code reads "0" as off; a variable cannot be unset from settings.
     routing.extend(CLAUDE_OTHER_PROVIDERS.map(|switch| (switch, "0".to_string())));
 
@@ -248,9 +359,11 @@ pub fn claude_command(
         cmd.env_remove(switch);
     }
     // A key of the developer's own would be sent in place of the gateway's
-    // (and to the gateway). Removed from the environment, and set to nothing
-    // in the settings, which is how one in a settings file is cleared: Claude
-    // Code then asks the key helper.
+    // (and to the gateway), or in place of their subscription. Removed from
+    // the environment, and set to nothing in the settings, which is how one
+    // in a settings file is cleared: Claude Code then asks the key helper, or
+    // uses its login. (`CLAUDE_CODE_OAUTH_TOKEN` is a subscription login too,
+    // and is left alone.)
     for key in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] {
         cmd.env_remove(key);
         settings_env.insert(key.to_string(), "".into());
@@ -266,17 +379,30 @@ pub fn claude_command(
         }
     }
     settings.insert("env".to_string(), settings_env.into());
-    settings.insert(
-        "apiKeyHelper".to_string(),
-        gateway.key_helper.clone().into(),
-    );
-    cmd.arg("--settings")
-        .arg(serde_json::Value::Object(settings).to_string());
+    // Empty, a helper from the developer's own settings files is not used
+    // (Claude Code 2.1.332, tried by hand): it would outrank the login.
+    let helper = match subscription {
+        true => String::new(),
+        false => gateway.key_helper.clone(),
+    };
+    settings.insert("apiKeyHelper".to_string(), helper.into());
+    let settings = serde_json::Value::Object(settings).to_string();
+    let private_file = match subscription {
+        true => {
+            let file = write_private_file(&gateway.private_dir, &settings)?;
+            cmd.arg("--settings").arg(&file);
+            Some(file)
+        }
+        false => {
+            cmd.arg("--settings").arg(settings);
+            None
+        }
+    };
     if !own_session {
         cmd.arg("--session-id").arg(&gateway.session_id);
     }
     cmd.args(args);
-    Ok(cmd)
+    Ok(AgentCommand { cmd, private_file })
 }
 
 /// A TOML basic string.
@@ -392,13 +518,21 @@ pub fn shell_quote(text: &str) -> String {
 /// The lines every such script starts and ends with: the key is not in the
 /// script, which only says how to get it, so the script can be kept (a shell
 /// profile, an `.envrc`) and shown around.
-fn script(agent: Agent, project: &str, lines: Vec<String>) -> String {
+fn script(agent: Agent, project: &str, billing: Billing, lines: Vec<String>) -> String {
+    let (paid, again) = match billing {
+        Billing::Project => ("", "24 hours at most"),
+        Billing::Subscription => (
+            ", paid by your Claude subscription",
+            "a subscription key lasts weeks",
+        ),
+    };
     let mut out = vec![
         format!(
-            "# {} through the Visdom AI Gateway (project `{project}`), started without `visdom`.",
+            "# {} through the Visdom AI Gateway (project `{project}`{paid}), started without \
+             `visdom`.",
             agent.label()
         ),
-        "# Use:  source <(visdom env)    — again when the key expires (24 hours at most).".into(),
+        format!("# Use:  source <(visdom env)    — again when the key expires ({again})."),
         "# Settings your agent's own configuration files make still win over these;".into(),
         "# `visdom` itself is the way that cannot be overruled.".into(),
     ];
@@ -413,7 +547,10 @@ fn script(agent: Agent, project: &str, lines: Vec<String>) -> String {
 }
 
 /// Shell commands that send a Claude Code started from that shell, without
-/// `visdom`, through the gateway.
+/// `visdom`, through the gateway. The project pays: the key is the bearer
+/// token. The subscription pays: Claude Code keeps its login, and the key
+/// goes into the custom headers (still got by running `visdom gateway-key`,
+/// so the script holds no secret).
 pub fn claude_env_script(gateway: &GatewayLaunch, project: &str) -> String {
     let mut headers = vec![format!(
         "x-tracevault-agent: {}",
@@ -422,27 +559,44 @@ pub fn claude_env_script(gateway: &GatewayLaunch, project: &str) -> String {
     if let Some(repo) = &gateway.repo_id {
         headers.push(format!("x-tracevault-repo: {}", header_value(repo)));
     }
-    let mut lines = vec![
-        format!(
-            "export ANTHROPIC_BASE_URL={}",
-            shell_quote(&gateway.llm_url)
-        ),
-        format!("export ANTHROPIC_AUTH_TOKEN=\"$({})\"", gateway.key_helper),
-        format!(
-            "export ANTHROPIC_CUSTOM_HEADERS={}",
-            shell_quote(&headers.join("\n"))
-        ),
-    ];
+    let mut lines = vec![format!(
+        "export ANTHROPIC_BASE_URL={}",
+        shell_quote(&gateway.llm_url)
+    )];
+    match gateway.billing {
+        Billing::Project => {
+            lines.push(format!(
+                "export ANTHROPIC_AUTH_TOKEN=\"$({})\"",
+                gateway.key_helper
+            ));
+            lines.push(format!(
+                "export ANTHROPIC_CUSTOM_HEADERS={}",
+                shell_quote(&headers.join("\n"))
+            ));
+        }
+        Billing::Subscription => {
+            // The newline inside single quotes ends the last header line.
+            lines.push(format!(
+                "export ANTHROPIC_CUSTOM_HEADERS={}\"$({})\"",
+                shell_quote(&format!(
+                    "{}\n{GATEWAY_KEY_HEADER}: Bearer ",
+                    headers.join("\n")
+                )),
+                gateway.key_helper
+            ));
+        }
+    }
     if let Some(model) = &gateway.model {
         for name in ["ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"] {
             lines.push(format!("export {name}={}", shell_quote(model)));
         }
     }
-    lines.push(format!(
-        "unset ANTHROPIC_API_KEY {}",
-        CLAUDE_OTHER_PROVIDERS.join(" ")
-    ));
-    script(Agent::ClaudeCode, project, lines)
+    let keys = match gateway.billing {
+        Billing::Project => "ANTHROPIC_API_KEY",
+        Billing::Subscription => "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN",
+    };
+    lines.push(format!("unset {keys} {}", CLAUDE_OTHER_PROVIDERS.join(" ")));
+    script(Agent::ClaudeCode, project, gateway.billing, lines)
 }
 
 /// The same for Codex, whose provider is given as options, not variables:
@@ -465,7 +619,7 @@ pub fn codex_env_script(
             options.join(" ")
         ),
     ];
-    Ok(script(Agent::Codex, project, lines))
+    Ok(script(Agent::Codex, project, gateway.billing, lines))
 }
 
 #[cfg(test)]
@@ -483,6 +637,8 @@ mod tests {
             model: Some("claude-sonnet".to_string()),
             repo_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
             session_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+            billing: Billing::Project,
+            private_dir: PathBuf::from("/nonexistent/visdom-private"),
         }
     }
 
@@ -517,7 +673,12 @@ mod tests {
         gateway: &GatewayLaunch,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Command {
-        claude_command("claude", args, gateway, env).unwrap()
+        let launched = claude_command("claude", args, gateway, env).unwrap();
+        assert_eq!(
+            launched.private_file, None,
+            "the project's key is not in it"
+        );
+        launched.cmd
     }
 
     fn codex(args: &[String], gateway: &GatewayLaunch) -> Command {
@@ -717,7 +878,9 @@ mod tests {
             (strings(&["--settings", "{not json"]), "is not JSON"),
             (strings(&["--settings=[1]"]), "cannot be read"),
         ] {
-            let err = claude_command("claude", &own, &gateway(), &no_env).unwrap_err();
+            let err = claude_command("claude", &own, &gateway(), &no_env)
+                .err()
+                .unwrap();
             assert!(err.contains(said), "{err}");
         }
         // After `--` it is the prompt, not an option.
@@ -851,6 +1014,181 @@ mod tests {
                 "{fine:?}"
             );
         }
+    }
+
+    /// A subscription launch, its settings read back from the private file.
+    fn subscription(
+        args: &[String],
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> (tempfile::TempDir, Command, PathBuf, serde_json::Value) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut launch = gateway();
+        launch.billing = Billing::Subscription;
+        launch.key = "sk-sub".to_string();
+        launch.private_dir = tmp.path().join("state/visdom");
+        let launched = claude_command("claude", args, &launch, env).unwrap();
+        let file = launched.private_file.clone().expect("a private file");
+        let settings = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        (tmp, launched.cmd, file, settings)
+    }
+
+    #[test]
+    fn a_subscription_launch_keeps_the_login_and_sends_the_key_in_a_header() {
+        let (_tmp, cmd, file, settings) = subscription(&strings(&["--verbose"]), &no_env);
+        let args = args_of(&cmd);
+        assert_eq!(args[0], "--settings");
+        assert_eq!(args[1], file.to_string_lossy());
+        assert_eq!(
+            args[2..],
+            [
+                "--session-id",
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "--verbose"
+            ]
+        );
+        assert!(!args.iter().any(|a| a.contains("sk-sub")), "{args:?}");
+        // No helper: the empty one overrides any in the developer's files.
+        assert_eq!(settings["apiKeyHelper"], "");
+        let headers = "x-tracevault-agent: claude-code\n\
+                       x-tracevault-repo: 11111111-2222-3333-4444-555555555555\n\
+                       x-tracevault-session: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n\
+                       x-litellm-api-key: Bearer sk-sub";
+        assert_eq!(settings["env"]["ANTHROPIC_CUSTOM_HEADERS"], headers);
+        assert_eq!(settings["env"]["ANTHROPIC_API_KEY"], "");
+        assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "");
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            "https://llm.example.com"
+        );
+        assert_eq!(settings["env"]["VISDOM_GATEWAY_SESSION"], "claude-code");
+        assert_eq!(settings["env"]["CLAUDE_CODE_USE_BEDROCK"], "0");
+        assert!(settings["env"]
+            .get("CLAUDE_CODE_API_KEY_HELPER_TTL_MS")
+            .is_none());
+        let env = envs_of(&cmd);
+        assert_eq!(env["ANTHROPIC_CUSTOM_HEADERS"].as_deref(), Some(headers));
+        assert_eq!(env["ANTHROPIC_API_KEY"], None);
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], None);
+        assert!(!env.contains_key("CLAUDE_CODE_API_KEY_HELPER_TTL_MS"));
+        assert!(
+            !env.contains_key("CLAUDE_CODE_OAUTH_TOKEN"),
+            "a subscription login of the developer's own is left alone"
+        );
+        assert_eq!(env["ANTHROPIC_MODEL"].as_deref(), Some("claude-sonnet"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_subscription_settings_file_is_the_users_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, _cmd, file, _settings) = subscription(&[], &no_env);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(file.parent().unwrap()), 0o700);
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with(&format!("claude-settings-{}-", std::process::id())),
+            "{name}"
+        );
+    }
+
+    #[test]
+    fn a_gateway_key_header_from_elsewhere_is_replaced_not_doubled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mine = tmp.path().join("mine.json");
+        std::fs::write(
+            &mine,
+            r#"{"apiKeyHelper":"echo mine","env":{"ANTHROPIC_CUSTOM_HEADERS":"X-LiteLLM-API-Key: Bearer sk-settings\nx-team: blue"}}"#,
+        )
+        .unwrap();
+        let env = |name: &str| {
+            (name == "ANTHROPIC_CUSTOM_HEADERS")
+                .then(|| "x-litellm-api-key: Bearer sk-outer\nx-env: 1".to_string())
+        };
+        let (_t, cmd, _file, settings) =
+            subscription(&strings(&["--settings", mine.to_str().unwrap()]), &env);
+        let headers = settings["env"]["ANTHROPIC_CUSTOM_HEADERS"]
+            .as_str()
+            .unwrap();
+        let keys: Vec<&str> = headers
+            .lines()
+            .filter(|l| l.to_ascii_lowercase().starts_with("x-litellm-api-key"))
+            .collect();
+        assert_eq!(keys, ["x-litellm-api-key: Bearer sk-sub"], "{headers}");
+        assert!(headers.starts_with("x-env: 1\nx-team: blue\n"), "{headers}");
+        assert_eq!(settings["apiKeyHelper"], "", "the caller's helper too");
+        assert_eq!(
+            args_of(&cmd).iter().filter(|a| *a == "--settings").count(),
+            1
+        );
+        // A project launch does not carry one from elsewhere either.
+        let cmd = claude(&[], &gateway(), &env);
+        let headers = envs_of(&cmd)["ANTHROPIC_CUSTOM_HEADERS"].clone().unwrap();
+        assert!(!headers.contains("sk-outer"), "{headers}");
+        assert!(headers.starts_with("x-env: 1\n"), "{headers}");
+    }
+
+    #[test]
+    fn a_subscription_launch_that_cannot_write_its_settings_does_not_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("file");
+        std::fs::write(&blocker, "").unwrap();
+        let mut launch = gateway();
+        launch.billing = Billing::Subscription;
+        launch.private_dir = blocker.join("visdom");
+        let err = claude_command("claude", &[], &launch, &no_env)
+            .err()
+            .unwrap();
+        assert!(err.contains("could not be written"), "{err}");
+        assert!(!err.contains("sk-abc"), "{err}");
+    }
+
+    #[test]
+    fn the_subscription_env_script_puts_the_key_helper_in_the_headers() {
+        let mut launch = gateway();
+        launch.billing = Billing::Subscription;
+        launch.key_helper = "'/usr/bin/visdom' gateway-key --console 'https://gw' --project \
+                             'p-1' --billing subscription"
+            .to_string();
+        let script = claude_env_script(&launch, "alpha");
+        assert!(!script.contains("sk-abc"), "{script}");
+        assert!(!script.contains("ANTHROPIC_AUTH_TOKEN="), "{script}");
+        assert!(
+            script.contains(
+                "x-tracevault-repo: 11111111-2222-3333-4444-555555555555\n\
+                 x-litellm-api-key: Bearer '\"$('/usr/bin/visdom' gateway-key --console \
+                 'https://gw' --project 'p-1' --billing subscription)\""
+            ),
+            "{script}"
+        );
+        assert!(
+            script.contains("unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK"),
+            "{script}"
+        );
+        assert!(
+            script.contains("paid by your Claude subscription"),
+            "{script}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_reads_the_subscription_headers_back() {
+        let mut launch = gateway();
+        launch.billing = Billing::Subscription;
+        launch.key_helper = "printf %s sk-from-helper".to_string();
+        let script = claude_env_script(&launch, "alpha");
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(format!("{script}\nprintf %s \"$ANTHROPIC_CUSTOM_HEADERS\""))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "x-tracevault-agent: claude-code\n\
+             x-tracevault-repo: 11111111-2222-3333-4444-555555555555\n\
+             x-litellm-api-key: Bearer sk-from-helper"
+        );
     }
 
     #[test]

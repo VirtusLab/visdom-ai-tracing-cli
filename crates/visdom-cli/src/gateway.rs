@@ -7,14 +7,27 @@
 //! only) and reused until shortly before it expires: sessions started side by
 //! side share it instead of cutting each other off. A kept key belongs to the
 //! account it was issued for and is not handed to another.
+//!
+//! A subscription key (`billing = subscription`) is the other kind: it only
+//! works with the developer's own Claude subscription token, lives about 30
+//! days, and a new one revokes nothing. Claude Code gets it once, in a header
+//! fixed when it starts, so it is renewed a week before it expires, and the
+//! older ones are kept until they expire for `visdom logout` to revoke.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracevault_cli::agent::Agent;
 
+use crate::billing::Billing;
+
 /// A key with less than this left is replaced rather than handed out.
 pub const MIN_KEY_SECONDS_LEFT: i64 = 15 * 60;
+
+/// A subscription key with less than this left is replaced rather than
+/// handed out: a session started with it keeps it to its end. (Of a key that
+/// lives shorter than twice this, half its life.)
+pub const MIN_SUBSCRIPTION_KEY_SECONDS_LEFT: i64 = 7 * 24 * 60 * 60;
 
 /// Assumed lifetime of a key whose expiry the console did not state in a form
 /// this version reads. Short, so a wrong guess costs one early renewal.
@@ -35,6 +48,8 @@ pub struct IssuedKey {
     pub secret: String,
     /// Unix seconds.
     pub expires_at: i64,
+    /// The console's id of the key, to revoke it by.
+    pub id: Option<String>,
 }
 
 /// The console's refusal, in its own words when it gave any.
@@ -136,13 +151,19 @@ fn expiry_seconds(expires_at: Option<&str>, now: i64) -> i64 {
     parsed.unwrap_or(now + UNKNOWN_EXPIRY_SECONDS)
 }
 
-/// Issue the developer a personal key for `project_id`. This revokes their
-/// previous one for that project.
+/// Issue the developer a personal key of the kind `billing` for
+/// `project_id`. An ordinary key revokes their previous ordinary one for that
+/// project; a subscription key revokes nothing.
+///
+/// A subscription key that comes back as anything else (a console from before
+/// subscription keys ignores the request's `billing`) is revoked again and is
+/// an error: such a key would let the project pay.
 pub async fn issue_key(
     http: &reqwest::Client,
     console_url: &str,
     token: &str,
     project_id: &str,
+    billing: Billing,
     now: i64,
 ) -> Result<IssuedKey, String> {
     #[derive(Deserialize)]
@@ -150,21 +171,77 @@ pub async fn issue_key(
     struct Issued {
         secret: String,
         #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
         expires_at: Option<String>,
+        #[serde(default)]
+        billing: Option<String>,
     }
-    let what = "cannot get a personal AI Gateway key";
+    let what = match billing {
+        Billing::Project => "cannot get a personal AI Gateway key",
+        Billing::Subscription => "cannot get a subscription key from the AI Gateway",
+    };
+    // An ordinary key is asked for as before subscription keys existed.
+    let body = match billing {
+        Billing::Project => serde_json::json!({ "projectId": project_id }),
+        Billing::Subscription => {
+            serde_json::json!({ "projectId": project_id, "billing": billing.name() })
+        }
+    };
     let request = http
         .post(format!("{}/api/me/keys", base(console_url)))
         .bearer_auth(token)
-        .json(&serde_json::json!({ "projectId": project_id }));
+        .json(&body);
     let issued: Issued = parse(what, &read(what, console_url, request).await?)?;
     if issued.secret.trim().is_empty() {
         return Err(format!("{what}: the answer carried no key"));
     }
+    let id = issued.id.filter(|id| !id.trim().is_empty());
+    if billing == Billing::Subscription && issued.billing.as_deref() != Some(billing.name()) {
+        if let Some(id) = &id {
+            // Best effort: the key is not used either way.
+            let _ = revoke_key(http, console_url, token, id).await;
+        }
+        return Err(format!(
+            "{what}: this AI Gateway issued an ordinary personal key instead, so it does not \
+             support billing = subscription yet (its console needs a newer version). Use \
+             --billing project, or set billing to project"
+        ));
+    }
     Ok(IssuedKey {
         expires_at: expiry_seconds(issued.expires_at.as_deref(), now),
         secret: issued.secret,
+        id,
     })
+}
+
+/// Revoke the developer's key `id` at the console. A key the console no
+/// longer has (expired, or revoked already) is gone, which is what was asked.
+pub async fn revoke_key(
+    http: &reqwest::Client,
+    console_url: &str,
+    token: &str,
+    id: &str,
+) -> Result<(), String> {
+    let what = "cannot revoke an AI Gateway key";
+    let mut url = url::Url::parse(&format!("{}/api/me/keys", base(console_url)))
+        .map_err(|e| format!("{what}: `{console_url}` is not a URL ({e})"))?;
+    url.path_segments_mut()
+        .map_err(|()| format!("{what}: `{console_url}` is not an http(s) URL"))?
+        .push(id);
+    let response = http
+        .delete(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("{what}: the AI Gateway ({console_url}) did not answer: {e}"))?;
+    let status = response.status();
+    // The console answers 400 for a key of yours it does not have.
+    if status.is_success() || matches!(status.as_u16(), 400 | 404) {
+        return Ok(());
+    }
+    let body = response.text().await.unwrap_or_default();
+    Err(refusal(what, status, &body))
 }
 
 /// Why the LLM gateway's models could not be listed.
@@ -318,14 +395,62 @@ struct StoredKey {
     account: String,
     secret: String,
     expires_at: i64,
+    /// The key's kind; a key kept before there were kinds is ordinary.
+    #[serde(default)]
+    billing: Billing,
+    /// The console's id of the key, to revoke it by on logout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    /// Unix seconds when it was kept, which is when it was issued.
+    #[serde(default)]
+    issued_at: i64,
+    /// The gateway refused it (revoked elsewhere): never handed out again,
+    /// but kept until it expires, for logout to revoke.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    refused: bool,
 }
 
 impl StoredKey {
-    fn is_for(&self, console_url: &str, project_id: &str, account: &str) -> bool {
+    fn is_for(&self, console_url: &str, project_id: &str, account: &str, billing: Billing) -> bool {
         self.console_url == base(console_url)
             && self.project_id == project_id
             && self.account == account
+            && self.billing == billing
     }
+
+    /// Whether it is still handed out at `now`, rather than replaced.
+    fn lasts(&self, now: i64) -> bool {
+        !self.refused
+            && self.expires_at - now >= renew_before(self.billing, self.issued_at, self.expires_at)
+    }
+}
+
+/// How long before it expires a key of the kind `billing` is replaced. A
+/// subscription key the console gives a short life (shorter than twice
+/// [`MIN_SUBSCRIPTION_KEY_SECONDS_LEFT`]) is replaced at half its life, not
+/// at once.
+fn renew_before(billing: Billing, issued_at: i64, expires_at: i64) -> i64 {
+    match billing {
+        Billing::Project => MIN_KEY_SECONDS_LEFT,
+        Billing::Subscription => {
+            let life = expires_at - issued_at;
+            if issued_at > 0 && life > 0 {
+                MIN_SUBSCRIPTION_KEY_SECONDS_LEFT.min(life / 2)
+            } else {
+                MIN_SUBSCRIPTION_KEY_SECONDS_LEFT
+            }
+        }
+    }
+}
+
+/// A kept key, as `visdom logout` revokes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeptKey {
+    pub console_url: String,
+    pub account: String,
+    pub id: Option<String>,
+    pub billing: Billing,
+    pub expires_at: i64,
 }
 
 /// The personal keys `visdom` holds, one per console, project and account.
@@ -369,41 +494,56 @@ impl KeyStore {
         Ok(KeyStoreLock(file))
     }
 
-    /// The stored key of `account` for this console and project, when it has
-    /// at least [`MIN_KEY_SECONDS_LEFT`] left.
+    /// The stored key of the kind `billing` of `account` for this console
+    /// and project, when it has enough left: [`MIN_KEY_SECONDS_LEFT`], or for
+    /// a subscription key [`MIN_SUBSCRIPTION_KEY_SECONDS_LEFT`]. Of several,
+    /// the one that lasts longest.
     pub fn usable(
         &self,
         console_url: &str,
         project_id: &str,
         account: &str,
+        billing: Billing,
         now: i64,
     ) -> Option<IssuedKey> {
         self.load()
             .into_iter()
-            .find(|k| k.is_for(console_url, project_id, account))
-            .filter(|k| k.expires_at - now >= MIN_KEY_SECONDS_LEFT)
+            .filter(|k| k.is_for(console_url, project_id, account, billing))
+            .filter(|k| k.lasts(now))
+            .max_by_key(|k| k.expires_at)
             .map(|k| IssuedKey {
                 secret: k.secret,
                 expires_at: k.expires_at,
+                id: k.id,
             })
     }
 
-    /// Keep `key`, replacing the one for the same console and project
-    /// (whoever's it was: this machine's user is now `account`) and dropping
-    /// keys that have expired. The file is the user's alone.
+    /// Keep `key` of the kind `billing`, dropping keys that have expired. An
+    /// ordinary key replaces the one for the same console and project
+    /// (whoever's it was: this machine's user is now `account`), as issuing
+    /// it revoked that one. A subscription key revoked nothing: `account`'s
+    /// earlier ones stay until they expire, for logout to revoke; another
+    /// account's go. The file is the user's alone.
     pub fn keep(
         &self,
         console_url: &str,
         project_id: &str,
         account: &str,
+        billing: Billing,
         key: &IssuedKey,
         now: i64,
     ) -> Result<(), String> {
+        let replaced = |k: &StoredKey| {
+            k.console_url == base(console_url)
+                && k.project_id == project_id
+                && k.billing == billing
+                && (billing == Billing::Project || k.account != account)
+        };
         let mut keys: Vec<StoredKey> = self
             .load()
             .into_iter()
             .filter(|k| k.expires_at > now)
-            .filter(|k| !(k.console_url == base(console_url) && k.project_id == project_id))
+            .filter(|k| !replaced(k))
             .collect();
         keys.push(StoredKey {
             console_url: base(console_url).to_string(),
@@ -411,14 +551,45 @@ impl KeyStore {
             account: account.to_string(),
             secret: key.secret.clone(),
             expires_at: key.expires_at,
+            billing,
+            id: key.id.clone(),
+            issued_at: now,
+            refused: false,
         });
         let text = serde_json::to_string(&keys).map_err(|e| e.to_string())?;
         write_private(&self.path, &text)
             .map_err(|e| format!("cannot write {}: {e}", self.path.display()))
     }
 
-    /// Forget every kept key (on logout). The keys stay valid at the gateway
-    /// until they expire; they are only no longer on this machine.
+    /// Mark the kept key `secret` as refused by the gateway: it is not handed
+    /// out again, but stays for logout to revoke. Call under [`Self::lock`].
+    pub fn refuse(&self, secret: &str) -> Result<(), String> {
+        let mut keys = self.load();
+        let Some(key) = keys.iter_mut().find(|k| k.secret == secret) else {
+            return Ok(());
+        };
+        key.refused = true;
+        let text = serde_json::to_string(&keys).map_err(|e| e.to_string())?;
+        write_private(&self.path, &text)
+            .map_err(|e| format!("cannot write {}: {e}", self.path.display()))
+    }
+
+    /// Every kept key that has not expired at `now`.
+    pub fn kept(&self, now: i64) -> Vec<KeptKey> {
+        self.load()
+            .into_iter()
+            .filter(|k| k.expires_at > now)
+            .map(|k| KeptKey {
+                console_url: k.console_url,
+                account: k.account,
+                id: k.id,
+                billing: k.billing,
+                expires_at: k.expires_at,
+            })
+            .collect()
+    }
+
+    /// Forget every kept key (on logout, after [`revoke_kept`]).
     pub fn clear(&self) -> std::io::Result<()> {
         match std::fs::remove_file(&self.path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
@@ -469,11 +640,13 @@ pub struct EnsuredKey {
 /// Looking, issuing and storing happen under the store's lock, so sessions
 /// starting side by side end up sharing one key instead of revoking each
 /// other's.
+#[allow(clippy::too_many_arguments)]
 pub async fn ensure_key(
     http: &reqwest::Client,
     console_url: &str,
     token: &str,
     project_id: &str,
+    billing: Billing,
     store: &KeyStore,
     now: i64,
     rejected: Option<&str>,
@@ -485,8 +658,13 @@ pub async fn ensure_key(
         .await
         .map_err(|e| e.to_string())
         .and_then(|locked| locked.map_err(|e| e.to_string()));
+    // A key the gateway refused is not offered again by any later session
+    // (a subscription key stays kept, and may outlast its replacement).
+    if let (Some(secret), Ok(_)) = (rejected, &lock) {
+        let _ = store.refuse(secret);
+    }
     let stored = store
-        .usable(console_url, project_id, &account, now)
+        .usable(console_url, project_id, &account, billing, now)
         .filter(|key| Some(key.secret.as_str()) != rejected);
     if let Some(key) = stored {
         return Ok(EnsuredKey { key, issued: false });
@@ -500,14 +678,43 @@ pub async fn ensure_key(
             store.path.display()
         )
     })?;
-    let key = issue_key(http, console_url, token, project_id, now).await?;
+    let key = issue_key(http, console_url, token, project_id, billing, now).await?;
     // A key that is not kept is issued again by the next session, and by the
     // agent's own key helper, each time revoking the one in use: that is no
     // working gateway session.
     store
-        .keep(console_url, project_id, &account, &key, now)
+        .keep(console_url, project_id, &account, billing, &key, now)
         .map_err(|why| format!("the personal AI Gateway key could not be kept: {why}"))?;
     Ok(EnsuredKey { key, issued: true })
+}
+
+/// Revoke at their consoles the kept keys of the person whose access token
+/// is `token` (on `visdom logout`, before the store is cleared). What could
+/// not be revoked is returned as warnings; such a key stays valid at the
+/// gateway until it expires. Keys of another account are not this token's
+/// to revoke.
+pub async fn revoke_kept(
+    http: &reqwest::Client,
+    store: &KeyStore,
+    token: &str,
+    now: i64,
+) -> Vec<String> {
+    let account = account_of(token);
+    let mut warnings = Vec::new();
+    for key in store.kept(now).into_iter().filter(|k| k.account == account) {
+        let Some(id) = &key.id else { continue };
+        if let Err(why) = revoke_key(http, &key.console_url, token, id).await {
+            warnings.push(format!(
+                "{why}; the {} key stays valid until it expires (revoke it in the AI Gateway \
+                 console under My API key)",
+                match key.billing {
+                    Billing::Project => "personal",
+                    Billing::Subscription => "subscription",
+                }
+            ));
+        }
+    }
+    warnings
 }
 
 #[cfg(test)]
@@ -567,7 +774,7 @@ mod tests {
             201,
             r#"{"secret":"sk-abc","id":"hash","name":"personal-x-1","expiresAt":"2026-11-20T10:00:00.250000+00:00"}"#,
         )]);
-        let key = issue_key(&http, &server.url, "tok", "p-1", 0)
+        let key = issue_key(&http, &server.url, "tok", "p-1", Billing::Project, 0)
             .await
             .unwrap();
         assert_eq!(key.secret, "sk-abc");
@@ -593,7 +800,7 @@ mod tests {
             ),
             ("GET /api/me/keys", 401, ""),
         ]);
-        let err = issue_key(&http, &server.url, "tok", "p-1", 0)
+        let err = issue_key(&http, &server.url, "tok", "p-1", Billing::Project, 0)
             .await
             .err()
             .unwrap();
@@ -693,31 +900,45 @@ mod tests {
         let key = IssuedKey {
             secret: "sk-abc".to_string(),
             expires_at: 10_000,
+            id: None,
         };
         assert!(store
-            .usable("https://gw.example.com", "p-1", "", 0)
+            .usable("https://gw.example.com", "p-1", "", Billing::Project, 0)
             .is_none());
         store
-            .keep("https://gw.example.com/", "p-1", "", &key, 0)
+            .keep(
+                "https://gw.example.com/",
+                "p-1",
+                "",
+                Billing::Project,
+                &key,
+                0,
+            )
             .unwrap();
         let again = store
-            .usable("https://gw.example.com", "p-1", "", 0)
+            .usable("https://gw.example.com", "p-1", "", Billing::Project, 0)
             .unwrap();
         assert_eq!(again.secret, "sk-abc");
         // Another project or console has its own key.
         assert!(store
-            .usable("https://gw.example.com", "p-2", "", 0)
+            .usable("https://gw.example.com", "p-2", "", Billing::Project, 0)
             .is_none());
         assert!(store
-            .usable("https://other.example.com", "p-1", "", 0)
+            .usable("https://other.example.com", "p-1", "", Billing::Project, 0)
             .is_none());
         // Close to expiry it is no longer handed out.
         let late = 10_000 - MIN_KEY_SECONDS_LEFT + 1;
         assert!(store
-            .usable("https://gw.example.com", "p-1", "", late)
+            .usable("https://gw.example.com", "p-1", "", Billing::Project, late)
             .is_none());
         assert!(store
-            .usable("https://gw.example.com", "p-1", "", late - 1)
+            .usable(
+                "https://gw.example.com",
+                "p-1",
+                "",
+                Billing::Project,
+                late - 1
+            )
             .is_some());
     }
 
@@ -728,26 +949,61 @@ mod tests {
         let key = |secret: &str, expires_at| IssuedKey {
             secret: secret.to_string(),
             expires_at,
+            id: None,
         };
         store
-            .keep("https://gw", "p-1", "", &key("old", 5_000), 0)
+            .keep(
+                "https://gw",
+                "p-1",
+                "",
+                Billing::Project,
+                &key("old", 5_000),
+                0,
+            )
             .unwrap();
         store
-            .keep("https://gw", "p-2", "", &key("other", 9_000), 0)
+            .keep(
+                "https://gw",
+                "p-2",
+                "",
+                Billing::Project,
+                &key("other", 9_000),
+                0,
+            )
             .unwrap();
         store
-            .keep("https://gw", "p-1", "", &key("new", 90_000), 6_000)
+            .keep(
+                "https://gw",
+                "p-1",
+                "",
+                Billing::Project,
+                &key("new", 90_000),
+                6_000,
+            )
             .unwrap();
         assert_eq!(
-            store.usable("https://gw", "p-1", "", 6_000).unwrap().secret,
+            store
+                .usable("https://gw", "p-1", "", Billing::Project, 6_000)
+                .unwrap()
+                .secret,
             "new"
         );
         assert_eq!(
-            store.usable("https://gw", "p-2", "", 6_000).unwrap().secret,
+            store
+                .usable("https://gw", "p-2", "", Billing::Project, 6_000)
+                .unwrap()
+                .secret,
             "other"
         );
         store
-            .keep("https://gw", "p-3", "", &key("third", 99_000), 9_500)
+            .keep(
+                "https://gw",
+                "p-3",
+                "",
+                Billing::Project,
+                &key("third", 99_000),
+                9_500,
+            )
             .unwrap();
         assert_eq!(store.load().len(), 2, "the expired p-2 key is gone");
     }
@@ -762,9 +1018,14 @@ mod tests {
         let key = IssuedKey {
             secret: "sk-abc".to_string(),
             expires_at: 10_000,
+            id: None,
         };
-        store.keep("https://gw", "p-1", "", &key, 0).unwrap();
-        store.keep("https://gw", "p-2", "", &key, 0).unwrap();
+        store
+            .keep("https://gw", "p-1", "", Billing::Project, &key, 0)
+            .unwrap();
+        store
+            .keep("https://gw", "p-2", "", Billing::Project, &key, 0)
+            .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
@@ -782,22 +1043,49 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-11-19T10:00:00Z")
             .unwrap()
             .timestamp();
-        let first = ensure_key(&http, &server.url, "tok", "p-1", &store, now, None)
-            .await
-            .unwrap();
+        let first = ensure_key(
+            &http,
+            &server.url,
+            "tok",
+            "p-1",
+            Billing::Project,
+            &store,
+            now,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!((first.key.secret.as_str(), first.issued), ("sk-abc", true));
-        let second = ensure_key(&http, &server.url, "tok", "p-1", &store, now + 3600, None)
-            .await
-            .unwrap();
+        let second = ensure_key(
+            &http,
+            &server.url,
+            "tok",
+            "p-1",
+            Billing::Project,
+            &store,
+            now + 3600,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             (second.key.secret.as_str(), second.issued),
             ("sk-abc", false)
         );
         assert_eq!(server.routes(), ["POST /api/me/keys"], "issued once");
         // A day later it has expired: a new one is issued.
-        ensure_key(&http, &server.url, "tok", "p-1", &store, now + 86_400, None)
-            .await
-            .unwrap();
+        ensure_key(
+            &http,
+            &server.url,
+            "tok",
+            "p-1",
+            Billing::Project,
+            &store,
+            now + 86_400,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(server.routes().len(), 2);
     }
 
@@ -850,14 +1138,32 @@ mod tests {
         ]);
         let alice = token_of("https://idp", "alice-id");
         let bob = token_of("https://idp", "bob-id");
-        let first = ensure_key(&http, &server.url, &alice, "p-1", &store, 0, None)
-            .await
-            .unwrap();
+        let first = ensure_key(
+            &http,
+            &server.url,
+            &alice,
+            "p-1",
+            Billing::Project,
+            &store,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(first.key.secret, "sk-alice");
         // Bob logs in on the same machine: Alice's key is not his.
-        let second = ensure_key(&http, &server.url, &bob, "p-1", &store, 0, None)
-            .await
-            .unwrap();
+        let second = ensure_key(
+            &http,
+            &server.url,
+            &bob,
+            "p-1",
+            Billing::Project,
+            &store,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             (second.key.secret.as_str(), second.issued),
             ("sk-bob", true)
@@ -867,7 +1173,7 @@ mod tests {
         assert_eq!(asked[1].authorization, Some(format!("Bearer {bob}")));
         // And Alice's is gone from the file, not kept beside his.
         assert!(store
-            .usable(&server.url, "p-1", &account_of(&alice), 0)
+            .usable(&server.url, "p-1", &account_of(&alice), Billing::Project, 0)
             .is_none());
         assert_eq!(store.load().len(), 1);
     }
@@ -885,20 +1191,41 @@ mod tests {
         let old = IssuedKey {
             secret: "sk-old".to_string(),
             expires_at: 4_000_000_000,
+            id: None,
         };
-        store.keep(&server.url, "p-1", "", &old, 0).unwrap();
-        // The gateway refused sk-old: the stored copy is not offered again.
-        let renewed = ensure_key(&http, &server.url, "tok", "p-1", &store, 0, Some("sk-old"))
-            .await
+        store
+            .keep(&server.url, "p-1", "", Billing::Project, &old, 0)
             .unwrap();
+        // The gateway refused sk-old: the stored copy is not offered again.
+        let renewed = ensure_key(
+            &http,
+            &server.url,
+            "tok",
+            "p-1",
+            Billing::Project,
+            &store,
+            0,
+            Some("sk-old"),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             (renewed.key.secret.as_str(), renewed.issued),
             ("sk-new", true)
         );
         // Another session that also saw sk-old refused finds the new one.
-        let other = ensure_key(&http, &server.url, "tok", "p-1", &store, 0, Some("sk-old"))
-            .await
-            .unwrap();
+        let other = ensure_key(
+            &http,
+            &server.url,
+            "tok",
+            "p-1",
+            Billing::Project,
+            &store,
+            0,
+            Some("sk-old"),
+        )
+        .await
+        .unwrap();
         assert_eq!((other.key.secret.as_str(), other.issued), ("sk-new", false));
         assert_eq!(server.routes().len(), 1);
     }
@@ -925,7 +1252,7 @@ mod tests {
             let (store, url) = (store.clone(), server.url.clone());
             tokio::spawn(async move {
                 let http = reqwest::Client::new();
-                ensure_key(&http, &url, "tok", "p-1", &store, 0, None)
+                ensure_key(&http, &url, "tok", "p-1", Billing::Project, &store, 0, None)
                     .await
                     .unwrap()
                     .key
@@ -980,10 +1307,19 @@ mod tests {
             201,
             r#"{"secret":"sk-abc","id":"h","name":"n","expiresAt":"2099-01-01T00:00:00Z"}"#,
         )]);
-        let err = ensure_key(&http, &server.url, "tok", "p-1", &store, 0, None)
-            .await
-            .err()
-            .unwrap();
+        let err = ensure_key(
+            &http,
+            &server.url,
+            "tok",
+            "p-1",
+            Billing::Project,
+            &store,
+            0,
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
         assert!(err.contains("could not be kept"), "{err}");
         assert!(!err.contains("sk-abc"), "{err}");
     }
@@ -1002,22 +1338,43 @@ mod tests {
             201,
             r#"{"secret":"sk-abc","id":"h","name":"n","expiresAt":"2099-01-01T00:00:00Z"}"#,
         )]);
-        let err = ensure_key(&http, &server.url, "tok", "p-1", &store, 0, None)
-            .await
-            .err()
-            .unwrap();
+        let err = ensure_key(
+            &http,
+            &server.url,
+            "tok",
+            "p-1",
+            Billing::Project,
+            &store,
+            0,
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
         assert!(err.contains("could not be locked"), "{err}");
         assert!(server.routes().is_empty(), "{:?}", server.routes());
 
         let kept = IssuedKey {
             secret: "sk-kept".to_string(),
             expires_at: 1_000_000,
+            id: None,
         };
         let account = account_of("tok");
-        store.keep(&server.url, "p-1", &account, &kept, 0).unwrap();
-        let ensured = ensure_key(&http, &server.url, "tok", "p-1", &store, 0, None)
-            .await
+        store
+            .keep(&server.url, "p-1", &account, Billing::Project, &kept, 0)
             .unwrap();
+        let ensured = ensure_key(
+            &http,
+            &server.url,
+            "tok",
+            "p-1",
+            Billing::Project,
+            &store,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(ensured.key.secret, "sk-kept");
         assert!(!ensured.issued);
         assert!(server.routes().is_empty(), "{:?}", server.routes());
@@ -1031,9 +1388,359 @@ mod tests {
         let key = IssuedKey {
             secret: "sk-abc".to_string(),
             expires_at: 10_000,
+            id: None,
         };
-        store.keep("https://gw", "p-1", "", &key, 0).unwrap();
+        store
+            .keep("https://gw", "p-1", "", Billing::Project, &key, 0)
+            .unwrap();
         store.clear().unwrap();
-        assert!(store.usable("https://gw", "p-1", "", 0).is_none());
+        assert!(store
+            .usable("https://gw", "p-1", "", Billing::Project, 0)
+            .is_none());
+    }
+
+    const DAY: i64 = 24 * 60 * 60;
+
+    fn subscription_answer(secret: &str, id: &str, expires_at: &str) -> String {
+        format!(
+            r#"{{"secret":"{secret}","id":"{id}","name":"subscription-dev-1","expiresAt":"{expires_at}","billing":"subscription"}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn a_subscription_key_is_asked_for_by_its_kind() {
+        let http = reqwest::Client::new();
+        let answer = subscription_answer("sk-sub", "hash-1", "2026-12-26T10:00:00Z");
+        let server = MockServer::start(&[("POST /api/me/keys", 201, &answer)]);
+        let key = issue_key(&http, &server.url, "tok", "p-1", Billing::Subscription, 0)
+            .await
+            .unwrap();
+        assert_eq!(key.secret, "sk-sub");
+        assert_eq!(key.id.as_deref(), Some("hash-1"));
+        let asked = &server.requests()[0];
+        assert_eq!(
+            asked.body,
+            r#"{"projectId":"p-1","billing":"subscription"}"#
+        );
+        assert_eq!(asked.authorization.as_deref(), Some("Bearer tok"));
+    }
+
+    /// A console from before subscription keys ignores `billing` and issues
+    /// an ordinary key, which would let the project pay: it is revoked again,
+    /// and the answer is an error.
+    #[tokio::test]
+    async fn an_ordinary_key_given_for_a_subscription_is_given_back() {
+        let http = reqwest::Client::new();
+        let server = MockServer::start(&[
+            (
+                "POST /api/me/keys",
+                201,
+                r#"{"secret":"sk-ordinary","id":"hash-2","name":"personal-dev-1","expiresAt":"2099-01-01T00:00:00Z"}"#,
+            ),
+            ("DELETE /api/me/keys/hash-2", 204, ""),
+        ]);
+        let err = issue_key(&http, &server.url, "tok", "p-1", Billing::Subscription, 0)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            err.contains("does not support billing = subscription"),
+            "{err}"
+        );
+        assert!(!err.contains("sk-ordinary"), "{err}");
+        assert_eq!(
+            server.routes(),
+            ["POST /api/me/keys", "DELETE /api/me/keys/hash-2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deployment_that_denies_subscription_traffic_is_quoted() {
+        let http = reqwest::Client::new();
+        let server = MockServer::start(&[(
+            "POST /api/me/keys",
+            403,
+            r#"{"error":"This gateway does not take subscription traffic (VISDOM_SUBSCRIPTION_TRAFFIC=deny), so it issues no subscription keys; use an ordinary personal key","code":"subscription_traffic_denied"}"#,
+        )]);
+        let err = issue_key(&http, &server.url, "tok", "p-1", Billing::Subscription, 0)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.contains("does not take subscription traffic"), "{err}");
+        assert!(err.contains("HTTP 403"), "{err}");
+    }
+
+    #[test]
+    fn a_subscription_key_is_renewed_a_week_before_it_expires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KeyStore::at(key_store_path_in(tmp.path()));
+        let key = |secret: &str, expires_at| IssuedKey {
+            secret: secret.to_string(),
+            expires_at,
+            id: Some(format!("id-{secret}")),
+        };
+        let issued = 1_000_000;
+        let expires = issued + 30 * DAY;
+        let sub = Billing::Subscription;
+        store
+            .keep(
+                "https://gw",
+                "p-1",
+                "a",
+                sub,
+                &key("first", expires),
+                issued,
+            )
+            .unwrap();
+        // Kinds are kept apart.
+        assert!(store
+            .usable("https://gw", "p-1", "a", Billing::Project, issued)
+            .is_none());
+        let week = MIN_SUBSCRIPTION_KEY_SECONDS_LEFT;
+        assert_eq!(
+            store
+                .usable("https://gw", "p-1", "a", sub, expires - week)
+                .unwrap()
+                .secret,
+            "first"
+        );
+        assert!(store
+            .usable("https://gw", "p-1", "a", sub, expires - week + 1)
+            .is_none());
+        // The next one does not replace it in the store: the first stays
+        // until it expires, for logout to revoke, and the new one is used.
+        let now = expires - week + 1;
+        store
+            .keep(
+                "https://gw",
+                "p-1",
+                "a",
+                sub,
+                &key("second", now + 30 * DAY),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .usable("https://gw", "p-1", "a", sub, now)
+                .unwrap()
+                .secret,
+            "second"
+        );
+        let kept = store.kept(now);
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(kept.iter().all(|k| k.billing == sub));
+        // An ordinary key for the same project does not touch them.
+        store
+            .keep(
+                "https://gw",
+                "p-1",
+                "a",
+                Billing::Project,
+                &key("plain", now + DAY),
+                now,
+            )
+            .unwrap();
+        assert_eq!(store.kept(now).len(), 3);
+        // Once expired, it is dropped with the next write.
+        store
+            .keep(
+                "https://gw",
+                "p-2",
+                "a",
+                sub,
+                &key("other", expires + 60 * DAY),
+                expires + 1,
+            )
+            .unwrap();
+        let left: Vec<_> = store.kept(expires + 1);
+        assert_eq!(left.len(), 2, "{left:?}");
+        // Another account's subscription keys go when this one keeps its own.
+        store
+            .keep(
+                "https://gw",
+                "p-2",
+                "b",
+                sub,
+                &key("bobs", expires + 60 * DAY),
+                expires + 2,
+            )
+            .unwrap();
+        assert!(store
+            .usable("https://gw", "p-2", "a", sub, expires + 2)
+            .is_none());
+    }
+
+    #[test]
+    fn a_short_lived_subscription_key_is_renewed_at_half_its_life() {
+        assert_eq!(
+            renew_before(Billing::Subscription, 1000, 1000 + 30 * DAY),
+            MIN_SUBSCRIPTION_KEY_SECONDS_LEFT
+        );
+        assert_eq!(
+            renew_before(Billing::Subscription, 1000, 1000 + 4 * DAY),
+            2 * DAY
+        );
+        assert_eq!(
+            renew_before(Billing::Subscription, 0, 30 * DAY),
+            MIN_SUBSCRIPTION_KEY_SECONDS_LEFT,
+            "issue time unknown"
+        );
+        assert_eq!(renew_before(Billing::Project, 0, DAY), MIN_KEY_SECONDS_LEFT);
+    }
+
+    #[tokio::test]
+    async fn a_subscription_key_is_issued_once_and_shared() {
+        let http = reqwest::Client::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KeyStore::at(key_store_path_in(tmp.path()));
+        let answer = subscription_answer("sk-sub", "h", "2099-01-01T00:00:00Z");
+        let server = MockServer::start(&[("POST /api/me/keys", 201, &answer)]);
+        let sub = Billing::Subscription;
+        for issued in [true, false] {
+            let ensured = ensure_key(&http, &server.url, "tok", "p-1", sub, &store, 0, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                (ensured.key.secret.as_str(), ensured.issued),
+                ("sk-sub", issued)
+            );
+        }
+        assert_eq!(server.routes(), ["POST /api/me/keys"]);
+        // An ordinary key for the same project is its own.
+        assert!(store
+            .usable(&server.url, "p-1", "", Billing::Project, 0)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_the_kept_keys_of_the_person_at_their_console() {
+        let http = reqwest::Client::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KeyStore::at(key_store_path_in(tmp.path()));
+        let server = MockServer::start(&[
+            ("DELETE /api/me/keys/sub-1", 204, ""),
+            (
+                "DELETE /api/me/keys/sub%2F2",
+                400,
+                r#"{"error":"No such personal key of yours"}"#,
+            ),
+            ("DELETE /api/me/keys/plain-1", 500, ""),
+        ]);
+        let alice = token_of("https://idp", "alice-id");
+        let account = account_of(&alice);
+        let key = |id: Option<&str>, expires_at| IssuedKey {
+            secret: "sk".to_string(),
+            expires_at,
+            id: id.map(String::from),
+        };
+        let sub = Billing::Subscription;
+        store
+            .keep(
+                &server.url,
+                "p-1",
+                &account,
+                sub,
+                &key(Some("sub-1"), 100),
+                0,
+            )
+            .unwrap();
+        store
+            .keep(
+                &server.url,
+                "p-1",
+                &account,
+                sub,
+                &key(Some("sub/2"), 200),
+                0,
+            )
+            .unwrap();
+        store
+            .keep(
+                &server.url,
+                "p-1",
+                &account,
+                Billing::Project,
+                &key(Some("plain-1"), 100),
+                0,
+            )
+            .unwrap();
+        // Kept before keys had ids: nothing to revoke it by.
+        store
+            .keep(
+                &server.url,
+                "p-2",
+                &account,
+                Billing::Project,
+                &key(None, 100),
+                0,
+            )
+            .unwrap();
+        // Somebody else's, and an expired one: not asked about.
+        store
+            .keep(&server.url, "p-3", "other", sub, &key(Some("bobs"), 100), 0)
+            .unwrap();
+        let warnings = revoke_kept(&http, &store, &alice, 50).await;
+        let mut asked = server.routes();
+        asked.sort();
+        assert_eq!(
+            asked,
+            [
+                "DELETE /api/me/keys/plain-1",
+                "DELETE /api/me/keys/sub%2F2",
+                "DELETE /api/me/keys/sub-1"
+            ]
+        );
+        for request in server.requests() {
+            assert_eq!(request.authorization, Some(format!("Bearer {alice}")));
+        }
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("HTTP 500"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("personal key stays valid"),
+            "{warnings:?}"
+        );
+    }
+
+    /// A subscription key the gateway refused is not handed out again, even
+    /// when it would outlast its replacement; it stays kept for logout.
+    #[tokio::test]
+    async fn a_refused_subscription_key_does_not_come_back() {
+        let http = reqwest::Client::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KeyStore::at(key_store_path_in(tmp.path()));
+        let answer = subscription_answer("sk-new", "h-new", "2099-01-01T00:00:00Z");
+        let server = MockServer::start(&[("POST /api/me/keys", 201, &answer)]);
+        let sub = Billing::Subscription;
+        let old = IssuedKey {
+            secret: "sk-old".to_string(),
+            expires_at: 9_000_000_000,
+            id: Some("h-old".to_string()),
+        };
+        store.keep(&server.url, "p-1", "", sub, &old, 0).unwrap();
+        let renewed = ensure_key(
+            &http,
+            &server.url,
+            "tok",
+            "p-1",
+            sub,
+            &store,
+            0,
+            Some("sk-old"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (renewed.key.secret.as_str(), renewed.issued),
+            ("sk-new", true)
+        );
+        // The next session, which was not told, gets the new one too.
+        let next = ensure_key(&http, &server.url, "tok", "p-1", sub, &store, 0, None)
+            .await
+            .unwrap();
+        assert_eq!((next.key.secret.as_str(), next.issued), ("sk-new", false));
+        assert_eq!(server.routes().len(), 1);
+        let ids: Vec<_> = store.kept(0).into_iter().filter_map(|k| k.id).collect();
+        assert_eq!(ids, ["h-old", "h-new"]);
     }
 }

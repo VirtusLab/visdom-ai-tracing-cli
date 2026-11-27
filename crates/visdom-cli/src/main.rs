@@ -5,6 +5,7 @@ use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches};
 use tracevault_cli::agent::Agent;
 use tracevault_cli::cli::{run, Command, InitArgs};
+use visdom_cli::agents::via_gateway::AgentCommand;
 use visdom_cli::agents::McpScope;
 use visdom_cli::billing::{self, Billing, BillingUse};
 use visdom_cli::cli::{VisdomCli, VisdomCommand};
@@ -15,7 +16,7 @@ use visdom_cli::finding::FixAction;
 use visdom_cli::finding::{exit_code, render_json, render_text};
 use visdom_cli::fixes::FixExecutor;
 use visdom_cli::fixes::{policy_for, FixPolicy};
-use visdom_cli::gateway::{ensure_key, key_store_path_in, KeyStore};
+use visdom_cli::gateway::{ensure_key, key_store_path_in, revoke_kept, KeyStore};
 use visdom_cli::instructions::Told;
 use visdom_cli::interactive::InitScope;
 use visdom_cli::mode::{
@@ -47,7 +48,7 @@ fn main() {
         Some(VisdomCommand::Login(args)) => runtime.block_on(run(Command::Login(args))),
         Some(VisdomCommand::Logout) => {
             // First: a failed logout exits.
-            forget_gateway_keys();
+            forget_gateway_keys(&runtime);
             runtime.block_on(run(Command::Logout))
         }
         Some(VisdomCommand::Trace { command }) => runtime.block_on(run(command)),
@@ -99,9 +100,11 @@ fn main() {
             yes || cli.yes,
             json,
         ),
-        Some(VisdomCommand::GatewayKey { console, project }) => {
-            gateway_key(&runtime, &console, &project)
-        }
+        Some(VisdomCommand::GatewayKey {
+            console,
+            project,
+            billing,
+        }) => gateway_key(&runtime, &console, &project, billing),
         Some(VisdomCommand::Env { agent }) => {
             env_script(&runtime, agent.or(cli.agent), cli.billing)
         }
@@ -155,11 +158,16 @@ fn hand_over(secret: &str) -> ! {
 /// `visdom gateway-key`: the key a launched agent asks for. The kept key is
 /// printed without asking anybody; only a missing or expiring one costs a
 /// request. Nothing but the key goes to stdout.
-fn gateway_key(runtime: &tokio::runtime::Runtime, console: &str, project: &str) -> ! {
+fn gateway_key(
+    runtime: &tokio::runtime::Runtime,
+    console: &str,
+    project: &str,
+    billing: Billing,
+) -> ! {
     let env = Environment::current();
     let store = KeyStore::at(key_store_path_in(&env.config_root));
     let kept = checks::stored_account(&env.cwd)
-        .and_then(|account| store.usable(console, project, &account, now()));
+        .and_then(|account| store.usable(console, project, &account, billing, now()));
     if let Some(key) = kept {
         hand_over(&key.secret);
     }
@@ -169,6 +177,7 @@ fn gateway_key(runtime: &tokio::runtime::Runtime, console: &str, project: &str) 
             console,
             &token,
             project,
+            billing,
             &store,
             now(),
             None,
@@ -183,10 +192,38 @@ fn gateway_key(runtime: &tokio::runtime::Runtime, console: &str, project: &str) 
     }
 }
 
-/// `visdom logout`: the gateway keys kept for this login go with it.
-fn forget_gateway_keys() {
+/// `visdom logout`: the gateway keys kept for this login go with it, revoked
+/// at the console first while the login can still do that. A key that cannot
+/// be revoked is said, and forgotten anyway.
+fn forget_gateway_keys(runtime: &tokio::runtime::Runtime) {
     let env = Environment::current();
-    if let Err(e) = KeyStore::at(key_store_path_in(&env.config_root)).clear() {
+    let store = KeyStore::at(key_store_path_in(&env.config_root));
+    // Held from the snapshot to the clearing: a key another `visdom` issues
+    // meanwhile would otherwise be forgotten unrevoked. It waits, and keeps
+    // its key after this logout.
+    let _lock = match store.lock() {
+        Ok(lock) => Some(lock),
+        Err(e) => {
+            eprintln!("visdom: warning: the AI Gateway key store could not be locked: {e}");
+            None
+        }
+    };
+    if !store.kept(now()).is_empty() {
+        match checks::person_token(&env.cwd, runtime) {
+            Ok(token) => {
+                let http = launch::key_http_client();
+                for warning in runtime.block_on(revoke_kept(&http, &store, &token, now())) {
+                    eprintln!("visdom: warning: {warning}");
+                }
+            }
+            Err(why) => eprintln!(
+                "visdom: warning: the kept AI Gateway keys could not be revoked ({why}); they \
+                 stay valid until they expire (revoke them in the AI Gateway console under My \
+                 API key)"
+            ),
+        }
+    }
+    if let Err(e) = store.clear() {
         eprintln!("visdom: warning: the kept AI Gateway keys could not be removed: {e}");
     }
 }
@@ -882,8 +919,8 @@ fn agent_command(
     session: &Session,
     runtime: &tokio::runtime::Runtime,
     agent_args: &[String],
-) -> std::process::Command {
-    let hooks = |session: &Session| {
+) -> AgentCommand {
+    let hooks = |session: &Session| -> AgentCommand {
         let mut cmd = session
             .adapter
             .launch(&told_args(session, agent_args, false));
@@ -892,7 +929,7 @@ fn agent_command(
         // capture off for a session that does not use the gateway.
         cmd.env(MODE_ENV, TracingMode::Hooks.name());
         cmd.env_remove(GATEWAY_SESSION_ENV);
-        cmd
+        cmd.into()
     };
     if session.mode.mode != TracingMode::Gateway {
         return hooks(session);
@@ -939,18 +976,11 @@ fn agent_command(
 
 /// Stop before an agent is started through the gateway in a way the billing
 /// does not allow: a combination that cannot work (exit 2, like a mode that
-/// names none), or the subscription, which this version cannot start the
-/// agent on yet — rather than let the project pay without being asked to.
+/// names none).
 fn stop_on_billing(session: &Session) {
     if let BillingUse::Rejected(why) = &session.billing_use {
         eprintln!("visdom: {why}");
         exit(2);
-    }
-    if session.billing_use == BillingUse::Applies {
-        if let Some(why) = billing::launch_unavailable(&session.billing) {
-            eprintln!("visdom: {why}");
-            exit(1);
-        }
     }
 }
 
@@ -988,8 +1018,15 @@ fn check_and_launch(
         exit(2);
     }
     // In the directory visdom was run in, like starting the agent by hand.
-    let cmd = agent_command(&session, &runtime, agent_args);
-    // The agent takes over this process: no runtime threads may outlive it.
+    let AgentCommand { cmd, private_file } = agent_command(&session, &runtime, agent_args);
+    // The agent takes over this process (or runs as its only child): no
+    // runtime threads may outlive it.
     drop(runtime);
-    launch::exec_agent(cmd, session.ctx.agent, &session.user_config_path)
+    match private_file {
+        // Settings holding a key: removed once the agent has exited.
+        Some(file) => {
+            launch::run_agent_then_remove(cmd, file, session.ctx.agent, &session.user_config_path)
+        }
+        None => launch::exec_agent(cmd, session.ctx.agent, &session.user_config_path),
+    }
 }
