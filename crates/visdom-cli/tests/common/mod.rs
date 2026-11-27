@@ -26,18 +26,34 @@ pub const SUBSCRIPTION_LOGIN: &str = r#"{"loggedIn":true,"authMethod":"claude.ai
 /// the user's settings outranks the claude.ai login.
 pub const HELPER_LOGIN: &str = r#"{"loggedIn":true,"authMethod":"api_key_helper","apiProvider":"firstParty","apiKeySource":"apiKeyHelper"}"#;
 
+/// What Claude Code 2.1.332 answers to `auth status` signed in with a
+/// `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`) and no stored login.
+pub const TOKEN_LOGIN: &str =
+    r#"{"loggedIn":true,"authMethod":"oauth_token","apiProvider":"firstParty"}"#;
+
+/// What it answers signed out.
+pub const SIGNED_OUT: &str = r#"{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}"#;
+
 /// The first lines of a shell stand-in for Claude Code: `auth status` (the
-/// last two arguments, after any `--settings`) answers as
-/// [`SUBSCRIPTION_LOGIN`] — or `FAKE_CLAUDE_AUTH_STATUS`, or
+/// last two arguments, after any `--settings <JSON or file>`) answers as
+/// [`SUBSCRIPTION_LOGIN`] — or `FAKE_CLAUDE_AUTH_STATUS`; or, with
+/// `FAKE_CLAUDE_NO_LOGIN` set, [`TOKEN_LOGIN`] when the settings carry a
+/// `CLAUDE_CODE_OAUTH_TOKEN` and [`SIGNED_OUT`] otherwise; or
 /// [`HELPER_LOGIN`] when the user's Claude settings have an `apiKeyHelper`
-/// that the options do not set to nothing — exits 1 when signed out as
-/// Claude Code does, and is not recorded as a run.
+/// that the settings do not set to nothing. A token on the command line
+/// itself gets no JSON at all. Exits 1 when signed out as Claude Code does,
+/// and is not recorded as a run.
 fn shell_auth_status() -> String {
     format!(
         "case \" $* \" in *' auth status ') \n  \
+         given=; prev=; for a in \"$@\"; do [ \"$prev\" = --settings ] && given=\"$a\"; prev=\"$a\"; done\n  \
+         case \"$given\" in *CLAUDE_CODE_OAUTH_TOKEN*) echo 'token on the command line'; exit 3;; esac\n  \
+         if [ -f \"$given\" ]; then given=$(cat \"$given\"); fi\n  \
          if [ -n \"$FAKE_CLAUDE_AUTH_STATUS\" ]; then status=\"$FAKE_CLAUDE_AUTH_STATUS\"; \
+         elif [ -n \"$FAKE_CLAUDE_NO_LOGIN\" ]; then \
+         case \"$given\" in *CLAUDE_CODE_OAUTH_TOKEN*) status='{TOKEN_LOGIN}';; *) status='{SIGNED_OUT}';; esac; \
          elif grep -q apiKeyHelper \"$HOME/.claude/settings.json\" 2>/dev/null && \
-         ! printf '%s' \"$*\" | grep -q '\"apiKeyHelper\":\"\"'; then status='{HELPER_LOGIN}'; \
+         ! printf '%s' \"$given\" | grep -q '\"apiKeyHelper\":\"\"'; then status='{HELPER_LOGIN}'; \
          else status='{SUBSCRIPTION_LOGIN}'; fi\n  \
          printf '%s\\n' \"$status\"\n  \
          case \"$status\" in *'\"loggedIn\":false'*) exit 1;; esac\n  exit 0;;\nesac\n"
@@ -214,7 +230,13 @@ args = sys.argv[1:]
 if args[-2:] == ["auth", "status"]:
     status = os.environ.get("FAKE_CLAUDE_AUTH_STATUS") or '{SUBSCRIPTION_LOGIN}'
     user_file = os.path.join(os.environ["HOME"], ".claude", "settings.json")
-    given = json.loads(args[args.index("--settings") + 1]) if "--settings" in args else {{}}
+    given = {{}}
+    if "--settings" in args:
+        raw = args[args.index("--settings") + 1]
+        if os.path.isfile(raw):
+            with open(raw) as f:
+                raw = f.read()
+        given = json.loads(raw)
     if not os.environ.get("FAKE_CLAUDE_AUTH_STATUS") and os.path.isfile(user_file):
         with open(user_file) as f:
             helper = given["apiKeyHelper"] if "apiKeyHelper" in given else json.load(f).get("apiKeyHelper")

@@ -72,7 +72,7 @@ pub const CLAUDE_SETTINGS_PREFIX: &str = "claude-settings-";
 /// Write `text` to a new file in `dir` that only the user can read, named
 /// after this process (so a file left by a process that has gone can be told
 /// apart), and return its path.
-fn write_private_file(dir: &Path, text: &str) -> Result<PathBuf, String> {
+pub(crate) fn write_private_file(dir: &Path, text: &str) -> Result<PathBuf, String> {
     use std::io::Write;
     let failed = |e: std::io::Error| {
         format!(
@@ -373,9 +373,10 @@ pub fn claude_command(
     if let Some(model) = &gateway.model {
         // The project's allow-list has aliases, not Claude Code's defaults:
         // both the main and the small model must name one. A model the
-        // developer already chose stays.
+        // developer already chose stays; a blank one is no choice (Claude
+        // Code would fall back to its own default) and gets the alias.
         for name in ["ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"] {
-            if env(name).is_none() {
+            if env(name).is_none_or(|v| v.trim().is_empty()) {
                 cmd.env(name, model);
             }
         }
@@ -913,6 +914,13 @@ mod tests {
             "{headers}"
         );
         assert!(!headers.contains("x-tracevault-repo"), "{headers}");
+    }
+
+    #[test]
+    fn a_blank_model_variable_is_no_choice_and_gets_the_alias() {
+        let env = |name: &str| (name == "ANTHROPIC_MODEL").then(|| " ".to_string());
+        let set = envs_of(&claude(&[], &gateway(), &env));
+        assert_eq!(set["ANTHROPIC_MODEL"].as_deref(), Some("claude-sonnet"));
     }
 
     #[test]

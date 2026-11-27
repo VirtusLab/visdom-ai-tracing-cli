@@ -569,3 +569,177 @@ fn a_project_paid_setup_is_not_checked_for_a_subscription() {
     assert!(!ids.contains(&"gateway.subscription"), "{ids:?}");
     assert!(!ids.contains(&"gateway.claude_login"), "{ids:?}");
 }
+
+/// Outside a git checkout Claude Code reads the `.claude/` settings where it
+/// is started: a model named there is checked too.
+#[test]
+fn outside_a_checkout_the_start_directorys_claude_settings_count() {
+    let server = gateway("per_agent", ALLOWED, SUB_ISSUE);
+    let (sb, _log) = sandbox(&server);
+    let work = sb.home.path().join("work");
+    std::fs::create_dir_all(work.join(".claude")).unwrap();
+    std::fs::write(
+        work.join(".claude/settings.json"),
+        r#"{"env":{"ANTHROPIC_MODEL":"gpt-general"}}"#,
+    )
+    .unwrap();
+    let output = sb
+        .visdom(&work)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let (severity, message) = finding(&report, "gateway.subscription_model");
+    assert_eq!(severity, "error", "{message}");
+    assert!(message.contains("`gpt-general`"), "{message}");
+    assert!(message.contains("work/.claude/settings.json"), "{message}");
+}
+
+/// A kept subscription key with less than a week left (which the next
+/// launch replaces) is still tried by doctor, and reported with its date.
+#[test]
+fn doctor_tries_a_kept_key_inside_its_renewal_window() {
+    let server = gateway("per_agent", ALLOWED, SUB_ISSUE);
+    let (sb, _log) = sandbox(&server);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let day = 24 * 60 * 60;
+    let expires = now + 6 * day;
+    let store = sb.home.path().join(".config/visdom/gateway-keys.json");
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    let kept = serde_json::json!([{
+        "console_url": server.url,
+        "project_id": "p-1",
+        "account": "",
+        "secret": "sk-old-subscription",
+        "expires_at": expires,
+        "billing": "subscription",
+        "id": "sub-old",
+        "issued_at": now - 24 * day,
+    }]);
+    std::fs::write(&store, kept.to_string()).unwrap();
+    let report = doctor(&sb);
+    let (severity, message) = finding(&report, "gateway.subscription_key");
+    assert_eq!(severity, "ok", "{report}");
+    let date = chrono::DateTime::from_timestamp(expires, 0)
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string();
+    assert!(message.contains(&date), "{message}");
+    let tried = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.route == "GET /v1/models")
+        .any(|r| r.authorization.as_deref() == Some("Bearer sk-old-subscription"));
+    assert!(tried, "the kept key was tried on the gateway");
+    assert_eq!(count(&server, "POST /api/me/keys"), 0, "doctor issues none");
+}
+
+/// The way out the platform's message names — `visdom --mode hooks init` —
+/// works with a subscription saved: init saves hooks and the project's
+/// billing, and the next `visdom` starts. `--billing project` given with it
+/// is saved too.
+#[test]
+fn the_hooks_way_out_leaves_a_setup_that_starts() {
+    let server = gateway("per_agent", DENIED, SUB_ISSUE);
+    for args in [
+        &["--mode", "hooks", "init"][..],
+        &["--mode", "hooks", "--billing", "project", "init"][..],
+    ] {
+        let (sb, log) = sandbox(&server);
+        let output = sb.visdom(sb.repo.path()).args(args).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        let config = std::fs::read_to_string(sb.user_config()).unwrap();
+        assert!(config.contains("tracing_mode = \"hooks\""), "{config}");
+        assert!(
+            config.contains("billing = \"project\""),
+            "{args:?}: {config}"
+        );
+        let output = sb.visdom(sb.repo.path()).output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert!(lines(&log).contains(&"VISDOM_TRACING_MODE=hooks".to_string()));
+    }
+}
+
+/// A subscription token the caller passes in `--settings`
+/// (`CLAUDE_CODE_OAUTH_TOKEN`, from `claude setup-token`) is a login: the
+/// probe sees it, in a file rather than on its command line.
+#[test]
+fn a_token_in_the_callers_settings_is_a_login() {
+    let server = gateway("per_agent", ALLOWED, SUB_ISSUE);
+    let (sb, log) = sandbox(&server);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args([
+            "--",
+            "--settings",
+            r#"{"env":{"CLAUDE_CODE_OAUTH_TOKEN":"sk-ant-oat01-setup"}}"#,
+        ])
+        .env("FAKE_CLAUDE_NO_LOGIN", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        lines(&log).contains(&"VISDOM_TRACING_MODE=gateway".to_string()),
+        "{}",
+        stderr(&output)
+    );
+    // Without it, nobody is signed in.
+    let output = sb
+        .visdom(sb.repo.path())
+        .env("FAKE_CLAUDE_NO_LOGIN", "1")
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&output).contains("not signed in"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// Claude Code's `sonnet` stands for what ANTHROPIC_DEFAULT_SONNET_MODEL
+/// names; unset, for its own model, which no alias is. `--fallback-model`
+/// is checked too.
+#[test]
+fn selectors_and_the_fallback_model_are_checked_as_claude_code_uses_them() {
+    let server = gateway("per_agent", ALLOWED, SUB_ISSUE);
+    let (sb, log) = sandbox(&server);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--", "--model", "sonnet"])
+        .env("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        lines(&log).contains(&"VISDOM_TRACING_MODE=gateway".to_string()),
+        "{}",
+        stderr(&output)
+    );
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--", "--model", "sonnet"])
+        .output()
+        .unwrap();
+    let said = stderr(&output);
+    assert!(said.contains("ANTHROPIC_DEFAULT_SONNET_MODEL"), "{said}");
+    assert!(said.contains("hooks tracing instead"), "{said}");
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--", "-p", "hi", "--fallback-model", "gpt-general"])
+        .output()
+        .unwrap();
+    let said = stderr(&output);
+    assert!(
+        said.contains("--fallback-model given to Claude Code"),
+        "{said}"
+    );
+    assert!(said.contains("hooks tracing instead"), "{said}");
+}

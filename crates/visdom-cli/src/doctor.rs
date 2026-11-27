@@ -407,7 +407,17 @@ impl Session {
         self.subscription
             .push(subscription::login_finding(&subscription::claude_login(
                 self.adapter.program(),
+                agent_args,
+                &crate::launch::private_dir(&self.config_root),
             )));
+        // Claude Code reads a project's `.claude/` settings in the checkout,
+        // or, outside one, where it is started.
+        let project_dir = self
+            .ctx
+            .workdir
+            .checkout
+            .clone()
+            .unwrap_or_else(|| self.ctx.workdir.start_dir.clone());
         if let Some(Ok(plan)) = &self.gateway {
             // What the launch keeps of the environment, Claude Code's
             // settings and the caller's options wins over visdom's alias:
@@ -415,7 +425,7 @@ impl Session {
             let claude_env = subscription::ClaudeEnv::read(
                 &subscription::managed_settings_path(),
                 &self.ctx.home,
-                self.ctx.workdir.checkout.as_deref(),
+                Some(&project_dir),
                 agent_args,
             );
             let uses = subscription::models_in_use(model, agent_args, &|name| {
@@ -434,18 +444,20 @@ impl Session {
         self.subscription.push(subscription::settings_finding(
             &subscription::managed_settings_path(),
             &self.ctx.home,
-            self.ctx.workdir.checkout.as_deref(),
+            Some(&project_dir),
         ));
     }
 
     /// The kept subscription key, tried on the LLM gateway; none is issued
-    /// (`visdom doctor` changes nothing at the gateway).
+    /// (`visdom doctor` changes nothing at the gateway). Any key that has not
+    /// expired is tried, also one close enough to its end that the next
+    /// launch replaces it.
     pub fn kept_subscription_key(&self, runtime: &tokio::runtime::Runtime, now: i64) -> KeyState {
         let (Some(Ok(plan)), Some(token)) = (&self.gateway, &self.token) else {
             return KeyState::NoneKept;
         };
         let store = gateway::KeyStore::at(gateway::key_store_path_in(&self.config_root));
-        let kept = store.usable(
+        let kept = store.unexpired(
             &plan.console_url,
             &plan.project.id,
             &gateway::account_of(token),

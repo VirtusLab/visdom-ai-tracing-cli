@@ -122,7 +122,11 @@ pub fn read_auth_status(stdout: &str) -> ClaudeLogin {
             method: "a claude.ai account without a paid plan".to_string(),
         };
     }
-    if status.logged_in && (method == "claude.ai" || status.stored_claude_ai_login) {
+    // `oauth_token`: a subscription token from `claude setup-token` in
+    // `CLAUDE_CODE_OAUTH_TOKEN` (Claude Code 2.1.332, tried by hand), which
+    // the launch leaves alone.
+    let subscription_method = method == "claude.ai" || method == "oauth_token";
+    if status.logged_in && (subscription_method || status.stored_claude_ai_login) {
         return ClaudeLogin::Subscription {
             plan: status.subscription_type.filter(|p| !p.trim().is_empty()),
         };
@@ -140,19 +144,58 @@ const AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 /// session `visdom` starts would have: without the keys and provider
 /// switches the launch removes, which would otherwise be reported instead of
 /// the login.
-pub fn claude_login(program: &str) -> ClaudeLogin {
-    // The settings the launch sets aside are set aside here too: a key
-    // helper in the developer's settings would otherwise be reported
-    // (`authMethod: api_key_helper`, Claude Code 2.1.332, tried by hand),
-    // not the login the session uses.
-    let mut overrides = serde_json::Map::new();
+pub fn claude_login(program: &str, agent_args: &[String], private_dir: &Path) -> ClaudeLogin {
+    let (settings, callers) = probe_settings(agent_args);
+    let text = serde_json::Value::Object(settings).to_string();
+    // The caller's own settings may hold a token (`CLAUDE_CODE_OAUTH_TOKEN`
+    // in their `env`): in a file only the user can read, as the launch does,
+    // not on a command line.
+    let (value, file) = if callers {
+        match crate::agents::via_gateway::write_private_file(private_dir, &text) {
+            Ok(file) => (file.to_string_lossy().into_owned(), Some(file)),
+            Err(why) => return ClaudeLogin::Unknown(why),
+        }
+    } else {
+        (text, None)
+    };
+    let login = ask_auth_status(program, &value);
+    if let Some(file) = file {
+        let _ = std::fs::remove_file(file);
+    }
+    login
+}
+
+/// The settings `auth status` is asked with, and whether they include the
+/// caller's own: the caller's `--settings`, merged as the launch merges
+/// them, under what the launch sets aside — the developer's key helper
+/// (which Claude Code 2.1.332 would report as `authMethod: api_key_helper`,
+/// tried by hand, instead of the login the session uses), keys and provider
+/// switches.
+pub fn probe_settings(agent_args: &[String]) -> (serde_json::Map<String, serde_json::Value>, bool) {
+    let (given, _) = crate::agents::via_gateway::split_settings(agent_args);
+    let mut settings = serde_json::Map::new();
+    for value in &given {
+        if let Ok(read) = crate::agents::via_gateway::read_settings(value) {
+            settings.extend(read);
+        }
+    }
+    let mut env = match settings.remove("env") {
+        Some(serde_json::Value::Object(env)) => env,
+        _ => serde_json::Map::new(),
+    };
     for name in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] {
-        overrides.insert(name.to_string(), "".into());
+        env.insert(name.to_string(), "".into());
     }
     for switch in crate::agents::via_gateway::CLAUDE_OTHER_PROVIDERS {
-        overrides.insert(switch.to_string(), "0".into());
+        env.insert(switch.to_string(), "0".into());
     }
-    let settings = serde_json::json!({ "apiKeyHelper": "", "env": overrides }).to_string();
+    settings.insert("env".to_string(), env.into());
+    settings.insert("apiKeyHelper".to_string(), "".into());
+    (settings, !given.is_empty())
+}
+
+/// `program --settings <settings> auth status`, read.
+fn ask_auth_status(program: &str, settings: &str) -> ClaudeLogin {
     let mut cmd = Command::new(program);
     cmd.arg("--settings")
         .arg(settings)
@@ -322,7 +365,7 @@ impl ClaudeEnv {
                     .and_then(|v| v.as_str())
                     .map(|v| (v.to_string(), format!("`env` in {at}")))
             })
-            .or_else(|| process(name).map(|v| (v, "the environment".to_string())))
+            .or_else(|| process(name).map(|v| (v, IN_ENVIRONMENT.to_string())))
     }
 }
 
@@ -336,31 +379,48 @@ pub fn models_in_use(
     agent_args: &[String],
     env: &dyn Fn(&str) -> Option<(String, String)>,
 ) -> Vec<ModelUse> {
-    let set = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+    // A blank variable in the environment is replaced by visdom's alias at
+    // launch (as if unset). A blank one in a settings layer comes after the
+    // launch's environment and leaves Claude Code its own default, which no
+    // gateway alias is: a use with no model, reported where it is set.
     let named = |name: &str| {
-        env(name)
-            .filter(|(v, _)| !v.trim().is_empty())
-            .map(|(model, at)| ModelUse {
-                model: Some(model),
-                source: Some(format!("{name} in {at}")),
-            })
-    };
-    let from_args = agent_args
-        .iter()
-        .take_while(|a| *a != "--")
-        .enumerate()
-        .find_map(|(i, arg)| {
-            if arg == "--model" {
-                agent_args.get(i + 1).cloned()
+        env(name).and_then(|(value, at)| {
+            let source = Some(format!("{name} in {at}"));
+            if !value.trim().is_empty() {
+                Some(ModelUse {
+                    model: Some(value),
+                    source,
+                })
+            } else if at != IN_ENVIRONMENT {
+                Some(ModelUse {
+                    model: None,
+                    source,
+                })
             } else {
-                arg.strip_prefix("--model=").map(String::from)
+                None
             }
-        });
+        })
+    };
+    let option = |name: &str| {
+        let eq = format!("{name}=");
+        agent_args
+            .iter()
+            .take_while(|a| *a != "--")
+            .enumerate()
+            .find_map(|(i, arg)| {
+                if arg == name {
+                    agent_args.get(i + 1).cloned()
+                } else {
+                    arg.strip_prefix(&eq).map(String::from)
+                }
+            })
+            .filter(|v| !v.trim().is_empty())
+    };
     let ours = || ModelUse {
         model: configured.map(String::from),
         source: None,
     };
-    let main = match set(from_args) {
+    let main = match option("--model") {
         Some(model) => ModelUse {
             model: Some(model),
             source: Some("--model given to Claude Code".to_string()),
@@ -368,16 +428,79 @@ pub fn models_in_use(
         None => named("ANTHROPIC_MODEL").unwrap_or_else(ours),
     };
     let small = named("ANTHROPIC_DEFAULT_HAIKU_MODEL").unwrap_or_else(ours);
-    let mut uses = vec![main];
+    // Used when the main model is overloaded; passed on as given.
+    let fallback = option("--fallback-model").map(|model| ModelUse {
+        model: Some(model),
+        source: Some("--fallback-model given to Claude Code".to_string()),
+    });
+    let mut uses = Vec::new();
     // Background calls, the model aliases and subagents may each name
     // another model; the launch keeps whatever names one.
     let others = OTHER_MODEL_SETTINGS.iter().filter_map(|name| named(name));
-    for used in std::iter::once(small).chain(others) {
+    let all = [main, small]
+        .into_iter()
+        .chain(fallback)
+        .chain(others)
+        .flat_map(|used| resolve_selector(used, &named));
+    for used in all {
         if !uses.contains(&used) {
             uses.push(used);
         }
     }
     uses
+}
+
+/// Where [`ClaudeEnv::get`] says the process environment is.
+const IN_ENVIRONMENT: &str = "the environment";
+
+/// A Claude Code model selector (`sonnet`, `opus`, `haiku`, with or without
+/// `[1m]`, and `opusplan`, which uses Opus and Sonnet) stands for the model
+/// its `ANTHROPIC_DEFAULT_*_MODEL` setting names; unset, for Claude Code's
+/// own model of that family, which no gateway alias is. Anything else is
+/// the model itself.
+fn resolve_selector(used: ModelUse, named: &dyn Fn(&str) -> Option<ModelUse>) -> Vec<ModelUse> {
+    let Some(model) = used.model.as_deref() else {
+        return vec![used];
+    };
+    let bare = model
+        .trim()
+        .trim_end_matches("[1m]")
+        .trim_end_matches("[1M]")
+        .to_ascii_lowercase();
+    let families: &[&str] = match bare.as_str() {
+        "sonnet" => &["SONNET"],
+        "opus" => &["OPUS"],
+        "haiku" => &["HAIKU"],
+        "opusplan" => &["OPUS", "SONNET"],
+        _ => return vec![used],
+    };
+    let given = used
+        .source
+        .clone()
+        .unwrap_or_else(|| "visdom's model setting".to_string());
+    families
+        .iter()
+        .map(|family| {
+            let setting = format!("ANTHROPIC_DEFAULT_{family}_MODEL");
+            match named(&setting) {
+                Some(target) => ModelUse {
+                    source: Some(format!(
+                        "{}, which `{model}` ({given}) stands for",
+                        target.source.unwrap_or_else(|| setting.clone())
+                    )),
+                    model: target.model,
+                },
+                // Claude Code's own model: no alias of the gateway.
+                None => ModelUse {
+                    model: Some(model.to_string()),
+                    source: Some(format!(
+                        "{given}; `{model}` is Claude Code's own model unless {setting} names \
+                         an alias"
+                    )),
+                },
+            }
+        })
+        .collect()
 }
 
 /// Claude Code's other settings that name a model a session may ask for,
@@ -939,6 +1062,138 @@ mod tests {
                 .as_deref(),
             Some("claude-sonnet"),
             "after `--` it is the prompt's"
+        );
+    }
+
+    fn uses_with(
+        args: &[&str],
+        vars: &'static [(&'static str, &'static str, &'static str)],
+    ) -> Vec<ModelUse> {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let env = move |name: &str| {
+            vars.iter()
+                .find(|(n, ..)| *n == name)
+                .map(|(_, v, at)| (v.to_string(), at.to_string()))
+        };
+        models_in_use(Some("claude-sonnet"), &args, &env)
+    }
+
+    #[test]
+    fn claude_codes_selectors_stand_for_their_default_model_settings() {
+        // `sonnet` is what ANTHROPIC_DEFAULT_SONNET_MODEL names.
+        let uses = uses_with(
+            &["--model", "sonnet"],
+            &[(
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                "claude-sonnet",
+                "the environment",
+            )],
+        );
+        assert!(
+            uses.iter()
+                .all(|u| u.model.as_deref() == Some("claude-sonnet")),
+            "{uses:?}"
+        );
+        let source = uses[0].source.as_deref().unwrap();
+        assert!(
+            source.contains("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            "{source}"
+        );
+        assert!(source.contains("`sonnet`"), "{source}");
+        // Unset, it is Claude Code's own model, named as such.
+        let uses = uses_with(&["--model=opus[1m]"], &[]);
+        assert_eq!(uses[0].model.as_deref(), Some("opus[1m]"));
+        assert!(uses[0]
+            .source
+            .as_deref()
+            .unwrap()
+            .contains("ANTHROPIC_DEFAULT_OPUS_MODEL"));
+        // `opusplan` uses both.
+        let uses = uses_with(
+            &[],
+            &[
+                ("ANTHROPIC_MODEL", "opusplan", "the environment"),
+                (
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                    "claude-opus",
+                    "the environment",
+                ),
+                (
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                    "claude-sonnet",
+                    "the environment",
+                ),
+            ],
+        );
+        let models: Vec<_> = uses.iter().filter_map(|u| u.model.as_deref()).collect();
+        assert!(models.contains(&"claude-opus") && models.contains(&"claude-sonnet"));
+        assert!(!models.contains(&"opusplan"), "{models:?}");
+    }
+
+    #[test]
+    fn the_fallback_model_is_checked_too() {
+        let uses = uses_with(&["-p", "hi", "--fallback-model", "gpt-general"], &[]);
+        let fallback = uses
+            .iter()
+            .find(|u| u.model.as_deref() == Some("gpt-general"))
+            .unwrap();
+        assert_eq!(
+            fallback.source.as_deref(),
+            Some("--fallback-model given to Claude Code")
+        );
+        let alpha = project(Some(&[("claude-sonnet", true), ("gpt-general", false)]));
+        let finding = model_finding(&uses, None, &alpha, "claude_code_model");
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.message.contains("--fallback-model"), "{finding:?}");
+    }
+
+    #[test]
+    fn a_blank_model_in_a_settings_layer_is_claude_codes_own_default() {
+        // In the environment the launch replaces it with the alias.
+        let uses = uses_with(&[], &[("ANTHROPIC_MODEL", " ", "the environment")]);
+        assert_eq!(uses[0].model.as_deref(), Some("claude-sonnet"));
+        // In a settings file it stays blank: reported where it is set.
+        let uses = uses_with(
+            &[],
+            &[(
+                "ANTHROPIC_MODEL",
+                "",
+                "`env` in /home/u/.claude/settings.json",
+            )],
+        );
+        assert_eq!(uses[0].model, None);
+        let alpha = project(Some(&[("claude-sonnet", true)]));
+        let finding = model_finding(&uses, None, &alpha, "claude_code_model");
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(
+            finding
+                .message
+                .contains("change ANTHROPIC_MODEL in `env` in /home/u/.claude/settings.json"),
+            "{finding:?}"
+        );
+    }
+
+    #[test]
+    fn the_login_probe_keeps_the_callers_settings_under_the_launchs() {
+        let args = [
+            "--settings".to_string(),
+            r#"{"env":{"CLAUDE_CODE_OAUTH_TOKEN":"sk-ant-oat01-x","ANTHROPIC_API_KEY":"sk"},"apiKeyHelper":"mine"}"#
+                .to_string(),
+        ];
+        let (settings, callers) = probe_settings(&args);
+        assert!(callers);
+        let env = settings["env"].as_object().unwrap();
+        assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-x");
+        assert_eq!(env["ANTHROPIC_API_KEY"], "");
+        assert_eq!(env["CLAUDE_CODE_USE_BEDROCK"], "0");
+        assert_eq!(settings["apiKeyHelper"], "");
+        let (_, callers) = probe_settings(&[]);
+        assert!(!callers);
+        // A `CLAUDE_CODE_OAUTH_TOKEN` login is a subscription login.
+        let token = r#"{"loggedIn":true,"authMethod":"oauth_token","apiProvider":"firstParty"}"#;
+        assert_eq!(
+            read_auth_status(token),
+            ClaudeLogin::Subscription { plan: None }
         );
     }
 

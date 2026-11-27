@@ -653,10 +653,30 @@ fn init_gateway(
         &workspace_file.unwrap_or_else(|| config::user_config_path_in(&env.config_root));
     let mut session = gather(&env, Some(agent), flag, billing_flag, runtime);
     if let BillingUse::Rejected(why) = &session.billing_use {
-        eprintln!("visdom: {why}");
-        exit(2);
+        // Hooks chosen while the user config says a subscription pays (the
+        // way out the platform's message names): who pays means nothing
+        // for hooks, so init leaves a setup the next `visdom` starts, paid
+        // by the project should the gateway be chosen again.
+        let hooks_chosen =
+            session.mode.mode == TracingMode::Hooks && session.mode.reason == ModeReason::Chosen;
+        let in_user_config = matches!(session.billing.source, billing::BillingSource::User(_));
+        if !(hooks_chosen && in_user_config && billing_flag.is_none()) {
+            eprintln!("visdom: {why}");
+            exit(2);
+        }
+        eprintln!(
+            "billing = subscription is for sessions through the AI Gateway; with hooks tracing \
+             the project's setting applies"
+        );
+        init_billing(&session, Some(Billing::Project), false);
+        session = gather(&env, Some(agent), flag, billing_flag, runtime);
     }
     if session.mode.mode != TracingMode::Gateway {
+        // A `--billing` given is kept, as in gateway mode: it is what the
+        // gateway uses when it is chosen again.
+        if billing_flag.is_some() {
+            init_billing(&session, billing_flag, false);
+        }
         return;
     }
     let asking = interactive::is_interactive();

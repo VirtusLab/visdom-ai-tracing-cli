@@ -617,6 +617,31 @@ impl KeyStore {
             })
     }
 
+    /// The stored key of the kind `billing` of `account` for this console
+    /// and project that lasts longest, if any has not expired and was not
+    /// refused, however little it has left: what a check tries, changing
+    /// nothing. (A launch replaces one inside its renewal window; see
+    /// [`Self::usable`].)
+    pub fn unexpired(
+        &self,
+        console_url: &str,
+        project_id: &str,
+        account: &str,
+        billing: Billing,
+        now: i64,
+    ) -> Option<IssuedKey> {
+        self.load()
+            .into_iter()
+            .filter(|k| k.is_for(console_url, project_id, account, billing))
+            .filter(|k| !k.refused && k.expires_at > now)
+            .max_by_key(|k| k.expires_at)
+            .map(|k| IssuedKey {
+                secret: k.secret,
+                expires_at: k.expires_at,
+                id: k.id,
+            })
+    }
+
     /// Keep `key` of the kind `billing`, dropping keys that have expired. An
     /// ordinary key replaces the one for the same console and project
     /// (whoever's it was: this machine's user is now `account`), as issuing
@@ -1656,6 +1681,17 @@ mod tests {
         );
         assert!(store
             .usable("https://gw", "p-1", "a", sub, expires - week + 1)
+            .is_none());
+        // A check still finds it, until it expires or is refused.
+        assert_eq!(
+            store
+                .unexpired("https://gw", "p-1", "a", sub, expires - 1)
+                .unwrap()
+                .secret,
+            "first"
+        );
+        assert!(store
+            .unexpired("https://gw", "p-1", "a", sub, expires)
             .is_none());
         // The next one does not replace it in the store: the first stays
         // until it expires, for logout to revoke, and the new one is used.
