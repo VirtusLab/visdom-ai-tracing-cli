@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/visdom-v1.1.1...visdom-v1.2.0) - 2026-11-27
+
+### Added
+
+- *(visdom)* final check of a subscription setup in init, doctor and launch
+- *(visdom)* start Claude Code on its claude.ai login through the gateway (billing = subscription)
+- *(visdom)* who pays for gateway calls — billing = project | subscription, asked by init
+
+### Fixed
+
+- *(visdom)* Copilot review on the subscription check
+- *(visdom)* ask Claude Code's login as the launch sets it up; check every model setting; merge --settings as the launch does
+- *(visdom)* the subscription check reads models from Claude's settings, managed provider switches and a free plan
+- *(visdom)* the subscription check covers the models in use, an unanswerable login, empty managed overrides and a gateway without the alias list
+- *(visdom)* a subscription key the gateway refused is not handed out again; test a termination before the agent runs
+- *(visdom)* a termination that comes while the agent is being started is passed on to it
+- *(visdom)* logout holds the key store while it revokes and forgets; test the signal path of a subscription session
+- *(visdom)* an inherited billing is written with the folder's project; Codex init keeps --billing project
+- *(visdom)* init keeps an inherited billing whatever writes the folder's config first; --billing reaches every init step
+- *(visdom)* a workspace folder's new config keeps the billing named further up
+
 ## [1.1.1](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/visdom-v1.1.0...visdom-v1.1.1) - 2026-11-25
 
 ### Other
