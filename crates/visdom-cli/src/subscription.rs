@@ -105,6 +105,23 @@ pub fn read_auth_status(stdout: &str) -> ClaudeLogin {
         );
     };
     let method = status.auth_method.unwrap_or_default();
+    let plan = status
+        .subscription_type
+        .clone()
+        .filter(|p| !p.trim().is_empty());
+    // A claude.ai account without a paid plan has no subscription to pay
+    // with. (A plan Claude Code does not name is taken as one: it names it
+    // for every claude.ai login it can use.)
+    if status.logged_in
+        && method == "claude.ai"
+        && plan
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case("free"))
+    {
+        return ClaudeLogin::Other {
+            method: "a claude.ai account without a paid plan".to_string(),
+        };
+    }
     if status.logged_in && (method == "claude.ai" || status.stored_claude_ai_login) {
         return ClaudeLogin::Subscription {
             plan: status.subscription_type.filter(|p| !p.trim().is_empty()),
@@ -201,6 +218,7 @@ pub fn login_finding(login: &ClaudeLogin) -> Finding {
                 "Claude Code is signed in with {}, not a claude.ai subscription: {SIGN_IN}",
                 match method.as_str() {
                     "api_key" => "an API key (Anthropic Console)".to_string(),
+                    said if said.starts_with("a ") => said.to_string(),
                     other => format!("`{other}`"),
                 }
             ),
@@ -227,17 +245,87 @@ pub struct ModelUse {
     pub source: Option<String>,
 }
 
+/// The `env` of every Claude Code settings layer that applies over the
+/// environment a session is started in, the one that wins first: the
+/// settings an organisation manages, the caller's own `--settings` (the
+/// later one first), the project's `.claude/settings.local.json` and
+/// `.claude/settings.json`, the user's `settings.json`. `visdom`'s launch
+/// sets the model as environment, so any of these that names one wins.
+pub struct ClaudeEnv {
+    layers: Vec<(String, serde_json::Map<String, serde_json::Value>)>,
+}
+
+impl ClaudeEnv {
+    pub fn read(
+        managed: &Path,
+        home: &Path,
+        project_dir: Option<&Path>,
+        agent_args: &[String],
+    ) -> ClaudeEnv {
+        let mut files: Vec<(String, Option<serde_json::Map<String, serde_json::Value>>)> =
+            vec![(managed.display().to_string(), read_json(managed))];
+        let (given, _) = crate::agents::via_gateway::split_settings(agent_args);
+        for value in given.iter().rev() {
+            files.push((
+                "--settings given to Claude Code".to_string(),
+                crate::agents::via_gateway::read_settings(value).ok(),
+            ));
+        }
+        if let Some(dir) = project_dir {
+            for name in [".claude/settings.local.json", ".claude/settings.json"] {
+                let path = dir.join(name);
+                files.push((path.display().to_string(), read_json(&path)));
+            }
+        }
+        let user = claude_config_dir(home).join("settings.json");
+        files.push((user.display().to_string(), read_json(&user)));
+        let layers = files
+            .into_iter()
+            .filter_map(|(at, settings)| {
+                let env = settings?.get("env")?.as_object()?.clone();
+                Some((at, env))
+            })
+            .collect();
+        ClaudeEnv { layers }
+    }
+
+    /// The value of `name` a session would see, and where it comes from:
+    /// a settings layer, else `process` (the environment).
+    pub fn get(
+        &self,
+        name: &str,
+        process: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<(String, String)> {
+        self.layers
+            .iter()
+            .find_map(|(at, env)| {
+                env.get(name)
+                    .and_then(|v| v.as_str())
+                    .map(|v| (v.to_string(), format!("`env` in {at}")))
+            })
+            .or_else(|| process(name).map(|v| (v, "the environment".to_string())))
+    }
+}
+
 /// The aliases a session started now would ask for: the main model (the
-/// caller's `--model`, else `ANTHROPIC_MODEL` from the environment, which the
-/// launch keeps, else `configured`) and the small one
-/// (`ANTHROPIC_DEFAULT_HAIKU_MODEL`, else `configured`). `env` reads the
-/// environment.
+/// caller's `--model`, else `ANTHROPIC_MODEL` as the session sees it — a
+/// settings layer, else the environment, which the launch keeps — else
+/// `configured`) and the small one (`ANTHROPIC_DEFAULT_HAIKU_MODEL`, else
+/// `configured`). `env` gives a variable's value and where it is set.
 pub fn models_in_use(
     configured: Option<&str>,
     agent_args: &[String],
-    env: &dyn Fn(&str) -> Option<String>,
+    env: &dyn Fn(&str) -> Option<(String, String)>,
 ) -> Vec<ModelUse> {
     let set = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+    let named = |name: &str| {
+        env(name)
+            .filter(|(v, _)| !v.trim().is_empty())
+            .map(|(model, at)| ModelUse {
+                model: Some(model),
+                source: Some(format!("{name} in {at}")),
+            })
+    };
     let from_args = agent_args
         .iter()
         .take_while(|a| *a != "--")
@@ -253,24 +341,14 @@ pub fn models_in_use(
         model: configured.map(String::from),
         source: None,
     };
-    let main = match (set(from_args), set(env("ANTHROPIC_MODEL"))) {
-        (Some(model), _) => ModelUse {
+    let main = match set(from_args) {
+        Some(model) => ModelUse {
             model: Some(model),
             source: Some("--model given to Claude Code".to_string()),
         },
-        (None, Some(model)) => ModelUse {
-            model: Some(model),
-            source: Some("ANTHROPIC_MODEL in the environment".to_string()),
-        },
-        (None, None) => ours(),
+        None => named("ANTHROPIC_MODEL").unwrap_or_else(ours),
     };
-    let small = match set(env("ANTHROPIC_DEFAULT_HAIKU_MODEL")) {
-        Some(model) => ModelUse {
-            model: Some(model),
-            source: Some("ANTHROPIC_DEFAULT_HAIKU_MODEL in the environment".to_string()),
-        },
-        None => ours(),
-    };
+    let small = named("ANTHROPIC_DEFAULT_HAIKU_MODEL").unwrap_or_else(ours);
     if main == small {
         vec![main]
     } else {
@@ -540,6 +618,26 @@ pub fn managed_takeovers(settings: &serde_json::Map<String, serde_json::Value>) 
             found.push(format!("`{name}` in `env` ({what})"));
         }
     }
+    // A switch to another provider's API outranks the gateway's address;
+    // visdom turns them off ("0"), but managed settings come after it.
+    for switch in crate::agents::via_gateway::CLAUDE_OTHER_PROVIDERS {
+        let on = env
+            .and_then(|env| env.get(switch))
+            .map(|v| match v {
+                serde_json::Value::String(s) => {
+                    !matches!(s.trim().to_ascii_lowercase().as_str(), "" | "0" | "false")
+                }
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::Number(n) => n.as_f64() != Some(0.0),
+                _ => false,
+            })
+            .unwrap_or(false);
+        if on {
+            found.push(format!(
+                "`{switch}` in `env` (the session is sent to another provider, past the gateway)"
+            ));
+        }
+    }
     found
 }
 
@@ -636,6 +734,16 @@ mod tests {
             ClaudeLogin::Subscription {
                 plan: Some("team".to_string())
             }
+        );
+        // A claude.ai account without a paid plan has nothing to pay with.
+        let free = r#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"free"}"#;
+        let login = read_auth_status(free);
+        assert!(matches!(login, ClaudeLogin::Other { .. }), "{login:?}");
+        let finding = login_finding(&login);
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(
+            finding.message.contains("without a paid plan"),
+            "{finding:?}"
         );
         // A key helper outranks the stored login, which visdom keeps.
         let helper = r#"{"loggedIn":true,"authMethod":"api_key","storedClaudeAiLogin":true}"#;
@@ -751,7 +859,8 @@ mod tests {
         // The small model set in the environment is checked too, and its
         // source is the one to change.
         let env = |name: &str| {
-            (name == "ANTHROPIC_DEFAULT_HAIKU_MODEL").then(|| "gpt-general".to_string())
+            (name == "ANTHROPIC_DEFAULT_HAIKU_MODEL")
+                .then(|| ("gpt-general".to_string(), "the environment".to_string()))
         };
         let uses = models_in_use(Some("claude-sonnet"), &[], &env);
         assert_eq!(uses.len(), 2, "{uses:?}");
@@ -775,7 +884,10 @@ mod tests {
                 source: None
             }]
         );
-        let env = |name: &str| (name == "ANTHROPIC_MODEL").then(|| "claude-opus".to_string());
+        let env = |name: &str| {
+            (name == "ANTHROPIC_MODEL")
+                .then(|| ("claude-opus".to_string(), "the environment".to_string()))
+        };
         let uses = models_in_use(Some("claude-sonnet"), &[], &env);
         assert_eq!(uses[0].model.as_deref(), Some("claude-opus"));
         assert_eq!(uses[1].model.as_deref(), Some("claude-sonnet"));
@@ -794,6 +906,56 @@ mod tests {
             Some("claude-sonnet"),
             "after `--` it is the prompt's"
         );
+    }
+
+    #[test]
+    fn a_model_in_claude_codes_settings_wins_over_the_environment() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let repo = dir.path().join("repo");
+        let managed = dir.path().join("managed-settings.json");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(
+            home.join(".claude/settings.json"),
+            r#"{"env":{"ANTHROPIC_MODEL":"from-user","ANTHROPIC_DEFAULT_HAIKU_MODEL":"small-user"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join(".claude/settings.json"),
+            r#"{"env":{"ANTHROPIC_MODEL":"from-project"}}"#,
+        )
+        .unwrap();
+        let process = |_: &str| Some("from-process".to_string());
+        let env = ClaudeEnv::read(&managed, &home, Some(&repo), &[]);
+        let (model, at) = env.get("ANTHROPIC_MODEL", &process).unwrap();
+        assert_eq!(model, "from-project");
+        assert!(at.contains(".claude/settings.json"), "{at}");
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL", &process)
+                .unwrap()
+                .0,
+            "small-user"
+        );
+        assert_eq!(
+            env.get("OTHER", &process).unwrap(),
+            ("from-process".to_string(), "the environment".to_string())
+        );
+        let args = [
+            "--settings".to_string(),
+            r#"{"env":{"ANTHROPIC_MODEL":"first"}}"#.to_string(),
+            "--settings".to_string(),
+            r#"{"env":{"ANTHROPIC_MODEL":"from-flag"}}"#.to_string(),
+        ];
+        let env = ClaudeEnv::read(&managed, &home, Some(&repo), &args);
+        let (model, at) = env.get("ANTHROPIC_MODEL", &process).unwrap();
+        assert_eq!(
+            (model.as_str(), at.as_str()),
+            ("from-flag", "`env` in --settings given to Claude Code")
+        );
+        std::fs::write(&managed, r#"{"env":{"ANTHROPIC_MODEL":"managed"}}"#).unwrap();
+        let env = ClaudeEnv::read(&managed, &home, Some(&repo), &args);
+        assert_eq!(env.get("ANTHROPIC_MODEL", &process).unwrap().0, "managed");
     }
 
     #[test]
@@ -841,6 +1003,12 @@ mod tests {
         ));
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("ANTHROPIC_CUSTOM_HEADERS"), "{found:?}");
+        // A provider switch that is on; one that is off is fine.
+        let found = managed_takeovers(&settings(
+            r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1","CLAUDE_CODE_USE_VERTEX":"0","CLAUDE_CODE_USE_FOUNDRY":false}}"#,
+        ));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("CLAUDE_CODE_USE_BEDROCK"), "{found:?}");
     }
 
     #[test]

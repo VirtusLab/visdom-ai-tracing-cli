@@ -191,7 +191,7 @@ fn callers_session(args: &[String]) -> Option<&str> {
 
 /// The values `args` give `--settings`, each a file or a JSON text, and
 /// `args` without them. Options after `--` are the prompt's.
-fn split_settings(args: &[String]) -> (Vec<String>, Vec<String>) {
+pub(crate) fn split_settings(args: &[String]) -> (Vec<String>, Vec<String>) {
     let (mut given, mut rest) = (Vec::new(), Vec::new());
     let mut i = 0;
     while i < args.len() {
@@ -215,7 +215,9 @@ fn split_settings(args: &[String]) -> (Vec<String>, Vec<String>) {
 }
 
 /// The settings object a `--settings` value stands for.
-fn read_settings(value: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+pub(crate) fn read_settings(
+    value: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     let failed = |why: String| format!("the Claude Code settings given with --settings ({why})");
     let text = if value.trim_start().starts_with('{') {
         value.to_string()

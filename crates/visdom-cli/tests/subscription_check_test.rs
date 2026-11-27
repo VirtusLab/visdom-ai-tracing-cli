@@ -367,6 +367,57 @@ fn a_model_set_outside_visdom_must_take_subscription_calls_too() {
     assert!(lines(&log).contains(&"VISDOM_TRACING_MODE=hooks".to_string()));
 }
 
+/// A model named in Claude Code's own settings (here the caller's
+/// `--settings`) comes after the environment the launch sets: checked too.
+#[test]
+fn a_model_in_claude_codes_settings_must_take_subscription_calls_too() {
+    let server = gateway("per_agent", ALLOWED, SUB_ISSUE);
+    let (sb, log) = sandbox(&server);
+    let output = init(&sb);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let output = sb
+        .visdom(sb.repo.path())
+        .args([
+            "--",
+            "--settings",
+            r#"{"env":{"ANTHROPIC_MODEL":"gpt-general"}}"#,
+        ])
+        .output()
+        .unwrap();
+    let said = stderr(&output);
+    assert!(said.contains("`gpt-general`"), "{said}");
+    assert!(said.contains("--settings given to Claude Code"), "{said}");
+    assert!(said.contains("hooks tracing instead"), "{said}");
+    assert!(lines(&log).contains(&"VISDOM_TRACING_MODE=hooks".to_string()));
+}
+
+/// Managed settings that take the session over stop a plain `visdom` from
+/// going through the gateway: hooks under the developer's own choice, not
+/// started where the workspace requires the gateway.
+#[test]
+fn managed_settings_that_take_the_session_over_stop_a_launch() {
+    for (policy, managed) in [
+        ("per_agent", r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}"#),
+        ("enforced", r#"{"apiKeyHelper":"get-org-key"}"#),
+    ] {
+        let server = gateway(policy, ALLOWED, SUB_ISSUE);
+        let (sb, log) = sandbox(&server);
+        std::fs::write(sb.managed_settings(), managed).unwrap();
+        let output = sb.visdom(sb.repo.path()).output().unwrap();
+        let said = stderr(&output);
+        assert!(said.contains("managed-settings.json"), "{said}");
+        if policy == "enforced" {
+            assert_eq!(output.status.code(), Some(1), "{said}");
+            assert!(said.contains("not started"), "{said}");
+            assert!(lines(&log).is_empty(), "the agent must not have run");
+        } else {
+            assert_eq!(output.status.code(), Some(0), "{said}");
+            assert!(said.contains("CLAUDE_CODE_USE_BEDROCK"), "{said}");
+            assert!(lines(&log).contains(&"VISDOM_TRACING_MODE=hooks".to_string()));
+        }
+    }
+}
+
 /// A gateway that publishes the setting but not which aliases qualify
 /// cannot be relied on to keep the call on Anthropic: not accepted, and no
 /// alias is picked for it.

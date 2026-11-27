@@ -409,10 +409,18 @@ impl Session {
                 self.adapter.program(),
             )));
         if let Some(Ok(plan)) = &self.gateway {
-            // What the launch keeps of the environment and the caller's
-            // options wins over visdom's alias: each is checked.
-            let uses =
-                subscription::models_in_use(model, agent_args, &|name| std::env::var(name).ok());
+            // What the launch keeps of the environment, Claude Code's
+            // settings and the caller's options wins over visdom's alias:
+            // each is checked.
+            let claude_env = subscription::ClaudeEnv::read(
+                &subscription::managed_settings_path(),
+                &self.ctx.home,
+                self.ctx.workdir.checkout.as_deref(),
+                agent_args,
+            );
+            let uses = subscription::models_in_use(model, agent_args, &|name| {
+                claude_env.get(name, &|name| std::env::var(name).ok())
+            });
             self.subscription.push(subscription::model_finding(
                 &uses,
                 self.gateway_sources.model.as_deref(),
