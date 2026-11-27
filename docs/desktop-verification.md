@@ -52,3 +52,18 @@ Before any product code; checks 1–3 and part of 5.
 | 6 | Not built yet. |
 
 macOS: not run.
+
+### 2026-11-27 — Fedora 42, Claude Desktop 6.28899.6 (unofficial build), bundled Claude Code 2.1.330, `visdom` built from this branch
+
+Check 6, and the opener's side of 1 and 5. Nobody was at the app's window: no prompt was sent.
+
+| Check | Result |
+|---|---|
+| 1 | Not rerun from the icon. The app started by `visdom --surface desktop` from inside an agent's shell had no `VISDOM_*`, `TRACEVAULT_*` or `CLAUDE*` variable in its environment (names listed from `/proc/<pid>/environ`), and ran in its own session, not the terminal's. |
+| 2, 3 | Not rerun. |
+| 5 | `visdom` opens `claude://code/new` with no parameter: the vendor documents `q` and the `ssh_*` parameters for that link and none for a local folder, and none was found in the app. `visdom` returned after 2 s with the app running. |
+| 6 | `visdom --surface desktop`: "opened Claude Desktop; sessions there are traced by hooks. Choose this folder in the app: …", exit 0. `--mode gateway`: refused, names VIS-1396, exit 1. `-- --model x`: refused by name, exit 1. `visdom doctor --surface desktop`: app installed, CLI found, `visdom` on the login shell's `PATH`, bundled Claude Code 2.1.330, best effort on Linux; before the open "no desktop session has been traced yet", after it "Claude Desktop was opened at … and no traced session has been seen since". |
+
+Still open: a prompt sent in a session of an app started from its icon, then `visdom doctor
+--surface desktop` showing "a desktop session was traced at …" (needs the `visdom` on the app's
+`PATH` to be this build). macOS and Windows: not run.

@@ -24,7 +24,7 @@ pub const APP_ENV: &str = "VISDOM_CLAUDE_DESKTOP_APP";
 /// it was started with and gives it to every later session, so none of these
 /// may reach it: a desktop session would be attributed to this one, or have
 /// its hooks told to record nothing.
-const SESSION_VARIABLES: [&str; 8] = [
+const SESSION_VARIABLES: [&str; 10] = [
     "VISDOM_SESSION_ID",
     "TRACEVAULT_SESSION_ID",
     "VISDOM_GATEWAY_SESSION",
@@ -33,6 +33,8 @@ const SESSION_VARIABLES: [&str; 8] = [
     "TRACEVAULT_TRACING_MODE",
     "VISDOM_LAUNCHED",
     "CLAUDECODE",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
 ];
 
 fn is_session_variable(name: &str) -> bool {
