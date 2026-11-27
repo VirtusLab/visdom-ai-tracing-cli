@@ -1063,6 +1063,7 @@ async fn send_stream_event(
     if sent.is_ok() {
         // The one place that knows the server took an event: what `visdom
         // doctor` shows as evidence that a Claude Desktop session is traced.
+        // Only this hook's own session counts (see `this_hook_is_for`).
         crate::desktop_evidence::note_accepted_event(&req.session_id);
     }
     sent
@@ -1745,6 +1746,7 @@ pub async fn run_stream(
         session_dir,
         worktree_top,
     };
+    crate::desktop_evidence::this_hook_is_for(&hook_event.session_id);
     stream_event(
         hook_event,
         event_type,

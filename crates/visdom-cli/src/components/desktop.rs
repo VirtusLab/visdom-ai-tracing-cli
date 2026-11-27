@@ -13,6 +13,9 @@ use crate::surface::{refusal, supports, Platform, Surface};
 
 const COMPONENT: &str = "desktop";
 
+/// The program installed hooks call, by this name.
+const HOOK_PROGRAM: &str = "visdom";
+
 /// What was found out about the desktop app on this machine.
 #[derive(Clone, Debug)]
 pub struct DesktopFacts {
@@ -123,12 +126,11 @@ fn hook_path(facts: &DesktopFacts) -> Finding {
             ),
         );
     };
-    let exe_name = facts
-        .visdom_exe
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_else(|| "visdom".into());
-    if path.iter().any(|dir| dir.join(&exe_name).is_file()) {
+    // What the hooks run: the name, looked up as a shell would.
+    let on_path = std::env::join_paths(path)
+        .ok()
+        .and_then(|joined| crate::desktop::find_program(HOOK_PROGRAM, Some(joined.as_os_str())));
+    if on_path.is_some() {
         return finding(
             ID,
             Severity::Ok,
@@ -173,7 +175,8 @@ fn link_target(path: &[PathBuf], exe: &Path, home: &Path) -> Option<PathBuf> {
     if !cfg!(unix) {
         return None;
     }
-    let name = exe.file_name()?;
+    exe.file_name()?;
+    let name = HOOK_PROGRAM;
     path.iter()
         .filter(|dir| dir.starts_with(home) && dir.is_dir())
         .filter(|dir| {
@@ -276,25 +279,29 @@ pub fn login_shell_path(shell: &str) -> Option<Vec<PathBuf>> {
         .spawn()
         .ok()?;
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    // Read on a thread that is never waited for past the deadline: a profile
+    // may leave a background process holding the pipe open after the shell
+    // itself has gone.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut text = String::new();
-        let _ = stdout.read_to_string(&mut text);
-        text
-    });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
+        let mut buffer = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut buffer) {
+            if n == 0 {
+                break;
             }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
-            Err(_) => return None,
+            text.push_str(&String::from_utf8_lossy(&buffer[..n]));
+            // Everything asked for has arrived, whatever else holds the pipe.
+            if text.contains(END) {
+                break;
+            }
         }
-    }
-    let text = reader.join().ok()?;
+        let _ = sender.send(text);
+    });
+    let text = receiver.recv_timeout(std::time::Duration::from_secs(5));
+    let _ = child.kill();
+    let _ = child.wait();
+    let text = text.ok()?;
     let path = text.split(START).nth(1)?.split(END).next()?;
     (!path.is_empty()).then(|| std::env::split_paths(path).collect())
 }
@@ -322,6 +329,7 @@ mod tests {
     fn ok_facts(dir: &Path) -> DesktopFacts {
         let exe = dir.join("visdom");
         std::fs::write(&exe, "").unwrap();
+        make_executable(&exe, true);
         DesktopFacts {
             platform: Platform::MacOs,
             app_installed: Some(true),
@@ -333,6 +341,27 @@ mod tests {
             bundled_version: Some("2.1.330".into()),
             evidence: Ok(Evidence::default()),
         }
+    }
+
+    fn make_executable(file: &Path, executable: bool) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if executable { 0o755 } else { 0o644 };
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = (file, executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_visdom_that_cannot_be_run_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let facts = ok_facts(dir.path());
+        make_executable(&facts.visdom_exe, false);
+        let found = check(&facts, Agent::ClaudeCode, &hooks_mode());
+        assert_eq!(by_id(&found, "desktop.hook_path").severity, Severity::Error);
     }
 
     fn by_id<'a>(findings: &'a [Finding], id: &str) -> &'a Finding {

@@ -68,10 +68,17 @@ pub fn record_opened(config_root: &Path, dir: &Path, now: i64) -> std::io::Resul
 }
 
 /// The server accepted an event of desktop session `session_id`. Written once
-/// per session: later events of the same one change nothing.
+/// per session and per opening of the app: later events of the same session
+/// change nothing, until the app is opened again — a session continued after
+/// that is traced anew.
 pub fn record_traced(config_root: &Path, session_id: &str, now: i64) -> std::io::Result<()> {
     let mut evidence = match load(config_root) {
-        Ok(evidence) if evidence.traced_session.as_deref() == Some(session_id) => return Ok(()),
+        Ok(evidence)
+            if evidence.traced_session.as_deref() == Some(session_id)
+                && evidence.traced_at >= evidence.opened_at =>
+        {
+            return Ok(())
+        }
         Ok(evidence) => evidence,
         Err(_) => Evidence::default(),
     };
@@ -85,10 +92,31 @@ pub fn is_desktop_session(entrypoint: Option<&str>) -> bool {
     entrypoint == Some(DESKTOP_ENTRYPOINT)
 }
 
+/// The session this process is a capture hook of, when it is one.
+static HOOK_SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// This process is the capture hook of `session_id`: only that session's
+/// events are evidence about the app this hook runs in. What the same send
+/// path delivers for other sessions (an earlier one's queue, the catch-up
+/// sweep, `flush`) says nothing about it.
+pub fn this_hook_is_for(session_id: &str) {
+    let _ = HOOK_SESSION.set(session_id.to_string());
+}
+
+/// Whether an accepted event of `session_id` is evidence, in a process whose
+/// own hook session is `hook_session` and entrypoint is `entrypoint`.
+fn is_evidence(session_id: &str, hook_session: Option<&str>, entrypoint: Option<&str>) -> bool {
+    is_desktop_session(entrypoint) && hook_session == Some(session_id)
+}
+
 /// Called where the server has accepted an event: note it when this process
-/// is a hook of a desktop session. Never fails and never waits.
+/// is the hook of that session, in the desktop app. Never fails, never waits.
 pub fn note_accepted_event(session_id: &str) {
-    if !is_desktop_session(std::env::var("CLAUDE_CODE_ENTRYPOINT").ok().as_deref()) {
+    if !is_evidence(
+        session_id,
+        HOOK_SESSION.get().map(String::as_str),
+        std::env::var("CLAUDE_CODE_ENTRYPOINT").ok().as_deref(),
+    ) {
         return;
     }
     let Some(config_root) = dirs::config_dir() else {
@@ -165,6 +193,29 @@ mod tests {
             load(root.path()).unwrap().traced_session.as_deref(),
             Some("s1")
         );
+    }
+
+    #[test]
+    fn a_session_continued_after_the_app_is_opened_again_is_traced_anew() {
+        let root = tempfile::tempdir().unwrap();
+        record_traced(root.path(), "s1", 10).unwrap();
+        record_opened(root.path(), Path::new("/repo"), 20).unwrap();
+        record_traced(root.path(), "s1", 30).unwrap();
+        assert_eq!(load(root.path()).unwrap().traced_at, Some(30));
+        // And once more changes nothing again.
+        record_traced(root.path(), "s1", 40).unwrap();
+        assert_eq!(load(root.path()).unwrap().traced_at, Some(30));
+    }
+
+    #[test]
+    fn only_the_hooks_own_session_is_evidence() {
+        let desktop = Some(DESKTOP_ENTRYPOINT);
+        assert!(is_evidence("s1", Some("s1"), desktop));
+        // An earlier session's queue, drained by this hook.
+        assert!(!is_evidence("s0", Some("s1"), desktop));
+        // The catch-up sweep and `flush`: no capture hook at all.
+        assert!(!is_evidence("s0", None, desktop));
+        assert!(!is_evidence("s1", Some("s1"), Some("cli")));
     }
 
     #[test]
