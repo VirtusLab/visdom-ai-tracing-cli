@@ -520,8 +520,12 @@ fn settings_that_would_take_the_session_over_are_reported() {
         "{}",
         stderr(&output)
     );
-    let (severity, _) = finding(&doctor(&sb), "gateway.claude_settings");
+    let report = doctor(&sb);
+    let (severity, _) = finding(&report, "gateway.claude_settings");
     assert_eq!(severity, "warn");
+    // The login is asked for with the helper set aside, as the launch does:
+    // otherwise Claude Code reports the helper, not the claude.ai login.
+    assert_eq!(finding(&report, "gateway.claude_login").0, "ok", "{report}");
 
     std::fs::write(sb.managed_settings(), r#"{"forceLoginMethod":"console"}"#).unwrap();
     let output = init(&sb);

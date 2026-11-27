@@ -22,16 +22,25 @@ pub const FAKE_LOGIN_TOKEN: &str = "sk-ant-oat01-fake-login";
 /// claude.ai subscription, as Claude Code 2.1.332 prints it.
 pub const SUBSCRIPTION_LOGIN: &str = r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"team"}"#;
 
-/// The first lines of a shell stand-in for Claude Code: `auth status`
-/// answers as [`SUBSCRIPTION_LOGIN`] (or `FAKE_CLAUDE_AUTH_STATUS`), exits
-/// 1 when signed out as Claude Code does, and is not recorded as a run.
+/// What Claude Code 2.1.332 answers to `auth status` when a key helper in
+/// the user's settings outranks the claude.ai login.
+pub const HELPER_LOGIN: &str = r#"{"loggedIn":true,"authMethod":"api_key_helper","apiProvider":"firstParty","apiKeySource":"apiKeyHelper"}"#;
+
+/// The first lines of a shell stand-in for Claude Code: `auth status` (the
+/// last two arguments, after any `--settings`) answers as
+/// [`SUBSCRIPTION_LOGIN`] — or `FAKE_CLAUDE_AUTH_STATUS`, or
+/// [`HELPER_LOGIN`] when the user's Claude settings have an `apiKeyHelper`
+/// that the options do not set to nothing — exits 1 when signed out as
+/// Claude Code does, and is not recorded as a run.
 fn shell_auth_status() -> String {
     format!(
-        "if [ \"$1\" = auth ] && [ \"$2\" = status ]; then\n  \
+        "case \" $* \" in *' auth status ') \n  \
          if [ -n \"$FAKE_CLAUDE_AUTH_STATUS\" ]; then status=\"$FAKE_CLAUDE_AUTH_STATUS\"; \
+         elif grep -q apiKeyHelper \"$HOME/.claude/settings.json\" 2>/dev/null && \
+         ! printf '%s' \"$*\" | grep -q '\"apiKeyHelper\":\"\"'; then status='{HELPER_LOGIN}'; \
          else status='{SUBSCRIPTION_LOGIN}'; fi\n  \
          printf '%s\\n' \"$status\"\n  \
-         case \"$status\" in *'\"loggedIn\":false'*) exit 1;; esac\n  exit 0\nfi\n"
+         case \"$status\" in *'\"loggedIn\":false'*) exit 1;; esac\n  exit 0;;\nesac\n"
     )
 }
 
@@ -202,8 +211,15 @@ impl Sandbox {
             r#"#!/usr/bin/env python3
 import json, os, stat, subprocess, sys, time, urllib.request, urllib.error
 args = sys.argv[1:]
-if args[:2] == ["auth", "status"]:
+if args[-2:] == ["auth", "status"]:
     status = os.environ.get("FAKE_CLAUDE_AUTH_STATUS") or '{SUBSCRIPTION_LOGIN}'
+    user_file = os.path.join(os.environ["HOME"], ".claude", "settings.json")
+    given = json.loads(args[args.index("--settings") + 1]) if "--settings" in args else {{}}
+    if not os.environ.get("FAKE_CLAUDE_AUTH_STATUS") and os.path.isfile(user_file):
+        with open(user_file) as f:
+            helper = given["apiKeyHelper"] if "apiKeyHelper" in given else json.load(f).get("apiKeyHelper")
+        if helper:
+            status = '{HELPER_LOGIN}'
     print(status)
     sys.exit(0 if json.loads(status).get("loggedIn") else 1)
 record = {{"args": args}}

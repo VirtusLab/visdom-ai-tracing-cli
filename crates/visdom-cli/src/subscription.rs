@@ -141,8 +141,22 @@ const AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 /// switches the launch removes, which would otherwise be reported instead of
 /// the login.
 pub fn claude_login(program: &str) -> ClaudeLogin {
+    // The settings the launch sets aside are set aside here too: a key
+    // helper in the developer's settings would otherwise be reported
+    // (`authMethod: api_key_helper`, Claude Code 2.1.332, tried by hand),
+    // not the login the session uses.
+    let mut overrides = serde_json::Map::new();
+    for name in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] {
+        overrides.insert(name.to_string(), "".into());
+    }
+    for switch in crate::agents::via_gateway::CLAUDE_OTHER_PROVIDERS {
+        overrides.insert(switch.to_string(), "0".into());
+    }
+    let settings = serde_json::json!({ "apiKeyHelper": "", "env": overrides }).to_string();
     let mut cmd = Command::new(program);
-    cmd.args(["auth", "status"])
+    cmd.arg("--settings")
+        .arg(settings)
+        .args(["auth", "status"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -264,12 +278,17 @@ impl ClaudeEnv {
     ) -> ClaudeEnv {
         let mut files: Vec<(String, Option<serde_json::Map<String, serde_json::Value>>)> =
             vec![(managed.display().to_string(), read_json(managed))];
+        // Merged as the launch merges them: a later one wins key by key, so
+        // its `env` replaces an earlier `env` as a whole.
         let (given, _) = crate::agents::via_gateway::split_settings(agent_args);
-        for value in given.iter().rev() {
-            files.push((
-                "--settings given to Claude Code".to_string(),
-                crate::agents::via_gateway::read_settings(value).ok(),
-            ));
+        if !given.is_empty() {
+            let mut merged = serde_json::Map::new();
+            for value in &given {
+                if let Ok(settings) = crate::agents::via_gateway::read_settings(value) {
+                    merged.extend(settings);
+                }
+            }
+            files.push(("--settings given to Claude Code".to_string(), Some(merged)));
         }
         if let Some(dir) = project_dir {
             for name in [".claude/settings.local.json", ".claude/settings.json"] {
@@ -349,12 +368,27 @@ pub fn models_in_use(
         None => named("ANTHROPIC_MODEL").unwrap_or_else(ours),
     };
     let small = named("ANTHROPIC_DEFAULT_HAIKU_MODEL").unwrap_or_else(ours);
-    if main == small {
-        vec![main]
-    } else {
-        vec![main, small]
+    let mut uses = vec![main];
+    // Background calls, the model aliases and subagents may each name
+    // another model; the launch keeps whatever names one.
+    let others = OTHER_MODEL_SETTINGS.iter().filter_map(|name| named(name));
+    for used in std::iter::once(small).chain(others) {
+        if !uses.contains(&used) {
+            uses.push(used);
+        }
     }
+    uses
 }
+
+/// Claude Code's other settings that name a model a session may ask for,
+/// beside `ANTHROPIC_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL`. The list is
+/// Claude Code's: a setting it gains has to be added here.
+pub const OTHER_MODEL_SETTINGS: [&str; 4] = [
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+];
 
 /// `gateway.subscription_model`: whether every alias of `uses` is one the
 /// gateway takes a subscription call on, in `project`. `source` is where
@@ -953,6 +987,27 @@ mod tests {
             (model.as_str(), at.as_str()),
             ("from-flag", "`env` in --settings given to Claude Code")
         );
+        // As the launch merges them, a later `env` replaces an earlier one as
+        // a whole: the project's model shows through.
+        let replaced = [
+            "--settings".to_string(),
+            r#"{"env":{"ANTHROPIC_MODEL":"first"}}"#.to_string(),
+            "--settings".to_string(),
+            r#"{"env":{"OTHER":"1"}}"#.to_string(),
+        ];
+        let env = ClaudeEnv::read(&managed, &home, Some(&repo), &replaced);
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL", &process).unwrap().0,
+            "from-project"
+        );
+        // Other model settings are checked when they name one.
+        let named = |name: &str| {
+            (name == "CLAUDE_CODE_SUBAGENT_MODEL")
+                .then(|| ("gpt-general".to_string(), "the environment".to_string()))
+        };
+        let uses = models_in_use(Some("claude-sonnet"), &[], &named);
+        assert_eq!(uses.len(), 2, "{uses:?}");
+        assert_eq!(uses[1].model.as_deref(), Some("gpt-general"));
         std::fs::write(&managed, r#"{"env":{"ANTHROPIC_MODEL":"managed"}}"#).unwrap();
         let env = ClaudeEnv::read(&managed, &home, Some(&repo), &args);
         assert_eq!(env.get("ANTHROPIC_MODEL", &process).unwrap().0, "managed");
