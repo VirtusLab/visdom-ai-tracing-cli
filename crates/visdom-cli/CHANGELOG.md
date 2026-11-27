@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/visdom-v1.2.0...visdom-v1.2.1) - 2026-11-27
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [1.2.0](https://github.com/VirtusLab/visdom-ai-tracing-cli/compare/visdom-v1.1.1...visdom-v1.2.0) - 2026-11-27
 
 ### Added
