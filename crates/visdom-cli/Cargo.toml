@@ -3,7 +3,7 @@ name = "visdom-cli"
 # Its own version, apart from the workspace's: `visdom` is the developer's
 # entry point and is stable from 1.0, while `tracevault` it is shipped with
 # keeps its 0.x line.
-version = "1.1.1"
+version = "1.2.0"
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
