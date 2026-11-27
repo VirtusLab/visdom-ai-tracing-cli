@@ -1608,6 +1608,11 @@ fn warn_unsent(warned: &mut bool, failure: &str) {
     }
 }
 
+/// Set (to anything) in the environment of an agent `visdom` starts: that
+/// agent was told about Visdom's tools on its command line, so its
+/// session-start hook does not tell it again.
+pub const LAUNCHED_BY_VISDOM_ENV: &str = "VISDOM_LAUNCHED";
+
 /// The developer's choice of tracing mode for `visdom` (`hooks` or
 /// `gateway`). A preference, not a fact about a running agent: an agent
 /// started without `visdom` may well carry `gateway` here and still talk to

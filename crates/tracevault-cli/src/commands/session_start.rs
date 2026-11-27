@@ -24,7 +24,7 @@
 use crate::program::TOP;
 use std::path::Path;
 
-use crate::commands::session_hooks::{read_hook_event_or_allow, resolve_and_inject};
+use crate::commands::session_hooks::{read_hook_event_or_allow, resolve_and_inject_with};
 
 /// Append `export TRACEVAULT_SESSION_ID='<session_id>'` to the Claude Code
 /// session env file, unless that exact line is already present. Pure I/O
@@ -81,6 +81,12 @@ fn write_session_env_as(env_file: &Path, session_id: &str, visdom: bool) -> std:
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    run_with(None).await
+}
+
+/// [`run`], also handing the agent `extra_context` (ready text) with the
+/// policies: what `visdom` tells a session it did not start about its tools.
+pub async fn run_with(extra_context: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
     // 1. Read the hook event from stdin. A parse error must never fail the
     // hook — print the minimal allow response and return Ok.
@@ -106,7 +112,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Resolve the effective repo binding and, if warranted, inject its
     // policies. Shared with `user-prompt` (sub-plan C's UserPromptSubmit hook).
-    let injected = resolve_and_inject(&hook_event, notice).await;
+    let injected = resolve_and_inject_with(&hook_event, notice, extra_context).await;
 
     // 5. Send the cost reports earlier sessions of this repo left unsent
     // (VIS-1108). After the response is printed, so it never delays it, and

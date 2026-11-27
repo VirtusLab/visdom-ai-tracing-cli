@@ -5,6 +5,7 @@ use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches};
 use tracevault_cli::agent::Agent;
 use tracevault_cli::cli::{run, Command, InitArgs};
+use tracevault_cli::commands::stream::LAUNCHED_BY_VISDOM_ENV;
 use visdom_cli::agents::via_gateway::AgentCommand;
 use visdom_cli::agents::McpScope;
 use visdom_cli::billing::{self, Billing, BillingUse};
@@ -53,6 +54,24 @@ fn main() {
             // First: a failed logout exits.
             forget_gateway_keys(&runtime);
             runtime.block_on(run(Command::Logout))
+        }
+        // The session-start hook of a session `visdom` did not start (the
+        // Claude Desktop app, a plain `claude`) is where that session learns
+        // of Visdom's tools; a launched agent was told on its command line.
+        Some(VisdomCommand::Trace {
+            command: Command::SessionStart,
+        }) => {
+            let extra = match std::env::var_os(LAUNCHED_BY_VISDOM_ENV) {
+                Some(_) => None,
+                None => checks::hook_instructions(&Environment::current()),
+            };
+            // As in the library: the hook has printed its answer, and a
+            // failure here must not stop the session from starting.
+            if let Err(e) =
+                runtime.block_on(tracevault_cli::commands::session_start::run_with(extra))
+            {
+                eprintln!("SessionStart error: {e}");
+            }
         }
         Some(VisdomCommand::Trace { command }) => runtime.block_on(run(command)),
         Some(VisdomCommand::Init { mut args }) => {
@@ -1290,7 +1309,13 @@ fn check_and_launch(
         open_desktop(open, &session)
     }
     // In the directory visdom was run in, like starting the agent by hand.
-    let AgentCommand { cmd, private_file } = agent_command(&session, &runtime, agent_args);
+    let AgentCommand {
+        mut cmd,
+        private_file,
+    } = agent_command(&session, &runtime, agent_args);
+    // Told (or deliberately not told) on its command line: its session-start
+    // hook says nothing more.
+    cmd.env(LAUNCHED_BY_VISDOM_ENV, "1");
     // The agent takes over this process (or runs as its only child): no
     // runtime threads may outlive it.
     drop(runtime);

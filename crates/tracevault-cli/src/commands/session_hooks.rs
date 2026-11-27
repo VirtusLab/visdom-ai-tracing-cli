@@ -161,10 +161,55 @@ async fn fetch_context(client: &ApiClient, event: &str, repo_id: uuid::Uuid) -> 
 /// env file, which stays in `session_start.rs`). `notice` is a message for the
 /// user from that hook-specific part (the upgrade step's, VIS-1109); it is
 /// shown whatever this flow decides.
+/// What the agent is handed as context: `extra` (what the caller of the hook
+/// has to say), then the policies, capped together. `None` when there is
+/// neither.
+pub fn combine_context(extra: Option<&str>, policies: Option<&str>) -> Option<String> {
+    let parts: Vec<&str> = [extra, policies]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| cap_context(parts.join("\n\n")))
+}
+
+/// The response when no policies are injected: `extra` as the context when
+/// there is some, else the plain allow.
+fn print_extra(
+    event: &str,
+    notice: Option<String>,
+    extra: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match combine_context(extra, None) {
+        Some(context) => {
+            let output = HookOutput {
+                system_message: notice,
+                ..HookOutput::with_context(event, context)
+            };
+            println!("{}", serde_json::to_string(&output)?);
+            Ok(())
+        }
+        None => print_allow_with(notice),
+    }
+}
+
 pub async fn resolve_and_inject(
     hook_event: &HookEvent,
     notice: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    resolve_and_inject_with(hook_event, notice, None).await
+}
+
+/// [`resolve_and_inject`], also handing the agent `extra` as context: before
+/// the policies when there are some, alone when there are none (or when they
+/// could not be fetched). `extra` is ready text; nothing is asked for it.
+pub async fn resolve_and_inject_with(
+    hook_event: &HookEvent,
+    notice: Option<String>,
+    extra: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let extra = extra.as_deref();
     let deadline = std::time::Instant::now() + HOOK_BUDGET;
     let event = hook_event.hook_event_name.as_str();
     let hook_cwd = Path::new(&hook_event.cwd);
@@ -234,18 +279,18 @@ pub async fn resolve_and_inject(
         binding.as_ref().map(|b| b.repo_id.as_str()),
         session.last_injected_repo.as_deref(),
     ) {
-        return print_allow_with(notice);
+        return print_extra(event, notice, extra);
     }
     // `should_inject` returning true requires `effective_repo_id.is_some()`, so
     // `binding` is always `Some` here.
     let Some(binding) = binding else {
-        return print_allow_with(notice);
+        return print_extra(event, notice, extra);
     };
 
     let Ok(repo_uuid) = binding.repo_id.parse::<uuid::Uuid>() else {
         // A corrupted/hand-edited session-state or config file could contain a
         // non-UUID repo_id — skip injection rather than fail the hook.
-        return print_allow_with(notice);
+        return print_extra(event, notice, extra);
     };
 
     // A credential/URL mismatch is a misconfiguration the user has to fix, but
@@ -256,11 +301,11 @@ pub async fn resolve_and_inject(
         Ok(resolved) => resolved,
         Err(e) => {
             eprintln!("Skipping context injection: {e}");
-            return print_allow_with(notice);
+            return print_extra(event, notice, extra);
         }
     };
     let Some(server_url) = server_url else {
-        return print_allow_with(notice);
+        return print_extra(event, notice, extra);
     };
     let client = ApiClient::with_credential(&server_url, credential);
 
@@ -272,6 +317,10 @@ pub async fn resolve_and_inject(
     match fetched {
         Some(mut output) => {
             output.system_message = notice;
+            if let Some(specific) = &mut output.hook_specific_output {
+                specific.additional_context =
+                    combine_context(extra, Some(&specific.additional_context)).unwrap_or_default();
+            }
             println!("{}", serde_json::to_string(&output)?);
             // Best-effort: persist the last-injected repo so a later
             // UserPromptSubmit can avoid redundant re-injection. A save
@@ -285,13 +334,36 @@ pub async fn resolve_and_inject(
             let _ = crate::session_state::save(&hook_event.session_id, &fresh);
             Ok(())
         }
-        None => print_allow_with(notice),
+        None => print_extra(event, notice, extra),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── combine_context ──────────────────────────────────────────────────
+
+    #[test]
+    fn extra_context_comes_before_the_policies_and_alone_when_there_are_none() {
+        assert_eq!(
+            combine_context(Some("E\n"), Some("P")).as_deref(),
+            Some("E\n\nP")
+        );
+        assert_eq!(combine_context(Some("E"), None).as_deref(), Some("E"));
+        assert_eq!(combine_context(None, Some("P")).as_deref(), Some("P"));
+        assert_eq!(combine_context(None, None), None);
+        assert_eq!(combine_context(Some("  "), Some("")), None);
+    }
+
+    #[test]
+    fn extra_context_is_cut_with_the_rest_at_the_cap() {
+        let policies = "p".repeat(MAX_CONTEXT);
+        let combined = combine_context(Some("EXTRA"), Some(&policies)).unwrap();
+        assert!(combined.starts_with("EXTRA\n\np"));
+        assert!(combined.contains("truncated"));
+        assert!(combined.chars().count() <= MAX_CONTEXT);
+    }
 
     // ── should_inject ────────────────────────────────────────────────────
 

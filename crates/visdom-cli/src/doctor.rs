@@ -598,6 +598,53 @@ impl Session {
     }
 }
 
+/// What the session-start hook tells a Claude Code session `visdom` did not
+/// start (in the Claude Desktop app, or a plain `claude`) about Visdom's
+/// tools: the text a launch gives on the command line, for what the files
+/// say this session has. From files only — no request is made, the hook must
+/// not wait — and `None` whenever anything cannot be read, or the developer
+/// turned the instructions off.
+pub fn hook_instructions(env: &Environment) -> Option<String> {
+    let user = config::load_user_config_in(&env.config_root).ok()?;
+    if user.agent_instructions == Some(false) {
+        return None;
+    }
+    let checkout = git_toplevel(&env.cwd);
+    let primary = checkout
+        .as_deref()
+        .map(|dir| tracevault_cli::paths::resolve_project_root(dir).root);
+    let credential_root = primary.as_deref().unwrap_or(&env.cwd);
+    let (server_url, credential) =
+        tracevault_cli::credentials::resolve_credentials_quiet(credential_root).ok()?;
+    // Where the tracing server last said the rest of the suite is.
+    let remembered = server_url
+        .as_deref()
+        .and_then(|url| {
+            suite::load_cached_suite(&suite::suite_cache_path_in(&env.config_root), url)
+        })
+        .unwrap_or_default();
+    let bazaar_url = bazaar::resolve_bazaar_url(env.bazaar_url.clone(), &user, &Ok(remembered))
+        .ok()
+        .flatten();
+    let agent = Agent::ClaudeCode;
+    let paths = AgentPaths {
+        home: env.home.clone(),
+        codex_home: env.codex_home.clone(),
+    };
+    let adapter = adapter_for(agent, paths, user.agents.program_for(agent))?;
+    let workdir = Workdir {
+        start_dir: env.cwd.clone(),
+        checkout,
+        primary,
+    };
+    instructions::compose_for_hook(&Facts {
+        // This is the session's own hook running: the hooks are installed.
+        tracing: server_url.is_some() && credential.is_some(),
+        bazaar: bazaar::registered_name(bazaar_url.as_deref(), adapter.as_ref(), &workdir),
+        gateway: false,
+    })
+}
+
 /// What the desktop surface is checked against on this machine, `claude`
 /// being the terminal CLI `visdom` opens the app with.
 fn desktop_facts(env: &Environment, claude: &str) -> DesktopFacts {
