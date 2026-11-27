@@ -205,23 +205,86 @@ pub fn login_finding(login: &ClaudeLogin) -> Finding {
                 }
             ),
         ),
+        // Nothing shows a subscription to pay with: not a setup to accept.
         ClaudeLogin::Unknown(why) => Finding::new(
             COMPONENT,
             ID,
-            Severity::Unknown,
+            Severity::Error,
             format!(
                 "whether Claude Code is signed in with a claude.ai subscription could not be \
-                 checked: {why}"
+                 checked: {why}. Make sure Claude Code is installed and recent (`claude \
+                 update`), then {SIGN_IN}"
             ),
         ),
     }
 }
 
-/// `gateway.subscription_model`: whether `model` is an alias the gateway
-/// takes a subscription call on, in `project`. `source` says where the alias
-/// was set; `config_key` is the setting that names it.
+/// A model alias Claude Code will ask for, and who set it (`None`: the
+/// alias `visdom` configured or picked).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelUse {
+    pub model: Option<String>,
+    pub source: Option<String>,
+}
+
+/// The aliases a session started now would ask for: the main model (the
+/// caller's `--model`, else `ANTHROPIC_MODEL` from the environment, which the
+/// launch keeps, else `configured`) and the small one
+/// (`ANTHROPIC_DEFAULT_HAIKU_MODEL`, else `configured`). `env` reads the
+/// environment.
+pub fn models_in_use(
+    configured: Option<&str>,
+    agent_args: &[String],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<ModelUse> {
+    let set = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+    let from_args = agent_args
+        .iter()
+        .take_while(|a| *a != "--")
+        .enumerate()
+        .find_map(|(i, arg)| {
+            if arg == "--model" {
+                agent_args.get(i + 1).cloned()
+            } else {
+                arg.strip_prefix("--model=").map(String::from)
+            }
+        });
+    let ours = || ModelUse {
+        model: configured.map(String::from),
+        source: None,
+    };
+    let main = match (set(from_args), set(env("ANTHROPIC_MODEL"))) {
+        (Some(model), _) => ModelUse {
+            model: Some(model),
+            source: Some("--model given to Claude Code".to_string()),
+        },
+        (None, Some(model)) => ModelUse {
+            model: Some(model),
+            source: Some("ANTHROPIC_MODEL in the environment".to_string()),
+        },
+        (None, None) => ours(),
+    };
+    let small = match set(env("ANTHROPIC_DEFAULT_HAIKU_MODEL")) {
+        Some(model) => ModelUse {
+            model: Some(model),
+            source: Some("ANTHROPIC_DEFAULT_HAIKU_MODEL in the environment".to_string()),
+        },
+        None => ours(),
+    };
+    if main == small {
+        vec![main]
+    } else {
+        vec![main, small]
+    }
+}
+
+/// `gateway.subscription_model`: whether every alias of `uses` is one the
+/// gateway takes a subscription call on, in `project`. `source` is where
+/// `visdom`'s own alias was set; `config_key` is the setting that names it.
+/// A gateway that does not publish which aliases qualify cannot be relied on
+/// to keep a subscription call off another provider: an error too.
 pub fn model_finding(
-    model: Option<&str>,
+    uses: &[ModelUse],
     source: Option<&str>,
     project: &OpenProject,
     config_key: &str,
@@ -231,17 +294,62 @@ pub fn model_finding(
         return Finding::new(
             COMPONENT,
             ID,
-            Severity::Warn,
+            Severity::Error,
             format!(
                 "the AI Gateway does not say which model aliases of the project `{}` take calls \
-                 paid by a Claude subscription (a version from before it could): one served by \
-                 any other provider than Anthropic is refused",
+                 paid by a Claude subscription (a version from before it could), so none can be \
+                 relied on: ask your platform administrator to update it, or use --billing \
+                 project",
                 project.slug
             ),
         );
     };
-    let set =
-        format!("set {config_key} under [gateway] in your visdom config, or VISDOM_GATEWAY_MODEL");
+    for used in uses {
+        let finding = one_model_finding(
+            used.model.as_deref(),
+            used.source.as_deref().or(source),
+            used.source.is_some(),
+            &eligible,
+            project,
+            config_key,
+        );
+        if finding.severity != Severity::Ok {
+            return finding;
+        }
+    }
+    let names: Vec<String> = uses
+        .iter()
+        .filter_map(|u| u.model.as_deref())
+        .map(|m| format!("`{m}`"))
+        .collect();
+    Finding::new(
+        COMPONENT,
+        ID,
+        Severity::Ok,
+        format!(
+            "the model alias {} takes calls paid by a Claude subscription",
+            names.join(" and ")
+        ),
+    )
+}
+
+/// [`model_finding`] for one alias. `outside` says it was set outside
+/// visdom's config (the environment, the agent's options).
+fn one_model_finding(
+    model: Option<&str>,
+    source: Option<&str>,
+    outside: bool,
+    eligible: &[String],
+    project: &OpenProject,
+    config_key: &str,
+) -> Finding {
+    const ID: &str = "gateway.subscription_model";
+    let set = match (outside, source) {
+        (true, Some(source)) => format!("change {source}"),
+        _ => format!(
+            "set {config_key} under [gateway] in your visdom config, or VISDOM_GATEWAY_MODEL"
+        ),
+    };
     if eligible.is_empty() {
         return Finding::new(
             COMPONENT,
@@ -287,16 +395,14 @@ pub fn model_finding(
 }
 
 /// The aliases of `available` the gateway takes a subscription call on in
-/// `project`; all of them when it does not say.
+/// `project`; none when it does not say.
 pub fn eligible_of(project: &OpenProject, available: &[String]) -> Vec<String> {
-    match project.subscription_aliases() {
-        Some(eligible) => available
-            .iter()
-            .filter(|alias| eligible.contains(alias))
-            .cloned()
-            .collect(),
-        None => available.to_vec(),
-    }
+    let eligible = project.subscription_aliases().unwrap_or_default();
+    available
+        .iter()
+        .filter(|alias| eligible.contains(alias))
+        .cloned()
+        .collect()
 }
 
 /// The day (UTC) Unix seconds `at` fall on.
@@ -405,22 +511,32 @@ pub fn managed_takeovers(settings: &serde_json::Map<String, serde_json::Value>) 
         }
     }
     let env = settings.get("env").and_then(|v| v.as_object());
-    for (name, what) in [
+    // An empty key is no key; an empty address or header list still
+    // replaces visdom's (no address is Anthropic's own; no headers, no key).
+    for (name, what, even_empty) in [
         (
             "ANTHROPIC_API_KEY",
             "its key is sent instead of your subscription",
+            false,
         ),
         (
             "ANTHROPIC_AUTH_TOKEN",
             "its token is sent instead of your subscription",
+            false,
         ),
-        ("ANTHROPIC_BASE_URL", "the session is sent past the gateway"),
+        (
+            "ANTHROPIC_BASE_URL",
+            "the session is sent past the gateway",
+            true,
+        ),
         (
             "ANTHROPIC_CUSTOM_HEADERS",
             "they replace the headers that carry your subscription key",
+            true,
         ),
     ] {
-        if is_set(env.and_then(|env| env.get(name))) {
+        let value = env.and_then(|env| env.get(name));
+        if is_set(value) || (even_empty && value.is_some()) {
             found.push(format!("`{name}` in `env` ({what})"));
         }
     }
@@ -553,8 +669,10 @@ mod tests {
         assert_eq!(finding.severity, Severity::Error);
         assert!(finding.message.contains("Anthropic Console"), "{finding:?}");
         assert!(finding.message.contains("/login"), "{finding:?}");
+        // Nothing shows a subscription: not accepted either.
         let finding = login_finding(&ClaudeLogin::Unknown("x".to_string()));
-        assert_eq!(finding.severity, Severity::Unknown);
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.message.contains("claude update"), "{finding:?}");
     }
 
     fn project(models: Option<&[(&str, bool)]>) -> OpenProject {
@@ -581,13 +699,24 @@ mod tests {
             ("claude-sonnet", true),
             ("claude-opus", true),
         ]));
-        let ok = model_finding(Some("claude-sonnet"), None, &alpha, "claude_code_model");
+        let ours = |model: Option<&str>| {
+            vec![ModelUse {
+                model: model.map(String::from),
+                source: None,
+            }]
+        };
+        let ok = model_finding(
+            &ours(Some("claude-sonnet")),
+            None,
+            &alpha,
+            "claude_code_model",
+        );
         assert_eq!(
             (ok.id, ok.severity),
             ("gateway.subscription_model", Severity::Ok)
         );
         let bad = model_finding(
-            Some("gpt-general"),
+            &ours(Some("gpt-general")),
             Some("VISDOM_GATEWAY_MODEL in the environment"),
             &alpha,
             "claude_code_model",
@@ -601,12 +730,12 @@ mod tests {
             .message
             .contains("VISDOM_GATEWAY_MODEL in the environment"));
         assert!(bad.message.contains("claude_code_model"), "{bad:?}");
-        let none = model_finding(None, None, &alpha, "claude_code_model");
+        let none = model_finding(&ours(None), None, &alpha, "claude_code_model");
         assert_eq!(none.severity, Severity::Error);
         assert!(none.message.contains("claude-sonnet"), "{none:?}");
 
         let nothing = model_finding(
-            Some("gpt-general"),
+            &ours(Some("gpt-general")),
             None,
             &project(Some(&[("gpt-general", false)])),
             "claude_code_model",
@@ -614,8 +743,57 @@ mod tests {
         assert_eq!(nothing.severity, Severity::Error);
         assert!(nothing.message.contains("--billing project"), "{nothing:?}");
 
-        let silent = model_finding(Some("x"), None, &project(None), "claude_code_model");
-        assert_eq!(silent.severity, Severity::Warn);
+        // Without the list nothing can be relied on.
+        let silent = model_finding(&ours(Some("x")), None, &project(None), "claude_code_model");
+        assert_eq!(silent.severity, Severity::Error);
+        assert!(silent.message.contains("--billing project"), "{silent:?}");
+
+        // The small model set in the environment is checked too, and its
+        // source is the one to change.
+        let env = |name: &str| {
+            (name == "ANTHROPIC_DEFAULT_HAIKU_MODEL").then(|| "gpt-general".to_string())
+        };
+        let uses = models_in_use(Some("claude-sonnet"), &[], &env);
+        assert_eq!(uses.len(), 2, "{uses:?}");
+        let small = model_finding(&uses, None, &alpha, "claude_code_model");
+        assert_eq!(small.severity, Severity::Error);
+        assert!(
+            small
+                .message
+                .contains("change ANTHROPIC_DEFAULT_HAIKU_MODEL in the environment"),
+            "{small:?}"
+        );
+    }
+
+    #[test]
+    fn the_models_in_use_are_the_agents_options_then_the_environment_then_visdoms() {
+        let none = |_: &str| None;
+        assert_eq!(
+            models_in_use(Some("claude-sonnet"), &[], &none),
+            [ModelUse {
+                model: Some("claude-sonnet".to_string()),
+                source: None
+            }]
+        );
+        let env = |name: &str| (name == "ANTHROPIC_MODEL").then(|| "claude-opus".to_string());
+        let uses = models_in_use(Some("claude-sonnet"), &[], &env);
+        assert_eq!(uses[0].model.as_deref(), Some("claude-opus"));
+        assert_eq!(uses[1].model.as_deref(), Some("claude-sonnet"));
+        let args = ["--model=gpt-general".to_string(), "-p".to_string()];
+        let uses = models_in_use(Some("claude-sonnet"), &args, &env);
+        assert_eq!(uses[0].model.as_deref(), Some("gpt-general"));
+        assert_eq!(
+            uses[0].source.as_deref(),
+            Some("--model given to Claude Code")
+        );
+        let prompt = ["--".to_string(), "--model".to_string(), "x".to_string()];
+        assert_eq!(
+            models_in_use(Some("claude-sonnet"), &prompt, &none)[0]
+                .model
+                .as_deref(),
+            Some("claude-sonnet"),
+            "after `--` it is the prompt's"
+        );
     }
 
     #[test]
@@ -623,7 +801,7 @@ mod tests {
         let available = ["gpt-general".to_string(), "claude-sonnet".to_string()];
         let alpha = project(Some(&[("claude-sonnet", true), ("gpt-general", false)]));
         assert_eq!(eligible_of(&alpha, &available), ["claude-sonnet"]);
-        assert_eq!(eligible_of(&project(None), &available), available);
+        assert!(eligible_of(&project(None), &available).is_empty());
     }
 
     #[test]
@@ -657,6 +835,12 @@ mod tests {
         ));
         assert_eq!(found.len(), 4, "{found:?}");
         assert!(found[1].contains("forceLoginMethod = console"), "{found:?}");
+        // An empty key is none, but empty headers still replace visdom's.
+        let found = managed_takeovers(&settings(
+            r#"{"env":{"ANTHROPIC_API_KEY":"","ANTHROPIC_CUSTOM_HEADERS":""}}"#,
+        ));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("ANTHROPIC_CUSTOM_HEADERS"), "{found:?}");
     }
 
     #[test]

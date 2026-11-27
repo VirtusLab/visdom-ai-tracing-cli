@@ -326,6 +326,129 @@ fn the_model_alias_must_take_subscription_calls() {
     assert!(!message.contains("claude-haiku"), "{message}");
 }
 
+/// The model Claude Code would really ask for is checked: `ANTHROPIC_MODEL`
+/// or `ANTHROPIC_DEFAULT_HAIKU_MODEL` from the environment (which the launch
+/// keeps) and a `--model` given to it win over visdom's alias.
+#[test]
+fn a_model_set_outside_visdom_must_take_subscription_calls_too() {
+    let server = gateway("per_agent", ALLOWED, SUB_ISSUE);
+    let (sb, log) = sandbox(&server);
+    for (name, value) in [
+        ("ANTHROPIC_MODEL", "claude-haiku"),
+        ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "gpt-general"),
+    ] {
+        let output = sb
+            .visdom(sb.repo.path())
+            .arg("init")
+            .env(name, value)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        let said = stderr(&output);
+        assert!(said.contains(&format!("`{value}`")), "{said}");
+        assert!(
+            said.contains(&format!("change {name} in the environment")),
+            "{said}"
+        );
+    }
+    let output = init(&sb);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--", "--model", "gpt-general"])
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&output).contains("--model given to Claude Code"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains("hooks tracing instead"));
+    assert!(lines(&log).contains(&"VISDOM_TRACING_MODE=hooks".to_string()));
+}
+
+/// A gateway that publishes the setting but not which aliases qualify
+/// cannot be relied on to keep the call on Anthropic: not accepted, and no
+/// alias is picked for it.
+#[test]
+fn a_gateway_without_the_eligibility_list_is_not_accepted() {
+    let workspace = r#"{"timezone":"UTC","ai_traffic_policy":"per_agent"}"#;
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, workspace),
+        ("GET /api/settings", 200, ALLOWED),
+        (
+            "GET /api/me/keys",
+            200,
+            r#"{"projects":[{"id":"p-1","slug":"alpha","name":"Alpha"}],"keys":[]}"#,
+        ),
+        SUB_ISSUE,
+        MODELS,
+    ]);
+    let (sb, _log) = sandbox(&server);
+    let output = init(&sb);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("does not say which model aliases"),
+        "{}",
+        stderr(&output)
+    );
+    let config = std::fs::read_to_string(sb.user_config()).unwrap();
+    assert!(!config.contains("claude_code_model"), "{config}");
+    let (severity, _) = finding(&doctor(&sb), "gateway.subscription_model");
+    assert_eq!(severity, "error");
+}
+
+/// A subscription key the console issued but the LLM gateway refuses with
+/// the "denied" code: the same message in init and doctor; a plain `visdom`
+/// falls back to hooks, or under `enforced` does not start the agent.
+#[test]
+fn a_subscription_key_the_gateway_denies_is_the_same_message() {
+    const MODELS_DENIED: (&str, u16, &str) = (
+        "GET /v1/models",
+        403,
+        r#"{"error":{"message":"Subscription traffic is not allowed on this gateway","type":"permission_error","code":"subscription_traffic_denied"}}"#,
+    );
+    for policy in ["per_agent", "enforced"] {
+        let workspace = format!(r#"{{"timezone":"UTC","ai_traffic_policy":"{policy}"}}"#);
+        let server = MockServer::start(&[
+            SUITE,
+            ("GET /api/v1/workspace/settings", 200, &workspace),
+            ("GET /api/settings", 200, ALLOWED),
+            ("GET /api/me/keys", 200, PROJECT),
+            SUB_ISSUE,
+            MODELS_DENIED,
+        ]);
+        let (sb, log) = sandbox(&server);
+        let output = init(&sb);
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(
+            has_line(&stderr(&output), NOT_SUPPORTED),
+            "{}",
+            stderr(&output)
+        );
+
+        // The key init got is kept; doctor tries it.
+        let (severity, message) = finding(&doctor(&sb), "gateway.subscription_key");
+        assert_eq!(severity, "error");
+        assert_eq!(message, NOT_SUPPORTED);
+
+        let output = sb.visdom(sb.repo.path()).output().unwrap();
+        assert!(
+            stderr(&output).contains(NOT_SUPPORTED),
+            "{}",
+            stderr(&output)
+        );
+        if policy == "enforced" {
+            assert_eq!(output.status.code(), Some(1));
+            assert!(lines(&log).is_empty(), "the agent must not have run");
+        } else {
+            assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+            assert!(lines(&log).contains(&"VISDOM_TRACING_MODE=hooks".to_string()));
+        }
+    }
+}
+
 /// Settings that take the session over: managed ones are an error; a key
 /// helper of the developer's own is a warning (set aside by `visdom`).
 #[test]

@@ -388,7 +388,14 @@ impl Session {
     /// [`crate::subscription`]); [`Session::collect`] then reports it.
     /// `model` is the alias it would ask for, and `key` what is known of its
     /// key (`None`: not checked here). Nothing when the session is not one.
-    pub fn check_subscription(&mut self, model: Option<&str>, key: Option<&KeyState>) {
+    /// `agent_args` are the caller's own options for the agent, which may
+    /// name another model.
+    pub fn check_subscription(
+        &mut self,
+        model: Option<&str>,
+        agent_args: &[String],
+        key: Option<&KeyState>,
+    ) {
         self.subscription.clear();
         if !self.on_subscription() {
             return;
@@ -402,8 +409,12 @@ impl Session {
                 self.adapter.program(),
             )));
         if let Some(Ok(plan)) = &self.gateway {
+            // What the launch keeps of the environment and the caller's
+            // options wins over visdom's alias: each is checked.
+            let uses =
+                subscription::models_in_use(model, agent_args, &|name| std::env::var(name).ok());
             self.subscription.push(subscription::model_finding(
-                model,
+                &uses,
                 self.gateway_sources.model.as_deref(),
                 &plan.project,
                 &format!("{}_model", config::agent_config_key(self.ctx.agent)),

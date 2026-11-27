@@ -265,7 +265,7 @@ fn doctor(
 ) -> ! {
     let env = Environment::current();
     let mut session = gather(&env, agent, mode, billing, runtime);
-    check_subscription(&mut session, runtime, true);
+    check_subscription(&mut session, runtime, true, &[]);
     let mut findings = session.collect();
     let policy = policy_for(fix_flag, yes, true, stdin_is_tty());
     if policy != FixPolicy::Never && findings.iter().any(|f| f.fix.is_some()) {
@@ -273,7 +273,7 @@ fn doctor(
         print_attention(&findings);
         if fix(&findings, policy, &mut RealExecutor::new(json, policy)).applied {
             session = gather(&env, agent, mode, billing, runtime);
-            check_subscription(&mut session, runtime, true);
+            check_subscription(&mut session, runtime, true, &[]);
             findings = session.collect();
         }
     }
@@ -287,14 +287,20 @@ fn doctor(
 
 /// Check that a session on the developer's Claude subscription can work here
 /// (nothing for any other session). `doctor` also tries the kept key; a
-/// launch gets or tries its key when it prepares the gateway.
-fn check_subscription(session: &mut Session, runtime: &tokio::runtime::Runtime, doctor: bool) {
+/// launch gets or tries its key when it prepares the gateway. `agent_args`
+/// are the options the agent is started with.
+fn check_subscription(
+    session: &mut Session,
+    runtime: &tokio::runtime::Runtime,
+    doctor: bool,
+    agent_args: &[String],
+) {
     if !session.on_subscription() {
         return;
     }
     let model = session.subscription_model();
     let key = doctor.then(|| session.kept_subscription_key(runtime, now()));
-    session.check_subscription(model.as_deref(), key.as_ref());
+    session.check_subscription(model.as_deref(), agent_args, key.as_ref());
 }
 
 /// The agent `visdom init` sets up: the one typed, else the one configured
@@ -791,6 +797,7 @@ fn init_gateway(
         session.gateway_sources = sources.clone();
         session.check_subscription(
             prepared.launch.model.as_deref(),
+            &[],
             Some(&subscription::KeyState::Accepted {
                 expires_at: prepared.key_expires_at,
             }),
@@ -1069,13 +1076,13 @@ fn check_and_launch(
 ) -> ! {
     let env = Environment::current();
     let mut session = gather(&env, agent, mode, billing, &runtime);
-    check_subscription(&mut session, &runtime, false);
+    check_subscription(&mut session, &runtime, false, agent_args);
     let findings = session.collect();
     print_attention(&findings);
     let policy = policy_for(false, yes, false, stdin_is_tty());
     if fix(&findings, policy, &mut RealExecutor::new(false, policy)).applied {
         session = gather(&env, agent, mode, billing, &runtime);
-        check_subscription(&mut session, &runtime, false);
+        check_subscription(&mut session, &runtime, false, agent_args);
         // What is still open, once, above the agent.
         print_attention(&session.collect());
     } else if policy == FixPolicy::Never && findings.iter().any(|f| f.fix.is_some()) {
