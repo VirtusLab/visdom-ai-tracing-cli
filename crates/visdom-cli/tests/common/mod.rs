@@ -119,6 +119,10 @@ impl Sandbox {
             // The machine's own managed Claude Code settings are not the
             // sandbox's.
             .env("VISDOM_CLAUDE_MANAGED_SETTINGS", self.managed_settings())
+            // Nor is the machine's Claude Desktop: none unless a test puts
+            // one there ([`Sandbox::fake_app`]).
+            .env("VISDOM_CLAUDE_DESKTOP_APP", self.fake_app_path())
+            .env("XDG_DATA_HOME", self.home.path().join(".local/share"))
             .stdin(Stdio::null());
         for name in [
             "SERVER_URL",
@@ -133,6 +137,8 @@ impl Sandbox {
         }
         for name in [
             "VISDOM_AGENT",
+            "VISDOM_SURFACE",
+            "VISDOM_LAUNCHED",
             "VISDOM_BAZAAR_URL",
             "VISDOM_TRACING_MODE",
             "VISDOM_GATEWAY_SESSION",
@@ -298,6 +304,37 @@ with open({log:?}, "a") as f:
         fs::write(&script, text).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         (script, log)
+    }
+
+    /// Where this sandbox's Claude Desktop would be.
+    pub fn fake_app_path(&self) -> PathBuf {
+        self.home.path().join("Claude.app")
+    }
+
+    /// Claude Desktop, as far as `visdom` looks: installed.
+    pub fn fake_app(&self) {
+        fs::create_dir_all(self.fake_app_path()).unwrap();
+    }
+
+    /// A directory to put first on `PATH`, holding an `xdg-open` that appends
+    /// its arguments (one line per run) to the returned log and exits with
+    /// `status`.
+    pub fn fake_opener(&self, status: i32) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.home.path().join("opener");
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("xdg-open");
+        let log = dir.join("xdg-open.log");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit {status}\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, log)
     }
 
     /// An executable standing in for an agent: every invocation appends

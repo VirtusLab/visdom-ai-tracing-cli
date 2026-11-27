@@ -10,6 +10,7 @@ use visdom_cli::agents::McpScope;
 use visdom_cli::billing::{self, Billing, BillingUse};
 use visdom_cli::cli::{VisdomCli, VisdomCommand};
 use visdom_cli::components::CredentialState;
+use visdom_cli::desktop::{self, Closing};
 use visdom_cli::doctor::git_toplevel;
 use visdom_cli::doctor::{fix, print_attention, Environment, RealExecutor, Session};
 use visdom_cli::finding::FixAction;
@@ -24,7 +25,7 @@ use visdom_cli::mode::{
 };
 use visdom_cli::subscription;
 use visdom_cli::suite::PolicyState;
-use visdom_cli::surface::Surface;
+use visdom_cli::surface::{self, Platform, Surface};
 use visdom_cli::{config, interactive};
 use visdom_cli::{doctor as checks, env_alias, instructions, launch};
 
@@ -1096,6 +1097,115 @@ fn stop_on_billing(session: &Session) {
     }
 }
 
+/// Stop: the desktop app is not opened, and why.
+fn not_opened(why: &str) -> ! {
+    eprintln!(
+        "{}",
+        desktop::closing_line(&Closing::NotOpened(why.to_string()), None)
+    );
+    exit(1)
+}
+
+/// The command that opens Claude Desktop for this session, or a refusal that
+/// says what to do instead: a session the desktop cannot run, arguments it
+/// cannot be given, no app, no terminal CLI, or no terminal where
+/// `claude --desktop` needs one.
+fn desktop_open(
+    session: &Session,
+    env: &Environment,
+    agent_args: &[String],
+) -> desktop::DesktopOpen {
+    let platform = Platform::current();
+    let args = surface::supports(session.surface, session.ctx.agent, &session.mode, &platform)
+        .and_then(|()| surface::desktop_args(&platform, agent_args))
+        .unwrap_or_else(|why| {
+            eprintln!("{}", surface::refusal(&why));
+            exit(1)
+        });
+    let back = format!(
+        "use --surface terminal (or {}=terminal)",
+        surface::SURFACE_ENV
+    );
+    if desktop::app_installed(&platform, &env.home, &|name| std::env::var(name).ok()) == Some(false)
+    {
+        not_opened(&format!(
+            "the app is not installed here: install it, or {back}"
+        ));
+    }
+    let claude = session.adapter.program();
+    if desktop::find_program(claude, std::env::var_os("PATH").as_deref()).is_none() {
+        not_opened(&format!(
+            "`{claude}` was not found. Install the Claude Code CLI: the desktop surface needs \
+             it. Or {back}"
+        ));
+    }
+    let names: Vec<String> = std::env::vars_os()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .collect();
+    let open = desktop::open_command(
+        &platform,
+        claude,
+        &session.ctx.workdir.start_dir,
+        &args,
+        &names,
+    );
+    if open.needs_terminal && !(stdin_is_tty() && std::io::stdout().is_terminal()) {
+        not_opened(&format!(
+            "`{claude} --desktop` needs a terminal, and visdom was run without one: run it in a \
+             terminal, or {back}"
+        ));
+    }
+    open
+}
+
+/// Open Claude Desktop and say, in the last line, what state its sessions
+/// are in. `visdom` does not become the agent here.
+fn open_desktop(open: desktop::DesktopOpen, session: &Session) -> ! {
+    let closing = desktop::closing_for(&session.collect());
+    let choose = open.choose_folder.clone();
+    if open.detached {
+        if let Err(why) = desktop::spawn_detached(open.command) {
+            not_opened(&why);
+        }
+        eprintln!("{}", desktop::closing_line(&closing, choose.as_deref()));
+        exit(0)
+    }
+    // `claude --desktop` has this terminal, and says itself what it opened
+    // or why it could not (no app, no subscription login).
+    let mut command = open.command;
+    let program = command.get_program().to_string_lossy().into_owned();
+    match command.status() {
+        Ok(status) if status.success() => {
+            eprintln!("{}", desktop::closing_line(&closing, choose.as_deref()));
+            exit(0)
+        }
+        Ok(status) => {
+            eprintln!(
+                "{}",
+                desktop::closing_line(
+                    &Closing::NotOpened(format!(
+                        "`{program} --desktop` failed ({status}); what it said is above"
+                    )),
+                    None
+                )
+            );
+            exit(status.code().unwrap_or(1))
+        }
+        Err(error) => {
+            eprintln!(
+                "{}",
+                launch::launch_error_message(
+                    &program,
+                    &error,
+                    session.ctx.agent,
+                    &session.user_config_path
+                )
+            );
+            exit(127)
+        }
+    }
+}
+
 /// Plain `visdom`: check, offer the fixes, start the agent. Findings never
 /// stop the agent from starting; only a gateway the workspace requires and
 /// that cannot be used does.
@@ -1111,6 +1221,9 @@ fn check_and_launch(
 ) -> ! {
     let env = Environment::current();
     let mut session = gather_on(&env, agent, mode, billing, surface, &runtime);
+    // What the desktop cannot do is said before anything is changed.
+    let desktop =
+        (session.surface == Surface::Desktop).then(|| desktop_open(&session, &env, agent_args));
     check_subscription(&mut session, &runtime, false, agent_args);
     let findings = session.collect();
     print_attention(&findings);
@@ -1131,6 +1244,16 @@ fn check_and_launch(
     if matches!(session.billing_use, BillingUse::Rejected(_)) {
         eprintln!("visdom: the agent is not started: correct the billing (gateway.billing above)");
         exit(2);
+    }
+    if let Some(open) = desktop {
+        if !instructions {
+            eprintln!(
+                "visdom: --no-instructions has no effect on the desktop surface: set \
+                 agent_instructions = false in the user config"
+            );
+        }
+        drop(runtime);
+        open_desktop(open, &session)
     }
     // In the directory visdom was run in, like starting the agent by hand.
     let AgentCommand { cmd, private_file } = agent_command(&session, &runtime, agent_args);
