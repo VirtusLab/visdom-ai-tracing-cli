@@ -105,6 +105,9 @@ fn main() {
                 init_mode(&runtime, agent, cli.mode, cli.billing);
                 init_gateway(&runtime, agent, cli.mode, cli.billing, scope.scope);
             }
+            if agent == Agent::ClaudeCode {
+                init_surface(cli.surface);
+            }
         }
         Some(VisdomCommand::Doctor {
             fix,
@@ -292,6 +295,56 @@ fn gather_on(
 
 fn stdin_is_tty() -> bool {
     std::io::stdin().is_terminal()
+}
+
+/// Where `visdom` opens Claude Code, in `visdom init`: `--surface` is saved
+/// to the user config without asking; with nothing chosen anywhere, the
+/// Claude Desktop app installed and somebody to ask, the answer is. Nothing
+/// is asked of a developer without the app, and an empty answer changes
+/// nothing.
+fn init_surface(flag: Option<Surface>) {
+    let env = Environment::current();
+    let path = config::user_config_path_in(&env.config_root);
+    let surface = match flag {
+        Some(surface) => surface,
+        None => {
+            let user = config::load_user_config_in(&env.config_root).unwrap_or_default();
+            let chosen = env.surface.is_some()
+                || user.surface.is_some()
+                || checks_repo_config(&env).surface.is_some();
+            if chosen || !interactive::is_interactive() {
+                return;
+            }
+            let installed = desktop::app_installed(&Platform::current(), &env.home, &|name| {
+                std::env::var(name).ok()
+            });
+            let answer = interactive::ask_surface(
+                installed,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stderr(),
+            );
+            match answer {
+                Some(surface) => surface,
+                None => return,
+            }
+        }
+    };
+    match interactive::save_surface(&path, surface) {
+        Ok(()) => eprintln!(
+            "Saved surface = \"{}\" to {}",
+            surface.name(),
+            path.display()
+        ),
+        Err(e) => {
+            eprintln!("visdom: the surface could not be saved: {e}");
+            eprintln!(
+                "  Set it yourself: export {}={}",
+                surface::SURFACE_ENV,
+                surface.name()
+            );
+            exit(1);
+        }
+    }
 }
 
 /// What the command line chose for a session; `None` leaves it to the

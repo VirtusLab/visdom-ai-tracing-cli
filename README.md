@@ -147,6 +147,12 @@ visible to `visdom` and would be replaced: use `agent_instructions = false` ther
 user config leaves it out always. An agent started without `visdom` (see `visdom env`) is not told
 anything: `claude --append-system-prompt "$(visdom instructions)"` does it by hand.
 
+A Claude Code session that `visdom` did not start — in the Claude Desktop app, or a plain
+`claude` in a terminal — has no command line of `visdom`'s to be told on. Its `SessionStart` hook
+hands it the same text instead, made from what the files say that session has (a login, a
+registered bazaar server); no request is made for it. An agent `visdom` starts is marked
+(`VISDOM_LAUNCHED`) so it is not told twice, and `agent_instructions = false` turns this off too.
+
 ### Hooks or the AI Gateway
 
 A session reaches AI Tracing one of two ways, and **you choose**:
@@ -371,8 +377,11 @@ Settings:
   url = "https://ai-gateway.example.com"   # the console, until the server publishes it
   billing = "project"                  # or "subscription" (Claude Code): who pays
   ```
-- A repository may name its own in `.visdom/config.toml`: `agent`, `tracing_mode`, and
-  `[gateway] project` and `billing`.
+- A repository may name its own in `.visdom/config.toml`: `agent`, `tracing_mode`, `surface`,
+  and `[gateway] project` and `billing`.
+- Where the agent opens: `--surface`, then `VISDOM_SURFACE`, then `surface` in the repository's
+  config, then in the user config (`surface = "desktop"`), then `terminal`. See
+  [Claude Desktop](#claude-desktop----surface-desktop).
 - Who pays: `--billing`, then `VISDOM_GATEWAY_BILLING`, then `[gateway] billing` in the
   repository's config, then in the user config, then `project`.
 - The gateway project: `VISDOM_GATEWAY_PROJECT`, then `[gateway] project` in the repository's
@@ -391,6 +400,71 @@ Settings:
 `tracevault` keeps working during the transition and both binaries share one login
 (`visdom/credentials.json`). Run interactively, `tracevault` prints a one-line deprecation note
 on stderr.
+
+### Claude Desktop — `--surface desktop`
+
+`visdom` can open Claude Code in the Claude Desktop app instead of this terminal. Where it opens
+is the *surface*: `terminal` (the default) or `desktop`. It is `--surface`, then `VISDOM_SURFACE`,
+then `surface` in the repository's `.visdom/config.toml`, then `surface` in the user config.
+`visdom init` asks for it when the app is installed and nothing names it yet, and
+`visdom --surface desktop init` saves it without asking.
+
+```sh
+visdom --surface desktop        # checks, offers the fixes, opens the app, exits
+visdom doctor --surface desktop # the terminal's checks, and the desktop's on top
+```
+
+With the desktop surface `visdom` runs the same checks and offers the same fixes, then opens the
+app and exits — it does not become the agent. Sessions in the app are traced by the same hooks,
+see the same bazaar server, and learn of Visdom's tools from their `SessionStart` hook.
+
+| Platform | How the app is opened |
+|---|---|
+| macOS, Windows x64 | `claude --desktop` in the directory `visdom` was run in. Needs a terminal, Claude Code 2.1.285 or later and a Claude subscription login (the command's own requirements). `--continue` and `--resume <session id>` are passed on. |
+| Linux | The `claude://code/new` link, through `xdg-open`. **Best effort:** the link cannot name a folder, so `visdom` tells you which one to choose in the app, and it takes no arguments. |
+| anything else | Refused, by name. |
+
+The last line says what state that leaves you in:
+
+- `opened Claude Desktop; sessions there are traced by hooks.`
+- `opened Claude Desktop, but sessions there are NOT traced: …` — an error remains in what hooks
+  tracing needs (not logged in, hooks not installed, `visdom` not where the app finds it). As in
+  the terminal, findings do not stop the launch.
+- `Claude Desktop was not opened: …` — and why; exit 1.
+
+What the desktop cannot do is refused, never dropped silently, and each refusal names the way
+back (`--surface terminal`, or `VISDOM_SURFACE=terminal` for a repository that asks for the
+desktop):
+
+- **Gateway mode.** Sessions in the app cannot go through the AI Gateway yet (VIS-1396). With
+  `tracing_mode = gateway`, chosen or required by the workspace, the desktop is refused.
+- **Agent arguments** other than `--continue` / `--resume <id>`: they go to the terminal agent.
+  `--no-instructions` has no effect there (`agent_instructions = false` does).
+- **Codex**: its desktop app is not supported yet.
+- No app, no `claude` CLI (the desktop surface needs it to open the app and to register bazaar),
+  or — on macOS and Windows — no terminal.
+
+`visdom doctor` checks the desktop when it is the surface a plain `visdom` would open, or with
+`--surface desktop` (`all` is the same: the desktop is checked on top of the terminal). Its
+findings are the `desktop` component, and carry `"surface": "desktop"` in `--json`:
+
+- whether the app and the `claude` CLI are there (the app: `/Applications/Claude.app`, a
+  `.desktop` file handling `claude://` under the XDG data directories, or what
+  `VISDOM_CLAUDE_DESKTOP_APP` names; on Windows `visdom` cannot tell and says so);
+- **whether hooks in desktop sessions will find `visdom`.** Hooks run `visdom` by name, and the
+  app does not have your terminal's `PATH`: when it starts it reads what your login shell
+  exports. `doctor` asks your login shell the same and, when `visdom` is not there, offers to
+  link it into a directory of yours that is — then quit and reopen the app;
+- the Claude Code the app runs (its own copy, not the terminal's);
+- **whether a desktop session was actually traced**: `visdom` notes when it opened the app, and
+  the hook notes the first event the server accepted from a desktop session
+  (`visdom/desktop-evidence.json` in your config directory; nothing of it is sent). `doctor`
+  reports "a desktop session was traced at …", or that the app was opened and no traced session
+  has been seen since.
+
+The app keeps the environment it was started with and gives it to every session, so `visdom`
+opens it without this terminal's session variables (`VISDOM_SESSION_ID`, the gateway session
+marker, `CLAUDE_CODE_*`). An app that was already running keeps what it had.
 
 ### Which command the hooks call
 
