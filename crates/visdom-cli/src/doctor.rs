@@ -9,6 +9,7 @@ use tracevault_cli::agent::Agent;
 use tracevault_cli::credentials::Credential;
 
 use crate::agents::{adapter_for, AgentAdapter, AgentPaths, McpScope, Workdir};
+use crate::billing::{self, billing_use, Billing, BillingUse, ResolvedBilling};
 use crate::components::gateway::GatewayPlan;
 use crate::components::{
     bazaar, gateway as gateway_checks, tracing, CheckContext, CredentialState,
@@ -103,6 +104,8 @@ pub struct Environment {
     pub gateway_project: Option<String>,
     /// `VISDOM_GATEWAY_MODEL`: the model alias the agent asks the gateway for.
     pub gateway_model: Option<String>,
+    /// `VISDOM_GATEWAY_BILLING`: who pays for the calls through the gateway.
+    pub gateway_billing: Option<String>,
 }
 
 impl Environment {
@@ -122,6 +125,7 @@ impl Environment {
             control_plane_url: set("VISDOM_CONTROL_PLANE_URL"),
             gateway_project: set(GATEWAY_PROJECT_ENV),
             gateway_model: set(GATEWAY_MODEL_ENV),
+            gateway_billing: set(billing::BILLING_ENV),
             home,
         }
     }
@@ -160,15 +164,21 @@ pub struct Session {
     /// Whether the agent is told about Visdom's tools (`agent_instructions`
     /// in the user config; yes unless that says no).
     pub agent_instructions: bool,
+    /// Who pays for the agent's calls through the gateway, and who said so.
+    pub billing: ResolvedBilling,
+    /// Whether that can be used in this session's mode with this agent.
+    pub billing_use: BillingUse,
 }
 
 impl Session {
     /// Read the config files, choose the agent and gather the check context.
-    /// The only error is an agent that cannot be chosen or launched.
+    /// The errors are an agent that cannot be chosen or launched, and a mode
+    /// or billing in the environment that names none.
     pub fn gather(
         env: &Environment,
         agent_flag: Option<Agent>,
         mode_flag: Option<TracingMode>,
+        billing_flag: Option<Billing>,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Session, String> {
         let mut warnings = Vec::new();
@@ -193,6 +203,15 @@ impl Session {
             env.mode.as_deref(),
             repo.tracing_mode,
             user.tracing_mode,
+        )?;
+        let billing = billing::configured_billing(
+            billing_flag,
+            env.gateway_billing.as_deref(),
+            repo.gateway.billing,
+            user.gateway.billing,
+            &config::user_config_path_in(&env.config_root)
+                .display()
+                .to_string(),
         )?;
 
         let tracing_root = project_dir
@@ -254,6 +273,7 @@ impl Session {
             &suite::policy_cache_path_in(&env.config_root),
         ));
         let mode = effective_mode(chosen, policy.policy());
+        let billing_use = billing_use(&billing, &mode, agent);
         // The environment first, then the files, then what the server says:
         // a setting left out of the config is taken from the environment.
         let user_file = config::user_config_path_in(&env.config_root);
@@ -336,6 +356,8 @@ impl Session {
             },
             config_root: env.config_root.clone(),
             agent_instructions: user.agent_instructions.unwrap_or(true),
+            billing,
+            billing_use,
         })
     }
 
@@ -394,6 +416,10 @@ impl Session {
             &self.policy,
             self.gateway.as_ref(),
             self.ctx.agent,
+        ));
+        findings.extend(gateway_checks::billing_finding(
+            &self.billing,
+            &self.billing_use,
         ));
         findings.extend(bazaar::check(
             self.bazaar_url

@@ -19,7 +19,7 @@ visdom doctor --fix         # …and offer the fixes (--yes applies all, --json 
 
 | Command | What it does |
 |---|---|
-| `visdom [--agent <a>] [--mode <m>] [--yes] [--no-instructions] [-- <agent args>]` | Check, offer each fix, start the agent in the current directory. Findings never stop the agent from starting (one exception: a gateway the workspace requires and that cannot be used, see below). |
+| `visdom [--agent <a>] [--mode <m>] [--billing <b>] [--yes] [--no-instructions] [-- <agent args>]` | Check, offer each fix, start the agent in the current directory. Findings never stop the agent from starting (one exception: a gateway the workspace requires and that cannot be used, see below). |
 | `visdom doctor [--fix] [--yes] [--json] [--agent <a>] [--mode <m>]` | The same checks without starting anything. |
 | `visdom login` / `visdom logout` | Same as `visdom login` / `logout`. |
 | `visdom init [...]` | Sets up this repository, the whole machine (`--global`) or a folder of checkouts (`--workspace`) — asked when no flag says which: tracing (`visdom trace init`, same flags), then registers the bazaar MCP server for the agent, then asks how your sessions are traced when that is yours to choose — and, through the AI Gateway, leaves the gateway ready to use. |
@@ -69,6 +69,10 @@ When your sessions go through the AI Gateway — you chose it just now or earlie
 ends by making the gateway ready, so that the first `visdom` does not fail on something init
 could have settled:
 
+- for Claude Code, it asks who pays for its calls — `[1] the project (gateway key)  [2] my Claude
+  subscription  (default 1)` — when nothing names it yet, and saves the answer as
+  `[gateway] billing` (see [Who pays](#who-pays-the-project-or-your-claude-subscription));
+  `visdom --mode gateway --billing subscription init` saves it without asking;
 - it writes down the gateway project (`[gateway] project`): the only one open to you, or, with
   several, the one you pick — so that a project opened to you later does not unsettle it;
 - it issues your personal key and tries it on the LLM gateway;
@@ -84,6 +88,7 @@ could have settled:
     LLM gateway  https://llm.example.com  (named by the console)
     project      payments                 (project under [gateway] in ~/.config/visdom/config.toml)
     model        claude-sonnet            (claude_code_model under [gateway] in ~/.config/visdom/config.toml)
+    billing      project (gateway key)    (billing under [gateway] in ~/.config/visdom/config.toml)
     personal key issued, and accepted by the LLM gateway  (kept for you only, renewed by `visdom`)
   ```
 
@@ -93,7 +98,7 @@ gateway that refuses the key, no model alias to ask for, a config that cannot be
 
 Every one of these settings can be kept in the config file; **what is left out there is taken
 from the environment** (`VISDOM_TRACING_MODE`, `VISDOM_GATEWAY_URL`, `VISDOM_GATEWAY_PROJECT`,
-`VISDOM_GATEWAY_MODEL`), and a variable that is set wins over the file — see Settings below.
+`VISDOM_GATEWAY_MODEL`, `VISDOM_GATEWAY_BILLING`), and a variable that is set wins over the file — see Settings below.
 
 ### What the agent is told
 
@@ -215,6 +220,35 @@ options of yours that choose another provider):
 An API key (`VISDOM_API_KEY`) is only ever sent to the tracing server; the gateway and Control
 Plane need a Visdom account login (`visdom login`).
 
+#### Who pays: the project or your Claude subscription
+
+Inside gateway mode there is a second choice, `billing` under `[gateway]`:
+
+- `project` (the default) — the agent's calls are paid by the project, through your personal
+  gateway key, as described above;
+- `subscription` — Claude Code's calls are paid by your own Claude subscription (its claude.ai
+  login), while still going through the gateway. **Claude Code only**: for Codex it is refused as
+  not supported yet. **Not started yet by this version:** with `subscription`, `visdom` (and
+  `visdom env`) stop with an error instead of starting the agent, rather than let the project pay
+  for it; `--billing project` starts it the usual way meanwhile.
+
+Who pays is `--billing`, then `VISDOM_GATEWAY_BILLING` (a blank one is ignored, one that names
+neither value is an error), then `[gateway] billing` in the repository's or workspace folder's
+`.visdom/config.toml`, then in the user config, then `project`. `visdom init` asks for it (Claude
+Code, gateway mode, nothing set yet) and saves it in the user config; `visdom --billing … init`
+saves it without asking, and fails when the environment or the repository's config names another
+value that would win. `visdom doctor` and init's summary show the value and where it comes from
+(finding `gateway.billing`).
+
+`subscription` only means something through the gateway: with hooks tracing it is an error that
+says why (hooks have no gateway key that would pay or not pay). A workspace policy `enforced`
+allows either value — it means through the gateway, not paid by the project; under `direct` the
+setting is unused.
+
+Through the gateway, the gateway sees and forwards the subscription's traffic, including its
+credential. Whether your organisation's arrangement with Anthropic permits that is for your
+organisation to make sure of; `visdom` does not check it.
+
 #### The agent started without `visdom` — `visdom env`
 
 `visdom` is the way to start an agent through the gateway. For the times it is started some
@@ -266,9 +300,12 @@ Settings:
   claude_code_model = "claude-sonnet"  # model aliases to ask the gateway for
   codex_model = "gpt-general"
   url = "https://ai-gateway.example.com"   # the console, until the server publishes it
+  billing = "project"                  # or "subscription" (Claude Code): who pays
   ```
 - A repository may name its own in `.visdom/config.toml`: `agent`, `tracing_mode`, and
-  `[gateway] project`.
+  `[gateway] project` and `billing`.
+- Who pays: `--billing`, then `VISDOM_GATEWAY_BILLING`, then `[gateway] billing` in the
+  repository's config, then in the user config, then `project`.
 - The gateway project: `VISDOM_GATEWAY_PROJECT`, then `[gateway] project` in the repository's
   config, then in the user config, then the only project open to you.
 - The model alias: `VISDOM_GATEWAY_MODEL`, then `[gateway] claude_code_model` / `codex_model` in

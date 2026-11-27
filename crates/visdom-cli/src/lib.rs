@@ -4,6 +4,7 @@
 //! not, and launches the agent.
 
 pub mod agents;
+pub mod billing;
 pub mod cli;
 pub mod components;
 pub mod config;

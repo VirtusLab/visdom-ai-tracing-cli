@@ -1798,3 +1798,325 @@ fn a_workspaces_new_config_keeps_the_mode_chosen_further_up() {
         lines(&log)
     );
 }
+
+/// Who pays, named further up, is kept in a workspace folder's new config
+/// too: otherwise that file would hide it and the project would pay.
+#[test]
+fn a_workspaces_new_config_keeps_the_billing_chosen_further_up() {
+    let settings = policy("per_agent");
+    let server = MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        PROJECTS,
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ]);
+    let (sb, log) = sandbox(&server);
+    let above = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(above.path().join(".visdom")).unwrap();
+    std::fs::write(
+        above.path().join(".visdom/config.toml"),
+        "tracing_mode = \"gateway\"\n\n[gateway]\nbilling = \"subscription\"\n",
+    )
+    .unwrap();
+    let folder = above.path().join("platform");
+    std::fs::create_dir_all(&folder).unwrap();
+    let output = sb
+        .visdom(&folder)
+        .args(["init", "--workspace", "--project", "my-platform"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let own = std::fs::read_to_string(folder.join(".visdom/config.toml")).unwrap();
+    assert!(own.contains("billing = \"subscription\""), "{own}");
+
+    // Still the subscription: the launch stops rather than let the project pay.
+    let output = sb.visdom(&folder).output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(lines(&log)
+        .iter()
+        .all(|l| l != "VISDOM_GATEWAY_SESSION=claude-code"));
+}
+
+fn gateway_server(policy_name: &str) -> MockServer {
+    let settings = policy(policy_name);
+    MockServer::start(&[
+        SUITE,
+        ("GET /api/v1/workspace/settings", 200, &settings),
+        SETTINGS,
+        ONE_PROJECT,
+        ISSUE,
+        MODELS,
+    ])
+}
+
+fn finding(output: &std::process::Output, id: &str) -> serde_json::Value {
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(output)).unwrap_or_else(|e| panic!("{e}: {}", stdout(output)));
+    json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("no {id} in {json}"))
+}
+
+/// `visdom --mode gateway --billing subscription init` saves who pays without
+/// asking and shows it with its source. Starting Claude Code on the
+/// subscription is not in this version: a launch stops instead of letting the
+/// project pay.
+#[test]
+fn init_saves_the_billing_given_on_the_command_line() {
+    let server = gateway_server("per_agent");
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway", "--billing", "subscription", "init"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let said = stdout(&output);
+    assert!(said.contains("AI Gateway ready for Claude Code"), "{said}");
+    assert!(said.contains("my Claude subscription"), "{said}");
+    assert!(said.contains("(--billing)"), "{said}");
+    assert!(said.contains("not available in this version"), "{said}");
+    assert!(!said.to_lowercase().contains("terms"), "{said}");
+    let config = std::fs::read_to_string(sb.user_config()).unwrap();
+    assert!(config.contains("billing = \"subscription\""), "{config}");
+    assert!(config.contains("tracing_mode = \"gateway\""), "{config}");
+
+    let (agent, log) = sb.recording_agent(&VARIABLES);
+    let mut config = config;
+    config.push_str(&format!(
+        "\n[agents]\nclaude_code = \"{}\"\n",
+        agent.display()
+    ));
+    sb.write_user_config(&config);
+    let output = sb.visdom(sb.repo.path()).output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("not available in this version of visdom yet"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(lines(&log).is_empty(), "the agent must not have run");
+    // `--billing project` for one run starts it, paid by the project.
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--billing", "project"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(lines(&log).contains(&"VISDOM_GATEWAY_SESSION=claude-code".to_string()));
+}
+
+/// A billing saved earlier is used by `init` without asking, and shown with
+/// the file it comes from; `doctor` reports it too.
+#[test]
+fn init_and_doctor_show_a_saved_billing_and_where_it_is() {
+    let server = gateway_server("enforced");
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    sb.write_user_config("[gateway]\nbilling = \"project\"\n");
+    let output = sb.visdom(sb.repo.path()).arg("init").output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let said = stdout(&output);
+    assert!(said.contains("project (gateway key)"), "{said}");
+    assert!(said.contains("billing under [gateway] in"), "{said}");
+    assert!(!said.contains("not available"), "{said}");
+
+    // `enforced` is satisfied by a subscription too: reported, not refused.
+    sb.write_user_config("[gateway]\nbilling = \"subscription\"\n");
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let billing = finding(&output, "gateway.billing");
+    assert_eq!(billing["severity"], "warn", "{billing}");
+    let message = billing["message"].as_str().unwrap();
+    assert!(message.contains("billing under [gateway] in"), "{message}");
+    // The environment comes before the file.
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["doctor", "--json"])
+        .env("VISDOM_GATEWAY_BILLING", "project")
+        .output()
+        .unwrap();
+    let billing = finding(&output, "gateway.billing");
+    assert_eq!(billing["severity"], "ok", "{billing}");
+    assert!(billing["message"]
+        .as_str()
+        .unwrap()
+        .contains("VISDOM_GATEWAY_BILLING in the environment"));
+    // A blank variable is not set; one that names nothing is an error.
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["doctor", "--json"])
+        .env("VISDOM_GATEWAY_BILLING", " ")
+        .output()
+        .unwrap();
+    assert_eq!(finding(&output, "gateway.billing")["severity"], "warn");
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["doctor", "--json"])
+        .env("VISDOM_GATEWAY_BILLING", "free")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("VISDOM_GATEWAY_BILLING"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// A subscription outside the gateway, or for Codex, is an error that says
+/// why, and nothing is started or saved.
+#[test]
+fn a_subscription_where_it_cannot_be_used_is_refused() {
+    let server = gateway_server("per_agent");
+    let (sb, log) = sandbox(&server);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "hooks", "--billing", "subscription"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let said = stderr(&output);
+    assert!(said.contains("hooks tracing has no gateway key"), "{said}");
+    assert!(lines(&log).is_empty(), "the agent must not have run");
+
+    let output = sb
+        .visdom(sb.repo.path())
+        .args([
+            "--agent",
+            "codex",
+            "--mode",
+            "gateway",
+            "--billing",
+            "subscription",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("not supported yet for Codex"),
+        "{}",
+        stderr(&output)
+    );
+
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "hooks", "--billing", "subscription", "init"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let config = std::fs::read_to_string(sb.user_config()).unwrap();
+    assert!(!config.contains("billing"), "{config}");
+
+    let output = sb
+        .visdom(sb.repo.path())
+        .args([
+            "doctor",
+            "--json",
+            "--mode",
+            "hooks",
+            "--billing",
+            "subscription",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(finding(&output, "gateway.billing")["severity"], "error");
+}
+
+/// Where the repository's config names who pays, a different `--billing`
+/// saved by init would not be used by a plain `visdom`: init says so.
+#[test]
+fn init_fails_when_the_billing_it_saves_would_be_overruled() {
+    let server = gateway_server("per_agent");
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    std::fs::create_dir_all(sb.repo.path().join(".visdom")).unwrap();
+    std::fs::write(
+        sb.repo.path().join(".visdom/config.toml"),
+        "[gateway]\nbilling = \"project\"\n",
+    )
+    .unwrap();
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--mode", "gateway", "--billing", "subscription", "init"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let said = stderr(&output);
+    assert!(said.contains(".visdom/config.toml"), "{said}");
+    assert!(!stdout(&output).contains("AI Gateway ready"));
+}
+
+/// `visdom env` with the subscription: no script that would let the project
+/// pay, an error saying it is not available yet; Codex is refused outright.
+#[test]
+fn env_refuses_a_subscription_it_cannot_set_up() {
+    let server = gateway_server("per_agent");
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["--billing", "subscription", "env"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("not available in this version of visdom yet"),
+        "{}",
+        stderr(&output)
+    );
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["env", "--agent", "codex"])
+        .env("VISDOM_GATEWAY_BILLING", "subscription")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("not supported yet for Codex"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// Codex is not asked who pays, but `--billing project` given to its init is
+/// kept: a subscription saved earlier (for Claude Code) would otherwise stop
+/// every Codex launch.
+#[test]
+fn codex_init_keeps_an_explicit_project_billing() {
+    let server = gateway_server("per_agent");
+    let sb = Sandbox::new();
+    sb.log_in(&server.url, PERSON_TOKEN);
+    sb.write_user_config("[gateway]\nbilling = \"subscription\"\n");
+    let output = sb
+        .visdom(sb.repo.path())
+        .args([
+            "--mode",
+            "gateway",
+            "--billing",
+            "project",
+            "init",
+            "--agent",
+            "codex",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let config = std::fs::read_to_string(sb.user_config()).unwrap();
+    assert!(config.contains("billing = \"project\""), "{config}");
+    assert!(stdout(&output).contains("AI Gateway ready for Codex"));
+}

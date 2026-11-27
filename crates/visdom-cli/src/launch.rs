@@ -151,6 +151,7 @@ pub fn gateway_setting_env(key: &str) -> Option<&'static str> {
     match key {
         "project" => Some("export VISDOM_GATEWAY_PROJECT=<project>"),
         "url" => Some("export VISDOM_GATEWAY_URL=<console address>"),
+        "billing" => Some("export VISDOM_GATEWAY_BILLING=<project|subscription>"),
         key if key.ends_with("_model") => Some("export VISDOM_GATEWAY_MODEL=<model alias>"),
         _ => None,
     }
@@ -206,11 +207,12 @@ pub fn usable_model(
 /// ready or who wants another one.
 pub fn gateway_settings_hint(user_config: &Path) -> String {
     format!(
-        "  Settings: `url`, `project`, `claude_code_model`, `codex_model` under [gateway] and \
-         `tracing_mode` in {}.\n  \
+        "  Settings: `url`, `project`, `claude_code_model`, `codex_model`, `billing` under \
+         [gateway] and `tracing_mode` in {}.\n  \
          Left out there, they are taken from the environment — VISDOM_GATEWAY_URL, \
-         VISDOM_GATEWAY_PROJECT, VISDOM_GATEWAY_MODEL, VISDOM_TRACING_MODE (which win over the \
-         file when set) — and the gateway's address from the tracing server.",
+         VISDOM_GATEWAY_PROJECT, VISDOM_GATEWAY_MODEL, VISDOM_GATEWAY_BILLING, \
+         VISDOM_TRACING_MODE (which win over the file when set) — and the gateway's address \
+         from the tracing server.",
         user_config.display()
     )
 }
@@ -223,6 +225,7 @@ pub fn gateway_summary(
     plan: &crate::components::gateway::GatewayPlan,
     sources: &crate::doctor::GatewaySources,
     model: Option<&str>,
+    billing: &crate::billing::ResolvedBilling,
     user_config: &Path,
 ) -> String {
     use crate::mode::ModeReason;
@@ -265,6 +268,15 @@ pub fn gateway_summary(
             },
         ),
         (
+            "billing",
+            match billing.billing {
+                crate::billing::Billing::Project => "project (gateway key)",
+                crate::billing::Billing::Subscription => "my Claude subscription",
+            }
+            .to_string(),
+            billing.source.describe(),
+        ),
+        (
             "personal key",
             "issued, and accepted by the LLM gateway".to_string(),
             "kept for you only, renewed by `visdom`".to_string(),
@@ -281,6 +293,9 @@ pub fn gateway_summary(
     );
     for (name, value, source) in rows {
         out.push_str(&format!("  {name:<13}{value:<width$}  ({source})\n"));
+    }
+    if let Some(why) = crate::billing::launch_unavailable(billing) {
+        out.push_str(&format!("  Note: {why}.\n"));
     }
     out.push_str(&gateway_settings_hint(user_config));
     out.push_str(

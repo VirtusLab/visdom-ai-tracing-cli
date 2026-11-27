@@ -3,6 +3,7 @@
 
 use tracevault_cli::agent::Agent;
 
+use crate::billing::{self, Billing, BillingUse, ResolvedBilling};
 use crate::finding::{Finding, Severity};
 use crate::gateway::OpenProject;
 use crate::mode::{ModeReason, ResolvedMode, TracingMode, TrafficPolicy};
@@ -148,6 +149,43 @@ pub fn check(
     findings
 }
 
+/// Who pays for the agent's calls through the gateway, and who said so
+/// (`gateway.billing`). Nothing outside the gateway unless a subscription is
+/// set where it cannot be used.
+pub fn billing_finding(billing: &ResolvedBilling, usage: &BillingUse) -> Option<Finding> {
+    const ID: &str = "gateway.billing";
+    let finding = match (usage, billing.billing) {
+        (BillingUse::Rejected(why), _) => Finding::new(COMPONENT, ID, Severity::Error, why.clone()),
+        (BillingUse::Unused, Billing::Project) => return None,
+        (BillingUse::Unused, Billing::Subscription) => Finding::new(
+            COMPONENT,
+            ID,
+            Severity::Info,
+            format!(
+                "billing = {}: not used, the workspace's AI traffic policy keeps sessions off the \
+                 AI Gateway",
+                billing.describe()
+            ),
+        ),
+        (BillingUse::Applies, Billing::Project) => Finding::new(
+            COMPONENT,
+            ID,
+            Severity::Ok,
+            format!(
+                "billing = {}: the project pays for the agent's calls, through your personal key",
+                billing.describe()
+            ),
+        ),
+        (BillingUse::Applies, Billing::Subscription) => Finding::new(
+            COMPONENT,
+            ID,
+            Severity::Warn,
+            billing::launch_unavailable(billing).unwrap_or_default(),
+        ),
+    };
+    Some(finding)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +318,40 @@ mod tests {
             Agent::ClaudeCode,
         );
         assert!(findings[1].message.contains("will not be started"));
+    }
+
+    #[test]
+    fn who_pays_is_reported_with_its_source() {
+        use crate::billing::BillingSource;
+        let project = ResolvedBilling {
+            billing: Billing::Project,
+            source: BillingSource::Default,
+        };
+        let finding = billing_finding(&project, &BillingUse::Applies).unwrap();
+        assert_eq!(
+            (finding.id, finding.severity),
+            ("gateway.billing", Severity::Ok)
+        );
+        assert!(
+            finding.message.contains("project (the default)"),
+            "{finding:?}"
+        );
+        assert!(billing_finding(&project, &BillingUse::Unused).is_none());
+
+        let sub = ResolvedBilling {
+            billing: Billing::Subscription,
+            source: BillingSource::Flag,
+        };
+        let finding = billing_finding(&sub, &BillingUse::Applies).unwrap();
+        assert_eq!(finding.severity, Severity::Warn);
+        assert!(finding.message.contains("not available"), "{finding:?}");
+        let finding = billing_finding(&sub, &BillingUse::Unused).unwrap();
+        assert_eq!(finding.severity, Severity::Info);
+        let finding = billing_finding(&sub, &BillingUse::Rejected("why".to_string())).unwrap();
+        assert_eq!(
+            (finding.severity, finding.message.as_str()),
+            (Severity::Error, "why")
+        );
     }
 
     #[test]
