@@ -10,6 +10,7 @@ use tracevault_cli::credentials::Credential;
 
 use crate::agents::{adapter_for, AgentAdapter, AgentPaths, McpScope, Workdir};
 use crate::billing::{self, billing_use, Billing, BillingUse, ResolvedBilling};
+use crate::components::desktop::DesktopFacts;
 use crate::components::gateway::GatewayPlan;
 use crate::components::{
     bazaar, gateway as gateway_checks, tracing, CheckContext, CredentialState,
@@ -22,6 +23,7 @@ use crate::instructions::{self, Facts, Told};
 use crate::mode::{configured_mode, effective_mode, ResolvedMode, TracingMode, MODE_ENV};
 use crate::subscription::{self, KeyState};
 use crate::suite::{self, PolicyState, SuiteMap};
+use crate::surface::{resolve_surface, Surface, SURFACE_ENV};
 
 /// The first of `candidates` that is set to something.
 fn first_set(candidates: [Option<String>; 3]) -> Option<String> {
@@ -107,6 +109,8 @@ pub struct Environment {
     pub gateway_model: Option<String>,
     /// `VISDOM_GATEWAY_BILLING`: who pays for the calls through the gateway.
     pub gateway_billing: Option<String>,
+    /// `VISDOM_SURFACE`.
+    pub surface: Option<String>,
 }
 
 impl Environment {
@@ -127,6 +131,7 @@ impl Environment {
             gateway_project: set(GATEWAY_PROJECT_ENV),
             gateway_model: set(GATEWAY_MODEL_ENV),
             gateway_billing: set(billing::BILLING_ENV),
+            surface: set(SURFACE_ENV),
             home,
         }
     }
@@ -171,6 +176,10 @@ pub struct Session {
     pub billing_use: BillingUse,
     /// What [`Session::check_subscription`] found; empty until it runs.
     pub subscription: Vec<Finding>,
+    /// Where the agent opens.
+    pub surface: Surface,
+    /// What the desktop surface is checked against; `None` in the terminal.
+    pub desktop: Option<DesktopFacts>,
 }
 
 impl Session {
@@ -182,6 +191,19 @@ impl Session {
         agent_flag: Option<Agent>,
         mode_flag: Option<TracingMode>,
         billing_flag: Option<Billing>,
+        runtime: &tokio::runtime::Runtime,
+    ) -> Result<Session, String> {
+        Session::gather_on(env, agent_flag, mode_flag, billing_flag, None, runtime)
+    }
+
+    /// [`Session::gather`] for a command that takes `--surface`. A surface in
+    /// the environment that names none is an error too.
+    pub fn gather_on(
+        env: &Environment,
+        agent_flag: Option<Agent>,
+        mode_flag: Option<TracingMode>,
+        billing_flag: Option<Billing>,
+        surface_flag: Option<Surface>,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Session, String> {
         let mut warnings = Vec::new();
@@ -201,6 +223,12 @@ impl Session {
             .unwrap_or_default();
         let repo: RepoConfig = repo;
         let agent = config::resolve_agent(agent_flag, env.agent.as_deref(), &repo, &user)?;
+        let surface = resolve_surface(
+            surface_flag,
+            env.surface.as_deref(),
+            repo.surface,
+            user.surface,
+        )?;
         let chosen = configured_mode(
             mode_flag,
             env.mode.as_deref(),
@@ -326,6 +354,7 @@ impl Session {
         };
         let adapter = adapter_for(agent, paths, user.agents.program_for(agent))
             .ok_or_else(|| format!("visdom cannot launch {}", agent.tool_name()))?;
+        let adapter_program = adapter.program().to_string();
         Ok(Session {
             ctx: CheckContext {
                 mode: mode.mode,
@@ -359,6 +388,9 @@ impl Session {
             },
             config_root: env.config_root.clone(),
             agent_instructions: user.agent_instructions.unwrap_or(true),
+            desktop: (surface == Surface::Desktop)
+                .then(|| desktop_facts(env, adapter_program.as_str())),
+            surface,
             billing,
             billing_use,
             subscription: Vec::new(),
@@ -545,6 +577,13 @@ impl Session {
             &self.billing_use,
         ));
         findings.extend(self.subscription.iter().cloned());
+        if let Some(facts) = &self.desktop {
+            findings.extend(crate::components::desktop::check(
+                facts,
+                self.ctx.agent,
+                &self.mode,
+            ));
+        }
         findings.extend(bazaar::check(
             self.bazaar_url
                 .as_ref()
@@ -556,6 +595,83 @@ impl Session {
             self.mcp_scope,
         ));
         findings
+    }
+}
+
+/// What the session-start hook tells a Claude Code session `visdom` did not
+/// start (in the Claude Desktop app, or a plain `claude`) about Visdom's
+/// tools: the text a launch gives on the command line, for what the files
+/// say this session has. From files only — no request is made, the hook must
+/// not wait — and `None` whenever anything cannot be read, or the developer
+/// turned the instructions off.
+pub fn hook_instructions(env: &Environment) -> Option<String> {
+    let user = config::load_user_config_in(&env.config_root).ok()?;
+    if user.agent_instructions == Some(false) {
+        return None;
+    }
+    let checkout = git_toplevel(&env.cwd);
+    let primary = checkout
+        .as_deref()
+        .map(|dir| tracevault_cli::paths::resolve_project_root(dir).root);
+    let credential_root = primary.as_deref().unwrap_or(&env.cwd);
+    let (server_url, credential) =
+        tracevault_cli::credentials::resolve_credentials_quiet(credential_root).ok()?;
+    // Where the tracing server last said the rest of the suite is.
+    let remembered = server_url
+        .as_deref()
+        .and_then(|url| {
+            suite::load_cached_suite(&suite::suite_cache_path_in(&env.config_root), url)
+        })
+        .unwrap_or_default();
+    let bazaar_url = bazaar::resolve_bazaar_url(env.bazaar_url.clone(), &user, &Ok(remembered))
+        .ok()
+        .flatten();
+    let agent = Agent::ClaudeCode;
+    let paths = AgentPaths {
+        home: env.home.clone(),
+        codex_home: env.codex_home.clone(),
+    };
+    let adapter = adapter_for(agent, paths, user.agents.program_for(agent))?;
+    let workdir = Workdir {
+        start_dir: env.cwd.clone(),
+        checkout,
+        primary,
+    };
+    instructions::compose_for_hook(&Facts {
+        // This is the session's own hook running: the hooks are installed.
+        tracing: server_url.is_some() && credential.is_some(),
+        bazaar: bazaar::registered_name(bazaar_url.as_deref(), adapter.as_ref(), &workdir),
+        gateway: false,
+    })
+}
+
+/// What the desktop surface is checked against on this machine, `claude`
+/// being the terminal CLI `visdom` opens the app with.
+fn desktop_facts(env: &Environment, claude: &str) -> DesktopFacts {
+    use crate::components::desktop::{bundled_version, login_shell_path};
+    use crate::surface::Platform;
+    let platform = Platform::current();
+    let read = |name: &str| std::env::var(name).ok();
+    // The app reads what the login shell exports when it starts (macOS and
+    // Linux); on Windows it takes the user's environment, which is not this
+    // terminal's to know.
+    let hook_path = match platform {
+        Platform::MacOs | Platform::Linux => {
+            login_shell_path(&read("SHELL").unwrap_or_else(|| "/bin/sh".into()))
+        }
+        _ => None,
+    };
+    DesktopFacts {
+        app_installed: crate::desktop::app_installed(&platform, &env.home, &read),
+        cli: claude.to_string(),
+        cli_found: crate::desktop::find_program(claude, std::env::var_os("PATH").as_deref())
+            .is_some(),
+        home: env.home.clone(),
+        visdom_exe: std::env::current_exe().unwrap_or_else(|_| "visdom".into()),
+        hook_path,
+        bundled_version: bundled_version(&env.config_root),
+        evidence: tracevault_cli::desktop_evidence::load(&env.config_root),
+        platform,
     }
 }
 

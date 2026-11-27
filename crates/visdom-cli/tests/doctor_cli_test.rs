@@ -456,3 +456,89 @@ fn a_machine_wide_visdom_setup_names_only_visdom() {
     assert!(md.contains("<!-- visdom:workspace-mode -->"), "{md}");
     assert!(md.contains("`visdom trace repo switch <path>`"), "{md}");
 }
+
+fn findings_of(output: &std::process::Output) -> Vec<serde_json::Value> {
+    let json: serde_json::Value = serde_json::from_str(&stdout(output))
+        .unwrap_or_else(|e| panic!("stdout must be JSON ({e}): {}", stdout(output)));
+    json["findings"].as_array().expect("findings").clone()
+}
+
+/// The desktop is checked when it is what a plain `visdom` would open, and
+/// only then: a terminal user's doctor is what it was.
+#[test]
+fn doctor_checks_the_resolved_surface_by_default() {
+    let sb = Sandbox::new();
+    let run = |sb: &Sandbox, args: &[&str]| {
+        let output = sb
+            .visdom(sb.repo.path())
+            .args(["doctor", "--json"])
+            .args(args)
+            .output()
+            .unwrap();
+        findings_of(&output)
+    };
+    let terminal = run(&sb, &[]);
+    assert!(terminal.iter().all(|f| f["component"] != "desktop"));
+    assert!(
+        terminal.iter().all(|f| f.get("surface").is_none()),
+        "the JSON of a terminal doctor has no new key"
+    );
+
+    sb.write_user_config("surface = \"desktop\"\n");
+    let desktop = run(&sb, &[]);
+    let ids: Vec<&str> = desktop
+        .iter()
+        .filter(|f| f["component"] == "desktop")
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    for id in [
+        "desktop.app",
+        "desktop.cli",
+        "desktop.hook_path",
+        "desktop.evidence",
+    ] {
+        assert!(ids.contains(&id), "{id} missing from {ids:?}");
+    }
+    // Asked about the terminal, the config's choice is set aside.
+    assert_eq!(run(&sb, &["--surface", "terminal"]), terminal);
+}
+
+#[test]
+fn doctor_all_reports_both_and_json_says_which() {
+    let sb = Sandbox::new();
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["doctor", "--surface", "all", "--json"])
+        .output()
+        .unwrap();
+    let findings = findings_of(&output);
+    let (desktop, shared): (Vec<_>, Vec<_>) =
+        findings.iter().partition(|f| f["component"] == "desktop");
+    assert!(!desktop.is_empty() && !shared.is_empty());
+    assert!(desktop.iter().all(|f| f["surface"] == "desktop"));
+    assert!(shared.iter().all(|f| f.get("surface").is_none()));
+    // No app in the sandbox: an error, not a pass.
+    let app = desktop.iter().find(|f| f["id"] == "desktop.app").unwrap();
+    assert_eq!(app["severity"], "error");
+}
+
+#[test]
+fn doctor_desktop_in_gateway_mode_exits_1_with_the_refusal_text() {
+    let sb = Sandbox::new();
+    sb.fake_app();
+    let output = sb
+        .visdom(sb.repo.path())
+        .args(["doctor", "--surface", "desktop", "--mode", "gateway"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("Desktop\n"), "{text}");
+    assert!(
+        text.contains(
+            "gateway mode was chosen, and gateway sessions in the Claude Desktop app are not \
+             supported yet (VIS-1396): use --surface terminal, or --mode hooks"
+        ),
+        "{text}"
+    );
+}

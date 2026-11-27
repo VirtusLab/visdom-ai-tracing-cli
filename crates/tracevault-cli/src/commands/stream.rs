@@ -1059,6 +1059,24 @@ async fn send_stream_event(
     req: &StreamEventRequest,
     warned: &mut bool,
 ) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn std::error::Error>> {
+    let sent = send_stream_event_inner(client, attribution, force, req, warned).await;
+    if sent.is_ok() {
+        // The one place that knows the server took an event: what `visdom
+        // doctor` shows as evidence that a Claude Desktop session is traced.
+        // Only this hook's own session counts (see `this_hook_is_for`).
+        crate::desktop_evidence::note_accepted_event(&req.session_id);
+    }
+    sent
+}
+
+/// [`send_stream_event`] without the note of an accepted event.
+async fn send_stream_event_inner(
+    client: &crate::api_client::ApiClient,
+    attribution: &Attribution,
+    force: AttributionForce,
+    req: &StreamEventRequest,
+    warned: &mut bool,
+) -> Result<tracevault_protocol::streaming::StreamEventResponse, Box<dyn std::error::Error>> {
     let (repo_id, capture_pid) = match attribution {
         // Repo-less: there is no repo-scoped endpoint to fall back TO. A
         // deterministic refusal is an error (VIS-316) that goes through the
@@ -1591,6 +1609,11 @@ fn warn_unsent(warned: &mut bool, failure: &str) {
     }
 }
 
+/// Set (to anything) in the environment of an agent `visdom` starts: that
+/// agent was told about Visdom's tools on its command line, so its
+/// session-start hook does not tell it again.
+pub const LAUNCHED_BY_VISDOM_ENV: &str = "VISDOM_LAUNCHED";
+
 /// The developer's choice of tracing mode for `visdom` (`hooks` or
 /// `gateway`). A preference, not a fact about a running agent: an agent
 /// started without `visdom` may well carry `gateway` here and still talk to
@@ -1723,6 +1746,7 @@ pub async fn run_stream(
         session_dir,
         worktree_top,
     };
+    crate::desktop_evidence::this_hook_is_for(&hook_event.session_id);
     stream_event(
         hook_event,
         event_type,

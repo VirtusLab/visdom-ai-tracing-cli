@@ -9,6 +9,7 @@ use tracevault_cli::agent::Agent;
 
 use crate::billing::Billing;
 use crate::mode::TracingMode;
+use crate::surface::Surface;
 
 /// Whether there is somebody to ask.
 pub fn is_interactive() -> bool {
@@ -144,6 +145,46 @@ pub fn ask_billing() -> Option<Billing> {
             None => eprintln!("Answer 1 or 2."),
         }
     }
+}
+
+/// Where Claude Code opens, asked only when the Claude Desktop app is known
+/// to be installed (`installed == Some(true)`): otherwise nothing is written
+/// and nothing changes. An empty answer or the end of input is `None` too:
+/// the terminal stays, and nothing is saved.
+pub fn ask_surface(
+    installed: Option<bool>,
+    read: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> Option<Surface> {
+    if installed != Some(true) {
+        return None;
+    }
+    loop {
+        let _ = write!(
+            out,
+            "Where should visdom open Claude Code? [1] in this terminal  [2] in the Claude \
+             Desktop app  (default 1): "
+        );
+        let _ = out.flush();
+        let mut line = String::new();
+        match read.read_line(&mut line) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "" => return None,
+            "1" | "terminal" => return Some(Surface::Terminal),
+            "2" | "desktop" => return Some(Surface::Desktop),
+            _ => {
+                let _ = writeln!(out, "Answer 1 or 2.");
+            }
+        }
+    }
+}
+
+/// Record `surface` in the user config at `path`, like the tracing mode.
+pub fn save_surface(path: &Path, surface: Surface) -> Result<(), String> {
+    save_user_setting(path, "surface", surface.name())
 }
 
 /// The entry of a list of `count` an answer names by its number, from 1.
@@ -294,6 +335,45 @@ fn save_user_setting(path: &Path, key: &str, value: &str) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn asked(installed: Option<bool>, input: &str) -> (Option<Surface>, String) {
+        let mut out = Vec::new();
+        let answer = ask_surface(installed, &mut input.as_bytes(), &mut out);
+        (answer, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn the_question_is_asked_only_when_the_app_is_there() {
+        for installed in [Some(false), None] {
+            assert_eq!(asked(installed, "desktop\n"), (None, String::new()));
+        }
+        assert!(asked(Some(true), "\n").1.contains("Claude Desktop app"));
+    }
+
+    #[test]
+    fn desktop_is_chosen_by_name_and_the_default_is_no_change() {
+        assert_eq!(asked(Some(true), "desktop\n").0, Some(Surface::Desktop));
+        assert_eq!(asked(Some(true), "2\n").0, Some(Surface::Desktop));
+        assert_eq!(asked(Some(true), "1\n").0, Some(Surface::Terminal));
+        assert_eq!(asked(Some(true), "\n").0, None);
+        assert_eq!(asked(Some(true), "").0, None);
+        // An answer that names neither is asked again.
+        let (answer, said) = asked(Some(true), "web\ndesktop\n");
+        assert_eq!(answer, Some(Surface::Desktop));
+        assert!(said.contains("Answer 1 or 2."));
+    }
+
+    #[test]
+    fn the_surface_is_saved_beside_what_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "bazaar_url = \"https://b.example.com\"\n").unwrap();
+        save_surface(&path, Surface::Desktop).unwrap();
+        let user: crate::config::UserConfig =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(user.surface, Some(Surface::Desktop));
+        assert_eq!(user.bazaar_url.as_deref(), Some("https://b.example.com"));
+    }
     use crate::config::load_user_config_in;
 
     #[test]

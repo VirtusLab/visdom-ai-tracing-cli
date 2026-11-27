@@ -8,6 +8,7 @@ pub mod billing;
 pub mod cli;
 pub mod components;
 pub mod config;
+pub mod desktop;
 pub mod doctor;
 pub mod env_alias;
 pub mod finding;
@@ -19,5 +20,6 @@ pub mod launch;
 pub mod mode;
 pub mod subscription;
 pub mod suite;
+pub mod surface;
 #[cfg(test)]
 mod test_http;

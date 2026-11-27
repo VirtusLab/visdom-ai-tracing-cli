@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use serde::{Serialize, Serializer};
 use tracevault_cli::agent::Agent;
 
+use crate::surface::Surface;
+
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
@@ -25,6 +27,9 @@ pub struct Finding {
     pub severity: Severity,
     pub message: String,
     pub fix: Option<Fix>,
+    /// The surface a finding is about, when it is about one only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface: Option<Surface>,
 }
 
 impl Finding {
@@ -40,6 +45,7 @@ impl Finding {
             severity,
             message: message.into(),
             fix: None,
+            surface: None,
         }
     }
 

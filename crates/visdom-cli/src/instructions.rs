@@ -48,12 +48,27 @@ fn plain_name(name: &str) -> Option<&str> {
 /// The instructions for a session with `facts`. `None` when the session has
 /// nothing of Visdom's to be told about.
 pub fn compose(facts: &Facts) -> Option<String> {
+    compose_as(facts, STARTED_BY_VISDOM)
+}
+
+const STARTED_BY_VISDOM: &str = "This session was started with `visdom`, which connects it";
+const SET_UP_WITH_VISDOM: &str = "This machine is set up with `visdom`, which connects this \
+                                  session";
+
+/// [`compose`] for a session `visdom` did not start (the Claude Desktop app,
+/// a plain `claude`): the same text, told by the session-start hook, saying
+/// how the session came to have these tools.
+pub fn compose_for_hook(facts: &Facts) -> Option<String> {
+    compose_as(facts, SET_UP_WITH_VISDOM)
+}
+
+fn compose_as(facts: &Facts, how: &str) -> Option<String> {
     if !facts.tracing && facts.bazaar.is_none() {
         return None;
     }
-    let mut text = String::from(
+    let mut text = format!(
         "# Visdom\n\
-         This session was started with `visdom`, which connects it to the organisation's Visdom \
+         {how} to the organisation's Visdom \
          platform. What is described below is set up and working here: use it on your own \
          initiative, without waiting to be asked.\n",
     );
@@ -441,6 +456,25 @@ pub fn agent_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hook_text_is_the_launch_text_but_for_how_the_session_began() {
+        let facts = Facts {
+            tracing: true,
+            bazaar: Some("bazaar".into()),
+            gateway: false,
+        };
+        let launched = compose(&facts).unwrap();
+        let hooked = compose_for_hook(&facts).unwrap();
+        assert!(launched.contains("was started with `visdom`"));
+        assert!(!hooked.contains("was started with `visdom`"));
+        assert_eq!(
+            hooked.replace(SET_UP_WITH_VISDOM, STARTED_BY_VISDOM),
+            launched
+        );
+        // Nothing to tell: nothing told, by either.
+        assert_eq!(compose_for_hook(&Facts::default()), None);
+    }
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()

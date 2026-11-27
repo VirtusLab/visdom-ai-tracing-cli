@@ -5,11 +5,13 @@ use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches};
 use tracevault_cli::agent::Agent;
 use tracevault_cli::cli::{run, Command, InitArgs};
+use tracevault_cli::commands::stream::LAUNCHED_BY_VISDOM_ENV;
 use visdom_cli::agents::via_gateway::AgentCommand;
 use visdom_cli::agents::McpScope;
 use visdom_cli::billing::{self, Billing, BillingUse};
 use visdom_cli::cli::{VisdomCli, VisdomCommand};
 use visdom_cli::components::CredentialState;
+use visdom_cli::desktop::{self, Closing};
 use visdom_cli::doctor::git_toplevel;
 use visdom_cli::doctor::{fix, print_attention, Environment, RealExecutor, Session};
 use visdom_cli::finding::FixAction;
@@ -24,6 +26,7 @@ use visdom_cli::mode::{
 };
 use visdom_cli::subscription;
 use visdom_cli::suite::PolicyState;
+use visdom_cli::surface::{self, Platform, Surface};
 use visdom_cli::{config, interactive};
 use visdom_cli::{doctor as checks, env_alias, instructions, launch};
 
@@ -51,6 +54,24 @@ fn main() {
             // First: a failed logout exits.
             forget_gateway_keys(&runtime);
             runtime.block_on(run(Command::Logout))
+        }
+        // The session-start hook of a session `visdom` did not start (the
+        // Claude Desktop app, a plain `claude`) is where that session learns
+        // of Visdom's tools; a launched agent was told on its command line.
+        Some(VisdomCommand::Trace {
+            command: Command::SessionStart,
+        }) => {
+            let extra = match std::env::var_os(LAUNCHED_BY_VISDOM_ENV) {
+                Some(_) => None,
+                None => checks::hook_instructions(&Environment::current()),
+            };
+            // As in the library: the hook has printed its answer, and a
+            // failure here must not stop the session from starting.
+            if let Err(e) =
+                runtime.block_on(tracevault_cli::commands::session_start::run_with(extra))
+            {
+                eprintln!("SessionStart error: {e}");
+            }
         }
         Some(VisdomCommand::Trace { command }) => runtime.block_on(run(command)),
         Some(VisdomCommand::Init { mut args }) => {
@@ -84,6 +105,9 @@ fn main() {
                 init_mode(&runtime, agent, cli.mode, cli.billing);
                 init_gateway(&runtime, agent, cli.mode, cli.billing, scope.scope);
             }
+            if agent == Agent::ClaudeCode {
+                init_surface(cli.surface);
+            }
         }
         Some(VisdomCommand::Doctor {
             fix,
@@ -92,11 +116,15 @@ fn main() {
             agent,
             mode,
             billing,
+            surface,
         }) => doctor(
             &runtime,
-            agent.or(cli.agent),
-            mode.or(cli.mode),
-            billing.or(cli.billing),
+            Choices {
+                agent: agent.or(cli.agent),
+                mode: mode.or(cli.mode),
+                billing: billing.or(cli.billing),
+                surface: surface.map(|choice| choice.surface()).or(cli.surface),
+            },
             fix,
             yes || cli.yes,
             json,
@@ -126,9 +154,12 @@ fn main() {
         }
         None => check_and_launch(
             runtime,
-            cli.agent,
-            cli.mode,
-            cli.billing,
+            Choices {
+                agent: cli.agent,
+                mode: cli.mode,
+                billing: cli.billing,
+                surface: cli.surface,
+            },
             cli.yes,
             !cli.no_instructions,
             &cli.agent_args,
@@ -236,7 +267,19 @@ fn gather(
     billing: Option<Billing>,
     runtime: &tokio::runtime::Runtime,
 ) -> Session {
-    match Session::gather(env, agent, mode, billing, runtime) {
+    gather_on(env, agent, mode, billing, None, runtime)
+}
+
+/// [`gather`] for the commands that take `--surface`.
+fn gather_on(
+    env: &Environment,
+    agent: Option<Agent>,
+    mode: Option<TracingMode>,
+    billing: Option<Billing>,
+    surface: Option<Surface>,
+    runtime: &tokio::runtime::Runtime,
+) -> Session {
+    match Session::gather_on(env, agent, mode, billing, surface, runtime) {
         Ok(session) => {
             for warning in &session.warnings {
                 eprintln!("visdom: warning: {warning}");
@@ -254,17 +297,88 @@ fn stdin_is_tty() -> bool {
     std::io::stdin().is_terminal()
 }
 
-fn doctor(
-    runtime: &tokio::runtime::Runtime,
+/// Where `visdom` opens Claude Code, in `visdom init`: `--surface` is saved
+/// to the user config without asking; with nothing chosen anywhere, the
+/// Claude Desktop app installed and somebody to ask, the answer is. Nothing
+/// is asked of a developer without the app, and an empty answer changes
+/// nothing.
+fn init_surface(flag: Option<Surface>) {
+    let env = Environment::current();
+    let path = config::user_config_path_in(&env.config_root);
+    let surface = match flag {
+        Some(surface) => surface,
+        None => {
+            let user = config::load_user_config_in(&env.config_root).unwrap_or_default();
+            let chosen = env.surface.is_some()
+                || user.surface.is_some()
+                || checks_repo_config(&env).surface.is_some();
+            if chosen || !interactive::is_interactive() {
+                return;
+            }
+            let installed = desktop::app_installed(&Platform::current(), &env.home, &|name| {
+                std::env::var(name).ok()
+            });
+            let answer = interactive::ask_surface(
+                installed,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stderr(),
+            );
+            match answer {
+                Some(surface) => surface,
+                None => return,
+            }
+        }
+    };
+    match interactive::save_surface(&path, surface) {
+        Ok(()) => eprintln!(
+            "Saved surface = \"{}\" to {}",
+            surface.name(),
+            path.display()
+        ),
+        Err(e) => {
+            eprintln!("visdom: the surface could not be saved: {e}");
+            eprintln!(
+                "  Set it yourself: export {}={}",
+                surface::SURFACE_ENV,
+                surface.name()
+            );
+            exit(1);
+        }
+    }
+}
+
+/// What the command line chose for a session; `None` leaves it to the
+/// environment and the config files.
+#[derive(Clone, Copy)]
+struct Choices {
     agent: Option<Agent>,
     mode: Option<TracingMode>,
     billing: Option<Billing>,
+    surface: Option<Surface>,
+}
+
+impl Choices {
+    fn gather(self, env: &Environment, runtime: &tokio::runtime::Runtime) -> Session {
+        gather_on(
+            env,
+            self.agent,
+            self.mode,
+            self.billing,
+            self.surface,
+            runtime,
+        )
+    }
+}
+
+fn doctor(
+    runtime: &tokio::runtime::Runtime,
+    choices: Choices,
     fix_flag: bool,
     yes: bool,
     json: bool,
 ) -> ! {
     let env = Environment::current();
-    let mut session = gather(&env, agent, mode, billing, runtime);
+    let mut session = choices.gather(&env, runtime);
     check_subscription(&mut session, runtime, true, &[]);
     let mut findings = session.collect();
     let policy = policy_for(fix_flag, yes, true, stdin_is_tty());
@@ -272,7 +386,7 @@ fn doctor(
         // What is wrong, before asking to change it.
         print_attention(&findings);
         if fix(&findings, policy, &mut RealExecutor::new(json, policy)).applied {
-            session = gather(&env, agent, mode, billing, runtime);
+            session = choices.gather(&env, runtime);
             check_subscription(&mut session, runtime, true, &[]);
             findings = session.collect();
         }
@@ -1082,26 +1196,146 @@ fn stop_on_billing(session: &Session) {
     }
 }
 
+/// Stop: the desktop app is not opened, and why.
+fn not_opened(why: &str) -> ! {
+    eprintln!(
+        "{}",
+        desktop::closing_line(&Closing::NotOpened(why.to_string()), None)
+    );
+    exit(1)
+}
+
+/// The command that opens Claude Desktop for this session, or a refusal that
+/// says what to do instead: a session the desktop cannot run, arguments it
+/// cannot be given, no app, no terminal CLI, or no terminal where
+/// `claude --desktop` needs one.
+fn desktop_open(
+    session: &Session,
+    env: &Environment,
+    agent_args: &[String],
+) -> desktop::DesktopOpen {
+    let platform = Platform::current();
+    let args = surface::supports(session.surface, session.ctx.agent, &session.mode, &platform)
+        .and_then(|()| surface::desktop_args(&platform, agent_args))
+        .unwrap_or_else(|why| {
+            eprintln!("{}", surface::refusal(&why));
+            exit(1)
+        });
+    let back = format!(
+        "use --surface terminal (or {}=terminal)",
+        surface::SURFACE_ENV
+    );
+    if desktop::app_installed(&platform, &env.home, &|name| std::env::var(name).ok()) == Some(false)
+    {
+        not_opened(&format!(
+            "the app is not installed here: install it, or {back}"
+        ));
+    }
+    let claude = session.adapter.program();
+    if desktop::find_program(claude, std::env::var_os("PATH").as_deref()).is_none() {
+        not_opened(&format!(
+            "`{claude}` was not found. Install the Claude Code CLI: the desktop surface needs \
+             it. Or {back}"
+        ));
+    }
+    let names: Vec<String> = std::env::vars_os()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .collect();
+    let open = desktop::open_command(
+        &platform,
+        claude,
+        &session.ctx.workdir.start_dir,
+        &args,
+        &names,
+    );
+    if open.needs_terminal && !(stdin_is_tty() && std::io::stdout().is_terminal()) {
+        not_opened(&format!(
+            "`{claude} --desktop` needs a terminal, and visdom was run without one: run it in a \
+             terminal, or {back}"
+        ));
+    }
+    open
+}
+
+/// Open Claude Desktop and say, in the last line, what state its sessions
+/// are in. `visdom` does not become the agent here.
+fn open_desktop(open: desktop::DesktopOpen, session: &Session) -> ! {
+    let closing = desktop::closing_for(&session.collect());
+    let choose = open.choose_folder.clone();
+    // What `visdom doctor` measures a traced session against. Best effort.
+    let opened = || {
+        let _ = tracevault_cli::desktop_evidence::record_opened(
+            &session.config_root,
+            &session.ctx.workdir.start_dir,
+            now(),
+        );
+    };
+    if open.detached {
+        if let Err(why) = desktop::spawn_detached(open.command) {
+            not_opened(&why);
+        }
+        opened();
+        eprintln!("{}", desktop::closing_line(&closing, choose.as_deref()));
+        exit(0)
+    }
+    // `claude --desktop` has this terminal, and says itself what it opened
+    // or why it could not (no app, no subscription login).
+    let mut command = open.command;
+    let program = command.get_program().to_string_lossy().into_owned();
+    match command.status() {
+        Ok(status) if status.success() => {
+            opened();
+            eprintln!("{}", desktop::closing_line(&closing, choose.as_deref()));
+            exit(0)
+        }
+        Ok(status) => {
+            eprintln!(
+                "{}",
+                desktop::closing_line(
+                    &Closing::NotOpened(format!(
+                        "`{program} --desktop` failed ({status}); what it said is above"
+                    )),
+                    None
+                )
+            );
+            exit(status.code().unwrap_or(1))
+        }
+        Err(error) => {
+            eprintln!(
+                "{}",
+                launch::launch_error_message(
+                    &program,
+                    &error,
+                    session.ctx.agent,
+                    &session.user_config_path
+                )
+            );
+            exit(127)
+        }
+    }
+}
+
 /// Plain `visdom`: check, offer the fixes, start the agent. Findings never
 /// stop the agent from starting; only a gateway the workspace requires and
 /// that cannot be used does.
 fn check_and_launch(
     runtime: tokio::runtime::Runtime,
-    agent: Option<Agent>,
-    mode: Option<TracingMode>,
-    billing: Option<Billing>,
+    choices: Choices,
     yes: bool,
     instructions: bool,
     agent_args: &[String],
 ) -> ! {
     let env = Environment::current();
-    let mut session = gather(&env, agent, mode, billing, &runtime);
+    let mut session = choices.gather(&env, &runtime);
+    // What the desktop cannot do is said before anything is changed.
+    let desktop =
+        (session.surface == Surface::Desktop).then(|| desktop_open(&session, &env, agent_args));
     check_subscription(&mut session, &runtime, false, agent_args);
     let findings = session.collect();
     print_attention(&findings);
     let policy = policy_for(false, yes, false, stdin_is_tty());
     if fix(&findings, policy, &mut RealExecutor::new(false, policy)).applied {
-        session = gather(&env, agent, mode, billing, &runtime);
+        session = choices.gather(&env, &runtime);
         check_subscription(&mut session, &runtime, false, agent_args);
         // What is still open, once, above the agent.
         print_attention(&session.collect());
@@ -1117,8 +1351,24 @@ fn check_and_launch(
         eprintln!("visdom: the agent is not started: correct the billing (gateway.billing above)");
         exit(2);
     }
+    if let Some(open) = desktop {
+        if !instructions {
+            eprintln!(
+                "visdom: --no-instructions has no effect on the desktop surface: set \
+                 agent_instructions = false in the user config"
+            );
+        }
+        drop(runtime);
+        open_desktop(open, &session)
+    }
     // In the directory visdom was run in, like starting the agent by hand.
-    let AgentCommand { cmd, private_file } = agent_command(&session, &runtime, agent_args);
+    let AgentCommand {
+        mut cmd,
+        private_file,
+    } = agent_command(&session, &runtime, agent_args);
+    // Told (or deliberately not told) on its command line: its session-start
+    // hook says nothing more.
+    cmd.env(LAUNCHED_BY_VISDOM_ENV, "1");
     // The agent takes over this process (or runs as its only child): no
     // runtime threads may outlive it.
     drop(runtime);
